@@ -1,0 +1,21 @@
+{
+  "releases": [
+    {
+      "version": "0.1.1",
+      "published_at": "2026-03-25",
+      "highlights": [
+        "Coverage Center is now built into the desktop app so you can review folder coverage, scan progress, and attention items in one place.",
+        "Post-quantum protection status is clearer across the workspace home, folder detail view, and header badge."
+      ],
+      "important_changes": [
+        "Protected-folder enrollment errors now classify common failures such as permissions, missing paths, and already-protected folders.",
+        "Mount progress and timeout messaging now identify the target folder and explain when backgrounding is available.",
+        "Force unmount now requires a typed FORCE confirmation before the destructive path can continue."
+      ],
+      "fixes": [
+        "Refined empty states, action labels, and workspace copy around coverage and folder protection.",
+        "Improved mount and unmount safety guidance for conflict, recovery, and long-running operations."
+      ]
+    }
+  ]
+}

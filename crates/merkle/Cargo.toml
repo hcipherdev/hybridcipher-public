@@ -1,0 +1,30 @@
+[package]
+name = "hybridcipher-merkle"
+version = "0.1.0"
+edition = "2021"
+authors = ["HybridCipher Team"]
+description = "Memory-efficient Merkle tree implementation for HybridCipher"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hybridcipher/hybridcipher"
+readme = "../../README.md"
+keywords = ["cryptography", "merkle", "hybridcipher"]
+categories = ["cryptography", "data-structures"]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+sha2 = { workspace = true }
+hybridcipher-crypto = { path = "../crypto" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+hex = "0.4"
+
+[[bench]]
+name = "merkle_bench"
+harness = false

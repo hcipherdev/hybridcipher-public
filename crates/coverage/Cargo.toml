@@ -1,0 +1,24 @@
+[package]
+name = "hybridcipher-coverage"
+version = "0.1.0"
+edition = "2021"
+authors = ["HybridCipher Team"]
+description = "Coverage tracking utilities for HybridCipher transparency and auditing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hybridcipher/hybridcipher"
+readme = "../../README.md"
+keywords = ["cryptography", "audit", "hybridcipher"]
+categories = ["cryptography", "data-structures"]
+
+[dependencies]
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+hybridcipher-crypto = { path = "../crypto" }
+hybridcipher-merkle = { path = "../merkle" }
+hex = "0.4"
+hybridcipher-messages = { path = "../messages" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

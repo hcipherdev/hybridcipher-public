@@ -1,0 +1,10 @@
+/target/
+**/target/
+/.worktrees/
+*.orig
+*.bak
+*~
+.DS_Store
+node_modules/
+apps/desktop/node_modules/
+apps/desktop/src-tauri/src-tauri/

@@ -1,0 +1,23 @@
+#[cfg(feature = "experimental-security")]
+pub mod attack_simulation;
+pub mod audit;
+pub mod crypto_validator;
+pub mod documentation;
+pub mod errors;
+#[cfg(feature = "experimental-security")]
+pub mod hardening;
+#[cfg(feature = "experimental-security")]
+pub mod hsm_integration;
+pub mod network_security;
+#[cfg(feature = "experimental-security")]
+pub mod operational_security;
+#[cfg(feature = "experimental-security")]
+pub mod penetration_testing;
+#[cfg(feature = "experimental-security")]
+pub mod runtime_protection;
+pub mod security_validator;
+pub mod static_analyzer;
+pub mod threat_detection;
+pub mod vulnerability_scanner;
+
+pub use errors::*;

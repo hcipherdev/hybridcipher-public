@@ -1,0 +1,318 @@
+[client]
+server_url = "https://api.hybridcipher.com"
+timeout = 120
+retry_attempts = 3
+state_save_debounce_ms = 500
+membership_proof_max_age_hours = 24
+# [device trust policy]
+# Second-party verification is an extra safety step where a separate verifier confirms the
+# device fingerprint. When enabled, a device is considered fully trusted only after:
+# 1 the local pin is verified, and
+# 2 the second-party status is verified.
+# This influences unverified-device reporting and whether a local pin verify clears entries.
+# Set to true/false to disallow/allow local pin verification alone (second-party becomes optional).
+require_second_party_verification = false
+# [admin operations panel refresh]
+# Desktop app only: controls how often the Admin -> Operations queues auto-refresh in the background.
+# This refresh updates Issue Welcome, Stale Devices, and Unverified Devices counts + any active list.
+# Value is in seconds. Set to 0 to disable background refresh (manual refresh and login refresh still run).
+admin_operations_refresh_interval_secs = 300
+
+# [desktop session health watchdog]
+# Desktop app only: keeps the UI honest about auth state when a token expires while the window
+# stays open. The frontend polls at the interval below and logs out if the session is expired
+# or within the configured grace window (to avoid a race between UI and backend clock skew).
+# - session_health_check_interval_secs: how often to poll the session (0 disables polling).
+# - session_health_expiry_grace_secs: if the token expires within this many seconds from "now",
+#   treat it as expired and force a logout so operations don't silently fail.
+session_health_check_interval_secs = 60
+session_health_expiry_grace_secs = 5
+
+# [desktop mount waiting modal policy]
+# Desktop app only: controls when mount modal actions become available and when
+# a backgrounded mount is considered failed.
+# Timeline behavior:
+# - 0..mount_continue_enable_secs: "Starting mount..." state, no cancel.
+# - mount_continue_enable_secs..: "Continue in background" is enabled.
+# - mount_cancel_enable_secs.. (foreground only): "Cancel mount" is enabled with confirmation.
+# - If user continues in background, fail the mount after mount_background_timeout_secs
+#   and surface an error notification.
+# Notes:
+# - Values are seconds and are converted to milliseconds in the desktop frontend.
+# - Set to 0 to enable the action/timeout immediately.
+mount_continue_enable_secs = 10
+mount_cancel_enable_secs = 120
+mount_background_timeout_secs = 120
+
+# [rekey migration state persistence]
+# Rekey migration state persistence (idle crawler, it applies to auto/background rekey migration)
+# Save progress every N files or at least once every x seconds (whichever comes first).
+# Set either value to 0 to disable that trigger (final flush still runs at the end).
+# new updates: the values of both parameters cannot be 0, otherwise the migration won't progress.
+
+migration_state_save_batch_size = 200
+migration_state_save_max_interval_secs = 5
+
+
+file_index_cache_max_roots = 2
+metadata_cache_max_entries = 2048
+
+# [rekey heartbeat to server]
+# Rekey heartbeat reporting cadence
+# use the same migration_state_save_batch_size above to update heartbeats after every N files migrated or at least once every x seconds.
+
+migration_heartbeat_min_interval_secs = 5
+
+# [rekey start options]
+# Background automation toggles
+# When disabled, no automatic migration queueing or rekey heartbeats are emitted.
+migration_automation_enabled = false
+# When disabled, coverage filesystem watchers are not started automatically.
+coverage_watchers_enabled = true
+# [coverage IPC auto-detect opt-out]
+# CLI only: when the desktop app is running, the CLI auto-detects the coverage IPC socket
+# and uses it to avoid sled file-index lock contention.
+# Set this env var to a truthy value (1/true/on) to opt out and force direct disk access. if no value is set, auto-detect is enabled.
+coverage_ipc_opt_out_env = "HYBRIDCIPHER_COVERAGE_IPC_DISABLE"
+
+[security]
+# Enable post-quantum cryptography
+pq_crypto = true
+# Verify server certificates
+verify_tls = true  # Enforce TLS by default; set to false only for local HTTP testing
+# Enable transparency log verification
+transparency_log = true  # Set to false only for local testing
+
+[storage]
+# Local storage for client data
+data_dir = "~/.hybridcipher"
+cache_size = "100MB"
+
+[network]
+# Network configuration
+max_connections = 10
+connection_timeout = 60
+
+[coverage]
+# Files matching these patterns will be excluded from encryption and coverage tracking
+exclude_files = [".hybridcipher-tmp",
+  ".hybridcipher-tmp/**",
+  "**/.hybridcipher-tmp",
+  "**/.hybridcipher-tmp/**",
+  ".hybridcipher-root-*.json",
+  # macOS system files
+  ".DS_Store",
+  ".Spotlight-V100",
+  ".Trashes",
+  ".fseventsd",
+  ".TemporaryItems",
+  ".DocumentRevisions-V100",
+  ".localized",
+  ".AppleDouble",
+  "__MACOSX",
+  # Windows system files
+  "desktop.ini",
+  "Thumbs.db",
+  # Note-taking & knowledge management
+  ".obsidian",
+  ".obsidian/**",
+  "**/.obsidian",
+  "**/.obsidian/**",
+  ".logseq",
+  "**/.logseq",
+  "**/.logseq/**",
+  ".logseq/**",
+  ".bear",
+  "**/.bear",
+  "**/.bear/**",
+  ".bear/**",
+  # Code editors & IDEs
+  ".vscode",
+  "**/.vscode",
+  "**/.vscode/**",
+  ".vscode/**",
+  ".idea",
+  "**/.idea",
+  "**/.idea/**",
+  ".idea/**",
+  ".eclipse",
+  "**/.eclipse",
+  "**/.eclipse/**",
+  ".eclipse/**",
+  ".zed",
+  "**/.zed",
+  "**/.zed/**",
+  ".zed/**",
+  ".cursor",
+  "**/.cursor",
+  "**/.cursor/**",
+  ".cursor/**",
+  ".devcontainer",
+  "**/.devcontainer",
+  "**/.devcontainer/**",
+  ".devcontainer/**",
+  # Version control
+  ".git",
+  "**/.git",
+  "**/.git/**",
+  ".git/**",
+  ".svn",
+  "**/.svn",
+  "**/.svn/**",
+  ".svn/**",
+  ".hg",
+  "**/.hg",
+  "**/.hg/**",
+  ".hg/**",
+  # Build tools & package managers
+  "node_modules",
+  "**/node_modules",
+  "**/node_modules/**",
+  "node_modules/**",
+  ".npm",
+  "**/.npm",
+  "**/.npm/**",
+  ".npm/**",
+  ".yarn",
+  "**/.yarn",
+  "**/.yarn/**",
+  ".yarn/**",
+  "target",
+  "**/target",
+  "**/target/**",
+  "target/**",
+  ".cargo",
+  "**/.cargo",
+  "**/.cargo/**",
+  ".cargo/**",
+  "__pycache__",
+  "**/__pycache__",
+  "**/__pycache__/**",
+  "__pycache__/**",
+  ".venv",
+  "**/.venv",
+  "**/.venv/**",
+  ".venv/**",
+  "venv",
+  "**/venv",
+  "**/venv/**",
+  "venv/**",
+  ".gradle",
+  "**/.gradle",
+  "**/.gradle/**",
+  ".gradle/**",
+  ".m2",
+  "**/.m2",
+  "**/.m2/**",
+  ".m2/**",
+  # Cloud sync tools
+  ".dropbox",
+  ".dropbox.cache",
+  "**/.dropbox.cache",
+  "**/.dropbox.cache/**",
+  ".dropbox.cache/**",
+  # CI/CD & dev tooling
+  ".github",
+  "**/.github",
+  "**/.github/**",
+  ".github/**",
+  ".husky",
+  "**/.husky",
+  "**/.husky/**",
+  ".husky/**",
+  ".direnv",
+  "**/.direnv",
+  "**/.direnv/**",
+  ".direnv/**",
+  # Microsoft Office lock/temp files
+  "~$*",
+  "*.tmp",
+  # LibreOffice / OpenOffice lock files
+  ".~lock.*",
+  "node_modules",
+  "node_modules/**",
+  "**/node_modules",
+  "**/node_modules/**",
+  # General cache directories
+  ".cache",
+  "**/.cache",
+  "**/.cache/**",
+  ".cache/**",
+  ".local/share/Trash",
+  "**/.local/share/Trash",
+  "**/.local/share/Trash/**",
+  ".local/share/Trash/**",
+  # Package managers
+  ".pnpm-store",
+  "**/.pnpm-store",
+  "**/.pnpm-store/**",
+  ".pnpm-store/**",
+  ".conda",
+  "**/.conda",
+  "**/.conda/**",
+  ".conda/**",
+  ".julia",
+  "**/.julia",
+  "**/.julia/**",
+  ".julia/**",  
+]
+# Coverage replication batch size (files per request)
+batch_size = 64
+# Number of parallel upload workers (1 = sequential, >1 = parallel)
+parallel_uploads = 1 # set to 1 to avoid the server flood
+# Minimum interval between coverage upload requests (milliseconds, 0 disables throttling)
+upload_min_interval_ms = 5000
+# Base backoff delay for retryable coverage upload failures (milliseconds)
+upload_backoff_base_ms = 10000
+# Max backoff delay for retryable coverage upload failures (milliseconds)
+upload_backoff_max_ms = 70000
+# Pending delta threshold that triggers baseline coverage sync (0 disables baseline sync)
+baseline_threshold = 50000
+# Coverage journal compaction thresholds
+compaction_min_entries = 1000
+compaction_idle_quiet_secs = 10
+compaction_min_interval_secs = 30
+compaction_max_interval_secs = 300
+compaction_max_journal_bytes = 8000000
+compaction_bulk_force_journal_bytes = 64000000
+compaction_error_backoff_secs = 60
+compaction_bulk_mode_enabled = true
+
+[mount]
+# Skip re-encrypting updates for large sparse files to avoid densifying and disk blowups.
+# Set to 0 to disable sparse update skipping, now is 2 GiB by default.
+sparse_skip_size_bytes = 2147483648
+# Use streaming (chunked) encryption for large files to avoid full in-memory reads.
+# Set to 0 to disable streaming and always use in-memory encryption. Now is 1024 MiB by default.
+stream_threshold_bytes = 1073741824
+# Chunk size for streaming encryption/decryption. If file larger than stream_threshold_bytes,
+# it will be processed in chunks of this size. Now is 256 MiB by default
+stream_chunk_size_bytes = 268435456
+
+# Delay encrypting large files until they have been stable for this many seconds.set to 0 to disable stability wait, otherwise, the larger file may not appear in the encrypted folder at all.
+stream_stability_age_secs = 0
+
+# Startup reconciliation safety guard for sync mount.
+# When HybridCipher detects an unclean previous mount start, it runs reconciliation to recover
+# pending work. During that process, "local deleted" actions can be inferred if many previously
+# tracked files are missing from the decrypted mount view.
+#
+# This setting is a hard cap on how many startup local-delete actions may be queued in one pass.
+# If reconciliation detects more than this value, HybridCipher aborts reconciliation for that
+# startup cycle instead of queueing a bulk delete operation that could move many encrypted files
+# into retention due to a bad mountpoint state.
+#
+# Why this exists:
+# - Protects against accidental mass deletions when a mountpoint is unexpectedly empty/corrupt.
+# - Adds an operator-visible failure mode instead of silent destructive behavior.
+#
+# Tuning guidance:
+# - Keep this low in normal desktop usage.
+# - Raise only if you intentionally perform very large delete batches while unmounted and want
+#   startup reconciliation to process them automatically.
+# - Must be > 0. Invalid/non-positive values fall back to the built-in default.
+startup_local_delete_max_actions = 20
+
+[logging]
+level = "info"
+format = "text"

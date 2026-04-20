@@ -1,0 +1,2223 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HybridCipher - Secure File Sharing</title>
+    <link rel="stylesheet" href="vendor/xterm/xterm.css">
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <!-- Logged Out Welcome Screen -->
+    <div class="welcome-screen" id="welcomeScreen">
+        <div class="welcome-container">
+            <div class="welcome-logo">
+                <img src="logo.png" alt="HybridCipher Logo" width="120" height="120">
+                <h1 class="welcome-title">HybridCipher</h1>
+                <p class="welcome-subtitle">Post-Quantum Secure File Sharing</p>
+            </div>
+
+            <div class="welcome-actions">
+                <button class="btn btn-primary btn-large" id="loginBtn">Login</button>
+                <button class="btn btn-secondary btn-large" id="registerBtn">Register</button>
+                <button class="btn btn-text" id="forgotPasswordBtn">Forgot password</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- First Run Welcome -->
+    <div class="modal first-run-modal hidden" id="firstRunWelcomeModal">
+        <div class="modal-backdrop" id="firstRunWelcomeBackdrop"></div>
+        <div class="modal-content first-run-content" role="dialog" aria-modal="true"
+            aria-labelledby="firstRunWelcomeTitle">
+            <div class="first-run-hero">
+                <div class="first-run-hero-text">
+                    <h2 id="firstRunWelcomeTitle">Welcome to HybridCipher</h2>
+                    <p class="first-run-subtitle">
+                        Secure collaboration that stays secure as your team grows.
+                    </p>
+                </div>
+                <button class="modal-close" id="closeFirstRunWelcomeBtn" aria-label="Close">&times;</button>
+            </div>
+            <div class="first-run-body">
+                <div class="first-run-steps">
+                    <div class="first-run-step">
+                        <div class="first-run-step-title">1. Sign in</div>
+                        <div class="first-run-step-desc">Create an account or log in to your team server.</div>
+                    </div>
+                    <div class="first-run-step">
+                        <div class="first-run-step-title">2. Verify devices</div>
+                        <div class="first-run-step-desc">Confirm fingerprints so only trusted devices can join.</div>
+                    </div>
+                    <div class="first-run-step">
+                        <div class="first-run-step-title">3. Enroll folders</div>
+                        <div class="first-run-step-desc">Pick the folders you want protected and shared.</div>
+                    </div>
+                </div>
+                <div class="first-run-actions">
+                    <button class="btn btn-primary btn-large" id="firstRunCreateAccountBtn" type="button">
+                        Create account
+                    </button>
+                    <button class="btn btn-secondary btn-large" id="firstRunLoginBtn" type="button">
+                        I have an account
+                    </button>
+                    <button class="btn btn-text" id="firstRunSkipBtn" type="button">
+                        Skip for now
+                    </button>
+                    <button class="btn btn-secondary markers-reminder-muted first-run-dismiss-btn"
+                        id="firstRunDontShowAgainBtn" type="button">
+                        Don't show again
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal hidden" id="releaseNotesModal">
+        <div class="modal-backdrop" id="releaseNotesBackdrop"></div>
+        <div class="modal-content release-notes-modal" role="dialog" aria-modal="true"
+            aria-labelledby="releaseNotesTitle">
+            <div class="release-notes-hero">
+                <div class="release-notes-eyebrow">Updated app</div>
+                <h2 id="releaseNotesTitle">What’s new</h2>
+                <p class="release-notes-subtitle" id="releaseNotesIntro">
+                    Here are the most important changes in this release.
+                </p>
+            </div>
+            <div class="release-notes-body" id="releaseNotesBody"></div>
+            <div class="release-notes-actions">
+                <button class="btn btn-primary btn-large" id="releaseNotesContinueBtn" type="button">
+                    Continue
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal hidden" id="legalModal">
+        <div class="modal-backdrop" id="legalModalBackdrop"></div>
+        <div class="modal-content legal-modal">
+            <div class="modal-header">
+                <div>
+                    <h2 id="legalModalTitle">Legal documents</h2>
+                    <p class="legal-modal-subtitle" id="legalModalSubtitle">Review the bundled terms for this release.</p>
+                </div>
+                <button class="modal-close" id="closeLegalModalBtn" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body legal-modal-body">
+                <div class="legal-status-banner" id="legalStatusBanner"></div>
+                <div class="legal-layout">
+                    <div class="legal-doc-list" id="legalDocumentList" role="tablist" aria-label="Legal documents"></div>
+                    <div class="legal-reader">
+                        <div class="legal-reader-header">
+                            <div>
+                                <h3 id="legalDocumentHeading">Terms of Service</h3>
+                                <p class="legal-reader-meta" id="legalDocumentMeta">Version —</p>
+                            </div>
+                        </div>
+                        <pre class="legal-document-content" id="legalDocumentContent"></pre>
+                    </div>
+                </div>
+            </div>
+            <div class="form-actions legal-actions">
+                <button type="button" class="btn btn-secondary hidden" id="legalRetryBtn">Retry loading</button>
+                <button type="button" class="btn btn-secondary hidden" id="legalDeclineBtn">Quit app</button>
+                <button type="button" class="btn btn-primary hidden" id="legalAcceptBtn">Accept and continue</button>
+                <button type="button" class="btn btn-secondary" id="legalCloseBtn">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logged In Main App -->
+    <div class="app-container hidden" id="appContainer">
+        <!-- Header Bar -->
+        <header class="app-header">
+            <div class="header-left">
+                <button class="sidebar-toggle" id="settingsBtn" title="Settings">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                            d="M12 15a3 3 0 100-6 3 3 0 000 6z" />
+                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                            d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z" />
+                    </svg>
+                    <span class="update-badge hidden" id="settingsUpdateBadge"></span>
+                </button>
+                <div class="logo-compact">
+                    <img src="logo.png" alt="HybridCipher" width="32" height="32">
+                    <span class="app-name">HybridCipher</span>
+                    <span class="beta-badge">BETA</span>
+                </div>
+            </div>
+            <div class="header-center">
+                <div class="global-search">
+                    <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none">
+                        <path stroke="currentColor" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                    </svg>
+                    <input type="text" id="globalSearch" placeholder="Search CLI commands..." autocomplete="off" />
+                    <div class="command-palette" id="commandPalette" role="listbox" aria-hidden="true"></div>
+                </div>
+            </div>
+            <div class="header-right">
+                <button class="post-quantum-badge hidden" id="postQuantumBadge" type="button" aria-hidden="true">
+                    <span class="post-quantum-badge-eyebrow" id="postQuantumBadgeEyebrow">Post-quantum protection</span>
+                    <span class="post-quantum-badge-label" id="postQuantumBadgeLabel">Protected now</span>
+                </button>
+                <div class="user-status-wrapper" id="userStatusWrapper">
+                    <div class="user-status-pill" id="userStatusPill" aria-haspopup="true" aria-expanded="false">
+                        <span class="status-dot"></span>
+                        <span id="headerUserEmail">User</span>
+                        <span class="status-alert" id="userStatusAlert" aria-hidden="true">!</span>
+                    </div>
+                    <div class="status-warning-panel" id="statusWarningPanel" aria-hidden="true">
+                        <div class="status-warning-header">Action needed</div>
+                        <div class="status-warning-list" id="statusWarningList">
+                            <div class="status-warning-empty">All security checks look good.</div>
+                        </div>
+                    </div>
+                </div>
+                <button class="labeled-btn hidden" id="adminPanelBtn" title="Admin panel" aria-hidden="true" tabindex="-1">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                            d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
+                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 12h8M8 16h5" />
+                    </svg>
+                    <span class="btn-label">Admin panel</span>
+                </button>
+                <button class="labeled-btn" id="feedbackBtn" title="Send Feedback">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                            d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+                    </svg>
+                    <span class="btn-label">Feedback</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Layout -->
+        <div class="app-layout">
+            <!-- Sidebar -->
+            <aside class="sidebar" id="sidebar">
+                <div class="sidebar-resize-handle" id="sidebarResizeHandle" aria-hidden="true"></div>
+                <div class="sidebar-content">
+                    <div class="sidebar-header">
+                        <div>
+                            <h2 class="sidebar-title">Protected Folders</h2>
+                            <p class="sidebar-hint">Double click to mount</p>
+                            <p class="sidebar-mount-summary" id="sidebarMountSummary">0 protected • 0 mounted</p>
+                        </div>
+                        <button class="btn-icon btn-small" id="refreshFoldersBtn" title="Refresh">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                <path stroke="currentColor" stroke-width="2"
+                                    d="M1 4v6h6M23 20v-6h-6M20.49 9A9 9 0 105.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" />
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="folder-list" id="folderList">
+                        <div class="empty-state">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" opacity="0.5">
+                                <path stroke="currentColor" stroke-width="2"
+                                    d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+                            </svg>
+                            <p>No protected folders</p>
+                        </div>
+                    </div>
+                    <div class="sidebar-footer">
+                        <button class="btn btn-add-folder sidebar-action" id="sidebarCoverageCenterBtn" type="button">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    d="M3 12h3m4 0h3m4 0h3M12 3v3m0 12v3M6.5 6.5l2 2m6 6l2 2m0-10l-2 2m-6 6l-2 2" />
+                            </svg>
+                            Coverage Center
+                        </button>
+                        <button class="btn btn-add-folder" id="addFolderBtn">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14" />
+                            </svg>
+                            Add Protected Folder
+                        </button>
+                        <button class="btn btn-add-folder sidebar-action hidden" id="sidebarSwitchGroupBtn" type="button">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    d="M7 7h10l-3-3m3 13H7l3 3" />
+                            </svg>
+                            Switch group
+                        </button>
+                    </div>
+                </div>
+                <div class="sidebar-terminal-slot">
+                    <div class="sidebar-view-actions">
+                        <button class="btn btn-secondary sidebar-terminal-btn active" id="sidebarHomeBtn" type="button"
+                            title="Return to workspace home" aria-pressed="true">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    stroke-linejoin="round" d="M3 11l9-7 9 7" />
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    stroke-linejoin="round" d="M5 10v10h14V10" />
+                            </svg>
+                            Home
+                        </button>
+                        <button class="btn btn-secondary sidebar-terminal-btn" id="sidebarTerminalBtn" type="button"
+                            title="Open terminal" aria-pressed="false">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    d="M4 5h16a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2z" />
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    stroke-linejoin="round" d="M7 9l3 3-3 3m5 0h5" />
+                            </svg>
+                            Terminal
+                        </button>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Main Content -->
+            <main class="main-content" id="mainContent">
+                <div class="workspace" id="workspace">
+                    <section class="admin-dashboard" id="adminDashboard">
+                        <div class="dashboard-header">
+                            <div class="dashboard-header-main">
+                                <h2 class="dashboard-title">Admin Cockpit</h2>
+                                <p class="dashboard-subtitle">Team-wide security operations and onboarding at a glance.
+                                </p>
+                                <div class="dashboard-meta">
+                                    <span class="dashboard-meta-item" id="adminDeviceLabel">Device —</span>
+                                </div>
+                            </div>
+                            <div class="dashboard-header-actions">
+                                <button class="btn btn-secondary btn-small" id="adminRefreshStatusBtn" type="button">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                        <path stroke="currentColor" stroke-width="2"
+                                            d="M1 4v6h6M23 20v-6h-6M20.49 9A9 9 0 105.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" />
+                                    </svg>
+                                    Refresh
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Status Cards Grid -->
+                        <div class="dashboard-status-grid">
+                            <div class="dashboard-card dashboard-card-actionable" id="adminPendingActionsCard">
+                                <div class="card-icon">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M12 2v6m0 8v6M4.93 4.93l4.24 4.24m5.66 5.66 4.24 4.24M2 12h6m8 0h6M4.93 19.07l4.24-4.24m5.66-5.66 4.24-4.24" />
+                                    </svg>
+                                </div>
+                                <div class="dashboard-card-label">Pending</div>
+                                <div class="dashboard-card-value" id="adminPendingActionsValue">Pending actions: —</div>
+                                <div class="dashboard-card-meta" id="adminPendingActionsMeta">Need attention</div>
+                                <button class="btn btn-tertiary" id="adminPendingActionsRefreshBtn" type="button">
+                                    Refresh
+                                </button>
+                            </div>
+
+                            <div class="dashboard-card">
+                                <div class="card-icon">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
+                                        <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="2" />
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
+                                    </svg>
+                                </div>
+                                <div class="dashboard-card-label">Team members</div>
+                                <div class="dashboard-card-value" id="adminTeamMembersValue">Loading members...</div>
+                                <div class="dashboard-card-meta" id="adminTeamMembersMeta">—</div>
+                                <button class="btn btn-tertiary" id="adminTeamMembersRefreshBtn" type="button">
+                                    Refresh
+                                </button>
+                            </div>
+
+                            <div class="dashboard-card">
+                                <div class="card-icon card-icon-coverage">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M3 13h4l3-6 4 10 3-6h4" />
+                                    </svg>
+                                </div>
+                                <div class="dashboard-card-label">Coverage</div>
+                                <div class="dashboard-card-value" id="adminCoverageStatus">Loading coverage...</div>
+                                <div class="dashboard-card-meta" id="adminCoverageMeta">—</div>
+                                <button class="btn btn-tertiary" id="adminCoverageRefreshBtn" type="button">
+                                    Refresh
+                                </button>
+                            </div>
+
+                            <div class="dashboard-card">
+                                <div class="card-icon card-icon-trust">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M9 12l2 2 4-4" />
+                                    </svg>
+                                </div>
+                                <div class="dashboard-card-label">Server status</div>
+                                <div class="dashboard-card-value" id="adminServerStatusValue">Loading status...</div>
+                                <div class="dashboard-card-meta" id="adminServerStatusMeta">Last: —</div>
+                                <button class="btn btn-tertiary" id="adminServerStatusRefreshBtn" type="button">
+                                    Refresh
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Accordion Sections -->
+                        <div class="dashboard-accordion">
+                            <!-- Section: Operations -->
+                            <div class="accordion-section expanded" data-section="operations">
+                                <button class="accordion-header" type="button">
+                                    <div class="accordion-header-content">
+                                        <svg class="accordion-icon" width="20" height="20" viewBox="0 0 24 24"
+                                            fill="none">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+                                        </svg>
+                                        <span class="accordion-title">Operations</span>
+                                        <span class="accordion-subtitle">Quick actions and workflow queues</span>
+                                    </div>
+                                    <svg class="accordion-chevron" width="20" height="20" viewBox="0 0 24 24"
+                                        fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M6 9l6 6 6-6" />
+                                    </svg>
+                                </button>
+                                <div class="accordion-content">
+                                    <div class="accordion-panels accordion-panels-operations">
+                                        <div class="dashboard-panel dashboard-panel-queues">
+                                            <div class="dashboard-panel-header">
+                                                <h3>Queues</h3>
+                                                <p>Pending work that needs attention.</p>
+                                            </div>
+                                            <div class="dashboard-queue">
+                                                <div class="queue-row" id="adminIssueWelcomeQueue">
+                                                    <div class="queue-info">
+                                                        <div class="queue-title">Issue welcome</div>
+                                                        <div class="queue-desc">Send a Welcome to a waiting device.</div>
+                                                    </div>
+                                                    <div class="queue-actions">
+                                                        <span class="queue-count">—</span>
+                                                        <span class="queue-alert-dot" aria-hidden="true"></span>
+                                                    </div>
+                                                </div>
+                                                <div class="queue-row" id="adminStaleDevicesQueue">
+                                                    <div class="queue-info">
+                                                        <div class="queue-title">Stale devices</div>
+                                                        <div class="queue-desc">Review inactive or missing-key devices.</div>
+                                                    </div>
+                                                    <div class="queue-actions">
+                                                        <span class="queue-count">—</span>
+                                                        <span class="queue-alert-dot" aria-hidden="true"></span>
+                                                    </div>
+                                                </div>
+                                                <div class="queue-row" id="adminUnverifiedDevicesQueue">
+                                                    <div class="queue-info">
+                                                        <div class="queue-title">Unverified devices</div>
+                                                        <div class="queue-desc">Devices pending verification in this group.</div>
+                                                    </div>
+                                                    <div class="queue-actions">
+                                                        <span class="queue-count">—</span>
+                                                        <span class="queue-alert-dot" aria-hidden="true"></span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div class="dashboard-panel dashboard-panel-queue-details"
+                                            id="adminQueueDetailsPanel">
+                                            <div class="dashboard-panel-header queue-details-header">
+                                                <div>
+                                                    <h3 id="adminQueueDetailsTitle">Queue details</h3>
+                                                    <p id="adminQueueDetailsSubtitle">Select a queue to view its list.</p>
+                                                </div>
+                                                <button class="btn btn-secondary btn-small" id="adminQueueRefreshBtn"
+                                                    type="button">
+                                                    Refresh
+                                                </button>
+                                            </div>
+                                            <div class="queue-details-body" id="adminQueueDetailsBody">
+                                            </div>
+                                            <div class="queue-details-footer" id="adminQueueDetailsFooter" hidden>
+                                                <div class="queue-pagination">
+                                                    <button class="btn btn-secondary btn-small" id="adminQueuePrevBtn"
+                                                        type="button">
+                                                        Prev
+                                                    </button>
+                                                    <span class="queue-pagination-info"
+                                                        id="adminQueuePageInfo">Page 1 of 1</span>
+                                                    <button class="btn btn-secondary btn-small" id="adminQueueNextBtn"
+                                                        type="button">
+                                                        Next
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Section: Folder & File Audit -->
+                            <div class="accordion-section" data-section="audit">
+                                <button class="accordion-header" type="button">
+                                    <div class="accordion-header-content">
+                                        <svg class="accordion-icon" width="20" height="20" viewBox="0 0 24 24"
+                                            fill="none">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M9 13l2 2 4-4" />
+                                        </svg>
+                                        <span class="accordion-title">Folder &amp; File Audit</span>
+                                        <span class="accordion-subtitle">Coverage proof checks and file verification</span>
+                                    </div>
+                                    <svg class="accordion-chevron" width="20" height="20" viewBox="0 0 24 24"
+                                        fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M6 9l6 6 6-6" />
+                                    </svg>
+                                </button>
+                                <div class="accordion-content">
+                                    <div class="accordion-panels">
+                                        <div class="dashboard-panel">
+                                            <div class="dashboard-panel-header">
+                                                <h3>Coverage checks</h3>
+                                                <p>Audit coverage proofs and verify a specific file ID.</p>
+                                            </div>
+                                            <div class="dashboard-actions-grid">
+                                                <button class="btn btn-secondary" id="adminCoverageSampleAuditBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+                                                    </svg>
+                                                    Sample Audit
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminCoverageFullAuditBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M12 3v18m-6-6 6 6 6-6" />
+                                                    </svg>
+                                                    Full Audit
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminCoverageVerifyBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                    </svg>
+                                                    Coverage Verify
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminCoverageEnrolledListBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round" stroke-linejoin="round"
+                                                            d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+                                                    </svg>
+                                                    Enrolled List
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Section: Group & Members -->
+                            <div class="accordion-section" data-section="group">
+                                <button class="accordion-header" type="button">
+                                    <div class="accordion-header-content">
+                                        <svg class="accordion-icon" width="20" height="20" viewBox="0 0 24 24"
+                                            fill="none">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
+                                            <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="2" />
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
+                                        </svg>
+                                        <span class="accordion-title">Group & Members</span>
+                                        <span class="accordion-subtitle">Create groups and manage membership</span>
+                                    </div>
+                                    <svg class="accordion-chevron" width="20" height="20" viewBox="0 0 24 24"
+                                        fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M6 9l6 6 6-6" />
+                                    </svg>
+                                </button>
+                                <div class="accordion-content">
+                                    <div class="accordion-panels">
+                                        <div class="dashboard-panel">
+                                            <div class="dashboard-panel-header">
+                                                <h3>Group lifecycle</h3>
+                                                <p>Create and switch group context.</p>
+                                            </div>
+                                            <div class="dashboard-actions-grid">
+                                                <button class="btn btn-secondary" id="adminListGroupsBtn" type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+                                                    </svg>
+                                                    List groups
+                                                </button>
+                                                <button class="btn btn-primary" id="adminCreateGroupBtn" type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round" d="M12 5v14M5 12h14" />
+                                                    </svg>
+                                                    Create group
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminSwitchGroupBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round" d="M7 7h10l-3-3m3 13H7l3 3" />
+                                                    </svg>
+                                                    Switch group
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div class="dashboard-panel">
+                                            <div class="dashboard-panel-header">
+                                                <h3>Member management</h3>
+                                                <p>Invite, remove, and verify membership.</p>
+                                            </div>
+                                            <div class="dashboard-actions-grid">
+                                                <button class="btn btn-primary" id="adminAddMemberBtn" type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
+                                                        <circle cx="8.5" cy="7" r="4" stroke="currentColor"
+                                                            stroke-width="2" />
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round" d="M20 8v6M23 11h-6" />
+                                                    </svg>
+                                                    Add member
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminPendingDevicesBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <circle cx="12" cy="12" r="10" stroke="currentColor"
+                                                            stroke-width="2" />
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round" d="M12 6v6l4 2" />
+                                                    </svg>
+                                                    Pending devices
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminRemoveMemberBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
+                                                        <circle cx="8.5" cy="7" r="4" stroke="currentColor"
+                                                            stroke-width="2" />
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round" d="M18 11h6" />
+                                                    </svg>
+                                                    Remove member
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminListMembersBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
+                                                        <circle cx="9" cy="7" r="4" stroke="currentColor"
+                                                            stroke-width="2" />
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
+                                                    </svg>
+                                                    List members
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminVerifyMembershipBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                    </svg>
+                                                    Verify membership
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Section: Security & Maintenance -->
+                            <div class="accordion-section" data-section="security">
+                                <button class="accordion-header" type="button">
+                                    <div class="accordion-header-content">
+                                        <svg class="accordion-icon" width="20" height="20" viewBox="0 0 24 24"
+                                            fill="none">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M9 12l2 2 4-4" />
+                                        </svg>
+                                        <span class="accordion-title">Security & Maintenance</span>
+                                        <span class="accordion-subtitle">Rekey operations and trust verification</span>
+                                    </div>
+                                    <svg class="accordion-chevron" width="20" height="20" viewBox="0 0 24 24"
+                                        fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M6 9l6 6 6-6" />
+                                    </svg>
+                                </button>
+                                <div class="accordion-content">
+                                    <div class="accordion-panels">
+                                        <div class="dashboard-panel">
+                                            <div class="dashboard-panel-header">
+                                                <h3>Rekey</h3>
+                                                <p>Coordinate epoch transitions.</p>
+                                            </div>
+                                            <div class="dashboard-actions-grid">
+                                                <button class="btn btn-primary" id="adminRekeyStartBtn" type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+                                                    </svg>
+                                                    Start rekey
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminRekeyMigrationBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M12 3v18m-6-6 6 6 6-6" />
+                                                    </svg>
+                                                    Migrate coverage
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminRekeyCutoverBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                    </svg>
+                                                    Cutover
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminRekeyFallbackBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M3 12a9 9 0 019-9 9.75 9.75 0 016.74 2.74L21 8" />
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round" d="M21 3v5h-5" />
+                                                    </svg>
+                                                    Fallback
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div class="dashboard-panel">
+                                            <div class="dashboard-panel-header">
+                                                <h3>Trust & PIN</h3>
+                                                <p>Verification and key pinning.</p>
+                                            </div>
+                                            <div class="dashboard-actions-grid">
+                                                <button class="btn btn-secondary" id="adminTrustVerifyBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                                    </svg>
+                                                    Verify trust
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminTrustCheckpointBtn"
+                                                    type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z" />
+                                                    </svg>
+                                                    Checkpoint
+                                                </button>
+                                                <button class="btn btn-secondary" id="adminPinListBtn" type="button">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                                        <path stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round"
+                                                            d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+                                                    </svg>
+                                                    Pin list
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="workspace-home" id="workspaceHome">
+                        <div class="workspace-home-hero">
+                            <div class="workspace-home-copy">
+                                <span class="workspace-home-eyebrow">Workspace Home</span>
+                                <h2 class="workspace-home-title">Personal Workspace</h2>
+                                <p class="workspace-home-text" id="workspaceHomeLead">
+                                    Add a protected folder to start securing files on this account.
+                                </p>
+                            </div>
+                            <div class="workspace-home-summary-card" id="workspaceHomeSummaryCard">
+                                <div class="workspace-home-summary-label" id="workspaceHomeStatusLabel">Workspace status</div>
+                                <div class="workspace-home-summary-grid">
+                                    <div class="workspace-home-stat">
+                                        <span class="workspace-home-stat-value" id="workspaceHomeProtectedCount">0</span>
+                                        <span class="workspace-home-stat-label">Protected folders</span>
+                                    </div>
+                                    <div class="workspace-home-stat">
+                                        <span class="workspace-home-stat-value" id="workspaceHomeMountedCount">0</span>
+                                        <span class="workspace-home-stat-label">Mounted now</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="workspace-home-grid">
+                            <div class="workspace-home-panel">
+                                <div class="workspace-home-panel-header">
+                                    <h3>Safety checks</h3>
+                                    <p>Review post-quantum protection, sign-in protection, scan freshness, and this device at a glance.</p>
+                                </div>
+                                <div class="workspace-home-card-grid" id="workspaceHomeCardGrid"></div>
+                            </div>
+
+                            <div class="workspace-home-panel workspace-home-attention-panel" id="workspaceHomeAttentionPanel">
+                                <div class="workspace-home-panel-header">
+                                    <h3>Needs attention</h3>
+                                    <p>HybridCipher surfaces the next thing that should be reviewed instead of hiding it in secondary menus.</p>
+                                </div>
+                                <div class="workspace-home-attention-list" id="workspaceHomeAttentionList"></div>
+                            </div>
+                        </div>
+
+                        <div class="workspace-home-grid">
+                            <div class="workspace-home-panel">
+                                <div class="workspace-home-panel-header">
+                                    <h3>Quick actions</h3>
+                                    <p>Start from the actions you use most often.</p>
+                                </div>
+                                <div class="workspace-home-actions">
+                                    <button class="btn btn-primary" id="homeAddFolderBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M12 5v14M5 12h14" />
+                                        </svg>
+                                        Add protected folder
+                                    </button>
+                                    <button class="btn btn-secondary" id="homeOpenTerminalBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M4 5h16a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2z" />
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                stroke-linejoin="round" d="M7 9l3 3-3 3m5 0h5" />
+                                        </svg>
+                                        Open terminal
+                                    </button>
+                                    <button class="btn btn-secondary" id="homeOpenDevicesBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M16 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" />
+                                            <circle cx="10" cy="7" r="4" stroke="currentColor" stroke-width="2" />
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M20 8v6m-3-3h6" />
+                                        </svg>
+                                        Open device center
+                                    </button>
+                                    <button class="btn btn-secondary" id="homeRunCoverageScanBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                                d="M3 12h3m4 0h3m4 0h3M12 3v3m0 12v3M6.5 6.5l2 2m6 6l2 2m0-10l-2 2m-6 6l-2 2" />
+                                        </svg>
+                                        Run coverage scan
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="workspace-home-panel workspace-home-help">
+                                <div class="workspace-home-panel-header">
+                                    <h3>What this app does</h3>
+                                    <p>Everything here is tuned for your files and your devices.</p>
+                                </div>
+                                <ul class="workspace-home-list">
+                                    <li>Protect folders on this account with post-quantum encryption and mount them safely when you need to work.</li>
+                                    <li>Approve newly added devices and finish setup on the device you are using now.</li>
+                                    <li>Use recovery, coverage, and security tools without leaving the desktop app.</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="workspace-section-view" id="folderDetailView">
+                        <div id="folderDetailContent"></div>
+                    </section>
+
+                    <section class="workspace-section-view" id="devicesCenterView">
+                        <div id="devicesCenterContent"></div>
+                    </section>
+
+                    <section class="workspace-section-view" id="coverageCenterView">
+                        <div id="coverageCenterContent"></div>
+                    </section>
+
+                    <!-- File Browser - Hidden (legacy, kept for compatibility) -->
+                    <div class="file-browser hidden" id="fileBrowser">
+                        <div class="file-browser-header">
+                            <div class="breadcrumb" id="breadcrumb">
+                                <span>Select a folder to begin</span>
+                            </div>
+                            <div class="file-actions">
+                                <button class="btn btn-secondary hidden" id="resolveConflictsBtn">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                                            d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M12 9v4m0 4h.01" />
+                                    </svg>
+                                    Resolve conflicts
+                                </button>
+                                <button class="btn btn-secondary hidden" id="resolveRecoveryCopiesBtn">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                                            d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
+                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                            d="M8 12h8m-4-4v8" />
+                                    </svg>
+                                    Resolve recovery copies
+                                </button>
+                                <button class="btn btn-secondary hidden" id="unmountBtn">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                        <path stroke="currentColor" stroke-width="2"
+                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                    </svg>
+                                    Unmount
+                                </button>
+                            </div>
+                        </div>
+                        <div class="file-list" id="fileList">
+                            <div class="empty-state">
+                                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" opacity="0.5">
+                                    <path stroke="currentColor" stroke-width="2"
+                                        d="M9 13h6m-3-3v6m5 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                </svg>
+                                <p>No folder selected</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Embedded Terminal -->
+                    <div class="terminal-container" id="terminalContainer">
+                        <!-- Resize Handle -->
+                        <div class="terminal-resize-handle" id="terminalResizeHandle"></div>
+
+                        <!-- Tab Bar -->
+                        <div class="terminal-tabs" id="terminalTabs">
+                            <div class="terminal-tab active" data-tab-id="1">
+                                <span class="tab-title">Welcome</span>
+                                <button class="tab-close" title="Close tab">×</button>
+                            </div>
+                            <button class="terminal-new-tab" id="newTabBtn" title="New Terminal">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        d="M12 5v14M5 12h14" />
+                                </svg>
+                            </button>
+                        </div>
+
+                        <!-- Terminal Header with traffic lights -->
+                        <div class="terminal-header">
+                            <div class="terminal-title">
+                                <span class="dot dot-red"></span>
+                                <span class="dot dot-yellow"></span>
+                                <span class="dot dot-green"></span>
+                                <img src="logo.png" alt="HybridCipher" class="terminal-logo" width="16" height="16">
+                                <span id="terminalHeaderTitle">Embedded Terminal</span>
+                            </div>
+                            <div class="terminal-status" id="terminalCwdDisplay">Ready</div>
+                        </div>
+
+                        <!-- Tab Content -->
+                        <div class="terminal-tab-content" id="terminalTabContent">
+                            <div class="terminal-tab-pane active" data-tab-id="1">
+                                <div class="terminal-body" id="terminalBody-1" tabindex="0">
+                                    <div class="terminal-output" id="terminalOutput-1"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- Mount Progress Modal -->
+    <div class="modal hidden" id="mountProgressModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-small">
+            <div class="modal-header">
+                <h2 id="mountProgressModalTitle">Mounting Folder</h2>
+            </div>
+            <div class="modal-body">
+                <div class="mount-progress-content">
+                    <div class="spinner"></div>
+                    <p class="mount-progress-folder-label" id="mountProgressModalFolderLabel">Folder</p>
+                    <p class="mount-progress-folder-path" id="mountProgressModalFolderPath"></p>
+                    <p id="mountProgressModalText">Starting mount...</p>
+                    <p class="mount-progress-hint" id="mountProgressModalHint">This may take a few moments. The folder will open automatically when
+                        ready.</p>
+                    <div class="form-actions mount-progress-actions">
+                        <button type="button" class="btn btn-secondary" id="mountContinueBackgroundBtn" disabled>
+                            Continue in background
+                        </button>
+                        <button type="button" class="btn btn-secondary mount-cancel-btn hidden" id="mountCancelBtn">
+                            Cancel mount
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Update Progress Modal -->
+    <div class="modal hidden" id="updateProgressModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-small update-progress-modal-content">
+            <div class="modal-header">
+                <h2>Updating HybridCipher</h2>
+            </div>
+            <div class="modal-body">
+                <p id="updateProgressText">Preparing update...</p>
+                <div class="progress-track update-progress-track">
+                    <div class="progress-fill" id="updateProgressFill"></div>
+                </div>
+                <p class="update-progress-meta" id="updateProgressMeta">0%</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Update Restart Modal -->
+    <div class="modal hidden" id="updateRestartModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Update Ready</h2>
+            </div>
+            <div class="modal-body">
+                <p id="updateRestartText">The update has been installed. Restart now to apply it.</p>
+                <p class="update-restart-countdown" id="updateRestartCountdown">Restarting automatically in 15s...</p>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="updateRestartLaterBtn">Later</button>
+                    <button type="button" class="btn btn-primary" id="updateRestartNowBtn">Restart now</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Login Modal -->
+    <div class="modal hidden" id="loginModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Login to HybridCipher</h2>
+                <button class="modal-close" id="closeLoginModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="loginForm">
+                    <div class="form-group">
+                        <label for="loginEmail">Email</label>
+                        <input type="email" id="loginEmail" required placeholder="your@email.com">
+                    </div>
+                    <div class="form-group">
+                        <label for="loginPassword">Password</label>
+                        <div class="password-field">
+                            <input type="password" id="loginPassword" required placeholder="••••••••">
+                            <button class="password-toggle" id="loginPasswordToggle" type="button"
+                                aria-label="Show password" aria-pressed="false">
+                                <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6z" />
+                                    <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" />
+                                </svg>
+                                <svg class="icon-eye-off" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        d="M2 12s4-6 10-6c2.12 0 4.06.64 5.72 1.53M22 12s-4 6-10 6c-2.12 0-4.06-.64-5.72-1.53" />
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" d="M4 4l16 16" />
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="rememberMe">
+                            Remember me
+                        </label>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block">Login</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logging In Modal -->
+    <div class="modal hidden" id="loggingInModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-compact">
+            <div class="logging-in-content">
+                <div class="spinner"></div>
+                <p id="loggingInMessage">Logging in...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Login MFA Modal -->
+    <div class="modal hidden" id="loginMfaModal">
+        <div class="modal-backdrop" id="loginMfaBackdrop"></div>
+        <div class="modal-content login-mfa-modal">
+            <div class="modal-header">
+                <h2 id="loginMfaTitle">Multi-factor authentication</h2>
+                <button class="modal-close" id="closeLoginMfaModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="mfa-lead" id="loginMfaLead">
+                    Enter your authenticator code or backup code to continue sign-in.
+                </p>
+                <form id="loginMfaForm">
+                    <div class="form-group">
+                        <label for="loginMfaMethod">Verification method</label>
+                        <select id="loginMfaMethod">
+                            <option value="authenticator">Authenticator code</option>
+                            <option value="backup">Backup code</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="loginMfaInput" id="loginMfaLabel">Authenticator code</label>
+                        <div class="password-field">
+                            <input type="password" id="loginMfaInput" placeholder="123456" autocomplete="one-time-code">
+                            <button class="password-toggle" id="loginMfaToggle" type="button"
+                                aria-label="Show code" aria-pressed="false" data-visible="false">
+                                <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6z" />
+                                    <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" />
+                                </svg>
+                                <svg class="icon-eye-off" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        d="M2 12s4-6 10-6c2.12 0 4.06.64 5.72 1.53M22 12s-4 6-10 6c-2.12 0-4.06-.64-5.72-1.53" />
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" d="M4 4l16 16" />
+                                </svg>
+                            </button>
+                        </div>
+                        <p class="form-hint" id="loginMfaHint">
+                            Use the 6-digit code from your authenticator app.
+                        </p>
+                        <span class="form-error hidden" id="loginMfaError"></span>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="cancelLoginMfaBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitLoginMfaBtn">Continue</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Password Reset Modal -->
+    <div class="modal hidden" id="passwordResetModal">
+        <div class="modal-backdrop" id="passwordResetBackdrop"></div>
+        <div class="modal-content password-reset-modal">
+            <div class="modal-header">
+                <h2 id="passwordResetTitle">Set a New Password</h2>
+                <button class="modal-close" id="closePasswordResetModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="mfa-lead" id="passwordResetLead">
+                    Enter a new password that meets all requirements, then confirm it to finish the reset.
+                </p>
+                <form id="passwordResetForm">
+                    <div class="form-group">
+                        <label for="passwordResetInput">New Password</label>
+                        <div class="password-field">
+                            <input type="password" id="passwordResetInput" placeholder="••••••••" autocomplete="new-password">
+                            <button class="password-toggle" id="passwordResetToggle" type="button"
+                                aria-label="Show password" aria-pressed="false" data-visible="false">
+                                <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6z" />
+                                    <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" />
+                                </svg>
+                                <svg class="icon-eye-off" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        d="M2 12s4-6 10-6c2.12 0 4.06.64 5.72 1.53M22 12s-4 6-10 6c-2.12 0-4.06-.64-5.72-1.53" />
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" d="M4 4l16 16" />
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="password-strength" id="passwordResetStrength">
+                            <div class="password-strength-bar">
+                                <span class="password-strength-fill" id="passwordResetStrengthFill"></span>
+                            </div>
+                            <span class="password-strength-label" id="passwordResetStrengthLabel">
+                                Strength: --</span>
+                        </div>
+                        <ul class="password-hints" id="passwordResetHints">
+                            <li data-rule="length">
+                                <span class="hint-indicator"></span>
+                                12+ characters
+                            </li>
+                            <li data-rule="uppercase">
+                                <span class="hint-indicator"></span>
+                                Uppercase letter
+                            </li>
+                            <li data-rule="lowercase">
+                                <span class="hint-indicator"></span>
+                                Lowercase letter
+                            </li>
+                            <li data-rule="digit">
+                                <span class="hint-indicator"></span>
+                                Digit
+                            </li>
+                            <li data-rule="symbol">
+                                <span class="hint-indicator"></span>
+                                Symbol
+                            </li>
+                            <li data-rule="patterns">
+                                <span class="hint-indicator"></span>
+                                Avoid common patterns
+                            </li>
+                        </ul>
+                    </div>
+                    <div class="form-group">
+                        <label for="passwordResetConfirmInput">Confirm New Password</label>
+                        <div class="password-field">
+                            <input type="password" id="passwordResetConfirmInput" placeholder="••••••••" autocomplete="new-password">
+                            <button class="password-toggle" id="passwordResetConfirmToggle" type="button"
+                                aria-label="Show password confirmation" aria-pressed="false" data-visible="false">
+                                <svg class="icon-eye" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6z" />
+                                    <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" />
+                                </svg>
+                                <svg class="icon-eye-off" width="18" height="18" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        d="M2 12s4-6 10-6c2.12 0 4.06.64 5.72 1.53M22 12s-4 6-10 6c-2.12 0-4.06-.64-5.72-1.53" />
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        stroke-linejoin="round" d="M4 4l16 16" />
+                                </svg>
+                            </button>
+                        </div>
+                        <span class="form-error hidden" id="passwordResetConfirmError"></span>
+                    </div>
+                    <span class="form-error hidden" id="passwordResetError"></span>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="cancelPasswordResetBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitPasswordResetBtn">Reset Password</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recovery Code Modal -->
+    <div class="modal hidden" id="recoveryCodeModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content recovery-code-modal">
+            <div class="modal-header">
+                <h2>Save Your Recovery Code</h2>
+                <button class="modal-close" id="closeRecoveryCodeModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="recovery-code-lead">
+                    <span class="recovery-warning-icon" aria-hidden="true">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                            <path d="M12 3L2 21h20L12 3z" fill="currentColor" />
+                            <path d="M12 9v6" stroke="#0A1228" stroke-width="2" stroke-linecap="round" />
+                            <circle cx="12" cy="18" r="1.5" fill="#0A1228" />
+                        </svg>
+                    </span>
+                    <span>
+                        Critical: Without this code, losing all devices means permanent data loss. This is your only way
+                        to recover encrypted files. Save it securely now.
+                    </span>
+                </p>
+                <div class="recovery-code-box">
+                    <code id="recoveryCodeValue">----</code>
+                    <button class="btn btn-secondary btn-small" id="copyRecoveryCodeBtn" type="button">Copy</button>
+                </div>
+                <p class="recovery-code-hint">
+                    We do not store this code. Store them in a password manager or write them down in a secure location
+                    and never share them with anyone, including HybridCipher.
+                </p>
+                <button class="btn btn-primary btn-block" id="ackRecoveryCodeBtn" type="button">
+                    I have saved it
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MFA Prompt Modal -->
+    <div class="modal hidden" id="mfaPromptModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content mfa-prompt-modal">
+            <div class="modal-header">
+                <h2>Enable MFA (2FA)?</h2>
+                <button class="modal-close" id="closeMfaPromptModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="mfa-lead">
+                    MFA is required for password resets, password changes, and signing in from new devices.
+                </p>
+                <div class="form-actions">
+                    <button class="btn btn-primary" id="mfaPromptEnableBtn" type="button">Enable MFA</button>
+                    <button class="btn btn-secondary" id="mfaPromptLaterBtn" type="button">Not now</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MFA Setup Modal -->
+    <div class="modal hidden" id="mfaSetupModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content mfa-setup-modal">
+            <div class="modal-header">
+                <h2>Set up MFA</h2>
+                <button class="modal-close" id="closeMfaSetupModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="mfaSetupStepEnroll">
+                    <p class="mfa-lead">
+                        Scan the QR code in your authenticator app, then enter the 6-digit code.
+                    </p>
+                    <div class="mfa-qr-wrap" id="mfaQrContainer">
+                        <span class="mfa-qr-placeholder">QR code unavailable</span>
+                    </div>
+                    <div class="mfa-secret">
+                        <span class="mfa-secret-label">Manual key</span>
+                        <code id="mfaSecretValue">----</code>
+                    </div>
+                    <div class="form-group">
+                        <label for="mfaVerifyCodeInput">Authenticator code</label>
+                        <input type="text" id="mfaVerifyCodeInput" placeholder="Enter 6-digit code" autocomplete="one-time-code">
+                    </div>
+                    <div class="form-actions">
+                        <button class="btn btn-primary" id="mfaVerifyBtn" type="button">Verify &amp; enable</button>
+                        <button class="btn btn-secondary" id="mfaSetupCancelBtn" type="button">Cancel</button>
+                    </div>
+                </div>
+                <div class="hidden" id="mfaSetupStepBackup">
+                    <p class="mfa-lead">
+                        Save these backup codes. They can be used if you lose access to your authenticator app.
+                    </p>
+                    <div class="mfa-backup-codes" id="mfaBackupCodesList"></div>
+                    <div class="form-actions">
+                        <button class="btn btn-secondary" id="copyMfaBackupCodesBtn" type="button">Copy codes</button>
+                        <button class="btn btn-primary" id="mfaSetupDoneBtn" type="button">Done</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Group Modal -->
+    <div class="modal hidden" id="createGroupModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Create Group</h2>
+                <button class="modal-close" id="closeCreateGroupModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="createGroupForm">
+                    <div class="form-group">
+                        <label for="createGroupName">Group name</label>
+                        <input type="text" id="createGroupName" required placeholder="Team name">
+                    </div>
+                    <div class="form-group">
+                        <label for="createGroupDescription">Group description (optional)</label>
+                        <input type="text" id="createGroupDescription" placeholder="Team purpose or notes">
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="cancelCreateGroupBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitCreateGroupBtn">
+                            Create &amp; initialize
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Switch Group Modal -->
+    <div class="modal hidden" id="switchGroupModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Switch Group</h2>
+                <button class="modal-close" id="closeSwitchGroupModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="group-list" id="switchGroupList">
+                    <div class="group-list-empty">Loading groups...</div>
+                </div>
+                <span class="form-hint">Select a group, or enter an ID manually.</span>
+                <div class="form-group">
+                    <label for="switchGroupManualId">Group ID (optional)</label>
+                    <input type="text" id="switchGroupManualId" placeholder="UUID or prefix">
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="cancelSwitchGroupBtn">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="submitSwitchGroupBtn">Switch group</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- List Groups Modal -->
+    <div class="modal hidden" id="listGroupsModal">
+        <div class="modal-backdrop" id="listGroupsBackdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Groups</h2>
+                <button class="modal-close" id="closeListGroupsModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="group-details-list" id="listGroupsList">
+                    <div class="group-list-empty">Loading groups...</div>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="cancelListGroupsBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Remove Member Modal -->
+    <div class="modal hidden" id="removeMemberModal">
+        <div class="modal-backdrop" id="removeMemberBackdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Remove member</h2>
+                <button class="modal-close" id="closeRemoveMemberModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="member-list" id="removeMemberList">
+                    <div class="member-list-empty">Loading members...</div>
+                </div>
+                <span class="form-hint">Removing a member revokes access and requires a rekey.</span>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="cancelRemoveMemberBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- List Members Modal -->
+    <div class="modal hidden" id="listMembersModal">
+        <div class="modal-backdrop" id="listMembersBackdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Group members</h2>
+                <button class="modal-close" id="closeListMembersModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="member-details-list" id="listMembersList">
+                    <div class="member-list-empty">Loading members...</div>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="cancelListMembersBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Verify Trust Modal -->
+    <div class="modal hidden" id="adminPinVerifyModal">
+        <div class="modal-backdrop" id="adminPinVerifyBackdrop"></div>
+        <div class="modal-content admin-pin-verify-modal">
+            <div class="modal-header">
+                <h2>Verify trust</h2>
+                <button class="modal-close" id="closeAdminPinVerifyModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="adminPinVerifyForm">
+                    <div class="form-group">
+                        <label for="adminPinVerifyMemberSelect">Member</label>
+                        <select id="adminPinVerifyMemberSelect">
+                            <option value="">Loading members...</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="adminPinVerifyDeviceSelect">Device</label>
+                        <select id="adminPinVerifyDeviceSelect" disabled>
+                            <option value="">Select a member first</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="adminPinVerifyFingerprintInput">Fingerprint</label>
+                        <input type="text" id="adminPinVerifyFingerprintInput"
+                            placeholder="xxxx xxxx xxxx xxxx" autocomplete="off">
+                        <span class="form-hint">Format: xxxx xxxx xxxx xxxx</span>
+                        <span class="form-error hidden" id="adminPinVerifyError"></span>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="cancelAdminPinVerifyBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitAdminPinVerifyBtn">Verify</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Enrolled List Modal -->
+    <div class="modal hidden" id="adminEnrolledListModal">
+        <div class="modal-backdrop" id="adminEnrolledListBackdrop"></div>
+        <div class="modal-content admin-enrolled-list-modal">
+            <div class="modal-header">
+                <h2>Enrolled folders</h2>
+                <button class="modal-close" id="closeAdminEnrolledListModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="admin-enrolled-list-summary" id="adminEnrolledListSummary">
+                    Loading summary...
+                </div>
+                <div class="member-list admin-enrolled-list-rows" id="adminEnrolledList">
+                    <div class="member-list-empty">Loading enrolled folders...</div>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="cancelAdminEnrolledListBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Text Prompt Modal -->
+    <div class="modal text-prompt-modal hidden" id="textPromptModal">
+        <div class="modal-backdrop" id="textPromptBackdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="textPromptTitle">Enter details</h2>
+                <button class="modal-close" id="closeTextPromptBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="textPromptForm">
+                    <div class="form-group">
+                        <label for="textPromptInput" id="textPromptLabel">Enter value</label>
+                        <input type="text" id="textPromptInput" placeholder="">
+                        <span class="form-error hidden" id="textPromptError"></span>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary"
+                            id="cancelTextPromptBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitTextPromptBtn">Continue</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Action Prompt Modal -->
+    <div class="modal hidden" id="actionPromptModal">
+        <div class="modal-backdrop" id="actionPromptBackdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="actionPromptTitle">Action required</h2>
+                <button class="modal-close" id="closeActionPromptBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="action-prompt-message" id="actionPromptMessage"></p>
+                <p class="action-prompt-detail text-secondary hidden" id="actionPromptDetail"></p>
+                <div class="form-actions action-prompt-actions">
+                    <button type="button" class="btn btn-secondary" id="actionPromptSecondaryBtn">Cancel</button>
+                    <button type="button" class="btn btn-secondary hidden" id="actionPromptTertiaryBtn">Later</button>
+                    <button type="button" class="btn btn-primary" id="actionPromptPrimaryBtn">Continue</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Action Progress Modal -->
+    <div class="modal hidden" id="actionProgressModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-compact">
+            <div class="logging-in-content">
+                <div class="spinner"></div>
+                <p id="actionProgressMessage">Working...</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal hidden" id="postQuantumExplainerModal">
+        <div class="modal-backdrop" id="postQuantumExplainerBackdrop"></div>
+        <div class="modal-content action-prompt-modal" role="dialog" aria-modal="true"
+            aria-labelledby="postQuantumExplainerTitle">
+            <div class="modal-header">
+                <h2 id="postQuantumExplainerTitle">Why post-quantum protection matters</h2>
+                <button class="modal-close" id="closePostQuantumExplainerBtn" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body post-quantum-modal-body">
+                <p id="postQuantumExplainerBody">
+                    Your protected files are secured with hybrid post-quantum encryption, designed to protect against today’s attackers and to remain secure even if stolen encrypted data is targeted by future quantum-capable systems.
+                </p>
+            </div>
+            <div class="form-actions">
+                <button type="button" class="btn btn-secondary" id="closePostQuantumExplainerFooterBtn">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Conflict Center Modal -->
+    <div class="modal hidden" id="conflictCenterModal">
+        <div class="modal-backdrop" id="conflictCenterBackdrop"></div>
+        <div class="modal-content conflict-center-modal">
+            <div class="modal-header">
+                <h2 id="conflictCenterTitle">Resolve conflicts</h2>
+                <button class="modal-close" id="closeConflictCenterBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="action-prompt-detail text-secondary conflict-center-summary" id="conflictCenterSummary"></p>
+                <div class="conflict-center-list" id="conflictCenterList">
+                    <div class="conflict-center-empty">Loading conflicts…</div>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="refreshConflictCenterBtn">Refresh</button>
+                    <button type="button" class="btn btn-primary" id="closeConflictCenterFooterBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Conflict Review Modal -->
+    <div class="modal hidden" id="conflictReviewModal">
+        <div class="modal-backdrop" id="conflictReviewBackdrop"></div>
+        <div class="modal-content conflict-review-modal">
+            <div class="modal-header">
+                <div>
+                    <h2 id="conflictReviewTitle">Resolve conflict</h2>
+                    <p class="text-secondary conflict-review-subtitle" id="conflictReviewSubtitle"></p>
+                </div>
+                <button class="modal-close" id="closeConflictReviewBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="conflict-review-meta" id="conflictReviewMeta"></div>
+                <div class="conflict-review-actions-inline">
+                    <button type="button" class="btn btn-secondary btn-small" id="conflictReviewRevealMountedBtn">Reveal mounted file</button>
+                    <button type="button" class="btn btn-secondary btn-small" id="conflictReviewRevealConflictBtn">Reveal conflict copy</button>
+                </div>
+                <div class="conflict-review-grid">
+                    <div class="conflict-review-pane">
+                        <div class="conflict-review-pane-header">
+                            <h3>Mounted file</h3>
+                            <span class="conflict-pane-label">Synced path</span>
+                        </div>
+                        <div class="conflict-review-pane-body" id="conflictReviewLivePane"></div>
+                    </div>
+                    <div class="conflict-review-pane">
+                        <div class="conflict-review-pane-header">
+                            <h3>Conflict copy</h3>
+                            <span class="conflict-pane-label warning">LOCAL-ONLY</span>
+                        </div>
+                        <div class="conflict-review-pane-body" id="conflictReviewConflictPane"></div>
+                    </div>
+                </div>
+                <div class="conflict-review-actions-inline hidden" id="conflictReviewMergeTools">
+                    <button type="button" class="btn btn-secondary btn-small" id="conflictReviewUseMountedSeedBtn">Seed merge from mounted</button>
+                    <button type="button" class="btn btn-secondary btn-small" id="conflictReviewUseConflictSeedBtn">Seed merge from conflict</button>
+                </div>
+                <div class="form-group hidden" id="conflictMergeEditorGroup">
+                    <label for="conflictMergeEditor">Merged text result</label>
+                    <textarea id="conflictMergeEditor" class="conflict-merge-editor" spellcheck="false"></textarea>
+                    <span class="form-hint">Only the merged result written back to the normal mounted path will sync.</span>
+                </div>
+                <div class="form-actions conflict-review-footer">
+                    <button type="button" class="btn btn-secondary" id="conflictReviewKeepMountedBtn">Use mounted file</button>
+                    <button type="button" class="btn btn-secondary" id="conflictReviewUseConflictBtn">Use conflict copy</button>
+                    <button type="button" class="btn btn-secondary" id="conflictReviewSaveAsNewBtn">Save as new</button>
+                    <button type="button" class="btn btn-secondary hidden" id="conflictReviewArchiveDismissBtn">Archive and dismiss</button>
+                    <button type="button" class="btn btn-primary" id="conflictReviewMergeBtn">Save merged result</button>
+                    <button type="button" class="btn btn-secondary" id="closeConflictReviewFooterBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recovery Center Modal -->
+    <div class="modal hidden" id="recoveryCenterModal">
+        <div class="modal-backdrop" id="recoveryCenterBackdrop"></div>
+        <div class="modal-content conflict-center-modal">
+            <div class="modal-header">
+                <h2 id="recoveryCenterTitle">Resolve recovery copies</h2>
+                <button class="modal-close" id="closeRecoveryCenterBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="action-prompt-detail text-secondary conflict-center-summary" id="recoveryCenterSummary"></p>
+                <div class="conflict-center-list" id="recoveryCenterList">
+                    <div class="conflict-center-empty">Loading recovery copies…</div>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="refreshRecoveryCenterBtn">Refresh</button>
+                    <button type="button" class="btn btn-primary" id="closeRecoveryCenterFooterBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recovery Review Modal -->
+    <div class="modal hidden" id="recoveryReviewModal">
+        <div class="modal-backdrop" id="recoveryReviewBackdrop"></div>
+        <div class="modal-content conflict-review-modal">
+            <div class="modal-header">
+                <div>
+                    <h2 id="recoveryReviewTitle">Resolve recovery copy</h2>
+                    <p class="text-secondary conflict-review-subtitle" id="recoveryReviewSubtitle"></p>
+                </div>
+                <button class="modal-close" id="closeRecoveryReviewBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="conflict-review-meta" id="recoveryReviewMeta"></div>
+                <div class="conflict-review-actions-inline">
+                    <button type="button" class="btn btn-secondary btn-small" id="recoveryReviewRevealMountedBtn">Reveal mounted file</button>
+                    <button type="button" class="btn btn-secondary btn-small" id="recoveryReviewRevealRecoveryBtn">Reveal recovery copy</button>
+                </div>
+                <div class="conflict-review-grid">
+                    <div class="conflict-review-pane">
+                        <div class="conflict-review-pane-header">
+                            <h3>Mounted file</h3>
+                            <span class="conflict-pane-label">Synced path</span>
+                        </div>
+                        <div class="conflict-review-pane-body" id="recoveryReviewLivePane"></div>
+                    </div>
+                    <div class="conflict-review-pane">
+                        <div class="conflict-review-pane-header">
+                            <h3>Recovery copy</h3>
+                            <span class="conflict-pane-label warning">LOCAL-ONLY</span>
+                        </div>
+                        <div class="conflict-review-pane-body" id="recoveryReviewCopyPane"></div>
+                    </div>
+                </div>
+                <div class="form-actions conflict-review-footer">
+                    <button type="button" class="btn btn-secondary" id="recoveryReviewReplaceMountedBtn">Replace mounted file</button>
+                    <button type="button" class="btn btn-secondary" id="recoveryReviewSaveAsNewBtn">Save as new</button>
+                    <button type="button" class="btn btn-secondary" id="recoveryReviewArchiveDismissBtn">Archive and dismiss</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Register Modal -->
+    <div class="modal hidden" id="registerModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Create Account</h2>
+                <button class="modal-close" id="closeRegisterModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="registerForm">
+                    <div class="form-group">
+                        <label for="registerEmail">Email</label>
+                        <input type="email" id="registerEmail" required placeholder="your@email.com">
+                        <span class="form-error hidden" id="registerEmailError"></span>
+                    </div>
+                    <div class="form-group">
+                        <label for="registerEmailConfirm">Repeat Email</label>
+                        <input type="email" id="registerEmailConfirm" required placeholder="your@email.com">
+                        <span class="form-error hidden" id="registerEmailMatchError"></span>
+                    </div>
+                    <div class="form-group">
+                        <label for="registerPassword">Password</label>
+                        <input type="password" id="registerPassword" required placeholder="••••••••">
+                        <div class="password-strength">
+                            <div class="password-strength-bar">
+                                <span class="password-strength-fill" id="registerPasswordStrengthFill"></span>
+                            </div>
+                            <span class="password-strength-label" id="registerPasswordStrengthLabel">
+                                Strength: --</span>
+                        </div>
+                        <ul class="password-hints" id="registerPasswordHints">
+                            <li data-rule="length">
+                                <span class="hint-indicator"></span>
+                                12+ characters
+                            </li>
+                            <li data-rule="uppercase">
+                                <span class="hint-indicator"></span>
+                                Uppercase letter
+                            </li>
+                            <li data-rule="lowercase">
+                                <span class="hint-indicator"></span>
+                                Lowercase letter
+                            </li>
+                            <li data-rule="digit">
+                                <span class="hint-indicator"></span>
+                                Digit
+                            </li>
+                            <li data-rule="symbol">
+                                <span class="hint-indicator"></span>
+                                Symbol
+                            </li>
+                            <li data-rule="patterns">
+                                <span class="hint-indicator"></span>
+                                Avoid common patterns
+                            </li>
+                        </ul>
+                    </div>
+                    <div class="form-group">
+                        <label for="registerPasswordConfirm">Confirm Password</label>
+                        <input type="password" id="registerPasswordConfirm" required placeholder="••••••••">
+                        <span class="form-error hidden" id="registerPasswordMatchError"></span>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block" id="registerSubmitBtn" disabled>
+                        Register
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Email Confirmation Modal -->
+    <div class="modal hidden" id="emailConfirmModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content email-confirm-modal">
+            <div class="modal-header">
+                <h2>Confirm Your Email</h2>
+            </div>
+            <div class="modal-body">
+                <p class="email-confirm-lead">
+                    We sent a confirmation link to <span id="emailConfirmAddress">your@email.com</span>.
+                    Please open your inbox to confirm your registration.
+                </p>
+                <div class="email-confirm-status" id="emailConfirmStatus">
+                    Waiting for confirmation...
+                </div>
+                <div class="email-confirm-actions">
+                    <button class="btn btn-secondary" id="emailConfirmResendBtn" type="button">
+                        Resend email
+                    </button>
+                    <span class="form-hint" id="emailConfirmCooldownHint"></span>
+                </div>
+                <div class="form-actions">
+                    <button class="btn btn-secondary" id="emailConfirmLaterBtn" type="button">Later</button>
+                    <button class="btn btn-primary" id="emailConfirmYesBtn" type="button">Yes, I confirmed</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal hidden" id="settingsModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content settings-modal">
+            <div class="modal-header">
+                <h2>Settings</h2>
+                <button class="modal-close" id="closeSettingsModalBtn">&times;</button>
+            </div>
+            <div class="modal-body settings-body">
+                <div class="settings-grid">
+                    <section class="settings-section" id="settingsAccountSection">
+                        <div class="settings-section-header">
+                            <h3>Account</h3>
+                            <p>Account actions that apply immediately on this device.</p>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary settings-action" id="settingsLogoutBtn" type="button">
+                                Logout
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsQuitAppBtn" type="button">
+                                Quit app
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section" id="settingsFoldersSection">
+                        <div class="settings-section-header">
+                            <h3>Folders</h3>
+                            <p>Add protected folders, remove them later, or unmount everything at once.</p>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary settings-action" id="settingsEnrollFolderBtn"
+                                type="button">
+                                Add protected folder
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsUnenrollFoldersBtn"
+                                type="button" aria-expanded="false" aria-controls="settingsEnrollmentModal">
+                                Remove protected folder
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsUnmountBtn" type="button">
+                                Unmount all
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section" id="settingsDevicesSection">
+                        <div class="settings-section-header">
+                            <h3>My Devices</h3>
+                            <p>Open the device center to review trusted devices, approvals, and this device’s setup state.</p>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary settings-action settings-action-rich"
+                                id="settingsPendingDevicesBtn" type="button">
+                                <span class="settings-action-title">Open device center</span>
+                                <span class="settings-action-help">See trusted, pending, unverified, and stale devices in one place.</span>
+                            </button>
+                            <button class="btn btn-secondary settings-action settings-action-rich"
+                                id="settingsIssueWelcomeBtn" type="button">
+                                <span class="settings-action-title">Approve device</span>
+                                <span class="settings-action-help">Authorize one of your new devices to access your protected workspace.</span>
+                            </button>
+                            <button class="btn btn-secondary settings-action settings-action-rich"
+                                id="settingsProcessWelcomeBtn" type="button">
+                                <span class="settings-action-title">Complete device setup</span>
+                                <span class="settings-action-help">Finish access setup on this device after approval.</span>
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsDevicesListBtn" type="button">
+                                Device center
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsAuditDevicesBtn"
+                                type="button">
+                                Audit devices
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section" id="settingsSecuritySection">
+                        <div class="settings-section-header">
+                            <h3>Security</h3>
+                            <p>Protect sign-ins and inspect advanced trust checks when needed.</p>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn settings-action mfa-enable-btn" id="settingsMfaEnableBtn" type="button">
+                                Enable MFA
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsServerTrustShowBtn"
+                                type="button">
+                                Server trust status
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsServerTrustCheckpointBtn"
+                                type="button">
+                                Trust checkpoint
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsPinListBtn" type="button">
+                                Pin list
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsPinHelpBtn" type="button">
+                                Pin help
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsServerTrustHelpBtn"
+                                type="button">
+                                Server trust help
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section" id="settingsRecoverySection">
+                        <div class="settings-section-header">
+                            <h3>Recovery</h3>
+                            <p>Back up recovery data and restore it when you need to bring another device online.</p>
+                        </div>
+                        <div class="settings-info">
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Last registry upload</span>
+                                <span class="settings-info-value" id="settingsRegistryLastUpload">—</span>
+                            </div>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary settings-action" id="settingsRecoveryUploadBtn"
+                                type="button">
+                                Upload recovery backup
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsRecoveryFetchBtn"
+                                type="button">
+                                Fetch recovery backup
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section" id="settingsCoverageSection">
+                        <div class="settings-section-header">
+                            <h3>Coverage</h3>
+                            <p>Check folder visibility, scan now, and sync protected folders from your other devices.</p>
+                        </div>
+                        <div class="settings-info">
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Last scan</span>
+                                <span class="settings-info-value" id="settingsCoverageLastScan">—</span>
+                            </div>
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Desktop coverage</span>
+                                <span class="settings-info-value settings-status"
+                                    id="settingsCoverageIpcStatus">—</span>
+                            </div>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-primary settings-action" id="settingsCoverageScanBtn" type="button">
+                                Scan now
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsCoverageStatusBtn"
+                                type="button">
+                                Coverage status
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsAuditSampleBtn" type="button">
+                                Sample audit
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsAuditFullBtn" type="button">
+                                Full audit
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsRecoverMarkersBtn"
+                                type="button">
+                                Sync protected folders
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section" id="settingsUpdatesSection">
+                        <div class="settings-section-header">
+                            <h3>Updates</h3>
+                            <p>Keep the app and its bundled tools ready to use.</p>
+                        </div>
+                        <div class="settings-info">
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Current version</span>
+                                <span class="settings-info-value" id="settingsCurrentVersion">—</span>
+                            </div>
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Update preference</span>
+                                <select id="settingsUpdatePreference" class="settings-select">
+                                    <option value="automatic">Automatic</option>
+                                    <option value="notify">Notify only</option>
+                                    <option value="manual">Manual</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary" id="settingsCheckUpdateBtn" type="button">
+                                Check for updates
+                            </button>
+                        </div>
+                        <div class="settings-update-status" id="settingsUpdateStatus"></div>
+                    </section>
+
+                    <section class="settings-section" id="settingsLegalSection">
+                        <div class="settings-section-header">
+                            <h3>Legal &amp; About</h3>
+                            <p>Review the packaged terms for this release and check what this device has accepted.</p>
+                        </div>
+                        <div class="settings-info">
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">App version</span>
+                                <span class="settings-info-value" id="settingsAboutVersion">—</span>
+                            </div>
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Legal version</span>
+                                <span class="settings-info-value" id="settingsLegalVersion">—</span>
+                            </div>
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Accepted on this device</span>
+                                <span class="settings-info-value" id="settingsLegalAcceptedAt">Not accepted yet</span>
+                            </div>
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Status</span>
+                                <span class="settings-info-value" id="settingsLegalStatus">Loading legal documents…</span>
+                            </div>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary settings-action" id="settingsReviewTermsBtn" type="button">
+                                Review terms
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsReviewPrivacyBtn" type="button">
+                                Privacy notice
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section" id="settingsTerminalSection">
+                        <div class="settings-section-header">
+                            <h3>Terminal Tools</h3>
+                            <p>Install or repair the terminal command that points to this app’s bundled CLI.</p>
+                        </div>
+                        <div class="settings-info">
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Global command</span>
+                                <span class="settings-info-value" id="settingsGlobalCliStatus">—</span>
+                            </div>
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Install path</span>
+                                <span class="settings-info-value" id="settingsGlobalCliPath">/usr/local/bin/hybridcipher</span>
+                            </div>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary settings-action" id="settingsInstallGlobalCliBtn" type="button">
+                                Install terminal command
+                            </button>
+                        </div>
+                    </section>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- Enrollment Modal -->
+    <div class="modal hidden" id="settingsEnrollmentModal">
+        <div class="modal-backdrop" id="settingsEnrollmentModalBackdrop"></div>
+        <div class="modal-content settings-enrollment-modal">
+            <div class="modal-header">
+                <h2>Remove protected folders</h2>
+                <button class="modal-close" id="closeSettingsEnrollmentModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="member-list settings-enrollment-rows" id="settingsEnrollmentModalList">
+                    <div class="member-list-empty">Loading protected folders...</div>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="cancelSettingsEnrollmentModalBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Feedback Modal -->
+    <div class="modal hidden" id="feedbackModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content feedback-modal">
+            <div class="modal-header">
+                <h2>Send Feedback</h2>
+                <button class="modal-close" id="closeFeedbackModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="feedbackForm">
+                    <div class="form-group">
+                        <label for="feedbackTitle">Title <span class="form-required">*</span></label>
+                        <input type="text" id="feedbackTitle" required placeholder="Brief summary of the issue">
+                    </div>
+                    <div class="form-group">
+                        <label for="feedbackDescription">Description <span class="form-required">*</span></label>
+                        <textarea id="feedbackDescription" required placeholder="Please describe what happened..."
+                            rows="5"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label for="feedbackEmail">Your Email <span class="form-required">*</span></label>
+                        <input type="email" id="feedbackEmail" required placeholder="your@email.com">
+                        <span class="form-hint">For follow-up if needed</span>
+                    </div>
+                    <div class="form-group">
+                        <label>Attachments</label>
+                        <div class="attachment-zone" id="attachmentZone">
+                            <div class="attachment-list" id="attachmentList"></div>
+                            <button type="button" class="btn btn-secondary btn-small" id="addAttachmentBtn">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                        d="M12 5v14M5 12h14" />
+                                </svg>
+                                Add File
+                            </button>
+                        </div>
+                        <span class="form-hint">Screenshots, logs, or any relevant files</span>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="cancelFeedbackBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitFeedbackBtn">
+                            <span class="btn-text">Send Feedback</span>
+                            <span class="btn-loading hidden">
+                                <span class="spinner-small"></span>
+                                Sending...
+                            </span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="markers-reminder" id="markersReminder" aria-hidden="true">
+        <div class="markers-reminder-content">
+            <div class="markers-reminder-text">
+                <h4>Enroll Markers Discovery</h4>
+                <p>
+                    Working with shared folders from another device? Run this to sync enrollments.
+                    If this is your first device, skip and enroll folders manually.
+                </p>
+            </div>
+            <div class="markers-reminder-actions">
+                <button class="btn btn-primary" id="markersReminderRunBtn" type="button">Run now</button>
+                <button class="btn btn-secondary" id="markersReminderDismissBtn" type="button">Not now</button>
+                <button class="btn btn-secondary markers-reminder-muted" id="markersReminderDontShowBtn" type="button">
+                    Don't show again
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Container -->
+    <div class="notification-container" id="notificationContainer"></div>
+
+    <!-- Context Menu -->
+    <div class="context-menu hidden" id="contextMenu">
+        <div class="context-menu-item" data-action="mount">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path stroke="currentColor" stroke-width="2" d="M21 3L3 21M3 3l18 18" />
+            </svg>
+            <span>Mount</span>
+        </div>
+        <div class="context-menu-item hidden" data-action="open-mounted">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                    d="M3 7h5l2 2h11v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 13h7" />
+            </svg>
+            <span>Open</span>
+        </div>
+        <div class="context-menu-item hidden" data-action="resolve-conflicts">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                    d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
+                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 9v4m0 4h.01" />
+            </svg>
+            <span>Resolve conflicts</span>
+        </div>
+        <div class="context-menu-item hidden" data-action="resolve-recovery">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                    d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
+                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 12h8m-4-4v8" />
+            </svg>
+            <span>Resolve recovery copies</span>
+        </div>
+        <div class="context-menu-item" data-action="unmount-cli">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path stroke="currentColor" stroke-width="2" d="M18 6L6 18M6 6l12 12" />
+            </svg>
+            <span>Unmount</span>
+        </div>
+    </div>
+
+    <script src="cli-commands.js"></script>
+    <script src="vendor/xterm/xterm.js"></script>
+    <script src="vendor/xterm/xterm-addon-fit.js"></script>
+    <script src="security-utils.js"></script>
+    <script src="ui-utils.js"></script>
+    <script src="terminal-utils.js"></script>
+    <script src="beta-ux-utils.js"></script>
+    <script src="legal-utils.js"></script>
+    <script src="release-notes-utils.js"></script>
+    <script src="app-tauri.js"></script>
+    <script src="app-update-methods.js"></script>
+    <script src="app.js"></script>
+</body>
+
+</html>
