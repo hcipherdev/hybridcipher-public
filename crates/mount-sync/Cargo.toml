@@ -1,0 +1,45 @@
+[package]
+name = "hybridcipher-mount-sync"
+version = "0.1.0"
+edition = "2021"
+authors = ["HybridCipher Team"]
+description = "Shared sync tracker logic for HybridCipher mirror mounts"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hybridcipher/hybridcipher"
+readme = "../../README.md"
+keywords = ["cryptography", "filesystem", "sync", "hybridcipher"]
+categories = ["cryptography", "filesystem"]
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+hybridcipher-client = { path = "../client" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+glob = "0.3"
+sha2 = "0.10"
+thiserror = "1.0"
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+base64 = { workspace = true }
+filetime = "0.2"
+tokio = { version = "1.0", features = ["sync", "time"] }
+notify = "6.1"
+which = "6.0"
+dirs = "5.0"
+unicode-normalization = "0.1"
+sysinfo = "0.30"
+
+[target.'cfg(unix)'.dependencies]
+xattr = "1.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hybridcipher-mount = { path = "../mount" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "time"] }

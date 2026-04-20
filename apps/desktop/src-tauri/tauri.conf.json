@@ -1,0 +1,77 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0",
+  "productName": "HybridCipher",
+  "version": "0.1.1",
+  "identifier": "com.hybridcipher.app",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "HybridCipher Vault",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ipc: https://tauri.localhost https://*.workers.dev"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "resources": [
+      "resources/bin",
+      "../legal",
+      "../release-notes"
+    ],
+    "licenseFile": "../legal/TERMS.md",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns"
+    ],
+    "publisher": "HybridCipher Team",
+    "homepage": "https://hybridcipher.com",
+    "category": "Utility",
+    "shortDescription": "Post-quantum secure file encryption and sharing",
+    "longDescription": "HybridCipher is a post-quantum secure group file sharing system using hybrid X25519 + ML-KEM-768 encryption with zero-trust server architecture.",
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "frameworks": [],
+      "entitlements": "entitlements.plist",
+      "providerShortName": null,
+      "signingIdentity": null
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "",
+      "wix": {
+        "language": "en-US"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE3QkVDOEEyQjZFODA4QzEKUldUQkNPaTJvc2krcDNENnlUNW8xWmdTQmRFOERneW5STzhMUyt6Ry9vV0NvUnVpWFIwaEhLR2oK",
+      "endpoints": [
+        "https://hybridcipher-updater.server-216.workers.dev/update/{{target}}/{{arch}}/{{current_version}}"
+      ],
+      "dialog": false
+    }
+  }
+}

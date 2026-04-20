@@ -1,0 +1,117 @@
+# cargo-deny configuration for license and dependency checking
+# https://github.com/EmbarkStudios/cargo-deny
+
+[licenses]
+# List of explicitly allowed licenses
+# See https://spdx.org/licenses/ for list of possible licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Unlicense",
+]
+
+# Explicitly deny these licenses
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "AGPL-1.0",
+    "AGPL-3.0",
+    "LGPL-2.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+]
+
+# Lint level for when multiple versions of the same license are detected
+multiple-versions = "warn"
+
+# Confidence threshold for detecting a license from a license text.
+# Confidence is on a scale of 0-1 with 1 being 100% confident.
+confidence-threshold = 0.8
+
+# Allow 1 or more licenses on a per-crate basis, so that particular licenses
+# aren't accepted for every possible crate as with the normal allow list
+exceptions = [
+    # Each entry is the crate and version constraint, and its the license
+    { allow = ["Unicode-DFS-2016"], name = "unicode-ident" },
+    { allow = ["OpenSSL"], name = "ring" },
+]
+
+[bans]
+# Lint level for when multiple versions of the same crate are detected
+multiple-versions = "warn"
+wildcards = "allow"
+
+# Crates that are completely banned
+deny = [
+    # Potentially problematic crypto libraries
+    { name = "openssl", reason = "Use rustls or ring instead" },
+    { name = "native-tls", reason = "Use rustls instead" },
+    
+    # Old/deprecated crates
+    { name = "tempdir", reason = "Use tempfile instead" },
+    { name = "rand_os", reason = "Use getrandom instead" },
+]
+
+# Certain crates/versions that will be skipped when doing duplicate detection.
+skip = [
+    # Skip duplicate detection for proc-macro crates
+    { name = "proc-macro2" },
+    { name = "syn" },
+    { name = "quote" },
+]
+
+# Similarly to `skip` allows you to skip certain crates from being checked.
+skip-tree = [
+    # Dev dependencies can have different versions
+    { name = "criterion" },
+    { name = "proptest" },
+]
+
+[advisories]
+# The path where the advisory database is cloned/fetched into
+db-path = "~/.cargo/advisory-db"
+
+# The url(s) of the advisory databases to use
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# The lint level for security vulnerabilities
+vulnerability = "deny"
+
+# The lint level for unmaintained crates
+unmaintained = "warn"
+
+# The lint level for crates that have been yanked from their source registry
+yanked = "warn"
+
+# The lint level for crates with security notices.
+notice = "warn"
+
+# A list of advisory IDs to ignore. Note that ignored advisories will still
+# output a note when they are encountered.
+ignore = [
+    # Example: ignore a specific advisory
+    # "RUSTSEC-2020-0001",
+]
+
+[sources]
+# Lint level for what to happen when a crate from a crate registry that is
+# not in the allow list is encountered
+unknown-registry = "warn"
+
+# Lint level for what to happen when a crate from a git repository that is not
+# in the allow list is encountered
+unknown-git = "warn"
+
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+allow-git = [
+    # Allow git dependencies from trusted sources
+    "https://github.com/RustCrypto/",
+    "https://github.com/dalek-cryptography/",
+]

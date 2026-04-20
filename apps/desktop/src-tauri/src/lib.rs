@@ -1,0 +1,25 @@
+pub mod cli_schema;
+pub mod cli_utils;
+pub mod client;
+pub mod commands;
+pub mod coverage_ipc;
+pub mod demo;
+pub mod feedback;
+pub mod http_client;
+pub mod individual_views;
+pub mod key_bundle;
+pub mod legal;
+pub mod local_client;
+pub mod mount;
+pub mod recovery_artifact;
+pub mod release_notes;
+pub mod session;
+pub mod state;
+pub mod terminal_diagnostics;
+
+pub use cli_schema::CliSchemaManager;
+pub use client::HybridCipherClient;
+pub use local_client::LocalClientProvider;
+pub use mount::MountManager;
+pub use session::{PersistedSession, SessionStore};
+pub use state::AppState;

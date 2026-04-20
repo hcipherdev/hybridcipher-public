@@ -1,0 +1,9 @@
+disallowed-methods = []
+disallowed-types = []
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 7
+type-complexity-threshold = 100
+single-char-binding-names-threshold = 4
+trivial-copy-size-limit = 64
+avoid-breaking-exported-api = false
+doc-valid-idents = ["HybridCipher", "PAKE", "OPAQUE", "HKDF", "ChaCha20", "Poly1305", "Ed25519", "X25519", "ML-KEM"]
