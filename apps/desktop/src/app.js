@@ -335,6 +335,22 @@ const buildMountTimeoutMessageValue = typeof betaUxUtils.buildMountTimeoutMessag
         'Review the embedded terminal output for the mount command, then retry if needed.',
         'Before retrying, check whether the folder is already mounted.'
     ].filter(Boolean).join(' ');
+const autoMountUtils = window.HybridCipherAutoMountUtils || {};
+const loadAutoMountPreferenceValue = typeof autoMountUtils.loadAutoMountPreference === 'function'
+    ? autoMountUtils.loadAutoMountPreference
+    : () => true;
+const saveAutoMountPreferenceValue = typeof autoMountUtils.saveAutoMountPreference === 'function'
+    ? autoMountUtils.saveAutoMountPreference
+    : () => {};
+const loadLastMountedRootIdValue = typeof autoMountUtils.loadLastMountedRootId === 'function'
+    ? autoMountUtils.loadLastMountedRootId
+    : () => null;
+const saveLastMountedRootIdValue = typeof autoMountUtils.saveLastMountedRootId === 'function'
+    ? autoMountUtils.saveLastMountedRootId
+    : () => {};
+const resolveAutoMountFolderValue = typeof autoMountUtils.resolveAutoMountFolder === 'function'
+    ? autoMountUtils.resolveAutoMountFolder
+    : () => null;
 const legalUtils = window.HybridCipherLegalUtils || {};
 const readStoredLegalAcceptanceValue = typeof legalUtils.readStoredLegalAcceptance === 'function'
     ? legalUtils.readStoredLegalAcceptance
@@ -374,6 +390,7 @@ class HybridCipherApp {
         this.appMode = 'individual';
         this.activeWorkspaceView = 'home';
         this.rememberMePreference = this.loadRememberPreference();
+        this.autoMountLastFolderPreference = this.loadAutoMountLastFolderPreference();
         this.userFolderPreferences = this.loadFolderPreferences();
         this.mountProgressInterval = null;
         this.mountProgressValue = 0;
@@ -630,7 +647,7 @@ class HybridCipherApp {
 
     }
 
-    showMainApp() {
+    showMainApp({ skipLoadEnrolledFolders = false } = {}) {
         document.getElementById('welcomeScreen').style.display = 'none';
         const appContainer = document.getElementById('appContainer');
         if (appContainer) {
@@ -655,7 +672,9 @@ class HybridCipherApp {
             document.getElementById('mainContent')?.classList.add('sidebar-collapsed');
         }
 
-        this.loadEnrolledFolders();
+        if (!skipLoadEnrolledFolders) {
+            this.loadEnrolledFolders();
+        }
 
         // Keep terminal ready in the background, but land on Workspace Home.
         this.updateTerminalCwdDisplay();
@@ -2520,6 +2539,23 @@ class HybridCipherApp {
         }
     }
 
+    loadAutoMountLastFolderPreference() {
+        return loadAutoMountPreferenceValue(window.localStorage);
+    }
+
+    saveAutoMountLastFolderPreference(value) {
+        this.autoMountLastFolderPreference = Boolean(value);
+        saveAutoMountPreferenceValue(window.localStorage, this.autoMountLastFolderPreference);
+    }
+
+    loadLastMountedRootId() {
+        return loadLastMountedRootIdValue(window.localStorage);
+    }
+
+    saveLastMountedRootId(rootId) {
+        saveLastMountedRootIdValue(window.localStorage, rootId);
+    }
+
     loadMarkersReminderDismissed() {
         try {
             return localStorage.getItem('hybridcipher_markers_reminder_dismissed') === 'true';
@@ -2584,6 +2620,30 @@ class HybridCipherApp {
         } catch (error) {
             console.warn('Failed to save folder preferences:', error);
         }
+    }
+
+    resolveAutoMountFolder() {
+        return resolveAutoMountFolderValue({
+            storage: window.localStorage,
+            enrolledFolders: this.enrolledFolders,
+            activeMountsByRootId: this.activeMountsByRootId,
+        });
+    }
+
+    syncAutoMountSettingsUi() {
+        const checkbox = document.getElementById('settingsAutoMountLastFolder');
+        if (checkbox) {
+            checkbox.checked = Boolean(this.autoMountLastFolderPreference);
+        }
+    }
+
+    async maybeAutoMountLastFolder() {
+        const folder = this.resolveAutoMountFolder();
+        if (!folder?.root_id) {
+            return false;
+        }
+
+        return this.mountFolderFromContext(folder, { autoMountRestore: true });
     }
 
     saveAccordionState(sectionId, isExpanded) {
@@ -3389,6 +3449,9 @@ class HybridCipherApp {
                 }
             );
         });
+        document.getElementById('settingsAutoMountLastFolder')?.addEventListener('change', (event) => {
+            this.saveAutoMountLastFolderPreference(event.target.checked);
+        });
         document.getElementById('settingsUpdatePreference')?.addEventListener('change', (e) => {
             this.updatePreference = e.target.value;
             localStorage.setItem('hybridcipher_update_preference', this.updatePreference);
@@ -3727,10 +3790,14 @@ class HybridCipherApp {
                 this.currentUser = sessionInfo.email;
                 this.currentDeviceId = sessionInfo.device_id || null;
                 this.updateUserStatus(sessionInfo.email, true);
-                this.showMainApp();
+                this.showMainApp({ skipLoadEnrolledFolders: true });
                 this.showNotification(`Welcome back, ${sessionInfo.email}!`, 'success');
                 this.refreshSecurityStatus();
                 await this.initializeOperationsRefresh();
+                await this.loadEnrolledFolders({ suppressErrorNotification: true });
+                this.maybeAutoMountLastFolder().catch(error => {
+                    console.error('Auto-mount on restored session failed:', error);
+                });
             } else {
                 this.showWelcomeScreen();
             }
@@ -4110,10 +4177,14 @@ class HybridCipherApp {
                 this.currentDeviceId = result?.data?.device_id || null;
                 this.updateUserStatus(email, true);
                 this.closeLoginModal();
-                this.showMainApp();
+                this.showMainApp({ skipLoadEnrolledFolders: true });
                 this.showNotification('Successfully logged in!', 'success');
                 await this.refreshSecurityStatus();
                 await this.initializeOperationsRefresh();
+                await this.loadEnrolledFolders({ suppressErrorNotification: true });
+                this.maybeAutoMountLastFolder().catch(error => {
+                    console.error('Auto-mount after login failed:', error);
+                });
                 if (result.data && result.data.recovery_code) {
                     this.showRecoveryCodeModal(result.data.recovery_code);
                 }
@@ -10079,10 +10150,10 @@ class HybridCipherApp {
         }
     }
 
-    async mountFolderFromContext(folder) {
+    async mountFolderFromContext(folder, { autoMountRestore = false } = {}) {
         if (!folder) {
             this.showNotification('No folder provided', 'warning');
-            return;
+            return false;
         }
 
         // Check if already mounted - if so, just open the folder
@@ -10093,8 +10164,10 @@ class HybridCipherApp {
 
             if (checkResult.success && checkResult.data) {
                 // Already mounted, just open it
-                await this.openMountInExplorer(checkResult.data);
-                return;
+                if (!autoMountRestore) {
+                    await this.openMountInExplorer(checkResult.data);
+                }
+                return true;
             } else {
                 // Not mounted - clean up any stale session entry
                 if (this.mountSessions[folder.root_id]) {
@@ -10118,8 +10191,10 @@ class HybridCipherApp {
         // Check if there's already a mount session for this root_id
         // Only check this if mount status check passed (meaning we're sure it's not mounted)
         if (this.mountSessions[folder.root_id]) {
-            this.showNotification('Mount already in progress for this folder', 'info');
-            return;
+            if (!autoMountRestore) {
+                this.showNotification('Mount already in progress for this folder', 'info');
+            }
+            return false;
         }
 
         const mountJob = this.createMountProgressJob(folder.root_id, folder);
@@ -10163,6 +10238,7 @@ class HybridCipherApp {
 
             if (pollResult.status === 'mounted') {
                 this.currentMountPath = pollResult.mountpoint;
+                this.saveLastMountedRootId(folder.root_id);
                 this.updateMountButtons(true);
 
                 // Select the folder if not already selected
@@ -10178,19 +10254,24 @@ class HybridCipherApp {
                     this.showNotification(`${mountJob.folderLabel} mounted successfully in background.`, 'success');
                 } else {
                     // Open system file explorer
-                    await this.openMountInExplorer(pollResult.mountpoint);
+                    if (!autoMountRestore) {
+                        await this.openMountInExplorer(pollResult.mountpoint);
+                    }
                     this.showNotification(`${mountJob.folderLabel} mounted successfully.`, 'success');
                 }
+                return true;
             } else if (pollResult.status === 'cancelled') {
                 await this.cleanupMountSession(folder.root_id, sessionId);
                 this.showNotification('Mount cancelled', 'info');
+                return false;
             } else if (pollResult.status === 'background_timeout') {
                 await this.cleanupMountSession(folder.root_id, sessionId);
                 this.showNotification(buildMountTimeoutMessageValue({
                     folderLabel: mountJob.folderLabel,
                     folderPath: mountJob.folderPath,
                     inBackground: true,
-                }), 'error');
+                }), autoMountRestore ? 'warning' : 'error');
+                return false;
             } else {
                 await this.cleanupMountSession(folder.root_id, sessionId);
                 const fallbackError =
@@ -10201,13 +10282,22 @@ class HybridCipherApp {
                         folderPath: mountJob.folderPath,
                         inBackground: true,
                     });
-                    this.showNotification(`${failureMessage} Error detail: ${fallbackError}`, 'error');
+                    this.showNotification(
+                        `${failureMessage} Error detail: ${fallbackError}`,
+                        autoMountRestore ? 'warning' : 'error'
+                    );
                 } else {
-                    this.showMountProgressError(fallbackError, {
-                        folderLabel: mountJob.folderLabel,
-                        folderPath: mountJob.folderPath,
-                    });
+                    if (autoMountRestore) {
+                        this.hideMountProgressModal();
+                        this.showNotification(`Auto-mount failed for ${mountJob.folderLabel}: ${fallbackError}`, 'warning');
+                    } else {
+                        this.showMountProgressError(fallbackError, {
+                            folderLabel: mountJob.folderLabel,
+                            folderPath: mountJob.folderPath,
+                        });
+                    }
                 }
+                return false;
             }
         } catch (error) {
             const currentJob = this.getMountProgressJob(folder.root_id);
@@ -10227,13 +10317,22 @@ class HybridCipherApp {
                     folderPath: failureFolderPath,
                     inBackground: true,
                 });
-                this.showNotification(`${failureMessage} Error detail: ${error}`, 'error');
+                this.showNotification(
+                    `${failureMessage} Error detail: ${error}`,
+                    autoMountRestore ? 'warning' : 'error'
+                );
             } else {
-                this.showMountProgressError(`Mount failed: ${error}`, {
-                    folderLabel: failureFolderLabel,
-                    folderPath: failureFolderPath,
-                });
+                if (autoMountRestore) {
+                    this.hideMountProgressModal();
+                    this.showNotification(`Auto-mount failed for ${failureFolderLabel}: ${error}`, 'warning');
+                } else {
+                    this.showMountProgressError(`Mount failed: ${error}`, {
+                        folderLabel: failureFolderLabel,
+                        folderPath: failureFolderPath,
+                    });
+                }
             }
+            return false;
         }
     }
 
@@ -11287,6 +11386,7 @@ class HybridCipherApp {
         this.refreshSettingsStatus();
         this.refreshLegalStatusUi();
         this.updateMfaSettingsButton();
+        this.syncAutoMountSettingsUi();
         this.closeSettingsEnrollmentModal();
         // Populate update settings
         const prefSelect = document.getElementById('settingsUpdatePreference');

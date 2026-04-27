@@ -1849,6 +1849,18 @@
                             <h3>Folders</h3>
                             <p>Add protected folders, remove them later, or unmount everything at once.</p>
                         </div>
+                        <div class="settings-info">
+                            <div class="settings-info-item settings-info-item-checkbox">
+                                <div class="settings-info-copy">
+                                    <span class="settings-info-label">Auto-mount last folder</span>
+                                    <span class="settings-info-help">Automatically mount the last mounted protected folder after login.</span>
+                                </div>
+                                <label class="checkbox-label settings-checkbox-label">
+                                    <input type="checkbox" id="settingsAutoMountLastFolder">
+                                    <span>Enabled</span>
+                                </label>
+                            </div>
+                        </div>
                         <div class="settings-actions">
                             <button class="btn btn-secondary settings-action" id="settingsEnrollFolderBtn"
                                 type="button">
@@ -2213,6 +2225,7 @@
     <script src="ui-utils.js"></script>
     <script src="terminal-utils.js"></script>
     <script src="beta-ux-utils.js"></script>
+    <script src="auto-mount-utils.js"></script>
     <script src="legal-utils.js"></script>
     <script src="release-notes-utils.js"></script>
     <script src="app-tauri.js"></script>
