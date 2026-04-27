@@ -2533,6 +2533,26 @@ body {
     font-size: 0.9rem;
 }
 
+.settings-info-item-checkbox {
+    align-items: center;
+}
+
+.settings-info-copy {
+    display: grid;
+    gap: 4px;
+}
+
+.settings-info-help {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    line-height: 1.4;
+}
+
+.settings-checkbox-label {
+    flex-shrink: 0;
+    font-size: 0.85rem;
+}
+
 .settings-info-label {
     color: var(--text-secondary);
 }

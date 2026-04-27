@@ -1,18 +1,58 @@
-# HybridCipher Public Source
+# HybridCipher
 
-HybridCipher is a secure file-sharing system for teams that want client-side
-encryption, explicit device trust, and a post-quantum migration path. This
-repository contains the public client-side source for the desktop app, the
-bundled `hybridcipher` CLI, and the shared Rust crates they use.
+HybridCipher protects shared files before they leave the device.
 
-If you are new to the repository, start with this mental model:
+It is built for teams that need client-side encryption, explicit device trust,
+and a post-quantum migration path without asking the cloud service to handle
+plaintext files. The desktop app and bundled `hybridcipher` CLI give users two
+entry points into the same local client engine: files are encrypted, decrypted,
+checked, and trusted on the user's device before encrypted coordination data is
+sent to the cloud.
 
-- the desktop app and CLI are two entry points into the same client engine
-- encryption, decryption, local secret handling, and trust checks happen on the
-  client side
-- the server is an external coordination system from this repo's point of view
+## Why HybridCipher Exists
 
-## How It Fits Together
+Most file-sharing systems make the cloud service part of the trust boundary.
+HybridCipher is designed for a stricter model: user devices do the sensitive
+cryptographic work locally, while the cloud service coordinates encrypted
+collaboration, metadata, device state, and recovery workflows.
+
+That separation helps teams reduce the impact of server compromise, stolen
+devices, and long-term cryptographic migration pressure.
+
+## Who It Is For
+
+HybridCipher is for teams and builders who need stronger guarantees than
+ordinary cloud sync:
+
+- organizations sharing sensitive files across trusted devices
+- security-conscious teams that want client-side encryption by default
+- operators who need visible device trust, recovery, and coverage workflows
+- developers and auditors who want to inspect the public client implementation
+
+## What It Protects Against
+
+HybridCipher is designed to keep plaintext and local secrets on trusted user
+devices. The cloud coordination service should receive ciphertext, metadata,
+and encrypted coordination artifacts, not raw file contents or plaintext epoch
+keys.
+
+```mermaid
+flowchart LR
+    Device["User devices<br/>Desktop app + CLI"]
+    HC["HybridCipher<br/>local encryption + device trust"]
+    Cloud["Cloud coordination service<br/>ciphertext + metadata only"]
+
+    Device --> HC
+    HC --> Cloud
+    Cloud --> HC
+    HC --> Device
+```
+
+## How the Public Source Fits Together
+
+This repository contains the public client-side source for the desktop app, the
+bundled `hybridcipher` CLI, and the shared Rust crates they use. The server is
+an external coordination system from this repo's point of view.
 
 ```mermaid
 flowchart LR
@@ -96,8 +136,8 @@ Published verification values for the current source snapshot:
 <!-- BEGIN GENERATED VERIFY HASHES -->
 | Source ref | Target | Artifact | SHA-256 |
 | --- | --- | --- | --- |
-| `f84ec33f0ae697f13331ff235185d88ed8a41848` | `aarch64-apple-darwin` | `HybridCipher_aarch64.unsigned.app.tar.gz` | `76ece4198928b56323bd6ad7989a4e9c8e553da2027d08eb7321bc982aff7674` |
-| `f84ec33f0ae697f13331ff235185d88ed8a41848` | `x86_64-apple-darwin` | `HybridCipher_x86_64.unsigned.app.tar.gz` | `2e955aac18e7a16f1a03e6ff9dd1371d76675ebd7410df4203a94f0cd5783dc2` |
+| `46d564b72e069442243bad5055ea009678efa6dd` | `aarch64-apple-darwin` | `HybridCipher_aarch64.unsigned.app.tar.gz` | `082d30e6f28a8ba33477d5f9e8f778e155f7d1cbc49188485a0904675b4f27e1` |
+| `46d564b72e069442243bad5055ea009678efa6dd` | `x86_64-apple-darwin` | `HybridCipher_x86_64.unsigned.app.tar.gz` | `093c67fc00c07a4ee6e3cf2d31a4aeb1168e7b6a6bc23e08071cf8abb2082c06` |
 <!-- END GENERATED VERIFY HASHES -->
 
 That script:
