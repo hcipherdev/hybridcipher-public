@@ -872,7 +872,7 @@ pub fn enforce_individual_edition_command_policy(command: &Commands) -> Result<(
     };
 
     Err(CliError::permission(format!(
-        "This desktop edition is limited to individual-use workflows. `{}` is not available.",
+        "This build disables team and group administration commands. `{}` is not available.",
         command_name
     )))
 }

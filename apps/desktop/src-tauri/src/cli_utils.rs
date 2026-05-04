@@ -71,7 +71,7 @@ pub fn locate_cli_binary() -> Result<(PathBuf, PathBuf), String> {
         }
 
         return Err(
-            "Individual desktop edition requires the bundled `hybridcipher` CLI (or a workspace-built binary in local development). Rebuild the desktop bundle with the restricted CLI included.".to_string(),
+            "This restricted desktop build requires the bundled `hybridcipher` CLI (or a workspace-built binary in local development). Rebuild the desktop bundle with the restricted CLI included.".to_string(),
         );
     }
 

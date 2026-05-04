@@ -7714,7 +7714,7 @@ class HybridCipherApp {
     }
 
     getIndividualEditionRestrictionMessage(commandName) {
-        return `This desktop edition is limited to individual-use workflows. \`${commandName}\` is not available.`;
+        return `This build disables team and group administration commands. \`${commandName}\` is not available.`;
     }
 
     getRestrictedIndividualCliCommand(command) {

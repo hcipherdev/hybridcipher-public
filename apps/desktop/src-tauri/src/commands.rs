@@ -3534,7 +3534,7 @@ fn restricted_individual_command_name(command: &str) -> Option<&'static str> {
 #[cfg(feature = "individual-edition")]
 fn individual_command_restriction_message(command_name: &str) -> String {
     format!(
-        "This desktop edition is limited to individual-use workflows. `{}` is not available.",
+        "This build disables team and group administration commands. `{}` is not available.",
         command_name
     )
 }
