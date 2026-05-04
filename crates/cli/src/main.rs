@@ -40,8 +40,8 @@ All operations maintain cryptographic security properties even against untrusted
 #[cfg_attr(
     feature = "individual-edition",
     command(
-        about = "Secure personal file protection and device onboarding",
-        long_about = "HybridCipher provides encrypted file protection and device onboarding for individual use:
+        about = "Secure personal file protection with team administration disabled",
+        long_about = "HybridCipher provides encrypted file protection and device onboarding in a restricted personal build:
 - Post-quantum cryptographic resistance
 - Personal file encryption and decryption
 - Coverage enrollment and verification
@@ -49,7 +49,7 @@ All operations maintain cryptographic security properties even against untrusted
 - Recovery backup management
 - Sync mounts for local access
 
-This desktop edition focuses on personal workflows and hides team-administration commands."
+This build disables team and group administration commands while using the same shared HybridCipher client engine."
     )
 )]
 struct Cli {

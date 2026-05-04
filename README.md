@@ -51,8 +51,9 @@ flowchart LR
 ## How the Public Source Fits Together
 
 This repository contains the public client-side source for the desktop app, the
-bundled `hybridcipher` CLI, and the shared Rust crates they use. The server is
-an external coordination system from this repo's point of view.
+bundled `hybridcipher` CLI, and the shared Rust crates used by HybridCipher
+client builds. The server is an external coordination system from this repo's
+point of view.
 
 ```mermaid
 flowchart LR
@@ -74,6 +75,22 @@ At a high level:
 
 For the deeper repo-level explanation, start with
 [apps/desktop/architecture/README.md](apps/desktop/architecture/README.md).
+
+## Edition Model
+
+The public source is the shared client implementation used by both personal and
+team-capable HybridCipher builds. Some distributed desktop packages may enable a
+restricted personal build profile that disables team and group administration
+commands, but that restriction is a packaging choice layered on top of the same
+client engine.
+
+| Capability | Personal build | Team-capable build |
+| --- | --- | --- |
+| Shared crypto and client engine | Included | Included |
+| Desktop app and `hybridcipher` CLI core | Included | Included |
+| Personal protected-folder workflows | Included | Included |
+| Team and group administration | Disabled in restricted builds | Included |
+| Server, deployment, and operations code | Not included in this public repo | Not included in this public repo |
 
 ## What This Repo Contains
 
@@ -136,8 +153,8 @@ Published verification values for the current source snapshot:
 <!-- BEGIN GENERATED VERIFY HASHES -->
 | Source ref | Target | Artifact | SHA-256 |
 | --- | --- | --- | --- |
-| `46d564b72e069442243bad5055ea009678efa6dd` | `aarch64-apple-darwin` | `HybridCipher_aarch64.unsigned.app.tar.gz` | `082d30e6f28a8ba33477d5f9e8f778e155f7d1cbc49188485a0904675b4f27e1` |
-| `46d564b72e069442243bad5055ea009678efa6dd` | `x86_64-apple-darwin` | `HybridCipher_x86_64.unsigned.app.tar.gz` | `093c67fc00c07a4ee6e3cf2d31a4aeb1168e7b6a6bc23e08071cf8abb2082c06` |
+| `c1d626d3085c90e808578da788ff8fda6e7f6f67` | `aarch64-apple-darwin` | `HybridCipher_aarch64.unsigned.app.tar.gz` | `6f3fb78b2a04f43fdc6f7b9c948792d7013b32b1417068fd46cd3402a4ba0981` |
+| `c1d626d3085c90e808578da788ff8fda6e7f6f67` | `x86_64-apple-darwin` | `HybridCipher_x86_64.unsigned.app.tar.gz` | `c8efb24e8f213a372382f93ecffdb4c49c91c1e9362c7ee4157c7075be046e81` |
 <!-- END GENERATED VERIFY HASHES -->
 
 That script:
