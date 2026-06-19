@@ -14,6 +14,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, Local, Utc};
 use dashmap::DashMap;
 use dashmap::DashSet;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
@@ -22,17 +23,18 @@ use hybridcipher_client::{
     file::encrypt::{write_encrypted_file, SerializedEncryptedHeader, SparseFileMetadata},
     EncryptedFileMetadata,
 };
+#[cfg(unix)]
 use nix::sys::statvfs;
 use notify::event::{Event, EventKind, RemoveKind};
 use notify::{recommended_watcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp;
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -58,6 +60,13 @@ pub const ATTR_TTL: Duration = Duration::from_secs(1);
 pub const ENTRY_TTL: Duration = Duration::from_secs(1);
 
 const ENCRYPTED_SEPARATOR: &[u8] = b"\n---ENCRYPTED_DATA---\n";
+const ENCRYPTED_TMP_DIR_NAME: &str = ".hybridcipher-tmp";
+const MOUNT_JOURNAL_DIR_NAME: &str = ".hybridcipher-mount-journal";
+const MOUNT_RETENTION_DIR_NAME: &str = ".hybridcipher-retention";
+const MOUNT_CORRUPT_DIR_NAME: &str = "corrupt";
+const MOUNT_JOURNAL_VERSION: u32 = 1;
+const MAX_MOUNT_STATUS_PATHS: usize = 16;
+const MAX_MOUNT_RECOVERY_ACTIONS: usize = 64;
 
 /// Information about an open file handle
 #[derive(Debug, Clone)]
@@ -130,11 +139,23 @@ pub struct HybridCipher<
     /// Paths currently being replaced via rename to suppress watcher removal
     suppressed_removals: Arc<DashSet<String>>,
 
+    /// Serialize crash-sensitive backing-store mutations for the mount.
+    mount_commit_lock: Arc<parking_lot::Mutex<()>>,
+
+    /// Last flush/sync failure observed by the mount.
+    last_flush_error: Arc<RwLock<Option<String>>>,
+
+    /// Recent startup recovery actions for CLI/Desktop safety reporting.
+    recovery_actions: Arc<RwLock<Vec<String>>>,
+
     /// Root directory containing encrypted `.encrypted` files
     encrypted_root: PathBuf,
 
     /// Mount point directory where decrypted files are mirrored (for mirror mount on macOS)
     mount_point: Option<PathBuf>,
+
+    /// Volume label exposed by platform mounts that support named volumes.
+    volume_name: String,
 
     /// Next available file handle
     next_handle: Arc<parking_lot::Mutex<FileHandle>>,
@@ -167,8 +188,12 @@ where
             path_lookup: self.path_lookup.clone(),
             xattrs: self.xattrs.clone(),
             suppressed_removals: self.suppressed_removals.clone(),
+            mount_commit_lock: self.mount_commit_lock.clone(),
+            last_flush_error: self.last_flush_error.clone(),
+            recovery_actions: self.recovery_actions.clone(),
             encrypted_root: self.encrypted_root.clone(),
             mount_point: self.mount_point.clone(),
+            volume_name: self.volume_name.clone(),
             next_handle: self.next_handle.clone(),
             next_inode: self.next_inode.clone(),
             runtime: self.runtime.clone(),
@@ -198,6 +223,7 @@ where
         encrypted_root: PathBuf,
         mount_point: Option<PathBuf>,
         max_operations: u32,
+        volume_name: Option<String>,
     ) -> Result<Self> {
         let client = Arc::new(client);
         let migration_tracker = migration_tracker.map(Arc::new);
@@ -214,11 +240,17 @@ where
         let path_lookup = Arc::new(DashMap::new());
         let xattrs = Arc::new(DashMap::new());
         let suppressed_removals = Arc::new(DashSet::new());
+        let mount_commit_lock = Arc::new(parking_lot::Mutex::new(()));
+        let last_flush_error = Arc::new(RwLock::new(None));
+        let recovery_actions = Arc::new(RwLock::new(Vec::new()));
         let next_handle = Arc::new(parking_lot::Mutex::new(1));
         let next_inode = Arc::new(parking_lot::Mutex::new(2)); // Start after root inode
         let runtime = Handle::current();
         let max_ops = std::cmp::max(1, max_operations) as usize;
         let operation_semaphore = Arc::new(Semaphore::new(max_ops));
+        let volume_name = volume_name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "HybridCipher".to_string());
 
         let fs = HybridCipher {
             client,
@@ -232,8 +264,12 @@ where
             path_lookup,
             xattrs,
             suppressed_removals,
+            mount_commit_lock,
+            last_flush_error,
+            recovery_actions,
             encrypted_root,
             mount_point,
+            volume_name,
             next_handle,
             next_inode,
             runtime,
@@ -241,6 +277,13 @@ where
         };
 
         // Initialize the virtual tree with root directory
+        fs::create_dir_all(&fs.encrypted_root).with_context(|| {
+            format!(
+                "Failed to create encrypted root {}",
+                fs.encrypted_root.display()
+            )
+        })?;
+        fs.recover_mount_safety_state()?;
         fs.initialize_root_directory()?;
 
         // Start performance monitoring background tasks
@@ -495,6 +538,7 @@ where
     }
 
     /// Get the next available file handle
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn get_next_handle(&self) -> FileHandle {
         let mut handle = self.next_handle.lock();
         let result = *handle;
@@ -511,6 +555,7 @@ where
     }
 
     /// Convert FileInfo to FUSE FileAttr
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn file_info_to_attr(&self, inode: InodeId, info: &FileInfo) -> FileAttr {
         let file_type = if info.is_directory {
             FileType::Directory
@@ -573,6 +618,10 @@ where
             "Looking up file '{}' in parent inode {}",
             name, parent_inode
         );
+
+        if is_mount_internal_name(name) {
+            return Ok(None);
+        }
 
         // Resolve parent path
         let parent_info = match self.inode_map.get(&parent_inode) {
@@ -1554,6 +1603,16 @@ where
         }
     }
 
+    fn recover_mount_safety_state(&self) -> Result<()> {
+        let _commit_guard = self.mount_commit_lock.lock();
+        let mut summary = MountRecoverySummary::default();
+        recover_mount_journal_with_summary(&self.encrypted_root, &mut summary)?;
+        recover_encrypted_temp_files_with_summary(&self.encrypted_root, &mut summary)?;
+        scan_encrypted_file_health_with_summary(&self.encrypted_root, &mut summary)?;
+        *self.recovery_actions.write() = summary.actions.clone();
+        Ok(())
+    }
+
     fn parent_inode_for_path(&self, path: &str) -> InodeId {
         if path == "/" {
             return ROOT_INODE;
@@ -1581,7 +1640,7 @@ where
             .unwrap_or(ROOT_INODE)
     }
 
-    fn collect_directory_entries(&self, parent_path: &str) -> Vec<(InodeId, FileType, String)> {
+    fn collect_directory_entries(&self, parent_path: &str) -> Vec<(InodeId, bool, String)> {
         let mut entries = Vec::new();
         let directory_path = self.encrypted_dir_for(parent_path);
 
@@ -1618,6 +1677,10 @@ where
                 None => continue,
             };
 
+            if is_mount_internal_name(name) {
+                continue;
+            }
+
             let file_type = match entry.file_type() {
                 Ok(ft) => ft,
                 Err(err) => {
@@ -1636,7 +1699,7 @@ where
                     Ok(metadata) => {
                         let info = self.build_directory_info(&normalized_child, &metadata);
                         let inode = self.upsert_file_info(&normalized_child, info);
-                        entries.push((inode, FileType::Directory, name.to_string()));
+                        entries.push((inode, true, name.to_string()));
                     }
                     Err(err) => {
                         warn!(
@@ -1671,7 +1734,7 @@ where
                             &encrypted_metadata,
                         );
                         let inode = self.upsert_file_info(&normalized_child, info);
-                        entries.push((inode, FileType::RegularFile, decrypted_name.to_string()));
+                        entries.push((inode, false, decrypted_name.to_string()));
                     }
                     Err(err) => {
                         warn!(
@@ -1688,7 +1751,7 @@ where
         entries
     }
 
-    fn collect_virtual_entries(&self) -> Vec<(InodeId, FileType, String)> {
+    fn collect_virtual_entries(&self) -> Vec<(InodeId, bool, String)> {
         let virtual_entries = {
             let tree = self.virtual_tree.read();
             tree.get_virtual_entries()
@@ -1701,12 +1764,7 @@ where
             info.file_id = normalized.clone();
             info.is_virtual = true;
             let inode = self.upsert_file_info(&normalized, info.clone());
-            let file_type = if info.is_directory {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
-            entries.push((inode, file_type, name));
+            entries.push((inode, info.is_directory, name));
         }
 
         entries.sort_by(|a, b| a.2.cmp(&b.2));
@@ -1739,6 +1797,1304 @@ where
             avg_operation_time_ms: performance_snapshot.avg_operation_time.as_millis() as u64,
         }
     }
+
+    /// Return mount safety state for CLI/Desktop status surfaces.
+    pub fn runtime_status(&self) -> MountRuntimeStatus {
+        let mut status = collect_mount_runtime_status(&self.encrypted_root).unwrap_or_else(|err| {
+            MountRuntimeStatus::with_error(format!("Failed to collect mount runtime status: {err}"))
+        });
+        status.open_file_handle_count = self.file_handles.len();
+        status.pending_dirty_handles = 0;
+        status.last_flush_error = self.last_flush_error.read().clone();
+        status.recovery_actions = self.recovery_actions.read().clone();
+        status.rebuild_safety_fields();
+        status
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MountJournalOperation {
+    CreateFile,
+    CreateDirectory,
+    Delete,
+    Rename,
+    Replace,
+    Truncate,
+    SetBasicInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MountJournalRecord {
+    version: u32,
+    id: String,
+    operation: MountJournalOperation,
+    created_at: DateTime<Utc>,
+    source_path: Option<PathBuf>,
+    destination_path: Option<PathBuf>,
+    backup_path: Option<PathBuf>,
+    is_directory: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StagedMountOperation {
+    journal_path: PathBuf,
+    backup_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct MountRecoverySummary {
+    replayed_journals: usize,
+    promoted_temp_files: usize,
+    restored_backups: usize,
+    quarantined_corrupt_files: usize,
+    actions: Vec<String>,
+}
+
+impl MountRecoverySummary {
+    fn push_action(&mut self, action: impl Into<String>) {
+        if self.actions.len() < MAX_MOUNT_RECOVERY_ACTIONS {
+            self.actions.push(action.into());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CorruptQuarantineRecord {
+    original_path: PathBuf,
+    quarantine_path: PathBuf,
+    quarantined_at: DateTime<Utc>,
+    reason: String,
+}
+
+fn is_mount_internal_name(name: &str) -> bool {
+    matches!(
+        name,
+        ENCRYPTED_TMP_DIR_NAME | MOUNT_JOURNAL_DIR_NAME | MOUNT_RETENTION_DIR_NAME
+    )
+}
+
+fn mount_journal_dir(encrypted_root: &Path) -> PathBuf {
+    encrypted_root.join(MOUNT_JOURNAL_DIR_NAME)
+}
+
+fn mount_retention_dir(encrypted_root: &Path) -> PathBuf {
+    encrypted_root.join(MOUNT_RETENTION_DIR_NAME)
+}
+
+fn mount_corrupt_retention_dir(encrypted_root: &Path) -> PathBuf {
+    mount_retention_dir(encrypted_root).join(MOUNT_CORRUPT_DIR_NAME)
+}
+
+fn encrypted_tmp_dir_for(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow!(
+            "Encrypted file path {} has no parent directory",
+            path.display()
+        )
+    })?;
+    Ok(parent.join(ENCRYPTED_TMP_DIR_NAME))
+}
+
+fn sync_file_if_exists(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let open_result = fs::OpenOptions::new().read(true).write(true).open(path);
+    #[cfg(not(target_os = "windows"))]
+    let open_result = fs::File::open(path);
+
+    match open_result {
+        Ok(file) => file.sync_all(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn sync_directory_if_exists(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = path;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    match fs::File::open(path) {
+        Ok(dir) => dir.sync_all(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn sync_path_and_parent(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        sync_directory_if_exists(path)?;
+    } else {
+        sync_file_if_exists(path)?;
+    }
+    if let Some(parent) = path.parent() {
+        sync_directory_if_exists(parent)?;
+    }
+    Ok(())
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Path {} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create parent directory {}", parent.display()))?;
+
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mount-journal".to_string());
+    let tmp_path = parent.join(format!("{}.tmp-{}", file_name, Uuid::new_v4()));
+
+    {
+        let mut file = fs::File::create(&tmp_path)
+            .with_context(|| format!("Failed to create temp file {}", tmp_path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("Failed to write temp file {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to fsync temp file {}", tmp_path.display()))?;
+    }
+
+    replace_file_preserving_existing(&tmp_path, path)?;
+    sync_directory_if_exists(parent)
+        .with_context(|| format!("Failed to fsync directory {}", parent.display()))?;
+    Ok(())
+}
+
+fn replace_file_preserving_existing(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        fs::rename(source, destination).with_context(|| {
+            format!(
+                "Failed to atomically rename {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if !destination.exists() {
+            fs::rename(source, destination).with_context(|| {
+                format!(
+                    "Failed to rename {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            return Ok(());
+        }
+
+        let parent = destination.parent().ok_or_else(|| {
+            anyhow!(
+                "Destination path {} has no parent directory",
+                destination.display()
+            )
+        })?;
+        let file_name = destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "encrypted".to_string());
+        let backup = parent.join(ENCRYPTED_TMP_DIR_NAME).join(format!(
+            "replace-backup-{}.{}",
+            Uuid::new_v4(),
+            file_name
+        ));
+        if let Some(backup_parent) = backup.parent() {
+            fs::create_dir_all(backup_parent).with_context(|| {
+                format!(
+                    "Failed to create replacement backup directory {}",
+                    backup_parent.display()
+                )
+            })?;
+        }
+
+        fs::rename(destination, &backup).with_context(|| {
+            format!(
+                "Failed to move existing destination {} to backup {}",
+                destination.display(),
+                backup.display()
+            )
+        })?;
+        sync_directory_if_exists(parent).ok();
+
+        if let Err(err) = fs::rename(source, destination) {
+            if let Err(restore_err) = fs::rename(&backup, destination) {
+                return Err(anyhow!(
+                    "Failed to replace {} with {}: {}; also failed to restore backup {}: {}",
+                    destination.display(),
+                    source.display(),
+                    err,
+                    backup.display(),
+                    restore_err
+                ));
+            }
+            return Err(anyhow!(
+                "Failed to replace {} with {}: {}",
+                destination.display(),
+                source.display(),
+                err
+            ));
+        }
+
+        sync_path_and_parent(destination).ok();
+        if let Err(err) = fs::remove_file(&backup) {
+            warn!(
+                "Failed to remove replacement backup {} after successful replace: {}",
+                backup.display(),
+                err
+            );
+        }
+        Ok(())
+    }
+}
+
+fn write_encrypted_file_atomic(
+    path: &Path,
+    header: &SerializedEncryptedHeader<'_>,
+    encrypted_content: &[u8],
+) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow!(
+            "Encrypted file path {} has no parent directory",
+            path.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create parent directory {}", parent.display()))?;
+
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "encrypted".to_string());
+    let tmp_dir = encrypted_tmp_dir_for(path)?;
+    fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("Failed to create temp directory {}", tmp_dir.display()))?;
+    let tmp_path = tmp_dir.join(format!("tmp-{}.{}", Uuid::new_v4(), file_name));
+
+    if let Err(err) = write_encrypted_file(&tmp_path, header, encrypted_content) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| {
+            format!("Failed to write encrypted temp file {}", tmp_path.display())
+        });
+    }
+    sync_file_if_exists(&tmp_path)
+        .with_context(|| format!("Failed to fsync temp file {}", tmp_path.display()))?;
+
+    if let Err(err) = replace_file_preserving_existing(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "Failed to commit encrypted temp file {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        });
+    }
+    sync_directory_if_exists(parent)
+        .with_context(|| format!("Failed to fsync directory {}", parent.display()))?;
+    Ok(())
+}
+
+fn retention_backup_path(encrypted_root: &Path, id: &str, source: &Path) -> PathBuf {
+    let name = source
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "entry".to_string());
+    mount_retention_dir(encrypted_root).join(id).join(name)
+}
+
+fn copy_path_to_retention(source: &Path, backup: &Path, is_directory: bool) -> Result<()> {
+    if let Some(parent) = backup.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create retention backup parent {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    if is_directory {
+        fs::create_dir_all(backup)
+            .with_context(|| format!("Failed to create directory backup {}", backup.display()))?;
+        sync_path_and_parent(backup).ok();
+    } else {
+        fs::copy(source, backup).with_context(|| {
+            format!(
+                "Failed to copy {} to retention backup {}",
+                source.display(),
+                backup.display()
+            )
+        })?;
+        sync_path_and_parent(backup).ok();
+    }
+    Ok(())
+}
+
+fn move_path_to_retention(source: &Path, backup: &Path) -> Result<()> {
+    if let Some(parent) = backup.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create retention backup parent {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::rename(source, backup).with_context(|| {
+        format!(
+            "Failed to move {} to retention backup {}",
+            source.display(),
+            backup.display()
+        )
+    })?;
+    if let Some(parent) = source.parent() {
+        sync_directory_if_exists(parent).ok();
+    }
+    sync_path_and_parent(backup).ok();
+    Ok(())
+}
+
+fn quarantine_sidecar_path(quarantine_path: &Path) -> PathBuf {
+    let sidecar_name = quarantine_path
+        .file_name()
+        .map(|value| format!("{}.quarantine.json", value.to_string_lossy()))
+        .unwrap_or_else(|| "quarantine.json".to_string());
+    quarantine_path.with_file_name(sidecar_name)
+}
+
+fn quarantine_corrupt_path(
+    encrypted_root: &Path,
+    source: &Path,
+    reason: &str,
+    summary: Option<&mut MountRecoverySummary>,
+) -> Result<Option<PathBuf>> {
+    if !source.exists() {
+        return Ok(None);
+    }
+    if source.starts_with(mount_retention_dir(encrypted_root)) {
+        return Ok(None);
+    }
+
+    let relative = source
+        .strip_prefix(encrypted_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| {
+            source
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("corrupt-entry"))
+        });
+    let quarantine_path = mount_corrupt_retention_dir(encrypted_root)
+        .join(Uuid::new_v4().to_string())
+        .join(relative);
+
+    if let Some(parent) = quarantine_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create corrupt retention parent {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::rename(source, &quarantine_path).with_context(|| {
+        format!(
+            "Failed to quarantine corrupt encrypted path {} to {}",
+            source.display(),
+            quarantine_path.display()
+        )
+    })?;
+    if let Some(parent) = source.parent() {
+        sync_directory_if_exists(parent).ok();
+    }
+    sync_path_and_parent(&quarantine_path).ok();
+
+    let record = CorruptQuarantineRecord {
+        original_path: source.to_path_buf(),
+        quarantine_path: quarantine_path.clone(),
+        quarantined_at: Utc::now(),
+        reason: reason.to_string(),
+    };
+    match serde_json::to_vec_pretty(&record) {
+        Ok(data) => {
+            if let Err(err) = write_atomic_bytes(&quarantine_sidecar_path(&quarantine_path), &data)
+            {
+                warn!(
+                    "Failed to write corrupt quarantine sidecar for {}: {}",
+                    quarantine_path.display(),
+                    err
+                );
+            }
+        }
+        Err(err) => warn!(
+            "Failed to serialize corrupt quarantine record for {}: {}",
+            quarantine_path.display(),
+            err
+        ),
+    }
+
+    if let Some(summary) = summary {
+        summary.quarantined_corrupt_files += 1;
+        summary.push_action(format!(
+            "Quarantined suspicious encrypted file {} to {} ({})",
+            source.display(),
+            quarantine_path.display(),
+            reason
+        ));
+    }
+
+    Ok(Some(quarantine_path))
+}
+
+fn write_mount_journal(
+    encrypted_root: &Path,
+    record: MountJournalRecord,
+) -> Result<StagedMountOperation> {
+    let journal_dir = mount_journal_dir(encrypted_root);
+    fs::create_dir_all(&journal_dir).with_context(|| {
+        format!(
+            "Failed to create mount journal directory {}",
+            journal_dir.display()
+        )
+    })?;
+    let journal_path = journal_dir.join(format!("{}.json", record.id));
+    let data = serde_json::to_vec_pretty(&record)
+        .context("Failed to serialize mount operation journal")?;
+    write_atomic_bytes(&journal_path, &data)?;
+    Ok(StagedMountOperation {
+        journal_path,
+        backup_path: record.backup_path,
+    })
+}
+
+fn complete_mount_journal(journal_path: &Path) -> Result<()> {
+    match fs::remove_file(journal_path) {
+        Ok(()) => {
+            if let Some(parent) = journal_path.parent() {
+                sync_directory_if_exists(parent).ok();
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to remove completed mount journal {}",
+                journal_path.display()
+            )
+        }),
+    }
+}
+
+fn discard_staged_backup(staged: &StagedMountOperation) {
+    let Some(backup_path) = staged.backup_path.as_ref() else {
+        return;
+    };
+    let result = if backup_path.is_dir() {
+        fs::remove_dir_all(backup_path)
+    } else {
+        fs::remove_file(backup_path)
+    };
+    match result {
+        Ok(()) => {
+            if let Some(parent) = backup_path.parent() {
+                remove_empty_directory(parent);
+                sync_directory_if_exists(parent).ok();
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => warn!(
+            "Failed to discard completed staged backup {}: {}",
+            backup_path.display(),
+            err
+        ),
+    }
+}
+
+fn remove_empty_directory(path: &Path) {
+    match fs::remove_dir(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                sync_directory_if_exists(parent).ok();
+            }
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(err) => warn!(
+            "Failed to remove empty directory {}: {}",
+            path.display(),
+            err
+        ),
+    }
+}
+
+fn stage_create_operation(
+    encrypted_root: &Path,
+    target_path: &Path,
+    is_directory: bool,
+) -> Result<StagedMountOperation> {
+    let id = Uuid::new_v4().to_string();
+    let record = MountJournalRecord {
+        version: MOUNT_JOURNAL_VERSION,
+        id,
+        operation: if is_directory {
+            MountJournalOperation::CreateDirectory
+        } else {
+            MountJournalOperation::CreateFile
+        },
+        created_at: Utc::now(),
+        source_path: Some(target_path.to_path_buf()),
+        destination_path: None,
+        backup_path: None,
+        is_directory,
+    };
+    write_mount_journal(encrypted_root, record)
+}
+
+fn stage_delete_for_cleanup(
+    encrypted_root: &Path,
+    target_path: &Path,
+    is_directory: bool,
+) -> Result<StagedMountOperation> {
+    let id = Uuid::new_v4().to_string();
+    let backup_path = retention_backup_path(encrypted_root, &id, target_path);
+    copy_path_to_retention(target_path, &backup_path, is_directory)?;
+    let record = MountJournalRecord {
+        version: MOUNT_JOURNAL_VERSION,
+        id,
+        operation: MountJournalOperation::Delete,
+        created_at: Utc::now(),
+        source_path: Some(target_path.to_path_buf()),
+        destination_path: None,
+        backup_path: Some(backup_path),
+        is_directory,
+    };
+    write_mount_journal(encrypted_root, record)
+}
+
+fn stage_truncate_operation(
+    encrypted_root: &Path,
+    target_path: &Path,
+) -> Result<StagedMountOperation> {
+    let id = Uuid::new_v4().to_string();
+    let backup_path = retention_backup_path(encrypted_root, &id, target_path);
+    copy_path_to_retention(target_path, &backup_path, false)?;
+    let record = MountJournalRecord {
+        version: MOUNT_JOURNAL_VERSION,
+        id,
+        operation: MountJournalOperation::Truncate,
+        created_at: Utc::now(),
+        source_path: Some(target_path.to_path_buf()),
+        destination_path: None,
+        backup_path: Some(backup_path),
+        is_directory: false,
+    };
+    write_mount_journal(encrypted_root, record)
+}
+
+fn stage_metadata_operation(
+    encrypted_root: &Path,
+    target_path: &Path,
+    is_directory: bool,
+) -> Result<StagedMountOperation> {
+    let id = Uuid::new_v4().to_string();
+    let record = MountJournalRecord {
+        version: MOUNT_JOURNAL_VERSION,
+        id,
+        operation: MountJournalOperation::SetBasicInfo,
+        created_at: Utc::now(),
+        source_path: Some(target_path.to_path_buf()),
+        destination_path: None,
+        backup_path: None,
+        is_directory,
+    };
+    write_mount_journal(encrypted_root, record)
+}
+
+fn stage_rename_operation(
+    encrypted_root: &Path,
+    source_path: &Path,
+    destination_path: &Path,
+    is_directory: bool,
+    replace_if_exists: bool,
+) -> Result<StagedMountOperation> {
+    let id = Uuid::new_v4().to_string();
+    let mut backup_path = None;
+    let mut backup_to_move = None;
+
+    if destination_path.exists() {
+        if !replace_if_exists {
+            return Err(anyhow!(
+                "Destination {} already exists",
+                destination_path.display()
+            ));
+        }
+        if is_directory {
+            return Err(anyhow!(
+                "Replacing directories is not supported for {}",
+                destination_path.display()
+            ));
+        }
+        let backup = retention_backup_path(encrypted_root, &id, destination_path);
+        backup_to_move = Some(backup.clone());
+        backup_path = Some(backup);
+    }
+
+    let record = MountJournalRecord {
+        version: MOUNT_JOURNAL_VERSION,
+        id,
+        operation: if backup_path.is_some() {
+            MountJournalOperation::Replace
+        } else {
+            MountJournalOperation::Rename
+        },
+        created_at: Utc::now(),
+        source_path: Some(source_path.to_path_buf()),
+        destination_path: Some(destination_path.to_path_buf()),
+        backup_path,
+        is_directory,
+    };
+    let staged = write_mount_journal(encrypted_root, record)?;
+
+    if let Some(backup) = backup_to_move {
+        if let Err(err) = move_path_to_retention(destination_path, &backup) {
+            let _ = complete_mount_journal(&staged.journal_path);
+            return Err(err);
+        }
+    }
+
+    Ok(staged)
+}
+
+fn recover_staged_operation(record: &MountJournalRecord, journal_path: &Path) -> Result<()> {
+    let mut summary = MountRecoverySummary::default();
+    recover_staged_operation_with_summary(record, journal_path, &mut summary)
+}
+
+fn recover_staged_operation_with_summary(
+    record: &MountJournalRecord,
+    journal_path: &Path,
+    summary: &mut MountRecoverySummary,
+) -> Result<()> {
+    let encrypted_root = journal_path
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+
+    match record.operation {
+        MountJournalOperation::CreateFile | MountJournalOperation::CreateDirectory => {
+            if let Some(source) = record.source_path.as_ref() {
+                if source.exists() && !record.is_directory && parse_encrypted_file(source).is_err()
+                {
+                    if let Some(root) = encrypted_root.as_deref() {
+                        let _ = quarantine_corrupt_path(
+                            root,
+                            source,
+                            "create journal found unhealthy encrypted file",
+                            Some(&mut *summary),
+                        )?;
+                    }
+                }
+            }
+            complete_mount_journal(journal_path)?;
+            summary.replayed_journals += 1;
+            if let Some(source) = record.source_path.as_ref() {
+                summary.push_action(format!(
+                    "Reconciled pending {:?} journal for {}",
+                    record.operation,
+                    source.display()
+                ));
+            }
+        }
+        MountJournalOperation::Delete => {
+            if let Some(source) = record.source_path.as_ref() {
+                if source.exists() {
+                    if record.is_directory {
+                        match fs::remove_dir(source) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                                warn!(
+                                    "Skipping recovery delete for non-empty directory {}",
+                                    source.display()
+                                );
+                                return Ok(());
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    } else {
+                        match fs::remove_file(source) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+                    if let Some(parent) = source.parent() {
+                        sync_directory_if_exists(parent).ok();
+                    }
+                }
+            }
+            complete_mount_journal(journal_path)?;
+            summary.replayed_journals += 1;
+            if let Some(source) = record.source_path.as_ref() {
+                summary.push_action(format!(
+                    "Replayed pending delete journal for {}",
+                    source.display()
+                ));
+            }
+        }
+        MountJournalOperation::Rename | MountJournalOperation::Replace => {
+            let source = record.source_path.as_ref();
+            let destination = record.destination_path.as_ref();
+            let backup = record.backup_path.as_ref();
+
+            match (source, destination) {
+                (Some(_source), Some(destination)) if destination.exists() => {
+                    complete_mount_journal(journal_path)?;
+                    summary.replayed_journals += 1;
+                    summary.push_action(format!(
+                        "Completed pending {:?} journal for {}",
+                        record.operation,
+                        destination.display()
+                    ));
+                }
+                (Some(source), Some(destination)) if source.exists() => {
+                    if let Some(backup) = backup {
+                        if backup.exists() && !destination.exists() {
+                            fs::rename(backup, destination).with_context(|| {
+                                format!(
+                                    "Failed to restore retained destination {} to {}",
+                                    backup.display(),
+                                    destination.display()
+                                )
+                            })?;
+                            sync_path_and_parent(destination).ok();
+                            summary.restored_backups += 1;
+                            summary.push_action(format!(
+                                "Restored retained destination {} to {}",
+                                backup.display(),
+                                destination.display()
+                            ));
+                        }
+                    }
+                    complete_mount_journal(journal_path)?;
+                    summary.replayed_journals += 1;
+                }
+                (_, Some(destination)) => {
+                    if !destination.exists() {
+                        if let Some(backup) = backup {
+                            if backup.exists() {
+                                fs::rename(backup, destination).with_context(|| {
+                                    format!(
+                                        "Failed to restore retained destination {} to {}",
+                                        backup.display(),
+                                        destination.display()
+                                    )
+                                })?;
+                                sync_path_and_parent(destination).ok();
+                                summary.restored_backups += 1;
+                                summary.push_action(format!(
+                                    "Restored retained destination {} to {}",
+                                    backup.display(),
+                                    destination.display()
+                                ));
+                            }
+                        }
+                    }
+                    complete_mount_journal(journal_path)?;
+                    summary.replayed_journals += 1;
+                }
+                _ => {
+                    complete_mount_journal(journal_path)?;
+                    summary.replayed_journals += 1;
+                }
+            }
+        }
+        MountJournalOperation::Truncate => {
+            let target = record.source_path.as_ref();
+            let backup = record.backup_path.as_ref();
+
+            let target_healthy = target
+                .filter(|path| path.exists())
+                .map(|path| parse_encrypted_file(path).is_ok())
+                .unwrap_or(false);
+
+            if target_healthy {
+                complete_mount_journal(journal_path)?;
+                summary.replayed_journals += 1;
+                if let Some(target) = target {
+                    summary.push_action(format!(
+                        "Completed pending truncate journal for {}",
+                        target.display()
+                    ));
+                }
+            } else if let (Some(target), Some(backup)) = (target, backup) {
+                if target.exists() {
+                    if let Some(root) = encrypted_root.as_deref() {
+                        let _ = quarantine_corrupt_path(
+                            root,
+                            target,
+                            "truncate journal found unhealthy replacement",
+                            Some(&mut *summary),
+                        )?;
+                    } else if let Err(err) = fs::remove_file(target) {
+                        if err.kind() != io::ErrorKind::NotFound {
+                            return Err(err.into());
+                        }
+                    }
+                }
+                if backup.exists() {
+                    fs::rename(backup, target).with_context(|| {
+                        format!(
+                            "Failed to restore truncate backup {} to {}",
+                            backup.display(),
+                            target.display()
+                        )
+                    })?;
+                    sync_path_and_parent(target).ok();
+                    if let Some(parent) = backup.parent() {
+                        remove_empty_directory(parent);
+                    }
+                    summary.restored_backups += 1;
+                    summary.push_action(format!(
+                        "Restored truncate backup {} to {}",
+                        backup.display(),
+                        target.display()
+                    ));
+                }
+                complete_mount_journal(journal_path)?;
+                summary.replayed_journals += 1;
+            } else {
+                complete_mount_journal(journal_path)?;
+                summary.replayed_journals += 1;
+            }
+        }
+        MountJournalOperation::SetBasicInfo => {
+            complete_mount_journal(journal_path)?;
+            summary.replayed_journals += 1;
+            if let Some(source) = record.source_path.as_ref() {
+                summary.push_action(format!(
+                    "Reconciled pending metadata journal for {}",
+                    source.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn recover_mount_journal(encrypted_root: &Path) -> Result<()> {
+    let mut summary = MountRecoverySummary::default();
+    recover_mount_journal_with_summary(encrypted_root, &mut summary)
+}
+
+fn recover_mount_journal_with_summary(
+    encrypted_root: &Path,
+    summary: &mut MountRecoverySummary,
+) -> Result<()> {
+    let journal_dir = mount_journal_dir(encrypted_root);
+    if !journal_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(&journal_dir)
+        .with_context(|| format!("Failed to read journal dir {}", journal_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(err) => {
+                warn!("Failed to read mount journal {}: {}", path.display(), err);
+                continue;
+            }
+        };
+        let record: MountJournalRecord = match serde_json::from_slice(&data) {
+            Ok(record) => record,
+            Err(err) => {
+                warn!("Failed to parse mount journal {}: {}", path.display(), err);
+                continue;
+            }
+        };
+        if let Err(err) = recover_staged_operation_with_summary(&record, &path, summary) {
+            warn!(
+                "Failed to recover mount journal {} for {:?}: {}",
+                path.display(),
+                record.operation,
+                err
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn recover_encrypted_temp_files(encrypted_root: &Path) -> Result<()> {
+    let mut summary = MountRecoverySummary::default();
+    recover_encrypted_temp_files_with_summary(encrypted_root, &mut summary)
+}
+
+fn recover_encrypted_temp_files_with_summary(
+    encrypted_root: &Path,
+    summary: &mut MountRecoverySummary,
+) -> Result<()> {
+    if !encrypted_root.exists() {
+        return Ok(());
+    }
+
+    let mut stack = vec![encrypted_root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if file_type.is_dir() {
+                if name == ENCRYPTED_TMP_DIR_NAME {
+                    recover_one_temp_dir_with_summary(encrypted_root, &path, summary)?;
+                } else if !is_mount_internal_name(&name) {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recover_one_temp_dir_with_summary(
+    encrypted_root: &Path,
+    tmp_dir: &Path,
+    summary: &mut MountRecoverySummary,
+) -> Result<()> {
+    let parent = match tmp_dir.parent() {
+        Some(parent) => parent,
+        None => return Ok(()),
+    };
+
+    for entry in fs::read_dir(tmp_dir)
+        .with_context(|| format!("Failed to read temp dir {}", tmp_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(final_name) = name
+            .strip_prefix("tmp-")
+            .and_then(|value| value.split_once('.'))
+        {
+            let final_path = parent.join(final_name.1);
+            if final_path.exists() {
+                let final_healthy = parse_encrypted_file(&final_path).is_ok();
+                let temp_healthy = parse_encrypted_file(&path).is_ok();
+                if final_healthy {
+                    if let Err(err) = fs::remove_file(&path) {
+                        warn!(
+                            "Failed to remove stale encrypted temp file {}: {}",
+                            path.display(),
+                            err
+                        );
+                    }
+                } else if temp_healthy {
+                    let _ = quarantine_corrupt_path(
+                        encrypted_root,
+                        &final_path,
+                        "healthy temp ciphertext superseded corrupt final ciphertext",
+                        Some(&mut *summary),
+                    )?;
+                    if let Err(err) = fs::rename(&path, &final_path) {
+                        warn!(
+                            "Failed to promote recoverable encrypted temp file {} to {}: {}",
+                            path.display(),
+                            final_path.display(),
+                            err
+                        );
+                    } else {
+                        sync_path_and_parent(&final_path).ok();
+                        summary.promoted_temp_files += 1;
+                        summary.push_action(format!(
+                            "Promoted recoverable encrypted temp file {} to {}",
+                            path.display(),
+                            final_path.display()
+                        ));
+                    }
+                } else {
+                    let _ = quarantine_corrupt_path(
+                        encrypted_root,
+                        &path,
+                        "corrupt temp ciphertext left by interrupted write",
+                        Some(&mut *summary),
+                    )?;
+                }
+            } else if parse_encrypted_file(&path).is_ok() {
+                if let Err(err) = fs::rename(&path, &final_path) {
+                    warn!(
+                        "Failed to promote recoverable encrypted temp file {} to {}: {}",
+                        path.display(),
+                        final_path.display(),
+                        err
+                    );
+                } else {
+                    sync_path_and_parent(&final_path).ok();
+                    summary.promoted_temp_files += 1;
+                    summary.push_action(format!(
+                        "Promoted recoverable encrypted temp file {} to {}",
+                        path.display(),
+                        final_path.display()
+                    ));
+                    warn!(
+                        "Promoted recoverable encrypted temp file {} to {}",
+                        path.display(),
+                        final_path.display()
+                    );
+                }
+            }
+        } else if let Some(final_name) = name
+            .strip_prefix("replace-backup-")
+            .and_then(|value| value.split_once('.'))
+        {
+            let final_path = parent.join(final_name.1);
+            if final_path.exists() {
+                warn!(
+                    "Leaving replacement backup {} in place for manual inspection",
+                    path.display()
+                );
+            } else if let Err(err) = fs::rename(&path, &final_path) {
+                warn!(
+                    "Failed to restore replacement backup {} to {}: {}",
+                    path.display(),
+                    final_path.display(),
+                    err
+                );
+            } else {
+                sync_path_and_parent(&final_path).ok();
+                summary.restored_backups += 1;
+                summary.push_action(format!(
+                    "Restored replacement backup {} to {}",
+                    path.display(),
+                    final_path.display()
+                ));
+                warn!(
+                    "Restored replacement backup {} to {}",
+                    path.display(),
+                    final_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scan_encrypted_file_health_with_summary(
+    encrypted_root: &Path,
+    summary: &mut MountRecoverySummary,
+) -> Result<()> {
+    if !encrypted_root.exists() {
+        return Ok(());
+    }
+
+    let mut encrypted_files = Vec::new();
+    let mut stack = vec![encrypted_root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if file_type.is_dir() {
+                if !is_mount_internal_name(&name) {
+                    stack.push(path);
+                }
+            } else if file_type.is_file() && name.ends_with(".encrypted") {
+                encrypted_files.push(path);
+            }
+        }
+    }
+
+    for path in encrypted_files {
+        if let Err(err) = parse_encrypted_file(&path) {
+            warn!(
+                "Quarantining corrupt encrypted file {} after startup validation: {}",
+                path.display(),
+                err
+            );
+            let _ = quarantine_corrupt_path(
+                encrypted_root,
+                &path,
+                &format!("startup encrypted header validation failed: {err}"),
+                Some(&mut *summary),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn count_journal_files(encrypted_root: &Path) -> (usize, Vec<String>) {
+    let journal_dir = mount_journal_dir(encrypted_root);
+    let entries = match fs::read_dir(&journal_dir) {
+        Ok(entries) => entries,
+        Err(_) => return (0, Vec::new()),
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            paths.push(path.display().to_string());
+        }
+    }
+    paths.sort();
+    let count = paths.len();
+    paths.truncate(MAX_MOUNT_STATUS_PATHS);
+    (count, paths)
+}
+
+fn count_temp_files(encrypted_root: &Path) -> (usize, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut stack = vec![encrypted_root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if file_type.is_dir() {
+                if name == ENCRYPTED_TMP_DIR_NAME {
+                    if let Ok(temp_entries) = fs::read_dir(&path) {
+                        for temp_entry in temp_entries.flatten() {
+                            if temp_entry
+                                .file_type()
+                                .map(|ft| ft.is_file())
+                                .unwrap_or(false)
+                            {
+                                paths.push(temp_entry.path().display().to_string());
+                            }
+                        }
+                    }
+                } else if !is_mount_internal_name(&name) {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    let count = paths.len();
+    paths.truncate(MAX_MOUNT_STATUS_PATHS);
+    (count, paths)
+}
+
+fn count_retention_entries(encrypted_root: &Path) -> (usize, Vec<String>) {
+    let retention_dir = mount_retention_dir(encrypted_root);
+    let entries = match fs::read_dir(&retention_dir) {
+        Ok(entries) => entries,
+        Err(_) => return (0, Vec::new()),
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == MOUNT_CORRUPT_DIR_NAME {
+            continue;
+        }
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+            && fs::read_dir(entry.path())
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        paths.push(entry.path().display().to_string());
+    }
+    paths.sort();
+    let count = paths.len();
+    paths.truncate(MAX_MOUNT_STATUS_PATHS);
+    (count, paths)
+}
+
+fn count_corrupt_quarantine_entries(encrypted_root: &Path) -> (usize, Vec<String>) {
+    let corrupt_dir = mount_corrupt_retention_dir(encrypted_root);
+    let mut paths = Vec::new();
+    let mut stack = vec![corrupt_dir];
+    while let Some(current) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                paths.push(path.display().to_string());
+            }
+        }
+    }
+    paths.sort();
+    let count = paths.len();
+    paths.truncate(MAX_MOUNT_STATUS_PATHS);
+    (count, paths)
+}
+
+pub fn collect_mount_runtime_status(encrypted_root: &Path) -> Result<MountRuntimeStatus> {
+    let (pending_journal_count, pending_journal_paths) = count_journal_files(encrypted_root);
+    let (temp_file_count, temp_file_paths) = count_temp_files(encrypted_root);
+    let (retained_entry_count, retained_entry_paths) = count_retention_entries(encrypted_root);
+    let (corrupted_encrypted_file_count, corrupt_quarantine_paths) =
+        count_corrupt_quarantine_entries(encrypted_root);
+
+    let mut status = MountRuntimeStatus {
+        safe_to_report_all_synced: true,
+        pending_dirty_handles: 0,
+        open_file_handle_count: 0,
+        pending_journal_count,
+        pending_journal_paths,
+        temp_file_count,
+        temp_file_paths,
+        retained_entry_count,
+        retained_entry_paths,
+        corrupted_encrypted_file_count,
+        corrupt_quarantine_paths,
+        last_flush_error: None,
+        recovery_actions: Vec::new(),
+        preflight_warnings: Vec::new(),
+        updated_at: Utc::now(),
+    };
+    status.rebuild_safety_fields();
+    Ok(status)
 }
 
 fn normalize_child_path(parent: &str, name: &str) -> String {
@@ -1765,6 +3121,9 @@ fn normalize_encrypted_child_path(encrypted_root: &Path, path: &Path) -> Option<
         let segment = component.as_os_str().to_str()?;
         if segment.is_empty() {
             continue;
+        }
+        if is_mount_internal_name(segment) {
+            return None;
         }
         normalized.push('/');
         normalized.push_str(segment);
@@ -1951,14 +3310,16 @@ fn persist_encrypted_file(path: &Path, metadata: &EncryptedFileMetadata) -> Resu
         sparse_metadata: metadata.sparse_metadata.as_ref(),
     };
 
-    write_encrypted_file(path, &header, &metadata.encrypted_content)
-        .context("Failed to persist encrypted file payload")
+    write_encrypted_file_atomic(path, &header, &metadata.encrypted_content)
+        .context("Failed to persist encrypted file payload atomically")
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn io_error_to_errno(err: io::Error) -> libc::c_int {
     err.raw_os_error().unwrap_or(libc::EIO)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn time_or_now_to_system(value: TimeOrNow) -> SystemTime {
     match value {
         TimeOrNow::SpecificTime(ts) => ts,
@@ -1979,6 +3340,101 @@ pub struct FilesystemStats {
     pub avg_operation_time_ms: u64,
 }
 
+/// Safety status for mount commit state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountRuntimeStatus {
+    pub safe_to_report_all_synced: bool,
+    pub pending_dirty_handles: usize,
+    pub open_file_handle_count: usize,
+    pub pending_journal_count: usize,
+    pub pending_journal_paths: Vec<String>,
+    pub temp_file_count: usize,
+    pub temp_file_paths: Vec<String>,
+    pub retained_entry_count: usize,
+    pub retained_entry_paths: Vec<String>,
+    pub corrupted_encrypted_file_count: usize,
+    pub corrupt_quarantine_paths: Vec<String>,
+    pub last_flush_error: Option<String>,
+    pub recovery_actions: Vec<String>,
+    pub preflight_warnings: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl MountRuntimeStatus {
+    fn with_error(error: String) -> Self {
+        let mut status = Self {
+            safe_to_report_all_synced: false,
+            pending_dirty_handles: 0,
+            open_file_handle_count: 0,
+            pending_journal_count: 0,
+            pending_journal_paths: Vec::new(),
+            temp_file_count: 0,
+            temp_file_paths: Vec::new(),
+            retained_entry_count: 0,
+            retained_entry_paths: Vec::new(),
+            corrupted_encrypted_file_count: 0,
+            corrupt_quarantine_paths: Vec::new(),
+            last_flush_error: Some(error),
+            recovery_actions: Vec::new(),
+            preflight_warnings: Vec::new(),
+            updated_at: Utc::now(),
+        };
+        status.rebuild_safety_fields();
+        status
+    }
+
+    fn rebuild_safety_fields(&mut self) {
+        let mut warnings = Vec::new();
+        if self.pending_dirty_handles > 0 {
+            warnings.push(format!(
+                "{} dirty file handle(s) still need a durable commit.",
+                self.pending_dirty_handles
+            ));
+        }
+        if self.pending_journal_count > 0 {
+            warnings.push(format!(
+                "{} pending mount operation journal(s) require recovery or completion.",
+                self.pending_journal_count
+            ));
+        }
+        if self.temp_file_count > 0 {
+            warnings.push(format!(
+                "{} encrypted temp file(s) remain from interrupted writeback.",
+                self.temp_file_count
+            ));
+        }
+        if self.retained_entry_count > 0 {
+            warnings.push(format!(
+                "{} retained delete/replace recovery entry/entries remain for user review.",
+                self.retained_entry_count
+            ));
+        }
+        if self.corrupted_encrypted_file_count > 0 {
+            warnings.push(format!(
+                "{} corrupt encrypted file(s) were quarantined into retention.",
+                self.corrupted_encrypted_file_count
+            ));
+        }
+        if let Some(error) = self
+            .last_flush_error
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            warnings.push(format!("Last mount flush failed: {error}"));
+        }
+
+        self.safe_to_report_all_synced = self.pending_dirty_handles == 0
+            && self.pending_journal_count == 0
+            && self.temp_file_count == 0
+            && self.retained_entry_count == 0
+            && self.corrupted_encrypted_file_count == 0
+            && self.last_flush_error.is_none();
+        self.preflight_warnings = warnings;
+        self.updated_at = Utc::now();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<S, N> Filesystem for HybridCipher<S, N>
 where
     S: hybridcipher_client::storage::Storage + Send + Sync + 'static,
@@ -3106,11 +4562,37 @@ where
         entries.push((parent_inode, FileType::Directory, "..".to_string()));
 
         // Real filesystem entries
-        entries.extend(self.collect_directory_entries(&parent_path));
+        entries.extend(
+            self.collect_directory_entries(&parent_path)
+                .into_iter()
+                .map(|(inode, is_directory, name)| {
+                    (
+                        inode,
+                        if is_directory {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        },
+                        name,
+                    )
+                }),
+        );
 
         // Virtual overlay entries (root only)
         if ino == ROOT_INODE {
-            entries.extend(self.collect_virtual_entries());
+            entries.extend(self.collect_virtual_entries().into_iter().map(
+                |(inode, is_directory, name)| {
+                    (
+                        inode,
+                        if is_directory {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        },
+                        name,
+                    )
+                },
+            ));
         }
 
         let start_index = offset.max(0) as usize;
@@ -3164,6 +4646,27 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn test_metadata(file_path: &str, content: &[u8]) -> EncryptedFileMetadata {
+        EncryptedFileMetadata {
+            file_id: Uuid::new_v4().to_string(),
+            file_path: file_path.to_string(),
+            group_id: None,
+            epoch_id: 1,
+            header_version: Some(1),
+            wrapped_file_key: Some(vec![1; 32]),
+            key_wrap_nonce: Some(vec![2; 12]),
+            key_wrap_aad_hash: Some(vec![3; 32]),
+            content_nonce: Some(vec![4; 12]),
+            content_chunk_size: None,
+            content_size: content.len() as u64,
+            encrypted_size: content.len() as u64,
+            created_at: Utc::now(),
+            platform_metadata: None,
+            sparse_metadata: None,
+            encrypted_content: content.to_vec(),
+        }
+    }
+
     #[tokio::test]
     async fn test_hybridcipher_creation() {
         // This test would require a mock client
@@ -3179,6 +4682,253 @@ mod tests {
 
         // This is a basic smoke test for the type system
         assert!(temp_dir.path().exists());
+    }
+
+    #[test]
+    fn atomic_encrypted_persist_replaces_existing_payload() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("doc.encrypted");
+
+        persist_encrypted_file(&target, &test_metadata("doc.txt", b"old")).unwrap();
+        persist_encrypted_file(&target, &test_metadata("doc.txt", b"new")).unwrap();
+
+        let parsed = parse_encrypted_file(&target).unwrap();
+        assert_eq!(parsed.encrypted_content, b"new");
+    }
+
+    #[test]
+    fn delete_stage_writes_journal_and_retention_before_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let target = root.join("delete-me.encrypted");
+        fs::write(&target, b"ciphertext").unwrap();
+
+        let staged = stage_delete_for_cleanup(root, &target, false).unwrap();
+        assert!(target.exists());
+        assert!(staged.journal_path.exists());
+
+        let data = fs::read(&staged.journal_path).unwrap();
+        let record: MountJournalRecord = serde_json::from_slice(&data).unwrap();
+        let backup = record.backup_path.expect("backup path");
+        assert_eq!(fs::read(&backup).unwrap(), b"ciphertext");
+
+        fs::remove_file(&target).unwrap();
+        complete_mount_journal(&staged.journal_path).unwrap();
+        assert!(!staged.journal_path.exists());
+        assert!(backup.exists());
+    }
+
+    #[test]
+    fn replace_recovery_restores_destination_if_source_move_never_happened() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let source = root.join("source.encrypted");
+        let destination = root.join("destination.encrypted");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"destination").unwrap();
+
+        let staged = stage_rename_operation(root, &source, &destination, false, true).unwrap();
+        assert!(source.exists());
+        assert!(!destination.exists());
+        assert!(staged.journal_path.exists());
+
+        recover_mount_journal(root).unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"destination");
+        assert!(!staged.journal_path.exists());
+    }
+
+    #[test]
+    fn replace_recovery_completes_when_destination_exists() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let source = root.join("source.encrypted");
+        let destination = root.join("destination.encrypted");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"destination").unwrap();
+
+        let staged = stage_rename_operation(root, &source, &destination, false, true).unwrap();
+        fs::rename(&source, &destination).unwrap();
+
+        recover_mount_journal(root).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"source");
+        assert!(!staged.journal_path.exists());
+    }
+
+    #[test]
+    fn startup_recovery_promotes_valid_orphaned_temp_ciphertext() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let target = root.join("recover.encrypted");
+        let tmp_dir = root.join(ENCRYPTED_TMP_DIR_NAME);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let tmp_path = tmp_dir.join(format!("tmp-{}.recover.encrypted", Uuid::new_v4()));
+        let metadata = test_metadata("recover.txt", b"recovered");
+        let header = SerializedEncryptedHeader {
+            file_id: &metadata.file_id,
+            file_path: &metadata.file_path,
+            group_id: metadata.group_id,
+            epoch_id: metadata.epoch_id,
+            header_version: metadata.header_version.unwrap_or(1),
+            wrapped_file_key: metadata.wrapped_file_key.as_ref().unwrap(),
+            key_wrap_nonce: metadata.key_wrap_nonce.as_ref().unwrap(),
+            key_wrap_aad_hash: metadata.key_wrap_aad_hash.as_ref().unwrap(),
+            content_nonce: metadata.content_nonce.as_ref().unwrap(),
+            content_chunk_size: metadata.content_chunk_size,
+            original_size: metadata.content_size,
+            encrypted_size: metadata.encrypted_size,
+            encrypted_at: metadata.created_at,
+            original_name: None,
+            platform_metadata: metadata.platform_metadata.as_ref(),
+            sparse_metadata: metadata.sparse_metadata.as_ref(),
+        };
+        write_encrypted_file(&tmp_path, &header, &metadata.encrypted_content).unwrap();
+
+        recover_encrypted_temp_files(root).unwrap();
+
+        assert!(!tmp_path.exists());
+        assert!(target.exists());
+        assert_eq!(
+            parse_encrypted_file(&target).unwrap().encrypted_content,
+            b"recovered"
+        );
+    }
+
+    #[test]
+    fn startup_recovery_restores_replace_backup_when_final_missing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let target = root.join("doc.encrypted");
+        let tmp_dir = root.join(ENCRYPTED_TMP_DIR_NAME);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let backup_path = tmp_dir.join(format!("replace-backup-{}.doc.encrypted", Uuid::new_v4()));
+        fs::write(&backup_path, b"old committed").unwrap();
+
+        recover_encrypted_temp_files(root).unwrap();
+
+        assert!(!backup_path.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"old committed");
+    }
+
+    #[test]
+    fn create_journal_recovery_compacts_unfinished_noop_create() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let target = root.join("new-file.encrypted");
+
+        let staged = stage_create_operation(root, &target, false).unwrap();
+        assert!(staged.journal_path.exists());
+
+        recover_mount_journal(root).unwrap();
+
+        assert!(!target.exists());
+        assert!(!staged.journal_path.exists());
+    }
+
+    #[test]
+    fn truncate_recovery_restores_backup_when_replacement_is_corrupt() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let target = root.join("truncate.encrypted");
+        persist_encrypted_file(&target, &test_metadata("truncate.txt", b"old")).unwrap();
+
+        let staged = stage_truncate_operation(root, &target).unwrap();
+        fs::write(&target, b"not encrypted").unwrap();
+
+        recover_mount_journal(root).unwrap();
+
+        assert!(!staged.journal_path.exists());
+        assert_eq!(
+            parse_encrypted_file(&target).unwrap().encrypted_content,
+            b"old"
+        );
+        let status = collect_mount_runtime_status(root).unwrap();
+        assert_eq!(status.corrupted_encrypted_file_count, 1);
+        assert!(!status.safe_to_report_all_synced);
+    }
+
+    #[test]
+    fn startup_scanner_quarantines_corrupt_encrypted_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let target = root.join("bad.encrypted");
+        fs::write(&target, b"not encrypted").unwrap();
+
+        let mut summary = MountRecoverySummary::default();
+        scan_encrypted_file_health_with_summary(root, &mut summary).unwrap();
+
+        assert!(!target.exists());
+        assert_eq!(summary.quarantined_corrupt_files, 1);
+        let status = collect_mount_runtime_status(root).unwrap();
+        assert_eq!(status.corrupted_encrypted_file_count, 1);
+        assert!(!status.corrupt_quarantine_paths.is_empty());
+        assert!(!status.safe_to_report_all_synced);
+    }
+
+    #[test]
+    fn startup_recovery_promotes_valid_temp_over_corrupt_final() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let target = root.join("recover.encrypted");
+        fs::write(&target, b"corrupt final").unwrap();
+        let tmp_dir = root.join(ENCRYPTED_TMP_DIR_NAME);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let tmp_path = tmp_dir.join(format!("tmp-{}.recover.encrypted", Uuid::new_v4()));
+        let metadata = test_metadata("recover.txt", b"newer");
+        let header = SerializedEncryptedHeader {
+            file_id: &metadata.file_id,
+            file_path: &metadata.file_path,
+            group_id: metadata.group_id,
+            epoch_id: metadata.epoch_id,
+            header_version: metadata.header_version.unwrap_or(1),
+            wrapped_file_key: metadata.wrapped_file_key.as_ref().unwrap(),
+            key_wrap_nonce: metadata.key_wrap_nonce.as_ref().unwrap(),
+            key_wrap_aad_hash: metadata.key_wrap_aad_hash.as_ref().unwrap(),
+            content_nonce: metadata.content_nonce.as_ref().unwrap(),
+            content_chunk_size: metadata.content_chunk_size,
+            original_size: metadata.content_size,
+            encrypted_size: metadata.encrypted_size,
+            encrypted_at: metadata.created_at,
+            original_name: None,
+            platform_metadata: metadata.platform_metadata.as_ref(),
+            sparse_metadata: metadata.sparse_metadata.as_ref(),
+        };
+        write_encrypted_file(&tmp_path, &header, &metadata.encrypted_content).unwrap();
+
+        recover_encrypted_temp_files(root).unwrap();
+
+        assert!(!tmp_path.exists());
+        assert_eq!(
+            parse_encrypted_file(&target).unwrap().encrypted_content,
+            b"newer"
+        );
+        assert_eq!(
+            collect_mount_runtime_status(root)
+                .unwrap()
+                .corrupted_encrypted_file_count,
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_status_reports_pending_journals_and_retention() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let target = root.join("pending.encrypted");
+        fs::write(&target, b"ciphertext").unwrap();
+
+        let _staged_create =
+            stage_create_operation(root, &root.join("new.encrypted"), false).unwrap();
+        let _staged_delete = stage_delete_for_cleanup(root, &target, false).unwrap();
+
+        let status = collect_mount_runtime_status(root).unwrap();
+        assert_eq!(status.pending_journal_count, 2);
+        assert_eq!(status.retained_entry_count, 1);
+        assert!(!status.safe_to_report_all_synced);
+        assert!(!status.preflight_warnings.is_empty());
     }
 
     #[test]

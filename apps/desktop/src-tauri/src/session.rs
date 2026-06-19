@@ -187,8 +187,8 @@ pub struct SessionStore {
 impl SessionStore {
     /// Create a new session store using CLI's directory structure
     pub fn new() -> Result<Self, String> {
-        let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-        let base_dir = PathBuf::from(home).join(".hybridcipher");
+        let home = dirs::home_dir().ok_or_else(|| "Unable to locate home directory".to_string())?;
+        let base_dir = home.join(".hybridcipher");
         let global_dir = base_dir.join(GLOBAL_DIR);
 
         // Create directories if they don't exist

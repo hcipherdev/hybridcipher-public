@@ -18,5 +18,9 @@
   <array>
     <string>$(AppIdentifierPrefix)com.hybridcipher.macOS</string>
   </array>
+  <key>com.apple.security.application-groups</key>
+  <array>
+    <string>$(TeamIdentifierPrefix)group.com.hybridcipher.macOS</string>
+  </array>
 </dict>
 </plist>

@@ -795,14 +795,18 @@ pub async fn handle_coverage_command(
     session_manager.require_auth()?;
 
     match command {
-        CoverageCommands::Enroll { path, all_group } => {
+        CoverageCommands::Enroll {
+            path,
+            all_group,
+            yes,
+        } => {
             if all_group {
                 return handle_coverage_enroll_list_all(session_manager).await;
             }
-            handle_coverage_enroll(path, session_manager).await
+            handle_coverage_enroll(path, yes, session_manager).await
         }
-        CoverageCommands::Unenroll { path } => {
-            handle_coverage_unenroll(path, session_manager).await
+        CoverageCommands::Unenroll { path, yes } => {
+            handle_coverage_unenroll(path, yes, session_manager).await
         }
         CoverageCommands::Status { root } => handle_coverage_status(root, session_manager).await,
         CoverageCommands::Adopt { path, all, root } => {
@@ -867,6 +871,7 @@ pub async fn handle_coverage_command(
 
 async fn handle_coverage_enroll(
     path: Option<PathBuf>,
+    yes: bool,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
     ui::section("Enroll Coverage Root");
@@ -907,10 +912,12 @@ async fn handle_coverage_enroll(
 
     ui::warning("Auto-enrollment will encrypt every file under this folder in place.");
     ui::warning("Ensure recovery backups are healthy. Otherwise, encrypted data is unrecoverable if this device is lost.");
-    if !ui::prompts::confirm_with_default(
-        "Proceed with folder enrollment and automatic encryption?",
-        false,
-    )? {
+    if !yes
+        && !ui::prompts::confirm_with_default(
+            "Proceed with folder enrollment and automatic encryption?",
+            false,
+        )?
+    {
         ui::info("Operation cancelled.");
         return Ok(());
     }
@@ -1074,6 +1081,7 @@ async fn handle_coverage_enroll_list_all(session_manager: &SessionManager) -> Re
 
 async fn handle_coverage_unenroll(
     path: Option<PathBuf>,
+    yes: bool,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
     ui::section("Unenroll Coverage Root");
@@ -1168,7 +1176,9 @@ async fn handle_coverage_unenroll(
         ui::warning(
             "Unmount is required before unenroll/decrypt to avoid conflicting filesystem updates.",
         );
-        if !ui::prompts::confirm_with_default("Unmount this root and continue unenroll?", true)? {
+        if !yes
+            && !ui::prompts::confirm_with_default("Unmount this root and continue unenroll?", true)?
+        {
             ui::info("Operation cancelled.");
             return Ok(());
         }
@@ -1203,13 +1213,14 @@ async fn handle_coverage_unenroll(
             "Path '{}' is missing. Remove it from the enrolled list without decrypting?",
             display
         ));
-        if !ui::prompts::confirm_with_default("Remove missing root?", true)? {
+        if !yes && !ui::prompts::confirm_with_default("Remove missing root?", true)? {
             ui::info("Operation cancelled.");
             return Ok(());
         }
     } else {
         ui::warning("This will decrypt every encrypted file under the root (timestamps preserved) and remove it from coverage tracking.");
-        if !ui::prompts::confirm_with_default("Proceed with unenroll and decrypt?", false)? {
+        if !yes && !ui::prompts::confirm_with_default("Proceed with unenroll and decrypt?", false)?
+        {
             ui::info("Operation cancelled.");
             return Ok(());
         }

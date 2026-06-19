@@ -44,8 +44,10 @@ and the optional feedback API helper.
 - `../../scripts/macos/local_desktop_release.sh` is the local macOS release
   builder for signed/notarized release work when the required signing
   environment is available.
-- `npx tauri build` expects the bundled CLI resource to be staged into
-  `src-tauri/resources/bin/` before packaging.
+- `npx tauri build` stages the bundled CLI resource into
+  `src-tauri/resources/bin/` automatically when a workspace-built
+  `target/<profile>/hybridcipher` binary (or `HYBRIDCIPHER_CLI_PATH`) is
+  available.
 - `npx tauri dev` can use a workspace-built CLI via `HYBRIDCIPHER_CLI_PATH`.
 
 For the full local build commands and verification entrypoints, start with the

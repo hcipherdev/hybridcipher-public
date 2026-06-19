@@ -3814,7 +3814,7 @@ impl SessionManager {
         // Generate a device-specific binding token
         // In a real implementation, this would incorporate hardware identifiers
         let mut rng = rand::thread_rng();
-        let binding_data: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+        let binding_data: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
         Ok(hex::encode(binding_data))
     }
 

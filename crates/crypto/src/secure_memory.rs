@@ -677,6 +677,11 @@ impl MemoryProtection {
     }
 
     #[cfg(not(unix))]
+    /// Disable core dumps for the current process (no-op on this platform)
+    ///
+    /// # Errors
+    /// Returns [`SecureMemoryError::LockingFailed`] if the platform reports a
+    /// failure while attempting to disable core dumps.
     pub fn disable_core_dumps() -> Result<(), SecureMemoryError> {
         // Not supported on this platform
         Ok(())

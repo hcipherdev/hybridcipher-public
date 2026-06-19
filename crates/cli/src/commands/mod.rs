@@ -255,17 +255,7 @@ pub enum Commands {
     },
 
     /// Interactively mount an encrypted folder
-    Mount {
-        /// Mount a specific enrolled folder by root ID (non-interactive mode)
-        #[arg(long, value_name = "ROOT_ID")]
-        root_id: Option<uuid::Uuid>,
-        /// Prefer the FUSE filesystem (Linux only; falls back to sync when unavailable)
-        #[arg(long, conflicts_with = "sync")]
-        fuse: bool,
-        /// Prefer the mirror/sync filesystem
-        #[arg(long, conflicts_with = "fuse")]
-        sync: bool,
-    },
+    Mount(MountArgs),
 
     /// Request a mount to detach
     Unmount {
@@ -309,6 +299,9 @@ pub enum Commands {
         /// Automatically start rekey after removing member
         #[arg(long)]
         auto_rekey: bool,
+        /// Skip confirmation prompts
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Delete a group and revoke all access
@@ -530,6 +523,58 @@ pub enum ConflictCommands {
     },
 }
 
+#[derive(Args)]
+pub struct MountArgs {
+    /// Mount lifecycle action: status, dehydrate, or reset
+    #[arg(value_enum, value_name = "COMMAND")]
+    pub command: Option<MountCommandName>,
+    /// Mount a specific enrolled folder by root ID (non-interactive mode)
+    #[arg(long, value_name = "ROOT_ID")]
+    pub root_id: Option<uuid::Uuid>,
+    /// Prefer the FUSE filesystem (Linux only; falls back to sync when unavailable)
+    #[arg(long, conflicts_with_all = ["sync", "cloud_files", "file_provider"])]
+    pub fuse: bool,
+    /// Prefer the mirror/sync filesystem
+    #[arg(long, conflicts_with_all = ["fuse", "cloud_files", "file_provider"])]
+    pub sync: bool,
+    /// Prefer the Windows Cloud Files provider (Windows only)
+    #[arg(long = "cloud-files", conflicts_with_all = ["fuse", "sync", "file_provider"])]
+    pub cloud_files: bool,
+    /// Prefer the macOS File Provider backend (macOS only)
+    #[arg(long = "file-provider", conflicts_with_all = ["fuse", "sync", "cloud_files"])]
+    pub file_provider: bool,
+    /// Force a mount reset even when unsafe work is recorded
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum MountCommandName {
+    Status,
+    Dehydrate,
+    Reset,
+}
+
+pub enum MountCommands {
+    /// Show mount backend, lifecycle, and safe-unmount status
+    Status {
+        /// Mounted folder root ID (defaults to the only active mount)
+        root_id: Option<uuid::Uuid>,
+    },
+    /// Dehydrate a Windows Cloud Files sync root
+    Dehydrate {
+        /// Mounted folder root ID (defaults to the only active mount)
+        root_id: Option<uuid::Uuid>,
+    },
+    /// Reset Windows Cloud Files registration and local provider state
+    Reset {
+        /// Mounted folder root ID (defaults to the only active mount)
+        root_id: Option<uuid::Uuid>,
+        /// Reset even when unsafe pending work is recorded
+        force: bool,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum MountRecoveryCommands {
     /// List local-only recovery copies for a mounted folder
@@ -600,6 +645,9 @@ pub enum RekeyCommands {
         /// Path to a JSON file containing encrypted Welcome payloads for the new epoch
         #[arg(long, value_name = "FILE")]
         welcome_file: Option<std::path::PathBuf>,
+        /// Local coverage migration behavior after rekey start: prompt, now, or defer
+        #[arg(long, value_name = "MODE", default_value = "prompt")]
+        local_migration: String,
     },
 
     /// Show current rekey status (optionally streaming updates)
@@ -649,6 +697,9 @@ pub enum CoverageCommands {
         #[cfg_attr(feature = "individual-edition", arg(hide = true))]
         #[arg(long, conflicts_with = "path")]
         all_group: bool,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Unenroll a previously enrolled path
@@ -660,6 +711,9 @@ pub enum CoverageCommands {
         /// Filesystem path that should no longer be tracked
         #[arg(value_name = "PATH")]
         path: Option<std::path::PathBuf>,
+        /// Skip confirmation prompts
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Display enrolled roots and their status
@@ -957,19 +1011,44 @@ pub async fn handle_command(
             in_place,
             strict,
         } => files::handle_decrypt(path, output, in_place, strict, session_manager).await,
-        Commands::Mount {
-            root_id,
-            fuse,
-            sync,
-        } => {
-            let strategy = if fuse {
+        Commands::Mount(args) => {
+            if let Some(command) = args.command {
+                if args.fuse || args.sync || args.cloud_files || args.file_provider {
+                    return Err(CliError::invalid_input(
+                        "mount backend flags are only valid when starting a mount",
+                    ));
+                }
+                let command = match command {
+                    MountCommandName::Status => MountCommands::Status {
+                        root_id: args.root_id,
+                    },
+                    MountCommandName::Dehydrate => MountCommands::Dehydrate {
+                        root_id: args.root_id,
+                    },
+                    MountCommandName::Reset => MountCommands::Reset {
+                        root_id: args.root_id,
+                        force: args.force,
+                    },
+                };
+                return mount::handle_mount_command(session_manager, command).await;
+            }
+            if args.force {
+                return Err(CliError::invalid_input(
+                    "--force is only valid with `hybridcipher mount reset`",
+                ));
+            }
+            let strategy = if args.fuse {
                 mount::MountStrategyArg::Fuse
-            } else if sync {
+            } else if args.cloud_files {
+                mount::MountStrategyArg::CloudFiles
+            } else if args.file_provider {
+                mount::MountStrategyArg::FileProvider
+            } else if args.sync {
                 mount::MountStrategyArg::Sync
             } else {
                 mount::MountStrategyArg::Auto
             };
-            mount::handle_mount(session_manager, strategy, root_id).await
+            mount::handle_mount(session_manager, strategy, args.root_id).await
         }
         Commands::Unmount {
             root_id,
@@ -991,7 +1070,8 @@ pub async fn handle_command(
             user_id,
             force,
             auto_rekey,
-        } => members::handle_remove_member(user_id, force, auto_rekey, session_manager).await,
+            yes,
+        } => members::handle_remove_member(user_id, force, auto_rekey, yes, session_manager).await,
         Commands::DeleteGroup { group_id, yes } => {
             groups::handle_delete_group(&group_id, yes, session_manager).await
         }
@@ -1222,6 +1302,7 @@ mod tests {
                 activation_delay: None,
                 force: false,
                 welcome_file: None,
+                local_migration: "prompt".to_string(),
             })),
             Some("rekey start")
         );
@@ -1244,6 +1325,7 @@ mod tests {
             individual_edition_restricted_command(&Commands::Coverage(CoverageCommands::Enroll {
                 path: None,
                 all_group: false,
+                yes: false,
             })),
             None
         );

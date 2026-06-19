@@ -1,0 +1,38 @@
+[package]
+name = "hybridcipher-macos-file-provider"
+version = "0.1.0"
+edition = "2021"
+authors = ["HybridCipher Team"]
+description = "macOS File Provider host for HybridCipher"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hybridcipher/hybridcipher"
+readme = "../../README.md"
+keywords = ["macos", "file-provider", "provider", "hybridcipher"]
+categories = ["cryptography", "filesystem"]
+
+[lib]
+name = "hybridcipher_macos_file_provider"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hybridcipher-macos-file-provider"
+path = "src/bin/hybridcipher-macos-file-provider.rs"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+hybridcipher-mount-sync = { path = "../mount-sync" }
+hybridcipher-provider-core = { path = "../provider-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+tokio = { version = "1.0", features = ["io-util", "net", "rt", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+xattr = "1.3"
+
+[dev-dependencies]
+tempfile = "3.0"

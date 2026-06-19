@@ -86,13 +86,16 @@ hybridcipher-coverage = { path = "../coverage" }
 hybridcipher-messages = { path = "../messages" }
 hybridcipher-merkle = { path = "../merkle" }
 hybridcipher-mount-sync = { path = "../mount-sync" }
+hybridcipher-provider-core = { path = "../provider-core" }
 
 # Platform-specific keystore support
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", features = ["apple-native"] }
+hybridcipher-macos-file-provider = { path = "../macos-file-provider" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6", features = ["windows-native"] }
+hybridcipher-windows-cloud-provider = { path = "../windows-cloud-provider" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", features = ["linux-native"] }

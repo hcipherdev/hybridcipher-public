@@ -6,11 +6,14 @@ members = [
     "crates/client",
     "crates/coverage",
     "crates/crypto",
+    "crates/macos-file-provider",
     "crates/merkle",
     "crates/messages",
     "crates/mount",
     "crates/mount-sync",
+    "crates/provider-core",
     "crates/security",
+    "crates/windows-cloud-provider",
 ]
 
 [workspace.dependencies]

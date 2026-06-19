@@ -1131,6 +1131,7 @@ pub async fn handle_remove_member(
     user_id: String,
     force: bool,
     auto_rekey: bool,
+    yes: bool,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
     // Require authentication
@@ -1170,11 +1171,12 @@ pub async fn handle_remove_member(
     };
 
     // Show destructive operation warning
-    let should_proceed = ui::prompts::destructive_operation_warning(
-        &format!("Remove member {}", user_id),
-        &consequences,
-        "REMOVE",
-    )?;
+    let should_proceed = yes
+        || ui::prompts::destructive_operation_warning(
+            &format!("Remove member {}", user_id),
+            &consequences,
+            "REMOVE",
+        )?;
 
     if !should_proceed {
         ui::info("Member removal cancelled");
@@ -1201,10 +1203,11 @@ pub async fn handle_remove_member(
     }
 
     if auto_rekey {
-        let start_rekey = ui::prompts::confirm_with_default(
-            "Start rekey now? (activation delay: immediate)",
-            true,
-        )?;
+        let start_rekey = yes
+            || ui::prompts::confirm_with_default(
+                "Start rekey now? (activation delay: immediate)",
+                true,
+            )?;
         if start_rekey {
             ui::info("Starting rekey now...");
             rekey::handle_rekey_command(
@@ -1212,6 +1215,7 @@ pub async fn handle_remove_member(
                     activation_delay: Some("immediate".to_string()),
                     force: false,
                     welcome_file: None,
+                    local_migration: if yes { "defer" } else { "prompt" }.to_string(),
                 },
                 session_manager,
             )

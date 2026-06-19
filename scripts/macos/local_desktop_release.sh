@@ -489,7 +489,9 @@ build_tauri_bundle_for_target() {
   local target="$1"
   local mode="${2:-signed}"
   local config_path="${3:-}"
+  local bundled_cli_override="${4:-}"
   local -a tauri_build_cmd=(npx tauri build --target "$target")
+  local -a tauri_env=()
 
   if [[ "${INDIVIDUAL_EDITION:-0}" == "1" ]]; then
     tauri_build_cmd+=(--features individual-edition)
@@ -499,14 +501,20 @@ build_tauri_bundle_for_target() {
     tauri_build_cmd+=(--config "$config_path")
   fi
 
+  if [[ -n "$bundled_cli_override" ]]; then
+    tauri_env+=("HYBRIDCIPHER_CLI_PATH=$bundled_cli_override")
+  fi
+
   if [[ "$mode" == "signed" ]]; then
     log "Building Tauri bundle for $target"
     (
       cd "$ROOT_DIR/apps/desktop"
-      TAURI_SIGNING_PRIVATE_KEY="$TAURI_SIGNING_PRIVATE_KEY" \
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
-      APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY" \
-      "${tauri_build_cmd[@]}"
+      env \
+        "TAURI_SIGNING_PRIVATE_KEY=$TAURI_SIGNING_PRIVATE_KEY" \
+        "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+        "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" \
+        "${tauri_env[@]}" \
+        "${tauri_build_cmd[@]}"
     )
     return
   fi
@@ -514,8 +522,50 @@ build_tauri_bundle_for_target() {
   log "Building unsigned Tauri bundle for $target"
   (
     cd "$ROOT_DIR/apps/desktop"
-    "${tauri_build_cmd[@]}"
+    env "${tauri_env[@]}" "${tauri_build_cmd[@]}"
   )
+}
+
+extract_notary_json_value() {
+  local json_path="$1"
+  local key="$2"
+
+  python3 - "$json_path" "$key" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+key = sys.argv[2]
+
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+value = data.get(key, "")
+if isinstance(value, str):
+    print(value)
+PY
+}
+
+ensure_notary_submission_accepted() {
+  local submit_json="$1"
+  shift
+  local -a auth_args=("$@")
+  local notary_status
+  local notary_id
+
+  notary_status="$(extract_notary_json_value "$submit_json" "status" 2>/dev/null || true)"
+  notary_id="$(extract_notary_json_value "$submit_json" "id" 2>/dev/null || true)"
+
+  if [[ "$notary_status" == "Accepted" ]]; then
+    return 0
+  fi
+
+  echo "Notarization failed with status: ${notary_status:-unknown}" >&2
+  if [[ -n "$notary_id" ]]; then
+    echo "Retrieving notarization log for submission id: $notary_id" >&2
+    xcrun notarytool log "${auth_args[@]}" "$notary_id" || true
+  fi
+  exit 1
 }
 
 find_app_bundle_path() {
@@ -605,6 +655,11 @@ notarize_app_bundle() {
     --wait --timeout 45m \
     --output-format json > "$submit_json"
   cat "$submit_json"
+  ensure_notary_submission_accepted \
+    "$submit_json" \
+    --key "$api_key_path" \
+    --key-id "$APPLE_API_KEY_ID" \
+    --issuer "$APPLE_API_ISSUER"
 
   local staple_ok=0
   for attempt in 1 2 3 4 5 6; do
@@ -752,6 +807,11 @@ POSTINSTALL
       --wait --timeout 45m \
       --output-format json > "$submit_json"
     cat "$submit_json"
+    ensure_notary_submission_accepted \
+      "$submit_json" \
+      --key "$api_key_path" \
+      --key-id "$APPLE_API_KEY_ID" \
+      --issuer "$APPLE_API_ISSUER"
 
     local staple_ok=0
     for attempt in 1 2 3 4 5 6; do
@@ -874,7 +934,7 @@ build_target() {
   cli_bin="$(build_cli_for_target "$target")"
   bundled_cli="$(stage_bundled_cli_resource "$cli_bin")"
   sign_staged_bundled_cli "$bundled_cli"
-  build_tauri_bundle_for_target "$target" "signed"
+  build_tauri_bundle_for_target "$target" "signed" "" "$bundled_cli"
 
   app_path="$(find_app_bundle_path "$target")"
 
@@ -899,15 +959,16 @@ build_target() {
 build_public_verify_target() {
   local target="$1"
   local cli_bin
+  local bundled_cli
   local config_path
   local app_path
   local canonical_artifact
 
   cli_bin="$(build_cli_for_target "$target")"
-  stage_bundled_cli_resource "$cli_bin" >/dev/null
+  bundled_cli="$(stage_bundled_cli_resource "$cli_bin")"
 
   config_path="$(create_public_verify_tauri_config)"
-  build_tauri_bundle_for_target "$target" "unsigned" "$config_path"
+  build_tauri_bundle_for_target "$target" "unsigned" "$config_path" "$bundled_cli"
   rm -f "$config_path"
 
   app_path="$(find_app_bundle_path "$target")"

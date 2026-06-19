@@ -1,6 +1,27 @@
 use super::*;
 
 impl<S: Storage, N: Network> Client<S, N> {
+    pub(super) fn resolve_home_dir() -> Option<std::path::PathBuf> {
+        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+            return Some(std::path::PathBuf::from(home));
+        }
+
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Some(std::path::PathBuf::from(profile));
+        }
+
+        let home_drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty());
+        let home_path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty());
+        match (home_drive, home_path) {
+            (Some(drive), Some(path)) => {
+                let mut combined = std::path::PathBuf::from(drive);
+                combined.push(path);
+                Some(combined)
+            }
+            _ => None,
+        }
+    }
+
     /// Get authentication token for server requests.
     ///
     /// Production flows must rely on the session-based JWT produced by
@@ -40,9 +61,10 @@ impl<S: Storage, N: Network> Client<S, N> {
     }
 
     pub(super) async fn cleanup_conflicting_auth_state(&self) -> Result<(), ClientError> {
-        let home_dir = std::env::var("HOME").unwrap_or_default();
-        let auth_creds_path =
-            std::path::Path::new(&home_dir).join(".hybridcipher/auth_credentials.json");
+        let Some(home_dir) = Self::resolve_home_dir() else {
+            return Ok(());
+        };
+        let auth_creds_path = home_dir.join(".hybridcipher/auth_credentials.json");
 
         if auth_creds_path.exists() {
             match std::fs::remove_file(&auth_creds_path) {
@@ -383,11 +405,14 @@ impl<S: Storage, N: Network> Client<S, N> {
 
     /// Find the session file path using the new per-user session management
     pub(super) fn find_session_file_path(&self) -> Result<std::path::PathBuf, ClientError> {
-        let home_dir = std::env::var("HOME").map_err(|_| {
-            ClientError::InvalidState("HOME environment variable not set".to_string())
+        let home_dir = Self::resolve_home_dir().ok_or_else(|| {
+            ClientError::InvalidState(
+                "Home directory could not be determined from HOME, USERPROFILE, or HOMEDRIVE/HOMEPATH."
+                    .to_string(),
+            )
         })?;
 
-        let hybridcipher_dir = std::path::Path::new(&home_dir).join(".hybridcipher");
+        let hybridcipher_dir = home_dir.join(".hybridcipher");
 
         // First check for active user
         let active_user_file = hybridcipher_dir.join("global/active_user.json");

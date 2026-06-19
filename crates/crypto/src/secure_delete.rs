@@ -55,9 +55,16 @@ pub fn secure_zero(ptr: *mut u8, len: usize) {
     unsafe {
         #[cfg(target_os = "windows")]
         {
-            // Use SecureZeroMemory on Windows
-            use winapi::um::winbase::SecureZeroMemory;
-            SecureZeroMemory(ptr.cast::<winapi::ctypes::c_void>(), len);
+            // Use RtlSecureZeroMemory on Windows
+            use winapi::shared::basetsd::SIZE_T;
+            use winapi::shared::minwindef::LPVOID;
+
+            #[link(name = "ntdll")]
+            extern "system" {
+                fn RtlSecureZeroMemory(ptr: LPVOID, cnt: SIZE_T) -> LPVOID;
+            }
+
+            RtlSecureZeroMemory(ptr.cast::<winapi::ctypes::c_void>(), len as SIZE_T);
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -3112,8 +3112,7 @@ impl<S: Storage, N: Network> Client<S, N> {
     }
 
     fn load_active_user_server_url() -> Option<String> {
-        let home = std::env::var("HOME").ok()?;
-        let path = std::path::Path::new(&home)
+        let path = Self::resolve_home_dir()?
             .join(".hybridcipher")
             .join("global")
             .join("active_user.json");
