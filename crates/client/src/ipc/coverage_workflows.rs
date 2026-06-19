@@ -78,6 +78,57 @@ where
     enroll_and_hydrate_with_progress(client, path, &mut noop).await
 }
 
+pub async fn hydrate_existing_root<S, N>(
+    client: &Client<S, N>,
+    root: CoverageRoot,
+) -> Result<CoverageEnrollOutcome, ClientError>
+where
+    S: Storage,
+    N: Network,
+{
+    let mut noop = |_progress: CoverageEnrollProgress| {};
+    hydrate_existing_root_with_progress(client, root, &mut noop).await
+}
+
+pub async fn hydrate_existing_root_with_progress<S, N>(
+    client: &Client<S, N>,
+    root: CoverageRoot,
+    on_progress: &mut (dyn FnMut(CoverageEnrollProgress) + Send),
+) -> Result<CoverageEnrollOutcome, ClientError>
+where
+    S: Storage,
+    N: Network,
+{
+    client
+        .mark_coverage_enrollment_in_progress(root.root_id)
+        .await;
+    let hydration_result = hydrate_root_after_enroll(client, &root, Some(on_progress)).await;
+    client
+        .clear_coverage_enrollment_in_progress(root.root_id)
+        .await;
+    let hydration = hydration_result?;
+    on_progress(CoverageEnrollProgress {
+        phase: CoverageEnrollPhase::Finalizing,
+        total_files: hydration.scanned_files,
+        processed_files: hydration.scanned_files,
+        newly_encrypted: hydration.newly_encrypted,
+        skipped_due_to_errors: hydration.skipped_due_to_errors,
+    });
+    let scan =
+        coverage_rescan_after_enroll_with_progress(client, &root, &hydration, on_progress).await?;
+
+    client.start_coverage_replication();
+    client.start_coverage_watchers().await?;
+
+    log_hydration_warning_summary(&root, &hydration);
+
+    Ok(CoverageEnrollOutcome {
+        root,
+        hydration,
+        scan,
+    })
+}
+
 pub async fn enroll_and_hydrate_with_progress<S, N>(
     client: &Client<S, N>,
     path: PathBuf,

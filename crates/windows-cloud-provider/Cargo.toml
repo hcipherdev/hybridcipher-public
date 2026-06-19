@@ -1,0 +1,39 @@
+[package]
+name = "hybridcipher-windows-cloud-provider"
+version = "0.1.0"
+edition = "2021"
+authors = ["HybridCipher Team"]
+description = "Windows Cloud Files API provider host for HybridCipher"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hybridcipher/hybridcipher"
+readme = "../../README.md"
+keywords = ["windows", "cloud-files", "provider", "hybridcipher"]
+categories = ["cryptography", "filesystem"]
+
+[lib]
+name = "hybridcipher_windows_cloud_provider"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hybridcipher-cloud-provider"
+path = "src/bin/hybridcipher-cloud-provider.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+hybridcipher-provider-core = { path = "../provider-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.0", features = ["io-util", "net", "rt"] }
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_CorrelationVector",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+] }

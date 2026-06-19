@@ -6,7 +6,7 @@ use hybridcipher_desktop::demo;
 use hybridcipher_desktop::{
     cli_schema::CliSchemaManager, client::HybridCipherClient, commands::*,
     feedback::FeedbackResponse, local_client::LocalClientProvider, mount::MountManager,
-    state::AppState,
+    state::AppState, DesktopCloudProviderManager,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -62,6 +62,7 @@ fn main() {
                 let local_client = Arc::new(LocalClientProvider::new().map_err(|e| anyhow!(e))?);
                 let mount_manager =
                     Arc::new(MountManager::new(local_client.clone()).map_err(|e| anyhow!(e))?);
+                let cloud_provider = Arc::new(DesktopCloudProviderManager::new());
 
                 let state = AppState {
                     client: Arc::new(client),
@@ -69,6 +70,7 @@ fn main() {
                     session: Arc::new(Mutex::new(None)),
                     mount_manager,
                     local_client,
+                    cloud_provider,
                 };
 
                 let app_handle = app.app_handle().clone();
@@ -272,6 +274,8 @@ fn main() {
             get_folder_coverage_review,
             run_folder_coverage_action,
             enroll_folder,
+            enroll_folder_and_hydrate,
+            unenroll_folder_and_decrypt,
             mount_enrolled_folder,
             check_mount_status_by_root_id,
             list_active_mounts,

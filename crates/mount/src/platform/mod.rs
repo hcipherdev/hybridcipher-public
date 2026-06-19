@@ -4,9 +4,10 @@
 //! with migration status notifications, platform-specific optimizations, and
 //! desktop environment integration.
 
+#[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
 pub mod macos;
-pub mod windows;
 
 use crate::{filesystem::HybridCipher, MountOptions};
 use anyhow::Result;
@@ -61,7 +62,10 @@ pub async fn mount_with_migration_support<
 
     #[cfg(target_os = "windows")]
     {
-        windows::mount_windows(mountpoint, options)
+        let _ = (fs, mountpoint, options);
+        anyhow::bail!(
+            "Windows live filesystem mounts are not supported; use Cloud Files or sync mount"
+        )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -105,7 +109,10 @@ pub async fn unmount_filesystem(mountpoint: &Path, force: bool) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        windows::unmount_windows(mountpoint, force)
+        let _ = (mountpoint, force);
+        anyhow::bail!(
+            "Windows live filesystem mounts are not supported; use Cloud Files or sync mount"
+        )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -136,7 +143,8 @@ pub async fn is_mounted(mountpoint: &Path) -> Result<bool> {
 
     #[cfg(target_os = "windows")]
     {
-        windows::is_mounted(mountpoint)
+        let _ = mountpoint;
+        Ok(false)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

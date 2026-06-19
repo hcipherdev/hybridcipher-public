@@ -1,4 +1,5 @@
 use crate::local_client::LocalClientProvider;
+use crate::process_utils::{configure_background_std_command, configure_background_tokio_command};
 use serde::Deserialize;
 use std::{
     path::{Path, PathBuf},
@@ -23,6 +24,7 @@ async fn run_cli_unmount_command(
         cmd.arg("--force");
     }
 
+    configure_background_tokio_command(&mut cmd);
     match tokio::time::timeout(timeout, cmd.output()).await {
         Ok(Ok(output)) if output.status.success() => Ok(()),
         Ok(Ok(output)) => {
@@ -174,6 +176,10 @@ impl MountManager {
         struct MountRuntimeState {
             root_id: String,
             mountpoint: PathBuf,
+            #[serde(default)]
+            host_pid: Option<u32>,
+            #[serde(default = "default_mount_ready")]
+            ready: bool,
             requested_unmount: bool,
         }
 
@@ -196,7 +202,11 @@ impl MountManager {
                         }
                         if let Ok(content) = std::fs::read_to_string(&path) {
                             if let Ok(state) = serde_json::from_str::<MountRuntimeState>(&content) {
-                                if !state.requested_unmount && state.mountpoint.exists() {
+                                if !state.requested_unmount
+                                    && state.ready
+                                    && state.mountpoint.exists()
+                                    && state.host_pid.map(process_is_running).unwrap_or(true)
+                                {
                                     mounts.push((state.root_id, state.mountpoint));
                                 }
                             }
@@ -271,4 +281,46 @@ impl MountManager {
             }
         }
     }
+}
+
+fn default_mount_ready() -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn process_is_running(pid: u32) -> bool {
+    let filter = format!("PID eq {}", pid);
+    let mut command = std::process::Command::new("tasklist");
+    command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
+    configure_background_std_command(&mut command);
+    let output = command.output();
+
+    let Ok(output) = output else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .any(|line| line.contains(&format!(",\"{}\",", pid)) || line.contains("hybridcipher"))
+        && !stdout.contains("No tasks are running")
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_running(pid: u32) -> bool {
+    let mut command = std::process::Command::new("kill");
+    command.arg("-0").arg(pid.to_string());
+    configure_background_std_command(&mut command);
+    command
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn process_is_running(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{}", pid)).exists()
 }

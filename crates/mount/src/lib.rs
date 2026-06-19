@@ -44,7 +44,7 @@ pub mod virtual_fs;
 pub use cache::{CacheKey, CacheManager, EvictionPolicy};
 pub use error::MountError;
 pub use error::Result as MountResult;
-pub use filesystem::HybridCipher;
+pub use filesystem::{collect_mount_runtime_status, HybridCipher, MountRuntimeStatus};
 pub use migration::{MigrationTracker, OpportunisticRewrapper, OverlayFile};
 pub use virtual_fs::VirtualOverlay;
 
@@ -138,6 +138,7 @@ where
         encrypted_root.to_path_buf(),
         mount_point_opt,
         options.max_operations,
+        options.volume_name.clone(),
     )
     .await?;
 
@@ -150,7 +151,14 @@ where
     {
         platform::linux::mount_linux(fs, mountpoint, &options).await
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (fs, mountpoint, options);
+        anyhow::bail!(
+            "Windows live filesystem mounts are not supported; use Cloud Files or sync mount"
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         anyhow::bail!("Unsupported platform for FUSE mounting")
     }
@@ -178,7 +186,14 @@ pub async fn unmount_hybridcipher(mountpoint: &Path, force: bool) -> Result<()> 
     {
         platform::linux::unmount_linux(mountpoint, force).await
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (mountpoint, force);
+        anyhow::bail!(
+            "Windows live filesystem mounts are not supported; use Cloud Files or sync mount"
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         anyhow::bail!("Unsupported platform for FUSE unmounting")
     }
@@ -202,7 +217,12 @@ pub fn is_hybridcipher_mounted(mountpoint: &Path) -> bool {
     {
         platform::linux::is_mounted(mountpoint)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = mountpoint;
+        false
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
     }

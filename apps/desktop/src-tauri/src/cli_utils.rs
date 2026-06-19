@@ -12,28 +12,97 @@ fn is_truthy_env(var: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn push_unique(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
 fn app_bundle_cli_candidates(binary_name: &str) -> Vec<PathBuf> {
     let Ok(exe) = std::env::current_exe() else {
         return Vec::new();
     };
-    let Some(macos_dir) = exe.parent() else {
+    let Some(exe_dir) = exe.parent() else {
         return Vec::new();
     };
 
-    vec![
-        // .../HybridCipher.app/Contents/Resources/bin/hybridcipher
-        macos_dir.join("../Resources/bin").join(binary_name),
-        // .../HybridCipher.app/Contents/Resources/resources/bin/hybridcipher
-        macos_dir
-            .join("../Resources/resources/bin")
-            .join(binary_name),
-        // .../HybridCipher.app/Contents/Resources/hybridcipher
-        macos_dir.join("../Resources").join(binary_name),
-        // .../HybridCipher.app/Contents/Resources/resources/hybridcipher
-        macos_dir.join("../Resources/resources").join(binary_name),
-        // Same folder as desktop executable (fallback)
-        macos_dir.join(binary_name),
-    ]
+    let mut candidates = Vec::new();
+
+    // Tauri Windows/Linux bundles commonly stage resources next to the executable.
+    push_unique(
+        &mut candidates,
+        exe_dir.join("resources/bin").join(binary_name),
+    );
+    push_unique(&mut candidates, exe_dir.join("resources").join(binary_name));
+
+    // macOS app bundle layouts.
+    push_unique(
+        &mut candidates,
+        exe_dir.join("../Resources/bin").join(binary_name),
+    );
+    push_unique(
+        &mut candidates,
+        exe_dir.join("../Resources/resources/bin").join(binary_name),
+    );
+    push_unique(
+        &mut candidates,
+        exe_dir.join("../Resources").join(binary_name),
+    );
+    push_unique(
+        &mut candidates,
+        exe_dir.join("../Resources/resources").join(binary_name),
+    );
+
+    // Same folder as desktop executable (fallback).
+    push_unique(&mut candidates, exe_dir.join(binary_name));
+
+    candidates
+}
+
+fn candidate_roots_for_dev_search(current_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    for ancestor in current_dir.ancestors() {
+        push_unique(&mut roots, ancestor.to_path_buf());
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            for ancestor in exe_dir.ancestors() {
+                push_unique(&mut roots, ancestor.to_path_buf());
+            }
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for ancestor in manifest_dir.ancestors() {
+        push_unique(&mut roots, ancestor.to_path_buf());
+    }
+
+    roots
+}
+
+fn development_cli_candidates(binary_name: &str, current_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for root in candidate_roots_for_dev_search(current_dir) {
+        for profile in ["release", "debug"] {
+            push_unique(
+                &mut candidates,
+                root.join("target").join(profile).join(binary_name),
+            );
+            push_unique(
+                &mut candidates,
+                root.join("target")
+                    .join(profile)
+                    .join("resources")
+                    .join("bin")
+                    .join(binary_name),
+            );
+        }
+    }
+
+    candidates
 }
 
 /// Locate a CLI binary that is bundled with the desktop application package.
@@ -54,20 +123,15 @@ pub fn locate_cli_binary() -> Result<(PathBuf, PathBuf), String> {
 
     #[cfg(feature = "individual-edition")]
     {
-        if let Some(candidate) = locate_bundled_cli_binary() {
-            return Ok((candidate, current_dir.clone()));
-        }
-
-        for profile in ["release", "debug"] {
-            let candidate = current_dir
-                .join("../../../target")
-                .join(profile)
-                .join(&binary_name);
-
+        for candidate in development_cli_candidates(&binary_name, &current_dir) {
             if candidate.exists() {
                 let project_root = infer_project_root(&candidate, &current_dir);
                 return Ok((candidate, project_root));
             }
+        }
+
+        if let Some(candidate) = locate_bundled_cli_binary() {
+            return Ok((candidate, current_dir.clone()));
         }
 
         return Err(
@@ -91,12 +155,7 @@ pub fn locate_cli_binary() -> Result<(PathBuf, PathBuf), String> {
         }
 
         // 3) Development workspace build outputs.
-        for profile in ["release", "debug"] {
-            let candidate = current_dir
-                .join("../../../target")
-                .join(profile)
-                .join(&binary_name);
-
+        for candidate in development_cli_candidates(&binary_name, &current_dir) {
             if candidate.exists() {
                 let project_root = infer_project_root(&candidate, &current_dir);
                 return Ok((candidate, project_root));

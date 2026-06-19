@@ -221,6 +221,7 @@ test('buildFolderDetailModel promotes conflict resolution and mounted-folder act
     assert.equal(model.healthTone, 'warning');
     assert.equal(model.primaryAction.id, 'open-mounted');
     assert.equal(model.secondaryActions.some(action => action.id === 'unmount'), true);
+    assert.equal(model.secondaryActions.some(action => action.id === 'reveal-mounted'), false);
     assert.equal(model.attention.conflicts, 2);
     assert.equal(model.attention.recoveryCopies, 1);
     assert.equal(model.showResolveConflicts, true);
@@ -231,6 +232,32 @@ test('buildFolderDetailModel promotes conflict resolution and mounted-folder act
         model.protection.secondaryText,
         'Files in this protected folder are secured now with quantum-resistant encryption.'
     );
+});
+
+test('buildFolderDetailModel labels macOS File Provider mounts and keeps recovery actions', () => {
+    const model = buildFolderDetailModel({
+        folder: {
+            root_id: 'root-provider',
+            path: '/Users/test/Documents/Designs',
+        },
+        mountInfo: {
+            mountpoint: '/Users/test/Library/CloudStorage/HybridCipher-Designs-12345678',
+            backend: 'macos-file-provider',
+            sync_status: {
+                safe_to_unmount: false,
+                pending_conflict_count: 1,
+                recovered_pending_copy_count: 2,
+            },
+        },
+        isMounted: true,
+    });
+
+    assert.equal(model.backend, 'macos-file-provider');
+    assert.equal(model.backendLabel, 'macOS File Provider');
+    assert.equal(model.attention.conflicts, 1);
+    assert.equal(model.attention.recoveryCopies, 2);
+    assert.equal(model.showResolveConflicts, true);
+    assert.equal(model.showResolveRecoveryCopies, true);
 });
 
 test('buildFolderDetailModel reports unmounted folders without an unmount-safety state', () => {

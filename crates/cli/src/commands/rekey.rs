@@ -77,7 +77,17 @@ pub async fn handle_rekey_command(
             activation_delay,
             force,
             welcome_file,
-        } => handle_rekey_start(force, activation_delay, welcome_file, session_manager).await,
+            local_migration,
+        } => {
+            handle_rekey_start(
+                force,
+                activation_delay,
+                welcome_file,
+                local_migration,
+                session_manager,
+            )
+            .await
+        }
         RekeyCommands::Status { watch } => handle_rekey_status(watch, session_manager).await,
         RekeyCommands::Cutover {
             force,
@@ -101,6 +111,7 @@ async fn handle_rekey_start(
     force: bool,
     activation_delay: Option<String>,
     welcome_file: Option<PathBuf>,
+    local_migration: String,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
     ui::section("Start Rekey Operation");
@@ -506,12 +517,28 @@ async fn handle_rekey_start(
         println!();
     }
 
-    if ui::prompts::confirm_with_default("Run local coverage migration now?", true)? {
-        run_local_coverage_migration(&hc_client).await?;
-    } else {
-        ui::info("Migration deferred. When ready, run:");
-        ui::info("  hybridcipher coverage scan");
-        ui::info("  hybridcipher coverage migrate --all");
+    match local_migration.trim().to_ascii_lowercase().as_str() {
+        "now" => run_local_coverage_migration(&hc_client).await?,
+        "defer" => {
+            ui::info("Migration deferred. When ready, run:");
+            ui::info("  hybridcipher coverage scan");
+            ui::info("  hybridcipher coverage migrate --all");
+        }
+        "prompt" | "" => {
+            if ui::prompts::confirm_with_default("Run local coverage migration now?", true)? {
+                run_local_coverage_migration(&hc_client).await?;
+            } else {
+                ui::info("Migration deferred. When ready, run:");
+                ui::info("  hybridcipher coverage scan");
+                ui::info("  hybridcipher coverage migrate --all");
+            }
+        }
+        other => {
+            return Err(CliError::invalid_input(format!(
+                "Invalid local migration mode '{}'. Use 'prompt', 'now', or 'defer'.",
+                other
+            )))
+        }
     }
 
     Ok(())

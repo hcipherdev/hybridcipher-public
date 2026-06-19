@@ -11,9 +11,9 @@ use crate::{
 };
 use hybridcipher_client::ClientError;
 #[cfg(target_os = "linux")]
-use hybridcipher_mount::{
-    is_hybridcipher_mounted, mount_hybridcipher, unmount_hybridcipher, MountOptions,
-};
+use hybridcipher_mount::is_hybridcipher_mounted;
+#[cfg(target_os = "linux")]
+use hybridcipher_mount::{mount_hybridcipher, unmount_hybridcipher, MountOptions};
 use notify::{recommended_watcher, Event, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -39,6 +39,10 @@ pub enum MountStrategy {
     Sync,
     #[cfg(target_os = "linux")]
     Fuse,
+    #[cfg(target_os = "windows")]
+    CloudFiles,
+    #[cfg(target_os = "macos")]
+    MacOsFileProvider,
 }
 
 const CLEAN_MOUNT_MARKER_PREFIX: &str = "mount_clean_";
@@ -976,13 +980,13 @@ where
 
     let mut unmounted = false;
     let mountpoint_for_unmount = mountpoint;
+    let mut ready_reported = false;
+    let mut ready_poll = interval(Duration::from_millis(250));
+    ready_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             res = &mut mount_future => {
-                if let Some(ref ready_flag) = ready {
-                    ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
                 if !unmounted {
                     return res;
                 } else {
@@ -1005,6 +1009,14 @@ where
                         warn!("Failed to unmount cleanly: {}", err);
                     }
                     unmounted = true;
+                }
+            }
+            _ = ready_poll.tick(), if !ready_reported => {
+                if is_hybridcipher_mounted(&mountpoint_for_unmount) {
+                    if let Some(ref ready_flag) = ready {
+                        ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    ready_reported = true;
                 }
             }
         }
@@ -1913,7 +1925,12 @@ pub fn determine_mount_strategy() -> MountStrategy {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        MountStrategy::Sync
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         MountStrategy::Sync
     }
@@ -2013,13 +2030,29 @@ pub async fn unmount_mountpoint(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 pub async fn unmount_mountpoint(
     _mountpoint: &Path,
-    _strategy: MountStrategy,
+    strategy: MountStrategy,
     _force: bool,
 ) -> Result<(), String> {
-    Ok(())
+    match strategy {
+        MountStrategy::CloudFiles => Ok(()),
+        MountStrategy::Sync => Ok(()),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub async fn unmount_mountpoint(
+    _mountpoint: &Path,
+    strategy: MountStrategy,
+    _force: bool,
+) -> Result<(), String> {
+    match strategy {
+        MountStrategy::Sync => Ok(()),
+        #[cfg(target_os = "macos")]
+        MountStrategy::MacOsFileProvider => Ok(()),
+    }
 }
 
 #[cfg(test)]

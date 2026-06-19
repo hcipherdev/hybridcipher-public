@@ -1,6 +1,7 @@
 use crate::{
     cli_schema::CliSchemaManager,
     client::HybridCipherClient,
+    cloud_provider::DesktopCloudProviderManager,
     local_client::LocalClientProvider,
     mount::MountManager,
     session::{PersistedSession, SessionFlags, SessionSecurity},
@@ -17,6 +18,7 @@ pub struct AppState {
     pub session: Arc<Mutex<Option<UserSession>>>,
     pub mount_manager: Arc<MountManager>,
     pub local_client: Arc<LocalClientProvider>,
+    pub cloud_provider: Arc<DesktopCloudProviderManager>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +78,12 @@ impl AppState {
             }
         }
 
+        if let Err(err) = self.cloud_provider.stop_all(true, false).await {
+            tracing::warn!(
+                "Failed to stop Cloud Files roots during session clear: {}",
+                err
+            );
+        }
         self.mount_manager.clear_manifest_scope().await;
         self.local_client.clear().await;
         self.client.clear_auth_cache();
@@ -208,6 +216,8 @@ impl AppState {
 
         // Sync Welcome messages to load epoch keys (critical for decryption!)
         self.sync_welcome_messages_after_login().await;
+        self.reconcile_file_provider_roots_after_session_setup(&user_session, server_url)
+            .await;
 
         Ok(())
     }
@@ -329,6 +339,11 @@ impl AppState {
 
                         // Sync Welcome messages to load epoch keys
                         self.sync_welcome_messages_after_login().await;
+                        self.reconcile_file_provider_roots_after_session_setup(
+                            &user_session,
+                            &server_url,
+                        )
+                        .await;
 
                         return Ok(Some(user_session));
                     }
@@ -344,6 +359,36 @@ impl AppState {
 
         tracing::debug!("No valid sessions found");
         Ok(None)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn reconcile_file_provider_roots_after_session_setup(
+        &self,
+        user_session: &UserSession,
+        server_url: &str,
+    ) {
+        let Ok(client) = self.local_client.client().await else {
+            tracing::warn!("Cannot reconcile macOS File Provider roots: local client unavailable");
+            return;
+        };
+        let user_dir = self
+            .local_client
+            .user_dir_for_session(&user_session.email, server_url);
+        if let Err(err) = self
+            .cloud_provider
+            .reconcile_file_provider_roots(user_dir, client)
+            .await
+        {
+            tracing::warn!("macOS File Provider reconciliation failed: {}", err);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn reconcile_file_provider_roots_after_session_setup(
+        &self,
+        _user_session: &UserSession,
+        _server_url: &str,
+    ) {
     }
 }
 

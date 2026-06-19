@@ -1,18 +1,22 @@
 use crate::{
-    commands::{ConflictCommands, MountRecoveryCommands},
+    commands::{ConflictCommands, MountCommands, MountRecoveryCommands},
     error::{map_missing_welcome_error, CliError},
     session::SessionManager,
     ui::{self, prompts},
 };
-use async_trait::async_trait;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use clap::ValueEnum;
 use hybridcipher_client::{
-    coverage::CoverageRootState, network::MockNetwork, storage::FileMetadataData,
-    storage::LocalFsStorage, Client, EncryptedFileMetadata, PlatformFileMetadata,
+    coverage::{CoverageRoot, CoverageRootState},
+    ipc::coverage_workflows,
+    network::MockNetwork,
+    storage::LocalFsStorage,
+    Client,
 };
 #[cfg(target_os = "linux")]
-use hybridcipher_mount_sync::mount_runner::{build_mount_options, run_fuse_mount};
+use hybridcipher_mount_sync::mount_runner::build_mount_options;
+#[cfg(target_os = "linux")]
+use hybridcipher_mount_sync::mount_runner::run_fuse_mount;
 use hybridcipher_mount_sync::{
     load_mount_conflict_registry, load_mount_recovery_registry,
     mount_runner::{run_sync_mount_with_config, MountStrategy},
@@ -20,15 +24,17 @@ use hybridcipher_mount_sync::{
     sync_mount_conflict_registry_path, sync_mount_recovery_action_requests_dir,
     sync_mount_recovery_action_results_dir, sync_mount_recovery_registry_path,
     ConflictResolutionAction, ConflictResolutionRequest, ConflictResolutionResponse, LowSpaceMode,
-    MountConflictRecord, MountCrypto as MirrorMountCrypto, MountRecoveryCopyRecord,
-    MountSafetyReason, MountSyncError, MountSyncRuntimeStatus, RecoveryCopyResolutionAction,
-    RecoveryCopyResolutionRequest, RecoveryCopyResolutionResponse, StreamingEncryptedFile,
+    MountConflictRecord, MountRecoveryCopyRecord, MountSafetyReason, MountSyncRuntimeStatus,
+    RecoveryCopyResolutionAction, RecoveryCopyResolutionRequest, RecoveryCopyResolutionResponse,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::process::Command as ProcessCommand;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use std::{future::Future, pin::Pin};
@@ -41,6 +47,9 @@ use tokio::{
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum MountStrategyArg {
     /// Let the CLI pick the best mount strategy for this platform
@@ -49,6 +58,10 @@ pub enum MountStrategyArg {
     Sync,
     /// Force the FUSE filesystem implementation (Linux only)
     Fuse,
+    /// Force the Windows Cloud Files provider implementation (Windows only)
+    CloudFiles,
+    /// Force the macOS File Provider implementation (macOS only)
+    FileProvider,
 }
 
 type LocalClient = Client<LocalFsStorage, MockNetwork>;
@@ -58,13 +71,154 @@ struct MountPreferences {
     last_encrypted_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum MountBackend {
+    Sync,
+    LinuxFuse,
+    WindowsCloudFiles,
+    #[serde(rename = "macos-file-provider")]
+    MacOsFileProvider,
+}
+
+impl MountBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::LinuxFuse => "linux-fuse",
+            Self::WindowsCloudFiles => "windows-cloud-files",
+            Self::MacOsFileProvider => "macos-file-provider",
+        }
+    }
+
+    fn is_sync(self) -> bool {
+        matches!(self, Self::Sync)
+    }
+
+    fn is_windows_cloud_files(self) -> bool {
+        matches!(self, Self::WindowsCloudFiles)
+    }
+
+    fn is_macos_file_provider(self) -> bool {
+        matches!(self, Self::MacOsFileProvider)
+    }
+
+    fn supports_conflict_recovery(self) -> bool {
+        matches!(
+            self,
+            Self::Sync | Self::WindowsCloudFiles | Self::MacOsFileProvider
+        )
+    }
+}
+
+fn mount_backend_for_strategy(strategy: MountStrategy) -> MountBackend {
+    match strategy {
+        MountStrategy::Sync => MountBackend::Sync,
+        #[cfg(target_os = "linux")]
+        MountStrategy::Fuse => MountBackend::LinuxFuse,
+        #[cfg(target_os = "windows")]
+        MountStrategy::CloudFiles => MountBackend::WindowsCloudFiles,
+        #[cfg(target_os = "macos")]
+        MountStrategy::MacOsFileProvider => MountBackend::MacOsFileProvider,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct MountRuntimeState {
     root_id: Uuid,
     mountpoint: PathBuf,
     encrypted_dir: PathBuf,
     platform: String,
+    #[serde(default)]
+    backend: Option<MountBackend>,
+    #[serde(default)]
+    host_pid: Option<u32>,
+    #[serde(default)]
+    fallback_reason: Option<String>,
+    #[serde(default = "default_mount_ready")]
+    ready: bool,
     requested_unmount: bool,
+}
+
+impl MountRuntimeState {
+    fn backend(&self) -> MountBackend {
+        self.backend.unwrap_or(MountBackend::Sync)
+    }
+}
+
+fn default_mount_ready() -> bool {
+    true
+}
+
+fn ensure_sync_mount_backend(
+    state: &MountRuntimeState,
+    command_name: &str,
+) -> Result<(), CliError> {
+    if state.backend().supports_conflict_recovery() {
+        return Ok(());
+    }
+
+    Err(CliError::mount(format!(
+        "`hybridcipher {}` is not applicable for {} mounts.",
+        command_name,
+        state.backend().as_str()
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_mount_strategy(
+    strategy: MountStrategyArg,
+    cloud_files_prereqs: Result<(), String>,
+) -> Result<(MountStrategy, Option<String>), CliError> {
+    match strategy {
+        MountStrategyArg::Fuse => Err(CliError::mount(
+            "The --fuse option is only supported on Linux in this build.",
+        )),
+        MountStrategyArg::CloudFiles => {
+            cloud_files_prereqs.map_err(CliError::mount)?;
+            Ok((MountStrategy::CloudFiles, None))
+        }
+        MountStrategyArg::FileProvider => Err(CliError::mount(
+            "The --file-provider option is only supported on macOS in this build.",
+        )),
+        MountStrategyArg::Sync => Ok((MountStrategy::Sync, None)),
+        MountStrategyArg::Auto => match cloud_files_prereqs {
+            Ok(_) => Ok((MountStrategy::CloudFiles, None)),
+            Err(cloud_err) => Ok((
+                MountStrategy::Sync,
+                Some(format!("Cloud Files unavailable: {cloud_err}")),
+            )),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_mount_strategy(
+    strategy: MountStrategyArg,
+    file_provider_prereqs: Result<(), String>,
+) -> Result<(MountStrategy, Option<String>), CliError> {
+    match strategy {
+        MountStrategyArg::FileProvider => {
+            file_provider_prereqs.map_err(CliError::mount)?;
+            Ok((MountStrategy::MacOsFileProvider, None))
+        }
+        MountStrategyArg::Sync => Ok((MountStrategy::Sync, None)),
+        MountStrategyArg::Auto => match file_provider_prereqs {
+            Ok(_) => Ok((MountStrategy::MacOsFileProvider, None)),
+            Err(provider_err) => Ok((
+                MountStrategy::Sync,
+                Some(format!(
+                    "macOS File Provider unavailable: {provider_err}"
+                )),
+            )),
+        },
+        MountStrategyArg::Fuse => Err(CliError::mount(
+            "macOS builds no longer include libfuse/macFUSE support. Use --sync or the default File Provider backend instead.",
+        )),
+        MountStrategyArg::CloudFiles => Err(CliError::mount(
+            "The --cloud-files option is only supported on Windows in this build.",
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -252,94 +406,283 @@ pub async fn handle_mount(
     let sync_status_path = mount_sync_status_path(session_manager, final_root_id)?;
     if let Some(state) = read_runtime_state(&state_path)? {
         if !state.requested_unmount && state.root_id == final_root_id {
-            // Same folder is already mounted
-            if root_id.is_some() {
-                // Non-interactive mode: just return success (already mounted)
-                ui::info(&format!(
-                    "Folder is already mounted at {}.",
-                    state.mountpoint.display()
-                ));
-                return Ok(());
-            } else {
-                // Interactive mode: ask for confirmation
+            if runtime_mount_state_is_stale(&state).await {
                 ui::warning(&format!(
-                    "This folder is already mounted at {}.",
+                    "Found stale mount state at {}. Cleaning it before retrying.",
                     state.mountpoint.display()
                 ));
-                if !prompts::confirm_with_default("Proceed and remount?", false)? {
-                    return Err(CliError::cancelled());
-                }
-            }
-
-            // Unmount the existing mount before proceeding
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            {
-                ui::info("Unmounting existing mount...");
-
-                // Request unmount via state file first (if mount process is still running)
+                cleanup_stale_mount_before_retry(&state_path, &sync_status_path, &state)?;
+            } else if !state.ready {
+                ui::warning(&format!(
+                    "Found an incomplete previous mount attempt at {}. Resetting it before retrying.",
+                    state.mountpoint.display()
+                ));
                 mark_unmount_requested(&state_path)?;
-
-                // Wait a moment for the mount process to see the unmount request
                 tokio::time::sleep(Duration::from_millis(500)).await;
-
-                // Linux FUSE mounts still need an explicit unmount request. Sync mounts exit
-                // after they observe the runtime-state flag above.
-                if let Err(err) = request_fuse_unmount(&state.mountpoint, false).await {
-                    warn!("Failed to cleanly unmount existing mount: {}", err);
-                    ui::warning("Attempting force unmount...");
-                    request_fuse_unmount(&state.mountpoint, true).await?;
+                clear_runtime_state(&state_path)?;
+                clear_mount_sync_status(&sync_status_path)?;
+            } else {
+                // Same folder is already mounted
+                if root_id.is_some() {
+                    // Non-interactive mode: just return success (already mounted)
+                    ui::info(&format!(
+                        "Folder is already mounted at {}.",
+                        state.mountpoint.display()
+                    ));
+                    return Ok(());
+                } else {
+                    // Interactive mode: ask for confirmation
+                    ui::warning(&format!(
+                        "This folder is already mounted at {}.",
+                        state.mountpoint.display()
+                    ));
+                    if !prompts::confirm_with_default("Proceed and remount?", false)? {
+                        return Err(CliError::cancelled());
+                    }
                 }
 
-                // Wait for unmount to complete and verify mountpoint is no longer mounted
-                let max_wait = Duration::from_secs(10);
-                let check_interval = Duration::from_millis(500);
-                let mut waited = Duration::from_millis(0);
-                let mut mountpoint_unmounted = false;
+                // Unmount the existing mount before proceeding
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    ui::info("Unmounting existing mount...");
 
-                while waited < max_wait {
-                    // Check if mountpoint still exists and is accessible
-                    // If it's a FUSE mount, it should disappear or become empty after unmount
-                    if mountpoint_is_detached(&state.mountpoint).await {
-                        mountpoint_unmounted = true;
-                        break;
+                    // Request unmount via state file first (if mount process is still running)
+                    mark_unmount_requested(&state_path)?;
+
+                    // Wait a moment for the mount process to see the unmount request
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+
+                    // Linux FUSE mounts still need an explicit unmount request. Sync mounts exit
+                    // after they observe the runtime-state flag above.
+                    if let Err(err) = request_fuse_unmount(&state.mountpoint, false).await {
+                        warn!("Failed to cleanly unmount existing mount: {}", err);
+                        ui::warning("Attempting force unmount...");
+                        request_fuse_unmount(&state.mountpoint, true).await?;
                     }
 
-                    tokio::time::sleep(check_interval).await;
-                    waited += check_interval;
-                }
+                    // Wait for unmount to complete and verify mountpoint is no longer mounted
+                    let max_wait = Duration::from_secs(10);
+                    let check_interval = Duration::from_millis(500);
+                    let mut waited = Duration::from_millis(0);
+                    let mut mountpoint_unmounted = false;
 
-                if !mountpoint_unmounted {
-                    warn!(
+                    while waited < max_wait {
+                        // Check if mountpoint still exists and is accessible
+                        // If it's a FUSE mount, it should disappear or become empty after unmount
+                        if mountpoint_is_detached(&state.mountpoint).await {
+                            mountpoint_unmounted = true;
+                            break;
+                        }
+
+                        tokio::time::sleep(check_interval).await;
+                        waited += check_interval;
+                    }
+
+                    if !mountpoint_unmounted {
+                        warn!(
                         "Mountpoint {} may still be mounted after {} seconds. Proceeding with caution.",
                         state.mountpoint.display(),
                         max_wait.as_secs()
                     );
-                } else {
-                    ui::info("Mount successfully unmounted.");
-                }
+                    } else {
+                        ui::info("Mount successfully unmounted.");
+                    }
 
-                // Clean up and prepare the mountpoint after unmounting
-                // This will fail safely if directory still contains files
-                if let Err(e) = clean_and_prepare_mountpoint(&state.mountpoint) {
-                    warn!(
+                    // Clean up and prepare the mountpoint after unmounting
+                    // This will fail safely if directory still contains files
+                    if let Err(e) = clean_and_prepare_mountpoint(&state.mountpoint) {
+                        warn!(
                         "Could not clean mountpoint: {}. Will attempt to use existing directory.",
                         e
                     );
-                    // Don't fail completely - try to proceed with existing directory
-                    // The mount will fail later if there's a real problem
+                        // Don't fail completely - try to proceed with existing directory
+                        // The mount will fail later if there's a real problem
+                    }
                 }
-            }
 
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                // On Windows, just mark unmount requested and wait
-                mark_unmount_requested(&state_path)?;
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    // On Windows, just mark unmount requested and wait
+                    mark_unmount_requested(&state_path)?;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
             }
         }
     }
 
-    // Only create the guard after ensuring no existing mount is present
+    hydrate_unmanaged_files_before_mount(session_manager, final_root_id).await?;
+
+    let strategy = if cfg!(target_os = "linux") {
+        if let Some(env_override) = env_strategy_override() {
+            ui::warning(
+                "HYBRIDCIPHER_FORCE_FUSE is deprecated. Use --fuse/--sync instead. Applying override.",
+            );
+            env_override
+        } else {
+            strategy_arg
+        }
+    } else {
+        strategy_arg
+    };
+
+    let mut fallback_reason: Option<String> = None;
+
+    let effective_strategy = if cfg!(target_os = "windows") {
+        #[cfg(target_os = "windows")]
+        {
+            let cloud_prereqs = match strategy {
+                MountStrategyArg::Auto | MountStrategyArg::CloudFiles => cloud_files_prereqs(),
+                _ => Err("Cloud Files was not selected.".to_string()),
+            };
+            let (resolved_strategy, resolved_fallback_reason) =
+                resolve_windows_mount_strategy(strategy, cloud_prereqs)?;
+            fallback_reason = resolved_fallback_reason;
+
+            match resolved_strategy {
+                MountStrategy::CloudFiles => {
+                    if matches!(strategy, MountStrategyArg::Auto) {
+                        ui::info(
+                            "Auto-select: Cloud Files support detected, using Windows Cloud Files provider.",
+                        );
+                    } else {
+                        ui::info("Using Windows Cloud Files provider strategy.");
+                    }
+                }
+                MountStrategy::Sync => {
+                    if let Some(reason) = fallback_reason.as_deref() {
+                        ui::warning(&format!(
+                            "Auto-select: {} Falling back to sync strategy.",
+                            reason
+                        ));
+                    } else {
+                        ui::info("Using sync mount strategy.");
+                    }
+                }
+                #[allow(unreachable_patterns)]
+                _ => unreachable!("unexpected Windows mount strategy"),
+            }
+
+            resolved_strategy
+        }
+        #[cfg(not(target_os = "windows"))]
+        unreachable!()
+    } else if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        {
+            match strategy {
+                MountStrategyArg::Sync => {
+                    ui::info("Using sync mount strategy.");
+                    MountStrategy::Sync
+                }
+                MountStrategyArg::FileProvider => {
+                    return Err(CliError::mount(
+                        "The --file-provider option is only supported on macOS in this build.",
+                    ));
+                }
+                MountStrategyArg::Fuse => match fuse_prereqs() {
+                    Ok(_) => {
+                        ui::info("Using Linux FUSE mount strategy.");
+                        MountStrategy::Fuse
+                    }
+                    Err(err) => {
+                        ui::warning(&format!(
+                            "Requested FUSE mount but prerequisites failed: {err}\nFalling back to sync mount."
+                        ));
+                        MountStrategy::Sync
+                    }
+                },
+                MountStrategyArg::Auto => match fuse_prereqs() {
+                    Ok(_) => {
+                        ui::info("Auto-select: FUSE support detected, using FUSE strategy.");
+                        MountStrategy::Fuse
+                    }
+                    Err(err) => {
+                        ui::warning(&format!(
+                            "Auto-select: {err} Falling back to sync strategy."
+                        ));
+                        MountStrategy::Sync
+                    }
+                },
+                MountStrategyArg::CloudFiles => {
+                    return Err(CliError::mount(
+                        "The --cloud-files option is only supported on Windows in this build.",
+                    ));
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        unreachable!()
+    } else if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
+            let provider_prereqs = match strategy {
+                MountStrategyArg::Auto | MountStrategyArg::FileProvider => {
+                    macos_file_provider_prereqs(session_manager)
+                }
+                _ => Err("macOS File Provider was not selected.".to_string()),
+            };
+            let (resolved_strategy, resolved_fallback_reason) =
+                resolve_macos_mount_strategy(strategy, provider_prereqs)?;
+            fallback_reason = resolved_fallback_reason;
+
+            match resolved_strategy {
+                MountStrategy::MacOsFileProvider => {
+                    if matches!(strategy, MountStrategyArg::Auto) {
+                        ui::info(
+                            "Auto-select: macOS File Provider support detected, using File Provider strategy.",
+                        );
+                    } else {
+                        ui::info("Using macOS File Provider strategy.");
+                    }
+                }
+                MountStrategy::Sync => {
+                    if let Some(reason) = fallback_reason.as_deref() {
+                        ui::warning(&format!(
+                            "Auto-select: {} Falling back to sync strategy.",
+                            reason
+                        ));
+                    } else {
+                        ui::info("Using sync mount strategy.");
+                    }
+                }
+                #[allow(unreachable_patterns)]
+                _ => unreachable!("unexpected macOS mount strategy"),
+            }
+
+            resolved_strategy
+        }
+        #[cfg(not(target_os = "macos"))]
+        unreachable!()
+    } else {
+        match strategy {
+            MountStrategyArg::Fuse => {
+                return Err(CliError::mount(
+                    "The --fuse option is only supported on Linux in this build.",
+                ));
+            }
+            MountStrategyArg::CloudFiles => {
+                return Err(CliError::mount(
+                    "The --cloud-files option is only supported on Windows in this build.",
+                ));
+            }
+            MountStrategyArg::FileProvider => {
+                return Err(CliError::mount(
+                    "The --file-provider option is only supported on macOS in this build.",
+                ));
+            }
+            _ => {
+                ui::info("Using sync mount strategy on this platform.");
+                MountStrategy::Sync
+            }
+        }
+    };
+
+    let runtime_backend = mount_backend_for_strategy(effective_strategy);
+
+    if let Err(err) = prepare_mountpoint_for_strategy(&mountpoint, effective_strategy) {
+        return Err(err);
+    }
+
     let _guard = MountDirGuard::new(mountpoint.clone());
 
     let runtime_state = MountRuntimeState {
@@ -347,84 +690,20 @@ pub async fn handle_mount(
         mountpoint: mountpoint.to_path_buf(),
         encrypted_dir: encrypted_dir.to_path_buf(),
         platform: std::env::consts::OS.to_string(),
+        backend: Some(runtime_backend),
+        host_pid: Some(std::process::id()),
+        fallback_reason: fallback_reason.clone(),
+        ready: false,
         requested_unmount: false,
     };
     write_runtime_state(&state_path, &runtime_state)?;
-    clear_mount_sync_status(&sync_status_path)?;
-
-    let strategy = if let Some(env_override) = env_strategy_override() {
-        ui::warning(
-            "HYBRIDCIPHER_FORCE_FUSE is deprecated. Use --fuse/--sync instead. Applying override.",
-        );
-        env_override
-    } else {
-        strategy_arg
-    };
-
-    let (stop_tx, stop_rx) = watch::channel(false);
-
-    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
-    {
-        match strategy {
-            MountStrategyArg::Fuse => {
-                return Err(CliError::mount(
-                    "The --fuse option is only supported on Linux in this build.",
-                ));
-            }
-            _ => {
-                ui::info("Using sync mount strategy on this platform.");
-            }
-        }
+    if runtime_backend.is_sync() {
+        clear_mount_sync_status(&sync_status_path)?;
+    } else if sync_status_path.exists() {
+        clear_mount_sync_status(&sync_status_path)?;
     }
 
-    #[cfg(target_os = "linux")]
-    let effective_strategy = match strategy {
-        MountStrategyArg::Sync => {
-            ui::info("Using sync mount strategy.");
-            MountStrategy::Sync
-        }
-        MountStrategyArg::Fuse => match fuse_prereqs() {
-            Ok(_) => {
-                ui::info("Using Linux FUSE mount strategy.");
-                MountStrategy::Fuse
-            }
-            Err(err) => {
-                ui::warning(&format!(
-                "Requested FUSE mount but prerequisites failed: {err}\nFalling back to sync mount."
-            ));
-                MountStrategy::Sync
-            }
-        },
-        MountStrategyArg::Auto => match fuse_prereqs() {
-            Ok(_) => {
-                ui::info("Auto-select: FUSE support detected, using FUSE strategy.");
-                MountStrategy::Fuse
-            }
-            Err(err) => {
-                ui::warning(&format!(
-                    "Auto-select: {err} Falling back to sync strategy."
-                ));
-                MountStrategy::Sync
-            }
-        },
-    };
-
-    #[cfg(target_os = "macos")]
-    let effective_strategy = match strategy {
-        MountStrategyArg::Sync => {
-            ui::info("Using sync mount strategy.");
-            MountStrategy::Sync
-        }
-        MountStrategyArg::Fuse => {
-            return Err(CliError::mount(
-                "macOS builds no longer include libfuse/macFUSE support. Use the default sync mount instead.",
-            ));
-        }
-        MountStrategyArg::Auto => {
-            ui::info("Auto-select: using sync mount strategy.");
-            MountStrategy::Sync
-        }
-    };
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     async fn build_mount_future(
         session_manager: &SessionManager,
@@ -435,6 +714,7 @@ pub async fn handle_mount(
         mountpoint: PathBuf,
         stop_rx: watch::Receiver<bool>,
         sync_status_path: PathBuf,
+        ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Pin<Box<dyn Future<Output = Result<(), CliError>>>>, CliError> {
         let client = session_manager
             .create_client_with_config_overrides(|config| {
@@ -465,25 +745,34 @@ pub async fn handle_mount(
         match strategy {
             #[cfg(target_os = "linux")]
             MountStrategy::Fuse => {
-                let options = build_mount_options(volume_label);
+                let options = build_mount_options(_volume_label);
                 Ok(Box::pin(async move {
-                    run_fuse_mount(client, encrypted_dir, mountpoint, options, stop_rx, None)
-                        .await
-                        .map_err(|e| CliError::mount(map_missing_welcome_error(e.to_string())))
+                    run_fuse_mount(
+                        client,
+                        encrypted_dir,
+                        mountpoint,
+                        options,
+                        stop_rx,
+                        Some(ready),
+                    )
+                    .await
+                    .map_err(|e| CliError::mount(map_missing_welcome_error(e.to_string())))
                 }))
             }
             MountStrategy::Sync => {
                 // Clone client for the async block
                 let client_for_sync = client.clone();
                 Ok(Box::pin(async move {
-                    let client_crypto = ClientMountCrypto::new(&client_for_sync);
+                    let client_crypto = hybridcipher_provider_core::ClientMountCrypto::new(
+                        Arc::new(client_for_sync.clone()),
+                    );
                     run_sync_mount_with_config(
                         &client_for_sync,
                         &client_crypto,
                         encrypted_dir,
                         mountpoint,
                         stop_rx,
-                        None,
+                        Some(ready),
                         Some(&user_config_dir),
                         Some(&root_id.to_string()),
                         Some(&sync_status_path),
@@ -498,9 +787,38 @@ pub async fn handle_mount(
                     .map_err(|e| CliError::mount(map_missing_welcome_error(e.to_string())))
                 }))
             }
+            #[cfg(target_os = "windows")]
+            MountStrategy::CloudFiles => Ok(Box::pin(async move {
+                run_cloud_files_mount(
+                    client,
+                    user_config_dir,
+                    root_id,
+                    encrypted_dir,
+                    mountpoint,
+                    stop_rx,
+                    Some(ready),
+                )
+                .await
+                .map_err(|e| CliError::mount(map_missing_welcome_error(e.to_string())))
+            })),
+            #[cfg(target_os = "macos")]
+            MountStrategy::MacOsFileProvider => Ok(Box::pin(async move {
+                run_macos_file_provider_mount(
+                    client,
+                    user_config_dir,
+                    root_id,
+                    encrypted_dir,
+                    mountpoint,
+                    stop_rx,
+                    Some(ready),
+                )
+                .await
+                .map_err(|e| CliError::mount(map_missing_welcome_error(e.to_string())))
+            })),
         }
     }
 
+    let ready_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     let mut mount_future: Pin<Box<dyn Future<Output = Result<(), CliError>>>> = build_mount_future(
         session_manager,
@@ -511,6 +829,7 @@ pub async fn handle_mount(
         mountpoint.to_path_buf(),
         stop_rx.clone(),
         sync_status_path.clone(),
+        std::sync::Arc::clone(&ready_flag),
     )
     .await?;
     let mut poll_requested = interval(Duration::from_secs(1));
@@ -543,6 +862,8 @@ pub async fn handle_mount(
                         if retry_attempts < 3 && !unmount_requested {
                             retry_attempts += 1;
                             mount_ready_shown = false; // Reset ready flag on retry
+                            ready_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                            prepare_mountpoint_for_strategy(&mountpoint, effective_strategy)?;
                             ui::warning(&format!(
                                 "Mount attempt {} failed: {}. Retrying...",
                                 retry_attempts, err
@@ -556,6 +877,7 @@ pub async fn handle_mount(
                                 mountpoint.to_path_buf(),
                                 stop_rx.clone(),
                                 sync_status_path.clone(),
+                                std::sync::Arc::clone(&ready_flag),
                             ).await?;
                             continue;
                         }
@@ -582,27 +904,28 @@ pub async fn handle_mount(
                     unmount_requested = true;
                 }
 
-                // Check if mount is ready (mountpoint exists and is accessible)
-                if !mount_ready_shown && mountpoint.exists() {
-                    // Verify mountpoint is actually accessible (not just the directory exists)
-                    if let Ok(metadata) = std::fs::metadata(&mountpoint) {
-                        if metadata.is_dir() {
-                            // Mount is ready - show success message
-                            if retry_attempts > 0 {
-                                ui::success(&format!(
-                                    "Mount succeeded after {} retry attempt(s). Encrypted folder mounted at {}",
-                                    retry_attempts,
-                                    mountpoint.display()
-                                ));
-                            } else {
-                                ui::success(&format!(
-                                    "Mount successful. Encrypted folder mounted at {}",
-                                    mountpoint.display()
-                                ));
-                            }
-                            mount_ready_shown = true;
-                        }
+                // Check if the selected backend reported real readiness. The mountpoint
+                // directory exists before mounting, so existence alone is not enough.
+                if !mount_ready_shown
+                    && ready_flag.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Some(mut state) = read_runtime_state(&state_path)? {
+                        state.ready = true;
+                        write_runtime_state(&state_path, &state)?;
                     }
+                    if retry_attempts > 0 {
+                        ui::success(&format!(
+                            "Mount succeeded after {} retry attempt(s). Encrypted folder mounted at {}",
+                            retry_attempts,
+                            mountpoint.display()
+                        ));
+                    } else {
+                        ui::success(&format!(
+                            "Mount successful. Encrypted folder mounted at {}",
+                            mountpoint.display()
+                        ));
+                    }
+                    mount_ready_shown = true;
                 }
 
                 if mount_ready_shown && !recovery_notice_shown {
@@ -723,6 +1046,189 @@ pub async fn handle_unmount(
     }
 }
 
+pub async fn handle_mount_command(
+    session_manager: &SessionManager,
+    command: MountCommands,
+) -> Result<(), CliError> {
+    session_manager.require_auth()?;
+    match command {
+        MountCommands::Status { root_id } => handle_mount_status(session_manager, root_id).await,
+        MountCommands::Dehydrate { root_id } => {
+            handle_mount_dehydrate(session_manager, root_id).await
+        }
+        MountCommands::Reset { root_id, force } => {
+            handle_mount_reset(session_manager, root_id, force).await
+        }
+    }
+}
+
+async fn handle_mount_status(
+    session_manager: &SessionManager,
+    root_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    ui::section("Mount Status");
+    let state = resolve_target_mount_state(session_manager, root_id)?;
+    let status_path = mount_sync_status_path(session_manager, state.root_id)?;
+    let status = read_mount_sync_status(&status_path)?;
+
+    ui::info(&format!("Root ID: {}", state.root_id));
+    ui::info(&format!("Backend: {}", state.backend().as_str()));
+    ui::info(&format!("Ready: {}", state.ready));
+    ui::info(&format!("Mountpoint: {}", state.mountpoint.display()));
+    ui::info(&format!(
+        "Encrypted source: {}",
+        state.encrypted_dir.display()
+    ));
+    if let Some(reason) = state.fallback_reason.as_deref() {
+        ui::info(&format!("Fallback reason: {}", reason));
+    }
+
+    if let Some(status) = status {
+        ui::info(&format!("Safe to unmount: {}", status.safe_to_unmount));
+        ui::info(&format!(
+            "Pending writeback/mutation count: {}",
+            status.pending_writeback_count
+        ));
+        ui::info(&format!(
+            "Pending refresh count: {}",
+            status.pending_refresh_count
+        ));
+        ui::info(&format!(
+            "Conflict count: {}",
+            status.pending_conflict_count
+        ));
+        ui::info(&format!(
+            "Recovery copy count: {}",
+            status.recovered_pending_copy_count
+        ));
+        if let Some(err) = status.last_error.as_deref() {
+            ui::warning(&format!("Last error: {}", err));
+        }
+        for reason in status.unsafe_reasons {
+            ui::warning(&format!(
+                "Unsafe reason: {}",
+                format_mount_safety_reason(&state.mountpoint, &reason)
+            ));
+        }
+    } else {
+        ui::info("Runtime status: unavailable");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn cloud_provider_host(
+    session_manager: &SessionManager,
+) -> Result<hybridcipher_windows_cloud_provider::CloudProviderHost, CliError> {
+    let user_config_dir = session_manager
+        .user_config_dir()
+        .ok_or_else(|| CliError::session("No active user context configured"))?;
+    Ok(hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+        hybridcipher_windows_cloud_provider::ProviderHostConfig {
+            user_config_dir,
+            pipe_name: None,
+        },
+    ))
+}
+
+#[cfg(target_os = "windows")]
+async fn handle_mount_dehydrate(
+    session_manager: &SessionManager,
+    root_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    ui::section("Dehydrate Cloud Files Mount");
+    let state = resolve_target_mount_state(session_manager, root_id)?;
+    if !state.backend().is_windows_cloud_files() {
+        return Err(CliError::mount(format!(
+            "`hybridcipher mount dehydrate` is not applicable for {} mounts.",
+            state.backend().as_str()
+        )));
+    }
+    let host = cloud_provider_host(session_manager)?;
+    let summary = host
+        .dehydrate_root_path(&state.mountpoint)
+        .map_err(|err| CliError::mount(err.to_string()))?;
+    ui::success(&format!(
+        "Dehydrated {} of {} file(s) under {}.",
+        summary.dehydrated_count,
+        summary.attempted_count,
+        summary.sync_root_path.display()
+    ));
+    if summary.failed_count > 0 {
+        ui::warning(&format!(
+            "{} file(s) failed dehydration.",
+            summary.failed_count
+        ));
+        for failure in summary.failures.iter().take(5) {
+            ui::warning(failure);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn handle_mount_dehydrate(
+    _session_manager: &SessionManager,
+    _root_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    Err(CliError::mount(
+        "`hybridcipher mount dehydrate` is only supported for Windows Cloud Files mounts.",
+    ))
+}
+
+#[cfg(target_os = "windows")]
+async fn handle_mount_reset(
+    session_manager: &SessionManager,
+    root_id: Option<Uuid>,
+    force: bool,
+) -> Result<(), CliError> {
+    ui::section("Reset Cloud Files Mount");
+    let state = resolve_target_mount_state(session_manager, root_id)?;
+    if !state.backend().is_windows_cloud_files() {
+        return Err(CliError::mount(format!(
+            "`hybridcipher mount reset` is not applicable for {} mounts.",
+            state.backend().as_str()
+        )));
+    }
+    let host = cloud_provider_host(session_manager)?;
+    let pending = host
+        .unsafe_pending_mutation_count(state.root_id)
+        .map_err(|err| CliError::mount(err.to_string()))?;
+    if pending > 0 && !force {
+        return Err(CliError::mount(format!(
+            "Refusing to reset Cloud Files root {} because {} pending mutation(s) are still unsafe. Re-run with --force to override.",
+            state.root_id, pending
+        )));
+    }
+    if !force && !state.requested_unmount {
+        return Err(CliError::mount(
+            "Refusing to reset an active Cloud Files mount. Run `hybridcipher unmount --root-id <id>` first, or re-run reset with --force.".to_string(),
+        ));
+    }
+    host.reset_root(state.root_id)
+        .map_err(|err| CliError::mount(err.to_string()))?;
+    let state_path = mount_state_path(session_manager, state.root_id)?;
+    clear_runtime_state(&state_path)?;
+    let status_path = mount_sync_status_path(session_manager, state.root_id)?;
+    clear_mount_sync_status(&status_path)?;
+    if let Ok(journal_path) = host.mutation_journal_path(state.root_id) {
+        let _ = fs::remove_file(journal_path);
+    }
+    ui::success(&format!("Reset Cloud Files root {}.", state.root_id));
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn handle_mount_reset(
+    _session_manager: &SessionManager,
+    _root_id: Option<Uuid>,
+    _force: bool,
+) -> Result<(), CliError> {
+    Err(CliError::mount(
+        "`hybridcipher mount reset` is only supported for Windows Cloud Files mounts.",
+    ))
+}
+
 pub async fn handle_conflict_command(
     session_manager: &SessionManager,
     command: ConflictCommands,
@@ -733,6 +1239,7 @@ pub async fn handle_conflict_command(
     match command {
         ConflictCommands::List { root_id } => {
             let state = resolve_target_mount_state(session_manager, root_id)?;
+            ensure_sync_mount_backend(&state, "conflict")?;
             let conflicts = read_mount_conflicts(session_manager, state.root_id)?;
             if conflicts.is_empty() {
                 ui::info(&format!(
@@ -775,6 +1282,7 @@ pub async fn handle_conflict_command(
             conflict_id,
         } => {
             let state = resolve_target_mount_state(session_manager, root_id)?;
+            ensure_sync_mount_backend(&state, "conflict")?;
             let conflicts = read_mount_conflicts(session_manager, state.root_id)?;
             let conflict = conflicts
                 .into_iter()
@@ -897,6 +1405,7 @@ pub async fn handle_recovery_command(
     match command {
         MountRecoveryCommands::List { root_id } => {
             let state = resolve_target_mount_state(session_manager, root_id)?;
+            ensure_sync_mount_backend(&state, "mount-recovery")?;
             let records = read_mount_recovery_copies(session_manager, state.root_id)?;
             if records.is_empty() {
                 ui::info(&format!(
@@ -936,6 +1445,7 @@ pub async fn handle_recovery_command(
             recovery_path,
         } => {
             let state = resolve_target_mount_state(session_manager, root_id)?;
+            ensure_sync_mount_backend(&state, "mount-recovery")?;
             let record = read_mount_recovery_copies(session_manager, state.root_id)?
                 .into_iter()
                 .find(|entry| entry.recovery_relative_path == recovery_path)
@@ -1039,6 +1549,7 @@ fn submit_conflict_resolution_action(
     destination_path: Option<PathBuf>,
 ) -> Result<(), CliError> {
     let state = resolve_target_mount_state(session_manager, root_id)?;
+    ensure_sync_mount_backend(&state, "conflict")?;
     let request = ConflictResolutionRequest {
         request_id: Uuid::new_v4(),
         conflict_id,
@@ -1080,6 +1591,7 @@ fn submit_recovery_resolution_action(
     destination_path: Option<PathBuf>,
 ) -> Result<(), CliError> {
     let state = resolve_target_mount_state(session_manager, root_id)?;
+    ensure_sync_mount_backend(&state, "mount-recovery")?;
     let request = RecoveryCopyResolutionRequest {
         request_id: Uuid::new_v4(),
         recovery_relative_path: recovery_relative_path.clone(),
@@ -1124,6 +1636,28 @@ async fn unmount_single_mount(
         return Ok(());
     }
 
+    if runtime_mount_state_is_stale(state).await {
+        warn!(
+            "Cleaning stale mount state for {} because the recorded host is no longer active",
+            state.mountpoint.display()
+        );
+        if let Err(err) = cleanup_mountpoint_safe(&state.mountpoint) {
+            warn!(
+                "Safe cleanup failed for stale mountpoint {}: {}. Preserving mountpoint contents.",
+                state.mountpoint.display(),
+                err
+            );
+        }
+        clear_runtime_state(state_path)?;
+        let sync_status_path = mount_sync_status_path(session_manager, state.root_id)?;
+        clear_mount_sync_status(&sync_status_path)?;
+        ui::success(&format!(
+            "Cleaned stale mount state for {}.",
+            state.mountpoint.display()
+        ));
+        return Ok(());
+    }
+
     if !force {
         if let Some(sync_status) =
             wait_for_safe_unmount_status(session_manager, state.root_id, &state.mountpoint).await?
@@ -1133,6 +1667,17 @@ async fn unmount_single_mount(
             {
                 return Err(CliError::mount(message));
             }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if state.backend().is_windows_cloud_files() && !force {
+        let host = cloud_provider_host(session_manager)?;
+        if let Err(err) = host.dehydrate_root_path(&state.mountpoint) {
+            return Err(CliError::mount(format!(
+                "Cloud Files dehydration failed before unmount: {}. Re-run with --force to disconnect without dehydration.",
+                err
+            )));
         }
     }
 
@@ -1227,6 +1772,89 @@ async fn unmount_single_mount(
     Ok(())
 }
 
+async fn runtime_mount_state_is_stale(state: &MountRuntimeState) -> bool {
+    if mountpoint_has_fuse_mount(&state.mountpoint).await {
+        return false;
+    }
+
+    if let Some(host_pid) = state.host_pid {
+        if process_is_running(host_pid) {
+            return false;
+        }
+
+        if state.backend().is_windows_cloud_files() {
+            return true;
+        }
+
+        return state.backend().is_sync()
+            || state.backend().is_macos_file_provider()
+            || mountpoint_is_detached(&state.mountpoint).await;
+    }
+
+    state.backend().is_sync() && mountpoint_is_detached(&state.mountpoint).await
+}
+
+fn cleanup_stale_mount_before_retry(
+    state_path: &Path,
+    sync_status_path: &Path,
+    state: &MountRuntimeState,
+) -> Result<(), CliError> {
+    let can_remove_decrypted_view = state.backend().is_sync()
+        && read_mount_sync_status(sync_status_path)?
+            .map(|status| status.safe_to_unmount)
+            .unwrap_or(false);
+
+    if can_remove_decrypted_view {
+        cleanup_mountpoint_tree_for_safe_sync_remount(&state.mountpoint)?;
+    } else {
+        cleanup_mountpoint_safe(&state.mountpoint)?;
+    }
+
+    clear_runtime_state(state_path)?;
+    clear_mount_sync_status(sync_status_path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn process_is_running(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    let filter = format!("PID eq {}", pid);
+    let mut command = ProcessCommand::new("tasklist");
+    command
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command.output();
+
+    let Ok(output) = output else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .any(|line| line.contains(&format!(",\"{}\",", pid)) || line.contains("hybridcipher"))
+        && !stdout.contains("No tasks are running")
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_running(pid: u32) -> bool {
+    ProcessCommand::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn process_is_running(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{}", pid)).exists()
+}
+
 async fn active_enrolled_roots(session_manager: &SessionManager) -> Result<Vec<PathBuf>, CliError> {
     let client = session_manager.create_client().await?;
     let mut roots = client.coverage_roots().await?;
@@ -1238,7 +1866,7 @@ async fn active_enrolled_roots(session_manager: &SessionManager) -> Result<Vec<P
 /// Get all active enrolled roots with their root_ids
 async fn active_enrolled_roots_with_ids(
     session_manager: &SessionManager,
-) -> Result<Vec<hybridcipher_client::coverage::CoverageRoot>, CliError> {
+) -> Result<Vec<CoverageRoot>, CliError> {
     let client = session_manager.create_client().await?;
     let mut roots = client.coverage_roots().await?;
     roots.retain(|root| root.state == CoverageRootState::Active);
@@ -1264,6 +1892,53 @@ async fn find_enrolled_folder_by_root_id(
         })
 }
 
+async fn hydrate_unmanaged_files_before_mount(
+    session_manager: &SessionManager,
+    root_id: Uuid,
+) -> Result<(), CliError> {
+    let client = session_manager.create_client().await?;
+    let mut roots = client.coverage_roots().await?;
+    let Some(root) = roots
+        .drain(..)
+        .find(|root| root.root_id == root_id && root.state == CoverageRootState::Active)
+    else {
+        warn!(
+            "Skipping pre-mount hydration because no active coverage root matched {}",
+            root_id
+        );
+        return Ok(());
+    };
+
+    ui::info("Checking protected folder for unmanaged plaintext before mount...");
+    let outcome = coverage_workflows::hydrate_existing_root(&client, root)
+        .await
+        .map_err(|err| CliError::coverage(format!("Pre-mount hydration failed: {}", err)))?;
+
+    if outcome.hydration.newly_encrypted > 0 {
+        ui::info(&format!(
+            "Encrypted {} unmanaged file{} before mount.",
+            outcome.hydration.newly_encrypted,
+            if outcome.hydration.newly_encrypted == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    if outcome.hydration.skipped_due_to_errors > 0 {
+        ui::warning(&format!(
+            "{} file{} could not be encrypted before mount and may not appear in the mounted view.",
+            outcome.hydration.skipped_due_to_errors,
+            if outcome.hydration.skipped_due_to_errors == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    Ok(())
+}
+
 fn env_strategy_override() -> Option<MountStrategyArg> {
     match std::env::var("HYBRIDCIPHER_FORCE_FUSE") {
         Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => {
@@ -1279,6 +1954,154 @@ fn env_strategy_override() -> Option<MountStrategyArg> {
 #[cfg(target_os = "linux")]
 fn fuse_prereqs() -> Result<(), CliError> {
     hybridcipher_mount_sync::mount_runner::fuse_prereqs().map_err(|e| CliError::mount(e))
+}
+
+#[cfg(target_os = "windows")]
+fn cloud_files_prereqs() -> Result<(), String> {
+    let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+        hybridcipher_windows_cloud_provider::ProviderHostConfig {
+            user_config_dir: PathBuf::new(),
+            pipe_name: None,
+        },
+    );
+    let status = host.status();
+    if status.available && status.native_callbacks_ready {
+        Ok(())
+    } else {
+        Err(status.message.unwrap_or_else(|| {
+            "Windows Cloud Files provider native callbacks are not ready.".to_string()
+        }))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_prereqs(session_manager: &SessionManager) -> Result<(), String> {
+    let user_config_dir = session_manager
+        .user_config_dir()
+        .ok_or_else(|| "No active user context configured".to_string())?;
+    let host = hybridcipher_macos_file_provider::MacFileProviderHost::new(
+        hybridcipher_macos_file_provider::ProviderHostConfig {
+            user_config_dir,
+            socket_path: None,
+            provider_identifier: None,
+        },
+    );
+    let status = host.status();
+    if status.available && status.extension_ready {
+        Ok(())
+    } else {
+        Err(status
+            .message
+            .unwrap_or_else(|| "macOS File Provider extension is not ready.".to_string()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn run_cloud_files_mount(
+    client: LocalClient,
+    user_config_dir: PathBuf,
+    root_id: Uuid,
+    encrypted_dir: PathBuf,
+    mountpoint: PathBuf,
+    mut stop_rx: watch::Receiver<bool>,
+    ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), String> {
+    let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+        hybridcipher_windows_cloud_provider::ProviderHostConfig {
+            user_config_dir,
+            pipe_name: None,
+        },
+    );
+    let status = host.status();
+    if !status.native_callbacks_ready {
+        return Err(status.message.unwrap_or_else(|| {
+            "Windows Cloud Files provider native callbacks are not implemented yet.".to_string()
+        }));
+    }
+
+    let registration = hybridcipher_windows_cloud_provider::CloudRootRegistration {
+        root_id,
+        sync_root_path: mountpoint.clone(),
+        encrypted_root: encrypted_dir,
+        display_name: derive_mount_label(&mountpoint, root_id),
+    };
+    host.register_root(&registration)
+        .map_err(|err| err.to_string())?;
+    host.sync_placeholders(&registration)
+        .map_err(|err| err.to_string())?;
+    let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge(Arc::new(client));
+    host.start_root_with_bridge(root_id, bridge)
+        .await
+        .map_err(|err| err.to_string())?;
+    if let Some(ready) = ready {
+        ready.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    while stop_rx.changed().await.is_ok() {
+        if *stop_rx.borrow() {
+            host.stop_root(root_id).map_err(|err| err.to_string())?;
+            host.unregister_system_domain(&registration)
+                .and_then(|_| host.unregister_domain_state(root_id))
+                .map_err(|err| err.to_string())?;
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn run_macos_file_provider_mount(
+    client: LocalClient,
+    user_config_dir: PathBuf,
+    root_id: Uuid,
+    encrypted_dir: PathBuf,
+    mountpoint: PathBuf,
+    mut stop_rx: watch::Receiver<bool>,
+    ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), String> {
+    let host = hybridcipher_macos_file_provider::MacFileProviderHost::new(
+        hybridcipher_macos_file_provider::ProviderHostConfig {
+            user_config_dir,
+            socket_path: None,
+            provider_identifier: Some("com.hybridcipher.app.HybridCipherFileProvider".to_string()),
+        },
+    );
+    let status = host.status();
+    if !status.extension_ready {
+        return Err(status
+            .message
+            .unwrap_or_else(|| "macOS File Provider extension is not ready.".to_string()));
+    }
+
+    let registration = hybridcipher_macos_file_provider::FileProviderDomainRegistration {
+        root_id,
+        domain_identifier: format!("com.hybridcipher.root.{root_id}"),
+        encrypted_root: encrypted_dir,
+        display_name: derive_mount_label(&mountpoint, root_id),
+        user_visible_url: Some(mountpoint.clone()),
+    };
+    host.register_domain(&registration)
+        .map_err(|err| err.to_string())?;
+    host.register_system_domain(&registration)
+        .map_err(|err| err.to_string())?;
+    let excluded_patterns = client.excluded_file_patterns();
+    let crypto = Arc::new(hybridcipher_provider_core::ClientMountCrypto::new(
+        Arc::new(client),
+    ));
+    host.start_root_with_crypto_and_exclusions(root_id, crypto, excluded_patterns)
+        .await
+        .map_err(|err| err.to_string())?;
+    if let Some(ready) = ready {
+        ready.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    while stop_rx.changed().await.is_ok() {
+        if *stop_rx.borrow() {
+            host.stop_root(root_id).map_err(|err| err.to_string())?;
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1687,7 +2510,35 @@ fn mount_sync_unsafe_reasons(
     status: &MountSyncRuntimeStatus,
 ) -> Vec<MountSafetyReason> {
     if !status.unsafe_reasons.is_empty() {
-        return status.unsafe_reasons.clone();
+        return status
+            .unsafe_reasons
+            .iter()
+            .cloned()
+            .map(|reason| match reason {
+                MountSafetyReason::PendingWriteback {
+                    count,
+                    oldest_age_ms,
+                    mut sample_paths,
+                    last_error,
+                } => {
+                    if sample_paths.is_empty() {
+                        sample_paths = status
+                            .pending_writeback_paths
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect();
+                    }
+                    MountSafetyReason::PendingWriteback {
+                        count,
+                        oldest_age_ms,
+                        sample_paths,
+                        last_error: last_error.or_else(|| status.last_error.clone()),
+                    }
+                }
+                other => other,
+            })
+            .collect();
     }
 
     let mut reasons = Vec::new();
@@ -1709,6 +2560,13 @@ fn mount_sync_unsafe_reasons(
         reasons.push(MountSafetyReason::PendingWriteback {
             count: status.pending_writeback_count,
             oldest_age_ms: status.pending_writeback_oldest_age_ms.unwrap_or(0),
+            sample_paths: status
+                .pending_writeback_paths
+                .iter()
+                .take(3)
+                .cloned()
+                .collect(),
+            last_error: status.last_error.clone(),
         });
     }
     if status.pending_refresh_count > 0 {
@@ -1754,10 +2612,24 @@ fn format_mount_safety_reason(mountpoint: &Path, reason: &MountSafetyReason) -> 
         MountSafetyReason::PendingWriteback {
             count,
             oldest_age_ms,
-        } => format!(
-            "{count} pending encrypted commit(s) still need to finish before the newest local changes are protected. Oldest pending commit age: {}s.",
-            oldest_age_ms / 1000
-        ),
+            sample_paths,
+            last_error,
+        } => {
+            let mut reason = format!(
+                "{count} pending encrypted commit(s) still need to finish before the newest local changes are protected. Oldest pending commit age: {}s.",
+                oldest_age_ms / 1000
+            );
+            if let Some(example) = sample_paths.first() {
+                reason.push_str(&format!(" Example: {example}"));
+            }
+            if let Some(error) = last_error
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                reason.push_str(&format!(" Last error: {error}"));
+            }
+            reason
+        }
         MountSafetyReason::PendingRefresh { count } => format!(
             "{count} pending plaintext refresh(es) are still rebuilding the local mount state."
         ),
@@ -1780,14 +2652,20 @@ fn format_mount_safety_reason(mountpoint: &Path, reason: &MountSafetyReason) -> 
             }
             reason
         }
-        MountSafetyReason::DeletedOpen { count, sample_paths } => {
+        MountSafetyReason::DeletedOpen {
+            count,
+            sample_paths,
+        } => {
             let example = sample_paths
                 .first()
                 .cloned()
                 .unwrap_or_else(|| mountpoint.display().to_string());
             format!("{count} deleted-open path(s) are still active. Example: {example}")
         }
-        MountSafetyReason::TransactionalBlocked { count, sample_paths } => {
+        MountSafetyReason::TransactionalBlocked {
+            count,
+            sample_paths,
+        } => {
             let example = sample_paths
                 .first()
                 .cloned()
@@ -1796,7 +2674,10 @@ fn format_mount_safety_reason(mountpoint: &Path, reason: &MountSafetyReason) -> 
                 "{count} transactional path(s) are blocked because sync mount does not provide atomic-set guarantees for databases, packages, or bundle-style formats. Example: {example}"
             )
         }
-        MountSafetyReason::HardLinkBlocked { count, sample_paths } => {
+        MountSafetyReason::HardLinkBlocked {
+            count,
+            sample_paths,
+        } => {
             let example = sample_paths
                 .first()
                 .cloned()
@@ -1822,7 +2703,10 @@ fn format_mount_safety_reason(mountpoint: &Path, reason: &MountSafetyReason) -> 
             }
             reason
         }
-        MountSafetyReason::RecoveryCopiesPresent { count, sample_paths } => {
+        MountSafetyReason::RecoveryCopiesPresent {
+            count,
+            sample_paths,
+        } => {
             let example = sample_paths
                 .first()
                 .cloned()
@@ -2220,6 +3104,11 @@ fn prepare_mountpoint(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+fn prepare_mountpoint_for_strategy(path: &Path, strategy: MountStrategy) -> Result<(), CliError> {
+    let _ = strategy;
+    prepare_mountpoint(path)
+}
+
 // Helper function to check if a directory is empty
 fn is_directory_empty(path: &Path) -> Result<bool, CliError> {
     if !path.exists() || !path.is_dir() {
@@ -2380,6 +3269,80 @@ fn cleanup_mountpoint_safe(path: &Path) -> Result<(), CliError> {
     }
 }
 
+fn cleanup_mountpoint_tree_for_safe_sync_remount(path: &Path) -> Result<(), CliError> {
+    ensure_mountpoint_cleanup_target(path)?;
+
+    if !path.exists() {
+        fs::create_dir_all(path).map_err(|e| {
+            CliError::storage(format!(
+                "Failed to recreate mount directory {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        return Ok(());
+    }
+
+    fs::remove_dir_all(path).map_err(|e| {
+        CliError::storage(format!(
+            "Failed to remove stale decrypted mount view {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    fs::create_dir_all(path).map_err(|e| {
+        CliError::storage(format!(
+            "Failed to recreate mount directory {}: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
+fn ensure_mountpoint_cleanup_target(path: &Path) -> Result<(), CliError> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        CliError::configuration("Unable to resolve home directory for safety check")
+    })?;
+    let hybridcipher_base = home.join(".hybridcipher");
+
+    if !mountpoint_is_under_hybridcipher_base(path, &hybridcipher_base) {
+        return Err(CliError::mount(format!(
+            "Refusing to clean {} because it is not under ~/.hybridcipher",
+            path.display()
+        )));
+    }
+
+    let path_str = path.to_string_lossy();
+    if !path_str.contains("_mount") && !path_str.ends_with("mount") {
+        return Err(CliError::mount(format!(
+            "Refusing to clean {} because it does not look like a HybridCipher mountpoint",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn mountpoint_is_under_hybridcipher_base(path: &Path, hybridcipher_base: &Path) -> bool {
+    fn comparable(path: &Path) -> String {
+        normalize_canonical_path(path.to_path_buf())
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+
+    let path = comparable(path);
+    let base = comparable(hybridcipher_base);
+    path == base || path.starts_with(&format!("{}\\", base))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn mountpoint_is_under_hybridcipher_base(path: &Path, hybridcipher_base: &Path) -> bool {
+    path.starts_with(hybridcipher_base)
+}
+
 struct MountDirGuard {
     path: PathBuf,
 }
@@ -2425,13 +3388,30 @@ fn ensure_directory(path: &Path) -> Result<(), CliError> {
 
 fn canonicalize_existing(path: PathBuf) -> Result<PathBuf, CliError> {
     match fs::canonicalize(&path) {
-        Ok(canonical) => Ok(canonical),
+        Ok(canonical) => Ok(normalize_canonical_path(canonical)),
         Err(e) => Err(CliError::mount(format!(
             "Failed to canonicalize {}: {}",
             path.display(),
             e
         ))),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_canonical_path(path: PathBuf) -> PathBuf {
+    let path_str = path.as_os_str().to_string_lossy();
+    if let Some(stripped) = path_str.strip_prefix("\\\\?\\UNC\\") {
+        PathBuf::from(format!("\\\\{}", stripped))
+    } else if let Some(stripped) = path_str.strip_prefix("\\\\?\\") {
+        PathBuf::from(stripped)
+    } else {
+        path
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_canonical_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 fn path_to_string(path: &PathBuf) -> Result<String, CliError> {
@@ -2443,134 +3423,6 @@ fn path_to_string(path: &PathBuf) -> Result<String, CliError> {
 // run_fuse_mount, run_sync_mount, initialize_sync_migration_reporting,
 // drive_sync_migration_reporting, and log_sync_migration_error are now
 // imported from hybridcipher-mount-sync::mount_runner
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-struct ClientMountCrypto<'a> {
-    client: &'a LocalClient,
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-impl<'a> ClientMountCrypto<'a> {
-    fn new(client: &'a LocalClient) -> Self {
-        Self { client }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-#[async_trait]
-impl<'a> MirrorMountCrypto for ClientMountCrypto<'a> {
-    async fn decrypt_file(
-        &self,
-        _encrypted_path: &Path,
-        metadata: &EncryptedFileMetadata,
-    ) -> Result<Vec<u8>, MountSyncError> {
-        self.client
-            .decrypt_file(metadata)
-            .await
-            .map_err(MountSyncError::from)
-    }
-
-    async fn decrypt_file_streaming(
-        &self,
-        encrypted_path: &Path,
-        output_path: &Path,
-        metadata: &EncryptedFileMetadata,
-    ) -> Result<(), MountSyncError> {
-        self.client
-            .decrypt_file_streaming_to_path(encrypted_path, metadata, output_path)
-            .await
-            .map_err(MountSyncError::from)
-    }
-
-    async fn encrypt_file(
-        &self,
-        relative_path: &str,
-        plaintext: &[u8],
-    ) -> Result<EncryptedFileMetadata, MountSyncError> {
-        self.client
-            .encrypt_file(relative_path, plaintext)
-            .await
-            .map_err(MountSyncError::from)
-    }
-
-    async fn encrypt_file_with_id(
-        &self,
-        relative_path: &str,
-        plaintext: &[u8],
-        file_id: &str,
-    ) -> Result<EncryptedFileMetadata, MountSyncError> {
-        self.client
-            .encrypt_file_with_id(relative_path, plaintext, file_id)
-            .await
-            .map_err(MountSyncError::from)
-    }
-
-    async fn encrypt_file_streaming(
-        &self,
-        relative_path: &str,
-        plaintext_path: &Path,
-        output_path: &Path,
-        original_name: Option<&str>,
-        platform_metadata: Option<&PlatformFileMetadata>,
-        chunk_size: usize,
-    ) -> Result<StreamingEncryptedFile, MountSyncError> {
-        let (metadata, integrity_hash) = self
-            .client
-            .encrypt_file_streaming_to_path(
-                relative_path,
-                plaintext_path,
-                output_path,
-                original_name,
-                platform_metadata,
-                chunk_size,
-            )
-            .await
-            .map_err(MountSyncError::from)?;
-        Ok(StreamingEncryptedFile {
-            metadata,
-            integrity_hash,
-        })
-    }
-
-    async fn encrypt_file_streaming_with_id(
-        &self,
-        relative_path: &str,
-        plaintext_path: &Path,
-        output_path: &Path,
-        original_name: Option<&str>,
-        platform_metadata: Option<&PlatformFileMetadata>,
-        file_id: &str,
-        chunk_size: usize,
-    ) -> Result<StreamingEncryptedFile, MountSyncError> {
-        let (metadata, integrity_hash) = self
-            .client
-            .encrypt_file_streaming_with_id_to_path(
-                relative_path,
-                plaintext_path,
-                output_path,
-                original_name,
-                platform_metadata,
-                file_id,
-                chunk_size,
-            )
-            .await
-            .map_err(MountSyncError::from)?;
-        Ok(StreamingEncryptedFile {
-            metadata,
-            integrity_hash,
-        })
-    }
-
-    async fn coverage_store_metadata(
-        &self,
-        metadata: FileMetadataData,
-    ) -> Result<(), MountSyncError> {
-        self.client
-            .coverage_store_file_metadata(metadata)
-            .await
-            .map_err(MountSyncError::from)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -2606,12 +3458,151 @@ mod tests {
             mountpoint: PathBuf::from("/tmp/mount"),
             encrypted_dir: PathBuf::from("/tmp/encrypted"),
             platform: "linux".into(),
+            backend: Some(MountBackend::Sync),
+            host_pid: Some(1234),
+            fallback_reason: None,
+            ready: true,
             requested_unmount: false,
         };
         write_runtime_state(&state_path, &state).expect("write");
         assert!(!runtime_state_requested_unmount(&state_path).unwrap());
         mark_unmount_requested(&state_path).unwrap();
         assert!(runtime_state_requested_unmount(&state_path).unwrap());
+    }
+
+    #[test]
+    fn runtime_state_backward_compatibility_defaults_new_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+        fs::write(
+            &state_path,
+            r#"{
+  "root_id":"12345678-90ab-cdef-1234-567890abcdef",
+  "mountpoint":"/tmp/mount",
+  "encrypted_dir":"/tmp/encrypted",
+  "platform":"windows",
+  "requested_unmount":false
+}"#,
+        )
+        .unwrap();
+
+        let state = read_runtime_state(&state_path)
+            .unwrap()
+            .expect("runtime state should deserialize");
+        assert_eq!(state.backend(), MountBackend::Sync);
+        assert_eq!(state.host_pid, None);
+        assert_eq!(state.fallback_reason, None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_auto_uses_cloud_files_when_ready() {
+        let (strategy, fallback_reason) =
+            resolve_windows_mount_strategy(MountStrategyArg::Auto, Ok(())).unwrap();
+        assert_eq!(strategy, MountStrategy::CloudFiles);
+        assert_eq!(fallback_reason, None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_auto_falls_back_to_sync_when_cloud_files_not_ready() {
+        let (strategy, fallback_reason) = resolve_windows_mount_strategy(
+            MountStrategyArg::Auto,
+            Err("Cloud Files not ready".to_string()),
+        )
+        .unwrap();
+        assert_eq!(strategy, MountStrategy::Sync);
+        assert_eq!(
+            fallback_reason,
+            Some("Cloud Files unavailable: Cloud Files not ready".to_string())
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_explicit_sync_stays_sync() {
+        let (strategy, fallback_reason) = resolve_windows_mount_strategy(
+            MountStrategyArg::Sync,
+            Err("ignored cloud failure".to_string()),
+        )
+        .unwrap();
+        assert_eq!(strategy, MountStrategy::Sync);
+        assert_eq!(fallback_reason, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_auto_uses_file_provider_when_ready() {
+        let (strategy, fallback_reason) =
+            resolve_macos_mount_strategy(MountStrategyArg::Auto, Ok(())).unwrap();
+        assert_eq!(strategy, MountStrategy::MacOsFileProvider);
+        assert_eq!(fallback_reason, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_auto_falls_back_to_sync_when_file_provider_not_ready() {
+        let (strategy, fallback_reason) = resolve_macos_mount_strategy(
+            MountStrategyArg::Auto,
+            Err("extension not registered".to_string()),
+        )
+        .unwrap();
+        assert_eq!(strategy, MountStrategy::Sync);
+        assert_eq!(
+            fallback_reason,
+            Some("macOS File Provider unavailable: extension not registered".to_string())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_explicit_file_provider_does_not_fallback() {
+        let err = resolve_macos_mount_strategy(
+            MountStrategyArg::FileProvider,
+            Err("extension not registered".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("extension not registered"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_explicit_sync_stays_sync() {
+        let (strategy, fallback_reason) = resolve_macos_mount_strategy(
+            MountStrategyArg::Sync,
+            Err("ignored provider failure".to_string()),
+        )
+        .unwrap();
+        assert_eq!(strategy, MountStrategy::Sync);
+        assert_eq!(fallback_reason, None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_verbatim_mountpoint_paths_are_normalized() {
+        let normalized =
+            normalize_canonical_path(PathBuf::from(r"\\?\C:\Mounts\.hybridcipher\root_mount"));
+        assert_eq!(
+            normalized,
+            PathBuf::from(r"C:\Mounts\.hybridcipher\root_mount")
+        );
+
+        let normalized_unc = normalize_canonical_path(PathBuf::from(
+            r"\\?\UNC\server\share\.hybridcipher\root_mount",
+        ));
+        assert_eq!(
+            normalized_unc,
+            PathBuf::from(r"\\server\share\.hybridcipher\root_mount")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_verbatim_mountpoint_passes_hybridcipher_base_check() {
+        let base = PathBuf::from(r"C:\Users\Example\.hybridcipher");
+        let mountpoint = PathBuf::from(r"\\?\C:\Users\Example\.hybridcipher\root_mount");
+
+        assert!(mountpoint_is_under_hybridcipher_base(&mountpoint, &base));
     }
 
     #[test]
@@ -2706,6 +3697,8 @@ mod tests {
                 MountSafetyReason::PendingWriteback {
                     count: 1,
                     oldest_age_ms: 350,
+                    sample_paths: Vec::new(),
+                    last_error: None,
                 },
                 MountSafetyReason::PendingRefresh { count: 1 },
             ],
@@ -2721,6 +3714,8 @@ mod tests {
                 MountSafetyReason::PendingWriteback {
                     count: 1,
                     oldest_age_ms: 350,
+                    sample_paths: Vec::new(),
+                    last_error: None,
                 },
                 MountSafetyReason::Conflict {
                     count: 1,
@@ -2749,6 +3744,8 @@ mod tests {
                 MountSafetyReason::PendingWriteback {
                     count: 2,
                     oldest_age_ms: 900,
+                    sample_paths: vec!["/tmp/mount/document.txt".into()],
+                    last_error: Some("unstable file changed during read".into()),
                 },
             ],
             ..MountSyncRuntimeStatus::default()

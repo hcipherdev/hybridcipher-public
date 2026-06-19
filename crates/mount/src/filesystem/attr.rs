@@ -6,6 +6,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use fuser::{FileAttr, FileType};
+
 /// File attributes enhanced with migration information
 #[derive(Debug, Clone)]
 pub struct MigrationAwareAttr {
@@ -92,14 +95,15 @@ impl MigrationAwareAttr {
     /// # Returns
     ///
     /// Returns a FUSE `FileAttr` with encoded migration information
-    pub fn to_fuse_attr(&self, inode: u64) -> fuser::FileAttr {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn to_fuse_attr(&self, inode: u64) -> FileAttr {
         // Encode migration status in nanoseconds field
         let encoded_mtime = self.encode_migration_status_in_time(self.modified_time);
 
         let file_type = if self.is_directory {
-            fuser::FileType::Directory
+            FileType::Directory
         } else {
-            fuser::FileType::RegularFile
+            FileType::RegularFile
         };
 
         debug!(
@@ -107,7 +111,7 @@ impl MigrationAwareAttr {
             inode, self.size, self.migration_status
         );
 
-        fuser::FileAttr {
+        FileAttr {
             ino: inode,
             size: self.size,
             blocks: (self.size + 511) / 512, // 512-byte blocks

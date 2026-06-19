@@ -89,8 +89,43 @@ struct Cli {
     require_transparency: bool,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        let handle = std::thread::Builder::new()
+            .name("hybridcipher-cli-main".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to initialize Tokio runtime");
+                runtime.block_on(async_main());
+            });
+        match handle {
+            Ok(handle) => {
+                if let Err(payload) = handle.join() {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to start HybridCipher CLI thread: {}", err);
+                process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to initialize Tokio runtime");
+        runtime.block_on(async_main());
+    }
+}
+
+async fn async_main() {
     // Initialize enhanced error reporting with color-eyre
     if let Err(e) = color_eyre::install() {
         eprintln!("Failed to initialize error reporting: {}", e);

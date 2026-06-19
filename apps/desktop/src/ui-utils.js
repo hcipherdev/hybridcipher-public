@@ -14,6 +14,21 @@
         return count === 1 ? singular : plural;
     }
 
+    function getMountBackendLabel(backend) {
+        switch (backend) {
+            case 'macos-file-provider':
+                return 'macOS File Provider';
+            case 'windows-cloud-files':
+                return 'Windows Cloud Files';
+            case 'linux-fuse':
+                return 'Linux FUSE';
+            case 'sync':
+                return 'Sync Mount';
+            default:
+                return null;
+        }
+    }
+
     function buildPostQuantumStatusModel({
         protectedCount = null,
         isProtectedFolder = false,
@@ -190,7 +205,7 @@
                     ? 'No protected folders yet'
                     : 'Folder safety scan is out of date',
                 detail: protectedCount === 0
-                    ? 'Click Add Protected Folder button to start protecting your data.'
+                    ? 'Click Add Protected Folder on the left to start protecting folders before running a coverage scan.'
                     : (lastScanMs === null
                         ? 'Run your first scan to check protected-folder coverage.'
                         : 'Run another scan to confirm your protected folders are still covered.'),
@@ -331,6 +346,7 @@
 
     function buildFolderDetailModel({ folder = {}, mountInfo = null, isMounted = false, coverageReview = null } = {}) {
         const syncStatus = mountInfo?.syncStatus || mountInfo?.sync_status || {};
+        const backend = mountInfo?.backend || null;
         const conflicts = toCount(syncStatus.pending_conflict_count);
         const recoveryCopies = toCount(syncStatus.recovered_pending_copy_count);
         const hasUnmountSafetyValue = Object.prototype.hasOwnProperty.call(syncStatus, 'safe_to_unmount');
@@ -345,7 +361,6 @@
         ];
         if (isMounted) {
             secondaryActions.push(
-                { id: 'reveal-mounted', label: 'Reveal mounted folder' },
                 { id: 'unmount', label: 'Unmount' },
             );
         }
@@ -356,6 +371,8 @@
             path: folder.path || '',
             isMounted: Boolean(isMounted),
             mountpoint: mountInfo?.mountpoint || null,
+            backend,
+            backendLabel: getMountBackendLabel(backend),
             lastScanAt: folder.last_scan || null,
             trackedFiles: toCount(folder.tracked_files),
             coveragePercent: Math.round(Number(folder.coverage_ratio || 0) * 100),

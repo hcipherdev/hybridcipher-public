@@ -38,6 +38,20 @@ const quoteShellArgValue = typeof securityUtils.quoteShellArg === 'function'
         return `'${text.replace(/'/g, `'\"'\"'`)}'`;
     };
 const uiUtils = window.HybridCipherUiUtils || {};
+const getMountBackendLabelValue = (backend) => {
+    switch (backend) {
+        case 'macos-file-provider':
+            return 'macOS File Provider';
+        case 'windows-cloud-files':
+            return 'Windows Cloud Files';
+        case 'linux-fuse':
+            return 'Linux FUSE';
+        case 'sync':
+            return 'Sync Mount';
+        default:
+            return null;
+    }
+};
 const getEmbeddedTerminalHeaderTitleValue = typeof uiUtils.getEmbeddedTerminalHeaderTitle === 'function'
     ? uiUtils.getEmbeddedTerminalHeaderTitle
     : () => 'Embedded Terminal';
@@ -196,6 +210,8 @@ const buildFolderDetailModelValue = typeof uiUtils.buildFolderDetailModel === 'f
         path: folder.path || '',
         isMounted: Boolean(isMounted),
         mountpoint: mountInfo?.mountpoint || null,
+        backend: mountInfo?.backend || null,
+        backendLabel: getMountBackendLabelValue(mountInfo?.backend || null),
         primaryAction: isMounted
             ? { id: 'open-mounted', label: 'Open mounted folder' }
             : { id: 'mount', label: 'Mount folder' },
@@ -1753,6 +1769,9 @@ class HybridCipherApp {
             ? 'Needs attention'
             : (model.healthTone === 'safe' ? 'Healthy' : 'Not mounted');
         const coverage = model.coverage || buildFolderCoverageModelValue({ folder });
+        const mountStatusLabel = model.backendLabel && model.attention?.mountStatusLabel === 'Mounted'
+            ? `${model.attention.mountStatusLabel} (${model.backendLabel})`
+            : (model.attention?.mountStatusLabel || 'Not mounted');
 
         container.innerHTML = `
             <div class="folder-detail-shell tone-${this.escapeHtmlAttr(model.healthTone || 'idle')}">
@@ -1780,7 +1799,7 @@ class HybridCipherApp {
                 <div class="folder-detail-stats">
                     <div class="folder-detail-stat">
                         <span class="folder-detail-stat-label">Mount status</span>
-                        <span class="folder-detail-stat-value">${this.escapeHtml(model.attention.mountStatusLabel || 'Not mounted')}</span>
+                        <span class="folder-detail-stat-value">${this.escapeHtml(mountStatusLabel)}</span>
                     </div>
                     <div class="folder-detail-stat">
                         <span class="folder-detail-stat-label">Last scan</span>
@@ -1884,15 +1903,6 @@ class HybridCipherApp {
                 case 'reveal-protected':
                     await invoke('open_path_in_shell', { path: folder.path });
                     break;
-                case 'reveal-mounted': {
-                    const mountpoint = this.getMountpointForRootId(folder.root_id);
-                    if (!mountpoint) {
-                        this.showNotification('This folder is not mounted right now.', 'warning');
-                        return;
-                    }
-                    await invoke('open_path_in_shell', { path: mountpoint });
-                    break;
-                }
                 case 'unmount':
                     await this.executeUnmountCommand(folder);
                     break;
@@ -3610,12 +3620,11 @@ class HybridCipherApp {
 
             this.setAdminPanelVisible(false);
             await this.createTerminalTab();
-            const sessionId = await this.executeCommandDirectly(
-                'hybridcipher coverage migrate --all',
+            await this.executeCommandDirectly(
+                'hybridcipher coverage migrate --all --yes',
                 true,
                 { returnSessionId: true }
             );
-            this.queueCoverageAutoConfirm(sessionId);
         });
         document.getElementById('adminRekeyCutoverBtn')?.addEventListener('click', () => {
             this.runDashboardCliCommand(
@@ -5205,8 +5214,8 @@ class HybridCipherApp {
     }
 
     async handleSettingsUnenrollFolder(folder) {
-        if (!folder?.path) {
-            this.showNotification('Folder path is missing.', 'error');
+        if (!folder?.root_id) {
+            this.showNotification('Protected folder id is missing.', 'error');
             return;
         }
 
@@ -5218,7 +5227,7 @@ class HybridCipherApp {
                     rootId: folder.root_id
                 });
                 isMounted = Boolean(mountStatus?.success && mountStatus?.data);
-                mountpoint = isMounted ? mountStatus.data : null;
+                mountpoint = isMounted ? mountStatus.data.mountpoint : null;
             } catch (error) {
                 console.warn('Failed to check mount status before removal:', error);
             }
@@ -5251,21 +5260,41 @@ class HybridCipherApp {
             }
         }
 
-        const started = await this.executeCoverageCommand('unenroll', folder.path, {
-            skipPreConfirm: isMounted
-        });
-        if (!started) {
-            return;
+        if (!isMounted) {
+            const confirmed = await this.showConfirmDialog(
+                'Remove Protected Folder',
+                `This will decrypt all files in this folder and stop protecting it:\n\n"${folder.path}"\n\nDo you want to proceed?`
+            );
+            if (!confirmed) {
+                return;
+            }
         }
 
-        if (this.adminPanelVisible) {
-            this.setAdminPanelVisible(false);
+        this.showActionProgressModal(`Removing protection from ${folder.path}...`);
+        try {
+            const response = await invoke('unenroll_folder_and_decrypt', {
+                rootId: folder.root_id
+            });
+            if (!response?.success) {
+                throw new Error(response?.error || 'Folder removal failed.');
+            }
+            this.hideActionProgressModal();
+            await this.loadEnrolledFolders({ suppressErrorNotification: true });
+            this.renderSettingsEnrollmentList();
+            this.showNotification('Protected folder removed and decrypted.', 'success');
+        } catch (error) {
+            this.hideActionProgressModal();
+            console.error('Failed to remove protected folder:', error);
+            await this.showActionPrompt(
+                'Remove protected folder failed',
+                error?.message || String(error),
+                {
+                    primaryLabel: 'Close',
+                    secondaryLabel: null
+                }
+            );
+            return;
         }
-        if (this.activeWorkspaceView !== 'terminal') {
-            this.showTerminalView();
-        }
-        this.closeSettingsModal();
-        this.focusTerminalArea();
     }
 
     async addEnrolledFolder() {
@@ -5297,18 +5326,28 @@ class HybridCipherApp {
                 return;
             }
 
-            // Show terminal progress while enrolling.
-            this.setAdminPanelVisible(false);
+            this.showActionProgressModal(`Protecting ${selected}...`);
+            const response = await invoke('enroll_folder_and_hydrate', {
+                folderPath: selected
+            });
+            if (!response?.success) {
+                throw new Error(response?.error || 'Folder enrollment failed.');
+            }
 
-            // Execute enrollment command in terminal (similar to unenroll)
-            // Create a terminal tab first
-            await this.createTerminalTab();
-
-            // Execute the coverage enroll command
-            await this.executeCoverageCommand('enroll', { path: selected });
+            this.hideActionProgressModal();
+            await this.loadEnrolledFolders({ suppressErrorNotification: true });
+            this.showNotification('Folder protected now with post-quantum encryption.', 'success');
         } catch (error) {
+            this.hideActionProgressModal();
             console.error('Failed to add folder:', error);
-            this.showNotification('Failed to enroll folder: ' + error, 'error');
+            await this.showActionPrompt(
+                'Protect folder failed',
+                error?.message || String(error),
+                {
+                    primaryLabel: 'Close',
+                    secondaryLabel: null
+                }
+            );
         }
     }
 
@@ -5388,6 +5427,8 @@ class HybridCipherApp {
                     mountsByRoot[rootId] = mountpoint;
                     mountDetailsByRoot[rootId] = {
                         mountpoint,
+                        backend: String(entry?.backend || '').trim() || 'sync',
+                        fallbackReason: entry?.fallback_reason || null,
                         syncStatus: entry?.sync_status || null
                     };
                 }
@@ -5559,7 +5600,16 @@ class HybridCipherApp {
         if (!syncStatus) return [];
 
         if (Array.isArray(syncStatus.unsafe_reasons) && syncStatus.unsafe_reasons.length > 0) {
-            return syncStatus.unsafe_reasons;
+            return syncStatus.unsafe_reasons.map(reason => {
+                if (reason?.kind !== 'pending_writeback') {
+                    return reason;
+                }
+                return {
+                    ...reason,
+                    sample_paths: reason.sample_paths || (syncStatus.pending_writeback_paths || []).slice(0, 3),
+                    last_error: reason.last_error || syncStatus.last_error || null
+                };
+            });
         }
 
         const reasons = [];
@@ -5578,7 +5628,9 @@ class HybridCipherApp {
             reasons.push({
                 kind: 'pending_writeback',
                 count: syncStatus.pending_writeback_count,
-                oldest_age_ms: syncStatus.pending_writeback_oldest_age_ms || 0
+                oldest_age_ms: syncStatus.pending_writeback_oldest_age_ms || 0,
+                sample_paths: (syncStatus.pending_writeback_paths || []).slice(0, 3),
+                last_error: syncStatus.last_error || null
             });
         }
         if (syncStatus.pending_refresh_count > 0) {
@@ -5613,7 +5665,11 @@ class HybridCipherApp {
     }
 
     isAutoDrainableMountReason(reason) {
-        return reason?.kind === 'pending_writeback' || reason?.kind === 'pending_refresh';
+        if (reason?.kind === 'pending_writeback') {
+            const error = String(reason.last_error || '').toLowerCase();
+            return !error || error.includes('unstable file') || error.includes('changed during read') || error.includes('mid-write');
+        }
+        return reason?.kind === 'pending_refresh';
     }
 
     statusHasOnlyAutoDrainableReasons(syncStatus) {
@@ -5628,7 +5684,17 @@ class HybridCipherApp {
 
         switch (reason.kind) {
             case 'pending_writeback':
-                return `${reason.count || 0} pending encrypted commit(s) still need to finish before the newest local changes are protected. Oldest pending commit age: ${Math.floor((reason.oldest_age_ms || 0) / 1000)}s.`;
+                {
+                    let message = `${reason.count || 0} pending encrypted commit(s) still need to finish before the newest local changes are protected. Oldest pending commit age: ${Math.floor((reason.oldest_age_ms || 0) / 1000)}s.`;
+                    const examplePath = reason.sample_paths?.[0] || '';
+                    if (examplePath) {
+                        message += ` Example: ${examplePath}`;
+                    }
+                    if (reason.last_error) {
+                        message += ` Last error: ${reason.last_error}`;
+                    }
+                    return message;
+                }
             case 'pending_refresh':
                 return `${reason.count || 0} pending plaintext refresh(es) are still rebuilding the local mount state.`;
             case 'conflict': {
@@ -8042,7 +8108,10 @@ class HybridCipherApp {
 
     appendChunkToSession(sessionId, chunk) {
         const tab = this.terminalTabs.find(t => t.sessionId === sessionId);
-        if (!tab) return;
+        if (!tab) {
+            this.handleMountSessionOutput(sessionId, chunk);
+            return;
+        }
 
         let filteredChunk = this.filterRegisterOverlayChunk(sessionId, chunk);
         if (!filteredChunk) {
@@ -9360,7 +9429,7 @@ class HybridCipherApp {
         const sessionId = targetTab?.sessionId;
         if (sessionId) {
             try {
-                await invoke('write_terminal_stdin', { sessionId, data: `${command}\n` });
+                await invoke('write_terminal_stdin', { sessionId, data: `${command}\r` });
             } catch (error) {
                 console.error('Terminal PTY write error:', error);
                 this.appendTerminalLine(`Error: ${error}`, 'error');
@@ -9425,8 +9494,7 @@ class HybridCipherApp {
         let needsConfirm = false;
         switch (action) {
             case 'enroll':
-                command = `hybridcipher coverage enroll ${this.quoteCliArg(folderPath)}`;
-                needsConfirm = true;
+                command = `hybridcipher coverage enroll ${this.quoteCliArg(folderPath)} --yes`;
                 break;
             case 'unenroll':
                 // Show confirmation dialog first
@@ -9439,8 +9507,7 @@ class HybridCipherApp {
                         return false;
                     }
                 }
-                command = `hybridcipher coverage unenroll ${this.quoteCliArg(folderPath)}`;
-                needsConfirm = true;
+                command = `hybridcipher coverage unenroll ${this.quoteCliArg(folderPath)} --yes`;
                 break;
             case 'coverage-scan':
                 command = `hybridcipher coverage scan --root ${this.quoteCliArg(folderPath)}`;
@@ -9455,10 +9522,6 @@ class HybridCipherApp {
 
         // Execute command directly (no input field population, no auto-mount)
         const sessionId = await this.executeCommandDirectly(command, true, { returnSessionId: true });
-        if (needsConfirm) {
-            this.queueCoverageAutoConfirm(sessionId);
-        }
-
         if (action === 'enroll' || action === 'unenroll') {
             this.startCoverageCommandTracking({
                 action,
@@ -9468,17 +9531,6 @@ class HybridCipherApp {
         }
 
         return true;
-    }
-
-    queueCoverageAutoConfirm(sessionId) {
-        // Send confirmation to the command's PTY so CLI prompts stay interactive and progress bars render.
-        setTimeout(() => {
-            if (sessionId) {
-                this.sendInputToSession(sessionId, 'y\r');
-            } else {
-                this.sendInputToPty('y\r');
-            }
-        }, 250);
     }
 
     startCoverageCommandTracking({ action, path, sessionId }) {
@@ -9623,9 +9675,11 @@ class HybridCipherApp {
             const delay = initialDelay + index * interval;
             setTimeout(() => {
                 if (sessionId) {
-                    this.sendInputToSession(sessionId, response);
+                    const line = /\r|\n/.test(response) ? response : `${response}\r`;
+                    this.sendInputToSession(sessionId, line);
                 } else {
-                    this.sendInputToPty(response);
+                    const line = /\r|\n/.test(response) ? response : `${response}\r`;
+                    this.sendInputToPty(line);
                 }
             }, delay);
         });
@@ -9764,7 +9818,7 @@ class HybridCipherApp {
         if (responder.stage === 'await_prompt1' && prompt1Line && !prompt1Answered) {
             responder.answered.impact = true;
             this.suppressPromptEcho(sessionId, 1, { durationMs: 12000 });
-            this.sendInputToSession(sessionId, 'y');
+            this.sendInputToSession(sessionId, 'y\r');
             responder.stage = 'await_prompt2';
             responder.buffer = '';
             return;
@@ -10005,6 +10059,9 @@ class HybridCipherApp {
             cancelRequested: false,
             folderLabel: folder?.name || this.basename(folder?.path || rootId || 'Mounted folder'),
             folderPath: folder?.path || '',
+            outputBuffer: '',
+            commandError: null,
+            outputClosed: false,
         };
         this.mountProgressJobs[rootId] = job;
         return job;
@@ -10012,6 +10069,45 @@ class HybridCipherApp {
 
     getMountProgressJob(rootId) {
         return this.mountProgressJobs[rootId] || null;
+    }
+
+    getMountProgressJobBySessionId(sessionId) {
+        if (!sessionId) return null;
+        return Object.values(this.mountProgressJobs || {})
+            .find(job => job?.sessionId === sessionId) || null;
+    }
+
+    detectMountCommandError(output) {
+        const cleaned = this.stripAnsi(output || '').replace(/\r/g, '').trim();
+        if (!cleaned) return null;
+
+        const lines = cleaned
+            .split('\n')
+            .map(line => line.trim())
+            .filter(Boolean);
+        const errorLine = lines.find(line =>
+            !/Auto-select:.*Falling back to sync strategy/i.test(line) && (
+                /not recognized as an internal or external command/i.test(line)
+                || /\berror:/i.test(line)
+                || /No active enrolled root/i.test(line)
+                || /missing welcome/i.test(line)
+            )
+        );
+
+        return errorLine || null;
+    }
+
+    handleMountSessionOutput(sessionId, chunk) {
+        const job = this.getMountProgressJobBySessionId(sessionId);
+        if (!job) return false;
+
+        const text = this.stripAnsi(chunk || '');
+        job.outputBuffer = `${job.outputBuffer || ''}${text}`.slice(-12000);
+        if (text.includes('[session closed]')) {
+            job.outputClosed = true;
+        }
+        job.commandError = job.commandError || this.detectMountCommandError(job.outputBuffer);
+        return true;
     }
 
     clearMountProgressJob(rootId) {
@@ -10145,7 +10241,7 @@ class HybridCipherApp {
         if (this.mountSessions[rootId]) {
             delete this.mountSessions[rootId];
         }
-        if (targetSessionId) {
+        if (targetSessionId && targetSessionId !== 'native-mount') {
             await invoke('close_terminal_session', { sessionId: targetSessionId }).catch(() => { });
         }
     }
@@ -10165,7 +10261,7 @@ class HybridCipherApp {
             if (checkResult.success && checkResult.data) {
                 // Already mounted, just open it
                 if (!autoMountRestore) {
-                    await this.openMountInExplorer(checkResult.data);
+                    await this.openMountInExplorer(checkResult.data.mountpoint);
                 }
                 return true;
             } else {
@@ -10201,40 +10297,28 @@ class HybridCipherApp {
         this.showMountProgressModal(folder.root_id);
 
         try {
-            // Create a dedicated PTY session for this mount
-            const cwd = this.getTerminalCwd();
-            const sessionResult = await this.invokeWithTimeout(
-                'start_terminal_session',
-                { cwd },
-                15000,
-                'Timed out while starting mount session'
+            this.mountSessions[folder.root_id] = 'native-mount';
+            const mountResult = await this.invokeWithTimeout(
+                'mount_enrolled_folder',
+                { rootId: folder.root_id },
+                330000,
+                'Mount did not complete within timeout period'
             );
-
-            if (!sessionResult?.success || !sessionResult.data?.session_id) {
-                throw new Error('Failed to create mount session');
-            }
-
-            const sessionId = sessionResult.data.session_id;
-            this.mountSessions[folder.root_id] = sessionId;
-            mountJob.sessionId = sessionId;
-
-            // Get CLI binary path
-            await this.getCliBinaryPath();
-
-            // Send mount command to the dedicated PTY session
-            const command = `hybridcipher mount --root-id "${folder.root_id}"`;
-            await this.invokeWithTimeout(
-                'write_terminal_stdin',
-                { sessionId, data: `${command}\n` },
-                15000,
-                'Timed out while sending mount command'
-            );
-
-            // Poll mount state file to detect when mount is ready
-            const pollResult = await this.pollMountState(folder.root_id);
+            const pollResult = mountResult?.success && mountResult.data
+                ? {
+                    status: 'mounted',
+                    mountpoint: mountResult.data.mountpoint,
+                    backend: mountResult.data.backend || 'sync',
+                    fallbackReason: mountResult.data.fallback_reason || null
+                }
+                : {
+                    status: 'failed',
+                    error: mountResult?.error || 'Mount did not complete within timeout period'
+                };
             const currentJob = this.getMountProgressJob(folder.root_id);
             const completedInBackground = currentJob?.mode === 'background';
             this.clearMountProgressJob(folder.root_id);
+            delete this.mountSessions[folder.root_id];
 
             if (pollResult.status === 'mounted') {
                 this.currentMountPath = pollResult.mountpoint;
@@ -10250,6 +10334,17 @@ class HybridCipherApp {
                     suppressErrorNotification: true
                 });
 
+                if (
+                    (this.platformInfo?.os_type === 'windows' || this.platformInfo?.os_type === 'macos') &&
+                    pollResult.backend === 'sync' &&
+                    pollResult.fallbackReason
+                ) {
+                    this.showNotification(
+                        `${mountJob.folderLabel} mounted with sync fallback. ${pollResult.fallbackReason}`,
+                        'warning'
+                    );
+                }
+
                 if (completedInBackground) {
                     this.showNotification(`${mountJob.folderLabel} mounted successfully in background.`, 'success');
                 } else {
@@ -10261,11 +10356,11 @@ class HybridCipherApp {
                 }
                 return true;
             } else if (pollResult.status === 'cancelled') {
-                await this.cleanupMountSession(folder.root_id, sessionId);
+                await this.cleanupMountSession(folder.root_id);
                 this.showNotification('Mount cancelled', 'info');
                 return false;
             } else if (pollResult.status === 'background_timeout') {
-                await this.cleanupMountSession(folder.root_id, sessionId);
+                await this.cleanupMountSession(folder.root_id);
                 this.showNotification(buildMountTimeoutMessageValue({
                     folderLabel: mountJob.folderLabel,
                     folderPath: mountJob.folderPath,
@@ -10273,7 +10368,7 @@ class HybridCipherApp {
                 }), autoMountRestore ? 'warning' : 'error');
                 return false;
             } else {
-                await this.cleanupMountSession(folder.root_id, sessionId);
+                await this.cleanupMountSession(folder.root_id);
                 const fallbackError =
                     pollResult.error || 'Mount did not complete within timeout period';
                 if (completedInBackground) {
@@ -10351,6 +10446,24 @@ class HybridCipherApp {
                 return { status: 'cancelled' };
             }
 
+            if (job.commandError) {
+                return {
+                    status: 'failed',
+                    error: job.commandError
+                };
+            }
+
+            if (job.outputClosed) {
+                const { message, detail } = this.extractCliErrorMessage(
+                    job.outputBuffer,
+                    'Mount command exited before the folder became available.'
+                );
+                return {
+                    status: 'failed',
+                    error: detail ? `${message}\n${detail}` : message
+                };
+            }
+
             if (
                 job.mode === 'background' &&
                 job.backgroundDeadlineAt &&
@@ -10370,7 +10483,9 @@ class HybridCipherApp {
                 if (result.success && result.data) {
                     return {
                         status: 'mounted',
-                        mountpoint: result.data
+                        mountpoint: result.data.mountpoint,
+                        backend: result.data.backend || 'sync',
+                        fallbackReason: result.data.fallback_reason || null
                     };
                 }
             } catch (error) {
@@ -10808,6 +10923,7 @@ class HybridCipherApp {
 
         const mfaEnabled = Boolean(this.securityStatus?.mfa_enabled);
         const recoveryOk = Boolean(this.securityStatus?.recovery_auto_backup_ok);
+        const recoveryState = String(this.securityStatus?.recovery_auto_backup_state || '').trim().toLowerCase();
         this.securityWarnings = [];
 
         if (!mfaEnabled) {
@@ -10818,10 +10934,23 @@ class HybridCipherApp {
         }
 
         if (!recoveryOk) {
-            this.securityWarnings.push({
-                title: 'Automatic recovery backup unavailable',
-                text: 'Unlock your OS keychain/keyring and re-run <code>hybridcipher recovery upload</code> to re-enable silent backups.'
-            });
+            let title = 'Automatic recovery backup unavailable';
+            let text = 'Unlock your OS keychain/keyring and re-run <code>hybridcipher recovery upload</code> to re-enable silent backups.';
+
+            if (recoveryState === 'missing_writer_blob') {
+                if (this.securityStatus?.recovery_backup_ok) {
+                    title = 'Automatic recovery backup not enabled on this device';
+                    text = 'Run <code>hybridcipher recovery upload</code> once on this device to seed silent backups for future updates.';
+                } else {
+                    title = 'Recovery backup not set up';
+                    text = 'Run <code>hybridcipher recovery upload</code> to create your recovery backup and enable silent backups on this device.';
+                }
+            } else if (recoveryState === 'missing_writer_key') {
+                title = 'Recovery secure storage entry missing';
+                text = 'Re-run <code>hybridcipher recovery upload</code> on this device to restore the secure writer key used for silent backups.';
+            }
+
+            this.securityWarnings.push({ title, text });
         }
 
         const hasWarnings = this.securityWarnings.length > 0;
@@ -12557,9 +12686,8 @@ class HybridCipherApp {
 
         this.showActionProgressModal(`Removing ${targetLabel}...`);
         try {
-            const cliResult = await this.runCliCommandWithInput(
-                `hybridcipher remove-member ${this.quoteCliArg(targetId)}`,
-                ['REMOVE']
+            const cliResult = await this.runCliCommandRaw(
+                `hybridcipher remove-member ${this.quoteCliArg(targetId)} --yes`
             );
             const output = this.stripAnsi(`${cliResult.stdout || ''}\n${cliResult.stderr || ''}`.trim());
             if (typeof cliResult.status === 'number' && cliResult.status !== 0) {
@@ -12622,9 +12750,8 @@ class HybridCipherApp {
 
         this.setAdminPanelVisible(false);
         await this.createTerminalTab();
-        const command = 'hybridcipher rekey start --activation-delay immediate';
-        const sessionId = await this.executeCommandDirectly(command, true, { returnSessionId: true });
-        this.registerRekeyPromptResponder(sessionId);
+        const command = 'hybridcipher rekey start --activation-delay immediate --local-migration defer';
+        await this.executeCommandDirectly(command, true, { returnSessionId: true });
         const progressMessages = Array.isArray(progressMessage)
             ? progressMessage
             : [
@@ -12650,7 +12777,7 @@ class HybridCipherApp {
 
         const shouldMigrate = startMigration === true;
         this.suppressPromptEcho(sessionId, 1, { durationMs: 12000 });
-        this.sendInputToSession(sessionId, shouldMigrate ? 'y' : 'n');
+        this.sendInputToSession(sessionId, shouldMigrate ? 'y\r' : 'n\r');
         delete this.promptResponders[sessionId];
 
         if (!shouldMigrate) {
@@ -13872,7 +13999,31 @@ class HybridCipherApp {
     }
 
     resolveCliCommand(command, cliPath) {
-        return command.replace(/^hybridcipher\b/, quoteShellArgValue(cliPath));
+        if (this.platformInfo?.os_type === 'windows') {
+            const text = String(cliPath ?? '');
+            const lastSlash = Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'));
+            const cliDir = lastSlash >= 0 ? text.slice(0, lastSlash) : '';
+            if (cliDir) {
+                return `set "PATH=${cliDir};%PATH%" && ${command}`;
+            }
+        }
+
+        return command.replace(/^hybridcipher\b/, this.quoteTerminalArg(cliPath));
+    }
+
+    quoteTerminalArg(value) {
+        const text = String(value ?? '');
+        if (this.platformInfo?.os_type === 'windows') {
+            if (text.length === 0) {
+                return '""';
+            }
+
+            // The embedded terminal uses cmd.exe on Windows, so POSIX single-quote
+            // escaping breaks paths with spaces. Wrap with cmd-compatible quotes.
+            return `"${text.replace(/"/g, '""')}"`;
+        }
+
+        return quoteShellArgValue(text);
     }
 
     async runSettingsCliCommand(command, options = {}) {
@@ -14198,7 +14349,7 @@ class HybridCipherApp {
     }
 
     quoteCliArg(value) {
-        return quoteShellArgValue(value);
+        return this.quoteTerminalArg(value);
     }
 
     // ========================================================================

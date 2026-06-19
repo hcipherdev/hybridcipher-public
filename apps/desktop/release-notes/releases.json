@@ -1,6 +1,40 @@
 {
   "releases": [
     {
+      "version": "0.1.3",
+      "published_at": "2026-06-17",
+      "highlights": [
+        "macOS File Provider support is now built into the desktop app, giving protected folders a more native Finder-facing mount experience.",
+        "File Provider startup and restore flows are more resilient, with stronger runtime checks, persisted registration validation, and better lifecycle recovery."
+      ],
+      "important_changes": [
+        "Desktop login and session restore now reconcile persisted macOS File Provider roots, restarting stale bridges or unregistering unsafe stale domains when needed.",
+        "The File Provider bridge now supports persistent provider state, stable item identifiers, directory-scoped enumeration, and explicit domain signaling for Finder updates.",
+        "Provider control and readiness checks are more complete, with register, unregister, signal, and status flows backed by clearer runtime diagnostics."
+      ],
+      "fixes": [
+        "Fixed cases where protected folders on macOS did not mount or restore cleanly after app startup, login, or session recovery.",
+        "Removed a redundant mounted-folder action in the enrolled folders view, making the macOS folder controls clearer."
+      ]
+    },
+    {
+      "version": "0.1.2",
+      "published_at": "2026-05-05",
+      "highlights": [
+        "Auto-mount can now restore the last mounted protected folder after login, with a Settings toggle for users who prefer manual mounting.",
+        "Public source verification is clearer, with reproducible unsigned macOS build guidance and published hashes for comparing source-built artifacts."
+      ],
+      "important_changes": [
+        "The desktop app now remembers the last mounted root safely in local storage and skips auto-mount when the folder is no longer enrolled or already mounted.",
+        "Update install UI is split into dedicated frontend methods, with clearer update badges, progress states, restart prompts, and manual update checks in Settings.",
+        "Restricted personal builds now explain that team and group administration commands are disabled instead of describing the whole client as individual-only."
+      ],
+      "fixes": [
+        "Removed deprecated desktop shell-open and xterm package dependencies, reducing packaging noise and warning output.",
+        "Cleaned up Tauri command organization, CLI path handling, notification paths, and release-note loading fallback behavior for public desktop builds."
+      ]
+    },
+    {
       "version": "0.1.1",
       "published_at": "2026-03-25",
       "highlights": [

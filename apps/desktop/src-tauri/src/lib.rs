@@ -1,6 +1,7 @@
 pub mod cli_schema;
 pub mod cli_utils;
 pub mod client;
+pub mod cloud_provider;
 pub mod commands;
 pub mod coverage_ipc;
 pub mod demo;
@@ -10,7 +11,10 @@ pub mod individual_views;
 pub mod key_bundle;
 pub mod legal;
 pub mod local_client;
+#[cfg(target_os = "macos")]
+pub mod macos_file_provider_native;
 pub mod mount;
+pub mod process_utils;
 pub mod recovery_artifact;
 pub mod release_notes;
 pub mod session;
@@ -19,6 +23,7 @@ pub mod terminal_diagnostics;
 
 pub use cli_schema::CliSchemaManager;
 pub use client::HybridCipherClient;
+pub use cloud_provider::DesktopCloudProviderManager;
 pub use local_client::LocalClientProvider;
 pub use mount::MountManager;
 pub use session::{PersistedSession, SessionStore};

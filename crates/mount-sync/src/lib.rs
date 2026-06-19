@@ -237,6 +237,10 @@ pub enum MountSafetyReason {
     PendingWriteback {
         count: usize,
         oldest_age_ms: u64,
+        #[serde(default)]
+        sample_paths: Vec<String>,
+        #[serde(default)]
+        last_error: Option<String>,
     },
     PendingRefresh {
         count: usize,
@@ -271,10 +275,13 @@ pub enum MountSafetyReason {
 
 impl MountSafetyReason {
     pub fn is_auto_drainable(&self) -> bool {
-        matches!(
-            self,
-            MountSafetyReason::PendingWriteback { .. } | MountSafetyReason::PendingRefresh { .. }
-        )
+        match self {
+            MountSafetyReason::PendingWriteback { last_error, .. } => {
+                !pending_writeback_error_is_terminal(last_error.as_deref())
+            }
+            MountSafetyReason::PendingRefresh { .. } => true,
+            _ => false,
+        }
     }
 
     fn summary(&self) -> String {
@@ -282,10 +289,24 @@ impl MountSafetyReason {
             MountSafetyReason::PendingWriteback {
                 count,
                 oldest_age_ms,
-            } => format!(
-                "{count} pending encrypted commit(s) still need to finish before the newest local changes are protected. Oldest pending commit age: {}s.",
-                oldest_age_ms / 1000
-            ),
+                sample_paths,
+                last_error,
+            } => {
+                let mut message = format!(
+                    "{count} pending encrypted commit(s) still need to finish before the newest local changes are protected. Oldest pending commit age: {}s.",
+                    oldest_age_ms / 1000
+                );
+                if let Some(path) = sample_paths.first() {
+                    message.push_str(&format!(" Example: {path}"));
+                }
+                if let Some(error) = last_error
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    message.push_str(&format!(" Last error: {error}"));
+                }
+                message
+            }
             MountSafetyReason::PendingRefresh { count } => format!(
                 "{count} pending plaintext refresh(es) are still rebuilding the local mount state."
             ),
@@ -307,14 +328,20 @@ impl MountSafetyReason {
                 }
                 message
             }
-            MountSafetyReason::DeletedOpen { count, sample_paths } => {
+            MountSafetyReason::DeletedOpen {
+                count,
+                sample_paths,
+            } => {
                 let mut message = format!("{count} deleted-open path(s) are still active.");
                 if let Some(path) = sample_paths.first() {
                     message.push_str(&format!(" Example: {path}"));
                 }
                 message
             }
-            MountSafetyReason::TransactionalBlocked { count, sample_paths } => {
+            MountSafetyReason::TransactionalBlocked {
+                count,
+                sample_paths,
+            } => {
                 let mut message = format!(
                     "{count} transactional path(s) are blocked because sync mount does not provide atomic-set guarantees for databases, packages, or bundle-style formats."
                 );
@@ -323,7 +350,10 @@ impl MountSafetyReason {
                 }
                 message
             }
-            MountSafetyReason::HardLinkBlocked { count, sample_paths } => {
+            MountSafetyReason::HardLinkBlocked {
+                count,
+                sample_paths,
+            } => {
                 let mut message = format!(
                     "{count} hard-linked file(s) are blocked because sync mount does not preserve hard-link semantics."
                 );
@@ -350,7 +380,10 @@ impl MountSafetyReason {
                 }
                 message
             }
-            MountSafetyReason::RecoveryCopiesPresent { count, sample_paths } => {
+            MountSafetyReason::RecoveryCopiesPresent {
+                count,
+                sample_paths,
+            } => {
                 let mut message = format!(
                     "{count} recovered pending-work file(s) were recreated as local-only read-only copies after an unclean mount restart."
                 );
@@ -369,6 +402,8 @@ pub struct MountSyncRuntimeStatus {
     pub pending_writeback_count: usize,
     #[serde(default)]
     pub pending_writeback_oldest_age_ms: Option<u64>,
+    #[serde(default)]
+    pub pending_writeback_paths: Vec<String>,
     pub pending_refresh_count: usize,
     pub pending_open_unlinked_count: usize,
     #[serde(default)]
@@ -400,6 +435,7 @@ impl Default for MountSyncRuntimeStatus {
             safe_to_unmount: false,
             pending_writeback_count: 0,
             pending_writeback_oldest_age_ms: None,
+            pending_writeback_paths: Vec::new(),
             pending_refresh_count: 0,
             pending_open_unlinked_count: 0,
             pending_conflict_count: 0,
@@ -1217,7 +1253,12 @@ fn is_temp_like_name(name: &str) -> bool {
         return false;
     }
 
-    if name.starts_with("~$") || name.starts_with(".#") {
+    if name.starts_with("~$")
+        || name.starts_with(".#")
+        || name.starts_with('~')
+        || name.starts_with(".~lock.")
+        || (name.starts_with('#') && name.ends_with('#'))
+    {
         return true;
     }
 
@@ -1230,9 +1271,11 @@ fn is_temp_like_name(name: &str) -> bool {
         || lower.ends_with(".swp")
         || lower.ends_with(".swo")
         || lower.ends_with(".swx")
+        || lower.ends_with(".bak")
         || lower.ends_with(".tmp")
         || lower.ends_with(".temp")
         || lower.ends_with(".part")
+        || lower.ends_with('~')
 }
 
 fn is_directory_metadata_file(path: &Path) -> bool {
@@ -3697,7 +3740,7 @@ impl SyncTracker {
         self.path_mapping.insert(encrypted_path, mount_path);
     }
 
-    fn is_path_excluded(&self, path: &Path) -> bool {
+    pub fn is_path_excluded(&self, path: &Path) -> bool {
         if self.excluded_patterns.is_empty() {
             return false;
         }
@@ -3840,6 +3883,23 @@ impl SyncTracker {
                 .any(should_fast_drain_pending_writeback)
     }
 
+    /// Pre-populate the stability entry for a file that has been fully written
+    /// to the cache (e.g. by the File Provider writeback path).  The next
+    /// sync() pass will see the matching signature and encrypt immediately
+    /// instead of deferring for a second stability scan.
+    pub fn preseed_stable(&mut self, path: &Path) {
+        if let Ok(metadata) = fs::metadata(path) {
+            let signature = FileSignature::from_metadata(&metadata);
+            self.pending_stable.insert(
+                path.to_path_buf(),
+                StableEntry {
+                    signature,
+                    first_seen: Instant::now(),
+                },
+            );
+        }
+    }
+
     pub fn clear_pending_refreshes(&mut self) {
         if !self.pending_refreshes.is_empty() {
             info!(
@@ -3953,6 +4013,13 @@ impl SyncTracker {
         let pending_writeback_count = self.pending_writebacks.len();
         let pending_writeback_oldest_age_ms =
             pending_writeback_oldest_age_ms_from(self.pending_writebacks.values(), now);
+        let mut pending_writeback_paths = self
+            .pending_writebacks
+            .keys()
+            .map(|path| path.display().to_string())
+            .take(16)
+            .collect::<Vec<_>>();
+        pending_writeback_paths.sort();
         let pending_open_unlinked_count = self.pending_open_unlinked.len();
         let pending_conflict_count = self.conflict_baselines.len();
         let edited_conflict_count = self
@@ -4063,6 +4130,12 @@ impl SyncTracker {
             unsafe_reasons.push(MountSafetyReason::PendingWriteback {
                 count: pending_writeback_count,
                 oldest_age_ms: pending_writeback_oldest_age_ms.unwrap_or(0),
+                sample_paths: pending_writeback_paths.iter().take(3).cloned().collect(),
+                last_error: self
+                    .pending_writebacks
+                    .values()
+                    .filter_map(|pending| pending.last_error.clone())
+                    .next(),
             });
         }
         if pending_refresh_count > 0 {
@@ -4129,6 +4202,7 @@ impl SyncTracker {
             safe_to_unmount: self.can_cleanup_mountpoint(),
             pending_writeback_count,
             pending_writeback_oldest_age_ms,
+            pending_writeback_paths,
             pending_refresh_count,
             pending_open_unlinked_count,
             pending_conflict_count,
@@ -5792,6 +5866,9 @@ impl SyncTracker {
                     continue;
                 }
                 if file_type.is_dir() {
+                    if self.is_path_excluded(&path) {
+                        continue;
+                    }
                     let metadata = entry.metadata()?;
                     let signature = FileSignature::from_metadata(&metadata);
                     self.decrypted_directory_signatures
@@ -5854,10 +5931,26 @@ impl SyncTracker {
             let Some(existing) = self.pending_writebacks.get(&mount_path).cloned() else {
                 continue;
             };
+            if self.is_path_excluded(&mount_path) {
+                info!(
+                    "Clearing excluded pending writeback for {}",
+                    mount_path.display()
+                );
+                self.pending_stable.remove(&mount_path);
+                self.clear_pending_writeback(&mount_path);
+                continue;
+            }
             if !should_fast_drain_pending_writeback(&existing) {
                 continue;
             }
             if !mount_path.exists() {
+                if encrypted_path.exists() {
+                    info!(
+                        "Clearing stale pending writeback for {} because the decrypted source is gone and the encrypted file exists",
+                        mount_path.display()
+                    );
+                    self.clear_pending_writeback(&mount_path);
+                }
                 continue;
             }
 
@@ -7479,6 +7572,21 @@ impl SyncTracker {
             return Ok(DecryptOutcome::Ready(target));
         }
 
+        if !needs_refresh
+            && !target.exists()
+            && self.decrypted_directory_signatures.contains_key(&target)
+            && !self.pending_refreshes.contains_key(&target)
+        {
+            debug!(
+                "Directory metadata {} is unchanged but mounted directory {} is missing - treating as mounted-side delete",
+                encrypted_path.display(),
+                target.display()
+            );
+            self.encrypted_directory_signatures
+                .insert(encrypted_path.to_path_buf(), signature);
+            return Ok(DecryptOutcome::Ready(target));
+        }
+
         if self.mount_readonly_active {
             let err = low_space_readonly_error(&target);
             return self.defer_low_space_refresh(encrypted_path, &target, signature, &err);
@@ -8206,6 +8314,7 @@ impl SyncTracker {
                 .keys()
                 .cloned()
                 .collect();
+            let mut orphaned_encrypted_dirs: Vec<PathBuf> = Vec::new();
             for tracked_path in tracked_directories {
                 if tracked_path == mount_root || current_directories.contains(&tracked_path) {
                     continue;
@@ -8224,10 +8333,38 @@ impl SyncTracker {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(MountSyncError::Io(err)),
                 }
+                if let Some(parent) = encrypted_path.parent() {
+                    if parent != encrypted_root {
+                        orphaned_encrypted_dirs.push(parent.to_path_buf());
+                    }
+                }
                 self.clear_decrypted_directory_tracking(&tracked_path);
                 self.encrypted_directory_signatures.remove(&encrypted_path);
                 self.clear_pending_writeback(&tracked_path);
                 self.clear_pending_refresh(&tracked_path);
+            }
+            // Remove the now-empty encrypted-side directories deepest-first.
+            // encrypt_directory_metadata creates these via create_dir_all; without
+            // this cleanup they linger in the enrolled folder after a mounted-side delete.
+            orphaned_encrypted_dirs
+                .sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+            for encrypted_parent in orphaned_encrypted_dirs {
+                let tmp_dir = encrypted_parent.join(ENCRYPTED_TMP_DIR_NAME);
+                if tmp_dir.exists() {
+                    let _ = fs::remove_dir_all(&tmp_dir);
+                }
+                match fs::remove_dir(&encrypted_parent) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(err) => {
+                        warn!(
+                            "Failed to remove orphaned encrypted directory {}: {}",
+                            encrypted_parent.display(),
+                            err
+                        );
+                    }
+                }
             }
         }
 
@@ -8268,6 +8405,37 @@ impl SyncTracker {
         let encrypted_path =
             encrypted_directory_metadata_path_for(encrypted_root, mount_root, directory_path)?;
         let encrypted_exists = encrypted_path.exists();
+
+        // If the sidecar was previously tracked but is now externally deleted (e.g. by the
+        // File Provider tracker on a mounted-side delete), propagate the deletion back to the
+        // enrolled/mounted directory instead of re-creating the sidecar.
+        if !encrypted_exists
+            && self
+                .encrypted_directory_signatures
+                .contains_key(&encrypted_path)
+        {
+            debug!(
+                "Encrypted sidecar {} was externally deleted while enrolled directory {} still exists — propagating delete",
+                encrypted_path.display(),
+                directory_path.display()
+            );
+            self.encrypted_directory_signatures.remove(&encrypted_path);
+            self.clear_decrypted_directory_tracking(directory_path);
+            self.clear_pending_writeback(directory_path);
+            self.clear_pending_refresh(directory_path);
+            match fs::remove_dir_all(directory_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!(
+                        "Failed to remove enrolled directory {} after external sidecar deletion: {}",
+                        directory_path.display(),
+                        err
+                    );
+                }
+            }
+            return Ok(());
+        }
 
         if !self.should_sync_directory_metadata(encrypted_root, mount_root, directory_path) {
             self.decrypted_directory_signatures
@@ -9830,6 +9998,11 @@ impl SyncTracker {
         Ok(())
     }
 
+    pub fn flush_conflict_and_recovery_registries(&mut self, mount_root: &Path) {
+        self.flush_conflict_registry(mount_root);
+        self.flush_recovery_registry(mount_root);
+    }
+
     fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), MountSyncError> {
         let parent = path.parent().ok_or_else(|| {
             MountSyncError::Format(format!("Path {} has no parent directory", path.display()))
@@ -10129,6 +10302,49 @@ fn strip_encrypted_suffix(name: &str) -> String {
 pub struct ParsedEncryptedFile {
     pub metadata: EncryptedFileMetadata,
     pub original_name: Option<String>,
+}
+
+/// Parse only the JSON header of an encrypted file — skips reading the ciphertext payload.
+/// Returns `(file_id, epoch_id, encrypted_size)` for use during inventory scans where
+/// reading the full payload (O(file size) per file) would be unacceptably slow.
+pub fn parse_encrypted_header_only(path: &Path) -> Result<(String, u64, u64), MountSyncError> {
+    use std::io::{BufRead, BufReader, Seek};
+
+    let file_len = fs::metadata(path)?.len();
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut header_bytes = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            return Err(MountSyncError::Format(
+                "Invalid encrypted file format: separator not found".into(),
+            ));
+        }
+        if line == b"---ENCRYPTED_DATA---\n" || line == b"---ENCRYPTED_DATA---" {
+            break;
+        }
+        header_bytes.extend_from_slice(&line);
+    }
+    let ciphertext_offset = reader
+        .stream_position()
+        .map_err(|e| MountSyncError::Format(format!("Failed to locate ciphertext: {}", e)))?;
+
+    let json: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| MountSyncError::Format(format!("Failed to parse metadata: {}", e)))?;
+
+    let file_id = json["file_id"]
+        .as_str()
+        .ok_or_else(|| MountSyncError::Format("Missing file_id in metadata".into()))?
+        .to_string();
+    let epoch_id = json["epoch_id"]
+        .as_u64()
+        .ok_or_else(|| MountSyncError::Format("Missing epoch_id in metadata".into()))?;
+    let encrypted_size = file_len.saturating_sub(ciphertext_offset);
+
+    Ok((file_id, epoch_id, encrypted_size))
 }
 
 pub fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, MountSyncError> {
@@ -11159,6 +11375,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fast_drain_retry_clears_excluded_pending_directory_writeback() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        let journal_root = temp.path().join("journal");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+        fs::create_dir_all(&journal_root).unwrap();
+
+        let mount_path = mount_root.join(".obsidian");
+        fs::create_dir_all(&mount_path).unwrap();
+        let encrypted_path = encrypted_root
+            .join(".obsidian")
+            .join(DIRECTORY_METADATA_FILE_NAME);
+
+        let mut tracker = SyncTracker::new();
+        tracker.set_excluded_patterns(vec![
+            ".obsidian".to_string(),
+            ".obsidian/**".to_string(),
+            "**/.obsidian".to_string(),
+            "**/.obsidian/**".to_string(),
+        ]);
+        tracker.set_pending_writeback_path(journal_root.join("pending_writebacks.json"));
+        tracker.record_pending_writeback(
+            &mount_path,
+            &encrypted_path,
+            Some(&MountSyncError::PathExcluded(".obsidian".to_string())),
+        );
+
+        tracker
+            .retry_pending_writebacks_before_scan(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(!tracker.pending_writebacks.contains_key(&mount_path));
+        assert!(!encrypted_path.exists());
+        assert!(mount_path.exists());
+    }
+
+    #[tokio::test]
+    async fn sync_skips_excluded_directory_metadata_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+
+        let ignored_dir = mount_root.join(".obsidian");
+        fs::create_dir_all(&ignored_dir).unwrap();
+        fs::write(mount_root.join("note.md"), b"hello").unwrap();
+
+        let mut tracker = SyncTracker::new();
+        tracker.set_excluded_patterns(vec![
+            ".obsidian".to_string(),
+            ".obsidian/**".to_string(),
+            "**/.obsidian".to_string(),
+            "**/.obsidian/**".to_string(),
+        ]);
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(!encrypted_root
+            .join(".obsidian")
+            .join(DIRECTORY_METADATA_FILE_NAME)
+            .exists());
+        assert!(encrypted_root.join("note.md.encrypted").exists());
+    }
+
+    #[tokio::test]
     async fn recovered_pending_copy_is_tracked_readonly_and_skipped_from_sync() {
         let temp = TempDir::new().unwrap();
         let encrypted_root = temp.path().join("encrypted");
@@ -11919,6 +12210,227 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn tracked_directory_delete_removes_sidecar_instead_of_restoring_folder() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+
+        let folder_path = mount_root.join("untitled folder");
+        fs::create_dir_all(&folder_path).unwrap();
+
+        let mut tracker = SyncTracker::new();
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        let sidecar_path = encrypted_root
+            .join("untitled folder")
+            .join(DIRECTORY_METADATA_FILE_NAME);
+        assert!(sidecar_path.exists());
+        assert!(tracker
+            .decrypted_directory_signatures
+            .contains_key(&folder_path));
+        assert!(tracker
+            .encrypted_directory_signatures
+            .contains_key(&sidecar_path));
+
+        fs::remove_dir_all(&folder_path).unwrap();
+
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(
+            !folder_path.exists(),
+            "unchanged encrypted directory metadata must not recreate a mounted-side delete"
+        );
+        assert!(
+            !sidecar_path.exists(),
+            "mounted-side directory delete should remove the encrypted sidecar"
+        );
+        assert!(!tracker
+            .decrypted_directory_signatures
+            .contains_key(&folder_path));
+        assert!(!tracker
+            .encrypted_directory_signatures
+            .contains_key(&sidecar_path));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracked_directory_rename_replaces_old_sidecar_without_restoring_old_name() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+
+        let old_folder_path = mount_root.join("untitled folder");
+        let new_folder_path = mount_root.join("Project Alpha");
+        fs::create_dir_all(&old_folder_path).unwrap();
+
+        let mut tracker = SyncTracker::new();
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        let old_sidecar_path = encrypted_root
+            .join("untitled folder")
+            .join(DIRECTORY_METADATA_FILE_NAME);
+        let new_sidecar_path = encrypted_root
+            .join("Project Alpha")
+            .join(DIRECTORY_METADATA_FILE_NAME);
+        assert!(old_sidecar_path.exists());
+
+        fs::rename(&old_folder_path, &new_folder_path).unwrap();
+
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(
+            !old_folder_path.exists(),
+            "directory rename must not restore Finder's temporary source name"
+        );
+        assert!(new_folder_path.is_dir());
+        assert!(
+            !old_sidecar_path.exists(),
+            "directory rename should remove the old encrypted sidecar"
+        );
+        assert!(
+            new_sidecar_path.exists(),
+            "directory rename should publish the new encrypted sidecar"
+        );
+        assert!(!tracker
+            .decrypted_directory_signatures
+            .contains_key(&old_folder_path));
+        assert!(tracker
+            .decrypted_directory_signatures
+            .contains_key(&new_folder_path));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn externally_deleted_sidecar_removes_enrolled_directory() {
+        // Simulates the File Provider tracker deleting a sidecar (mounted-side delete)
+        // while the mount runner has the same enrolled dir still present. The mount
+        // runner must propagate the delete to the enrolled dir, not re-create the sidecar.
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+
+        let folder_path = mount_root.join("folder_a");
+        fs::create_dir_all(&folder_path).unwrap();
+
+        let mut tracker = SyncTracker::new();
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        let sidecar_path = encrypted_root
+            .join("folder_a")
+            .join(DIRECTORY_METADATA_FILE_NAME);
+        assert!(sidecar_path.exists());
+        assert!(tracker
+            .encrypted_directory_signatures
+            .contains_key(&sidecar_path));
+
+        // Simulate File Provider tracker externally deleting the sidecar.
+        fs::remove_file(&sidecar_path).unwrap();
+
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(
+            !folder_path.exists(),
+            "enrolled directory must be removed when its sidecar is externally deleted"
+        );
+        assert!(
+            !sidecar_path.exists(),
+            "sidecar must remain absent after propagation"
+        );
+        assert!(!tracker
+            .decrypted_directory_signatures
+            .contains_key(&folder_path));
+        assert!(!tracker
+            .encrypted_directory_signatures
+            .contains_key(&sidecar_path));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn externally_renamed_sidecar_removes_old_enrolled_directory_and_keeps_new() {
+        // Simulates the File Provider rename "untitled folder" → "Project Alpha":
+        // old sidecar deleted, new sidecar created externally. The mount runner must
+        // remove the enrolled "untitled folder" and keep/create "Project Alpha".
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+
+        let old_folder_path = mount_root.join("untitled folder");
+        fs::create_dir_all(&old_folder_path).unwrap();
+
+        let mut tracker = SyncTracker::new();
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        let old_sidecar_path = encrypted_root
+            .join("untitled folder")
+            .join(DIRECTORY_METADATA_FILE_NAME);
+        assert!(old_sidecar_path.exists());
+
+        // Simulate FP tracker: delete old sidecar, create new sidecar for renamed dir.
+        fs::remove_file(&old_sidecar_path).unwrap();
+        // The encrypted dir for the new name must exist for the sidecar to live in.
+        let new_encrypted_dir = encrypted_root.join("Project Alpha");
+        fs::create_dir_all(&new_encrypted_dir).unwrap();
+        let _new_sidecar_path = new_encrypted_dir.join(DIRECTORY_METADATA_FILE_NAME);
+        // Write a minimal placeholder so the sidecar file exists (MockCrypto will
+        // re-encrypt it, but we need it present for decrypt_directory_metadata).
+        // Use a real sync-created sidecar by first creating the enrolled dir, syncing,
+        // then removing the enrolled dir to simulate the rename.
+        // Simpler: just let the sync create it from scratch by pre-creating the enrolled dir.
+        let new_folder_path = mount_root.join("Project Alpha");
+        fs::create_dir_all(&new_folder_path).unwrap();
+
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(
+            !old_folder_path.exists(),
+            "old enrolled directory must be removed after its sidecar was externally deleted"
+        );
+        assert!(
+            new_folder_path.is_dir(),
+            "new enrolled directory must remain present"
+        );
+        assert!(!tracker
+            .decrypted_directory_signatures
+            .contains_key(&old_folder_path));
+        assert!(tracker
+            .decrypted_directory_signatures
+            .contains_key(&new_folder_path));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn encrypted_package_directory_metadata_restores_package_root() {
         let temp = TempDir::new().unwrap();
         let encrypted_root = temp.path().join("encrypted");
@@ -12653,6 +13165,36 @@ mod tests {
 
         assert!(retained_path.exists());
         assert!(metadata_path.exists());
+    }
+
+    #[test]
+    fn temp_like_name_detection_covers_windows_pdf_editor_patterns() {
+        for name in [
+            "~wang_2020_nature_intergrated_photonic.pdf",
+            "wang_2020_nature_intergrated_photonic.pdf.bak",
+            "#wang_2020_nature_intergrated_photonic.pdf#",
+            ".~lock.wang_2020_nature_intergrated_photonic.pdf#",
+            "wang_2020_nature_intergrated_photonic.pdf~",
+        ] {
+            assert!(
+                is_temp_like_name(name),
+                "expected temp-like name to be detected: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn temp_like_name_detection_keeps_normal_pdf_names() {
+        for name in [
+            "wang_2020_nature_intergrated_photonic.pdf",
+            "team-notes.bakery.pdf",
+            "tilde-analysis.pdf",
+        ] {
+            assert!(
+                !is_temp_like_name(name),
+                "expected normal name to remain syncable: {name}"
+            );
+        }
     }
 
     #[async_trait]

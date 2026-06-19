@@ -13,7 +13,7 @@ pub mod read;
 pub use decrypt::{
     AccessPattern, DecryptedChunk, DecryptionContext, DecryptionManager, DecryptionMetrics,
 };
-pub use hybridcipher::HybridCipher;
+pub use hybridcipher::{collect_mount_runtime_status, HybridCipher, MountRuntimeStatus};
 pub use lookup::{LookupManager, LookupResult, MigrationStatus};
 pub use performance::{
     MemoryPressureMonitor, MetricsCollector, PerformanceManager, PerformanceSnapshot,
