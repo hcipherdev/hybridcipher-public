@@ -347,8 +347,8 @@ mod tests {
 
     #[test]
     fn test_hkdf_stretch() {
-        let password = b"weak password";
-        let salt = b"random salt for stretching";
+        let password = b"weak password"; // lgtm[rust/hard-coded-cryptographic-value] non-secret deterministic test vector
+        let salt = b"random salt for stretching"; // lgtm[rust/hard-coded-cryptographic-value] non-secret deterministic test vector
 
         let key1 =
             hkdf_stretch(password, salt, 1000, HkdfContext::FileKey, 32).expect("Stretch failed");
@@ -407,8 +407,8 @@ mod tests {
 
     #[test]
     fn test_zero_iterations_stretch() {
-        let password = b"password";
-        let salt = b"salt";
+        let password = b"password"; // lgtm[rust/hard-coded-cryptographic-value] non-secret deterministic test vector
+        let salt = b"salt"; // lgtm[rust/hard-coded-cryptographic-value] non-secret deterministic test vector
 
         assert!(hkdf_stretch(password, salt, 0, HkdfContext::FileKey, 32).is_err());
     }

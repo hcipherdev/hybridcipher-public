@@ -1547,7 +1547,7 @@ fn encrypt_registry_blob(
     opaque_export_key: &[u8; 64],
     registry_json: String,
 ) -> Result<String, CliError> {
-    let mut salt = [0u8; 16];
+    let mut salt = [0u8; 16]; // lgtm[rust/hard-coded-cryptographic-value] zeroed buffer is immediately filled from OsRng
     OsRng.fill_bytes(&mut salt);
     let key = derive_registry_key(opaque_export_key, &salt)?;
     let package = CoverageRegistryPackage {

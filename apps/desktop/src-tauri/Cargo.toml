@@ -12,15 +12,15 @@ categories = ["cryptography", "gui"]
 
 [build-dependencies]
 cc = "1.2.33"
-tauri-build = { version = "2.0", features = [] }
+tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
 # Tauri framework
-tauri = { version = "2.0", features = [] }
-tauri-plugin-shell = "2.0"
-tauri-plugin-dialog = "2.0"
-tauri-plugin-fs = "2.0"
-tauri-plugin-updater = "2.0"
+tauri = { version = "2.11.3", features = [] }
+tauri-plugin-shell = "2.3"
+tauri-plugin-dialog = "2.4"
+tauri-plugin-fs = "2.4"
+tauri-plugin-updater = "2.10"
 ctrlc = "3.4"
 
 # HybridCipher workspace crates

@@ -60,9 +60,9 @@ impl BackupArtifact {
         let mut k2 = [0u8; KEY_LEN];
         xor_into(&mut k2, &k_file, &k1);
 
-        let mut k1_salt = [0u8; SALT_LEN];
-        let mut k2_salt = [0u8; SALT_LEN];
-        let mut hkdf_salt = [0u8; SALT_LEN];
+        let mut k1_salt = [0u8; SALT_LEN]; // lgtm[rust/hard-coded-cryptographic-value] zeroed buffer is immediately filled from OsRng
+        let mut k2_salt = [0u8; SALT_LEN]; // lgtm[rust/hard-coded-cryptographic-value] zeroed buffer is immediately filled from OsRng
+        let mut hkdf_salt = [0u8; SALT_LEN]; // lgtm[rust/hard-coded-cryptographic-value] zeroed buffer is immediately filled from OsRng
         OsRng.fill_bytes(&mut k1_salt);
         OsRng.fill_bytes(&mut k2_salt);
         OsRng.fill_bytes(&mut hkdf_salt);

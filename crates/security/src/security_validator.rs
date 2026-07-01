@@ -413,12 +413,12 @@ impl SecurityValidator {
 
     fn test_kdf_implementation(&self) -> TestResult {
         // Test Key Derivation Function
-        let password = b"test_password";
-        let salt = b"test_salt_123";
+        let password = b"test_password"; // lgtm[rust/hard-coded-cryptographic-value] non-secret deterministic validator input
+        let salt = b"test_salt_123"; // lgtm[rust/hard-coded-cryptographic-value] non-secret deterministic validator input
 
         let derived_key1 = self.simulate_kdf(password, salt);
         let derived_key2 = self.simulate_kdf(password, salt);
-        let derived_key3 = self.simulate_kdf(b"different_password", salt);
+        let derived_key3 = self.simulate_kdf(b"different_password", salt); // lgtm[rust/hard-coded-cryptographic-value] non-secret deterministic validator input
 
         let consistent = derived_key1 == derived_key2;
         let different_for_different_input = derived_key1 != derived_key3;
