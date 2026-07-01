@@ -29,6 +29,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.local}"
+FILE_PROVIDER_BUILD_SCRIPT="$SCRIPT_DIR/build_file_provider_extension.sh"
+APP_ENTITLEMENTS_TEMPLATE="$ROOT_DIR/apps/desktop/src-tauri/entitlements.plist"
+DEFAULT_APPLE_TEAM_ID="G2L88C9692"
 
 ARTIFACTS=()
 KEYCHAIN_PATH=""
@@ -415,6 +418,82 @@ upsert_component_key() {
   fi
 }
 
+require_file_provider_extension_in_app() {
+  local app_path="$1"
+  local appex="$app_path/Contents/PlugIns/HybridCipherFileProvider.appex"
+  local appex_info="$appex/Contents/Info.plist"
+  local bundle_id
+
+  if [[ ! -d "$appex" ]]; then
+    echo "File Provider extension bundle not found: $appex" >&2
+    echo "Build/package output is missing HybridCipherFileProvider.appex; refusing to publish an app that will fall back to sync mounts." >&2
+    exit 1
+  fi
+  if [[ ! -f "$appex_info" ]]; then
+    echo "File Provider extension Info.plist not found: $appex_info" >&2
+    exit 1
+  fi
+
+  bundle_id="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$appex_info" 2>/dev/null || true)"
+  if [[ "$bundle_id" != "com.hybridcipher.app.HybridCipherFileProvider" ]]; then
+    echo "Unexpected File Provider extension bundle id: ${bundle_id:-missing}" >&2
+    exit 1
+  fi
+}
+
+generate_desktop_app_entitlements() {
+  local output_path="$1"
+  local team_id="$2"
+  local team_prefix=""
+
+  if [[ -n "$team_id" ]]; then
+    team_prefix="${team_id}."
+  fi
+
+  sed \
+    -e "s/\$(TeamIdentifierPrefix)/$team_prefix/g" \
+    -e "s/\$(AppIdentifierPrefix)/$team_prefix/g" \
+    "$APP_ENTITLEMENTS_TEMPLATE" > "$output_path"
+  plutil -lint "$output_path" >/dev/null
+}
+
+stage_file_provider_runtime_in_app() {
+  local app_path="$1"
+  local signing_identity="$2"
+  local team_id="$3"
+  local version="$4"
+  local file_provider_build_dir
+  local staged_appex="$app_path/Contents/PlugIns/HybridCipherFileProvider.appex"
+  local bundled_providerctl="$app_path/Contents/Resources/bin/providerctl-native"
+
+  file_provider_build_dir="$(mktemp -d /tmp/hybridcipher-fileprovider.XXXXXX)"
+  log "Building and staging macOS File Provider runtime"
+  VERSION_OVERRIDE="$version" \
+    APPLE_APPLICATION_IDENTITY="$signing_identity" \
+    APPLE_TEAM_ID="$team_id" \
+    "$FILE_PROVIDER_BUILD_SCRIPT" "$file_provider_build_dir"
+
+  rm -rf "$staged_appex"
+  mkdir -p "$app_path/Contents/PlugIns" "$app_path/Contents/Resources/bin"
+  cp -R "$file_provider_build_dir/HybridCipherFileProvider.appex" "$staged_appex"
+  install -m 0755 "$file_provider_build_dir/providerctl-native" "$bundled_providerctl"
+
+  if [[ "$signing_identity" != "-" ]]; then
+    local app_entitlements="$file_provider_build_dir/HybridCipherApp.entitlements"
+    generate_desktop_app_entitlements "$app_entitlements" "$team_id"
+    log "Re-signing app bundle after staging File Provider runtime"
+    codesign --force \
+      --sign "$signing_identity" \
+      --entitlements "$app_entitlements" \
+      --timestamp \
+      --options runtime \
+      "$app_path"
+  fi
+
+  require_file_provider_extension_in_app "$app_path"
+  rm -rf "$file_provider_build_dir"
+}
+
 should_notarize() {
   [[ -n "${APPLE_API_KEY:-}" ]] && [[ -n "${APPLE_API_KEY_ID:-}" ]] && [[ -n "${APPLE_API_ISSUER:-}" ]]
 }
@@ -751,6 +830,23 @@ fi
 if ! ln -sfn "$TARGET" "/usr/local/bin/hybridcipher"; then
   echo "WARNING: Failed to set /usr/local/bin/hybridcipher symlink; app install will continue" >&2
 fi
+
+FILE_PROVIDER=""
+for CANDIDATE in \
+  "${TARGET_ROOT}/Applications/HybridCipher.app/Contents/PlugIns/HybridCipherFileProvider.appex" \
+  "/Applications/HybridCipher.app/Contents/PlugIns/HybridCipherFileProvider.appex"; do
+  if [ -d "$CANDIDATE" ]; then
+    FILE_PROVIDER="$CANDIDATE"
+    break
+  fi
+done
+
+if [ -n "$FILE_PROVIDER" ]; then
+  /usr/bin/pluginkit -a "$FILE_PROVIDER" >/dev/null 2>&1 || true
+else
+  echo "WARNING: HybridCipher File Provider extension not found after install; File Provider mounts may fall back to sync" >&2
+fi
+
 exit 0
 POSTINSTALL
   chmod 0755 "$pkg_scripts/postinstall"
@@ -930,6 +1026,7 @@ build_target() {
   local cli_bin
   local bundled_cli
   local app_path
+  local version
 
   cli_bin="$(build_cli_for_target "$target")"
   bundled_cli="$(stage_bundled_cli_resource "$cli_bin")"
@@ -937,6 +1034,13 @@ build_target() {
   build_tauri_bundle_for_target "$target" "signed" "" "$bundled_cli"
 
   app_path="$(find_app_bundle_path "$target")"
+  version="$(desktop_app_version)"
+  stage_file_provider_runtime_in_app \
+    "$app_path" \
+    "$APPLE_SIGNING_IDENTITY" \
+    "${APPLE_TEAM_ID:-$DEFAULT_APPLE_TEAM_ID}" \
+    "$version"
+  require_file_provider_extension_in_app "$app_path"
 
   notarize_app_bundle "$target" "$app_path"
   build_pkg_installer "$target" "$app_path"
@@ -963,6 +1067,7 @@ build_public_verify_target() {
   local config_path
   local app_path
   local canonical_artifact
+  local version
 
   cli_bin="$(build_cli_for_target "$target")"
   bundled_cli="$(stage_bundled_cli_resource "$cli_bin")"
@@ -972,6 +1077,9 @@ build_public_verify_target() {
   rm -f "$config_path"
 
   app_path="$(find_app_bundle_path "$target")"
+  version="$(desktop_app_version)"
+  stage_file_provider_runtime_in_app "$app_path" "-" "" "$version"
+  require_file_provider_extension_in_app "$app_path"
   canonical_artifact="$(create_canonical_unsigned_app_archive "$target" "$app_path" "$(dirname "$app_path")")"
 
   ARTIFACTS+=("$canonical_artifact" "${canonical_artifact}.sha256")

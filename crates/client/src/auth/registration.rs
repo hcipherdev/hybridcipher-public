@@ -479,7 +479,7 @@ mod tests {
 
         let invitation_key = [1u8; 32];
         let result = registration
-            .register("test-user", "test-password", invitation_key)
+            .register("test-user", "test-password", invitation_key) // lgtm[rust/hard-coded-cryptographic-value] non-secret test credential
             .await;
 
         assert!(result.is_ok());
@@ -509,7 +509,7 @@ mod tests {
         );
         let invitation_key = [1u8; 32];
         let registration_result = registration
-            .register("test-user", "test-password", invitation_key)
+            .register("test-user", "test-password", invitation_key) // lgtm[rust/hard-coded-cryptographic-value] non-secret test credential
             .await
             .unwrap();
 
@@ -548,7 +548,7 @@ mod tests {
             transparency_config.clone(),
         );
         let registration_result = registration
-            .register("test-user", "correct-password", [1u8; 32])
+            .register("test-user", "correct-password", [1u8; 32]) // lgtm[rust/hard-coded-cryptographic-value] non-secret test credential and deterministic test key
             .await
             .unwrap();
 
@@ -560,7 +560,7 @@ mod tests {
             transparency_config,
         );
         let login_result = login
-            .login("wrong-password", &registration_result.registration_record)
+            .login("wrong-password", &registration_result.registration_record) // lgtm[rust/hard-coded-cryptographic-value] non-secret negative-test credential
             .await;
 
         assert!(login_result.is_err());
@@ -582,7 +582,7 @@ mod tests {
 
         let invitation_key = [1u8; 32];
         let result = registration
-            .register("test-user", "test-password", invitation_key)
+            .register("test-user", "test-password", invitation_key) // lgtm[rust/hard-coded-cryptographic-value] non-secret test credential
             .await;
 
         assert!(result.is_ok());

@@ -33,23 +33,31 @@
 //! - **Migration Safety**: Atomic rewrapping ensures no data loss during migration
 //! - **Cache Security**: Encrypted caching with automatic cleanup of sensitive data
 
+#[cfg(target_os = "linux")]
 pub mod cache;
 pub mod error;
+#[cfg(target_os = "linux")]
 pub mod filesystem;
 pub mod migration;
+#[cfg(target_os = "linux")]
 pub mod platform;
+#[cfg(target_os = "linux")]
 pub mod virtual_fs;
 
 // Re-export main components
+#[cfg(target_os = "linux")]
 pub use cache::{CacheKey, CacheManager, EvictionPolicy};
 pub use error::MountError;
 pub use error::Result as MountResult;
+#[cfg(target_os = "linux")]
 pub use filesystem::{collect_mount_runtime_status, HybridCipher, MountRuntimeStatus};
 pub use migration::{MigrationTracker, OpportunisticRewrapper, OverlayFile};
+#[cfg(target_os = "linux")]
 pub use virtual_fs::VirtualOverlay;
 
 use anyhow::Result;
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use tracing::info;
 
 /// Options controlling how the mount is configured on each platform.
@@ -112,6 +120,7 @@ impl Default for MountOptions {
 /// # Ok(())
 /// # }
 /// ```
+#[cfg(target_os = "linux")]
 pub async fn mount_hybridcipher<S, N>(
     mountpoint: &Path,
     encrypted_root: &Path,
@@ -125,10 +134,6 @@ where
 {
     info!("Mounting HybridCipher at {}", mountpoint.display());
 
-    // For mirror mount (macOS), pass the mount point so we can sync deletions
-    #[cfg(target_os = "macos")]
-    let mount_point_opt = Some(mountpoint.to_path_buf());
-    #[cfg(not(target_os = "macos"))]
     let mount_point_opt = None;
 
     // Create the filesystem instance
@@ -142,26 +147,29 @@ where
     )
     .await?;
 
-    // Detect platform and mount accordingly
-    #[cfg(target_os = "macos")]
-    {
-        platform::macos::mount_macos(fs, mountpoint, &options).await
-    }
-    #[cfg(target_os = "linux")]
-    {
-        platform::linux::mount_linux(fs, mountpoint, &options).await
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (fs, mountpoint, options);
-        anyhow::bail!(
-            "Windows live filesystem mounts are not supported; use Cloud Files or sync mount"
-        )
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        anyhow::bail!("Unsupported platform for FUSE mounting")
-    }
+    platform::linux::mount_linux(fs, mountpoint, &options).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn mount_hybridcipher<S, N>(
+    mountpoint: &Path,
+    encrypted_root: &Path,
+    client: hybridcipher_client::Client<S, N>,
+    migration_tracker: Option<MigrationTracker<S, N>>,
+    options: MountOptions,
+) -> Result<()>
+where
+    S: hybridcipher_client::storage::Storage + Send + Sync + 'static,
+    N: hybridcipher_client::network::Network + Send + Sync + 'static,
+{
+    let _ = (
+        mountpoint,
+        encrypted_root,
+        client,
+        migration_tracker,
+        options,
+    );
+    anyhow::bail!("FUSE mounts are only available on Linux in this build")
 }
 
 /// Unmount a HybridCipher filesystem gracefully
@@ -175,28 +183,17 @@ where
 /// # Returns
 ///
 /// Returns `Ok(())` on successful unmount, `Err` on failure
+#[cfg(target_os = "linux")]
 pub async fn unmount_hybridcipher(mountpoint: &Path, force: bool) -> Result<()> {
     info!("Unmounting HybridCipher from {}", mountpoint.display());
 
-    #[cfg(target_os = "macos")]
-    {
-        platform::macos::unmount_macos(mountpoint, force).await
-    }
-    #[cfg(target_os = "linux")]
-    {
-        platform::linux::unmount_linux(mountpoint, force).await
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (mountpoint, force);
-        anyhow::bail!(
-            "Windows live filesystem mounts are not supported; use Cloud Files or sync mount"
-        )
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        anyhow::bail!("Unsupported platform for FUSE unmounting")
-    }
+    platform::linux::unmount_linux(mountpoint, force).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn unmount_hybridcipher(mountpoint: &Path, force: bool) -> Result<()> {
+    let _ = (mountpoint, force);
+    anyhow::bail!("FUSE mounts are only available on Linux in this build")
 }
 
 /// Check if a path is a valid HybridCipher mount point
@@ -209,21 +206,13 @@ pub async fn unmount_hybridcipher(mountpoint: &Path, force: bool) -> Result<()> 
 ///
 /// Returns `true` if the path is a valid HybridCipher mount, `false` otherwise
 pub fn is_hybridcipher_mounted(mountpoint: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        platform::macos::is_mounted_sync(mountpoint)
-    }
     #[cfg(target_os = "linux")]
     {
         platform::linux::is_mounted(mountpoint)
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = mountpoint;
-        false
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
         false
     }
 }

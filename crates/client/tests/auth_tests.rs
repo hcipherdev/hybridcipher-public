@@ -84,7 +84,7 @@ async fn test_registration_and_login_flow() {
     let invitation_key = [0x42u8; 32];
 
     let registration_result = registration
-        .register("test-user", "secure-password-123", invitation_key)
+        .register("test-user", "secure-password-123", invitation_key) // lgtm[rust/hard-coded-cryptographic-value] non-secret test credential
         .await
         .unwrap();
 
@@ -106,7 +106,7 @@ async fn test_registration_and_login_flow() {
     );
     let login_result = login
         .login(
-            "secure-password-123",
+            "secure-password-123", // lgtm[rust/hard-coded-cryptographic-value] non-secret test credential
             &registration_result.registration_record,
         )
         .await

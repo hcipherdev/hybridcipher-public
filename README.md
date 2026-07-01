@@ -153,8 +153,8 @@ Published verification values for the current source snapshot:
 <!-- BEGIN GENERATED VERIFY HASHES -->
 | Source ref | Target | Artifact | SHA-256 |
 | --- | --- | --- | --- |
-| `e309f198feda2a565035104b65c3a4f4b59f6a7c` | `aarch64-apple-darwin` | `HybridCipher_aarch64.unsigned.app.tar.gz` | `da1c04743feb34d1c3b51e1c8642f57eceddad75ca92817646ca25f4ee70f453` |
-| `e309f198feda2a565035104b65c3a4f4b59f6a7c` | `x86_64-apple-darwin` | `HybridCipher_x86_64.unsigned.app.tar.gz` | `524bfe4c7fef9fb5065ca2ac524a8f2c31bf894e6e8d71f6139d9a3e0210f072` |
+| `d5cb2de85b2a9f99b312ce263adfe06c7d0d40b4` | `aarch64-apple-darwin` | `HybridCipher_aarch64.unsigned.app.tar.gz` | `19eef7ebe808beb4b90fac862097028704a9b7f3709012aff468d9081dc719ac` |
+| `d5cb2de85b2a9f99b312ce263adfe06c7d0d40b4` | `x86_64-apple-darwin` | `HybridCipher_x86_64.unsigned.app.tar.gz` | `5220ee12f23ff9a04d1350bd6d68d348748f6dbfb85c27ef1ad51b15028a6fad` |
 <!-- END GENERATED VERIFY HASHES -->
 
 That script:

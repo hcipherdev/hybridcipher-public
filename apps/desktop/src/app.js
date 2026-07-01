@@ -2586,21 +2586,22 @@ class HybridCipherApp {
     loadRememberedCredentials() {
         try {
             const raw = localStorage.getItem('hybridcipher_remembered_login');
-            if (!raw) return { email: '', password: '' };
+            if (!raw) return { email: '' };
             const parsed = JSON.parse(raw);
-            return {
-                email: typeof parsed?.email === 'string' ? parsed.email : '',
-                password: typeof parsed?.password === 'string' ? parsed.password : ''
-            };
+            const email = typeof parsed?.email === 'string' ? parsed.email : '';
+            if (typeof parsed?.password === 'string' && parsed.password.length > 0) {
+                localStorage.setItem('hybridcipher_remembered_login', JSON.stringify({ email }));
+            }
+            return { email };
         } catch (error) {
             console.warn('Failed to read remembered credentials:', error);
-            return { email: '', password: '' };
+            return { email: '' };
         }
     }
 
-    saveRememberedCredentials(email, password) {
+    saveRememberedCredentials(email) {
         try {
-            localStorage.setItem('hybridcipher_remembered_login', JSON.stringify({ email, password }));
+            localStorage.setItem('hybridcipher_remembered_login', JSON.stringify({ email }));
         } catch (error) {
             console.warn('Failed to save remembered credentials:', error);
         }
@@ -4178,7 +4179,7 @@ class HybridCipherApp {
 
             if (result?.success) {
                 if (this.rememberMePreference) {
-                    this.saveRememberedCredentials(email, password);
+                    this.saveRememberedCredentials(email);
                 } else {
                     this.clearRememberedCredentials();
                 }
@@ -11235,10 +11236,10 @@ class HybridCipherApp {
 
         const emailInput = document.getElementById('loginEmail');
         if (!prefillEmail && this.rememberMePreference && emailInput && passwordInput) {
-            const { email, password } = this.loadRememberedCredentials();
+            const { email } = this.loadRememberedCredentials();
             emailInput.value = email;
-            passwordInput.value = password;
-            if (password) {
+            passwordInput.value = '';
+            if (email) {
                 passwordInput.focus();
                 return;
             }
