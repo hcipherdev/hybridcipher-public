@@ -19,12 +19,16 @@ name = "hybridcipher-cloud-provider"
 path = "src/bin/hybridcipher-cloud-provider.rs"
 
 [dependencies]
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
 hybridcipher-provider-core = { path = "../provider-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "1.0"
-tokio = { version = "1.0", features = ["io-util", "net", "rt"] }
+notify = "6.1"
+tokio = { version = "1.0", features = ["io-util", "net", "rt", "sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 
@@ -37,3 +41,6 @@ windows = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
 ] }
+
+[dev-dependencies]
+tempfile = "3.0"

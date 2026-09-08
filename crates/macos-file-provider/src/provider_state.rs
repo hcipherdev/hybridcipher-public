@@ -155,9 +155,11 @@ impl ProviderChangeJournal {
             let keep_from = self.records.len() - retention;
             self.records.drain(..keep_from);
         }
-        self.earliest_anchor = self.records.first().map(|record| record.anchor).unwrap_or_else(|| {
-            self.latest_anchor.saturating_add(1).max(1)
-        });
+        self.earliest_anchor = self
+            .records
+            .first()
+            .map(|record| record.anchor)
+            .unwrap_or_else(|| self.latest_anchor.saturating_add(1).max(1));
     }
 
     pub fn anchor_is_expired(&self, anchor: u64) -> bool {
@@ -269,8 +271,7 @@ impl ProviderPersistentState {
 
         for entry in directory_entries {
             let snapshot = self.snapshot_for_entry(root_id, entry);
-            self.items
-                .insert(snapshot.provider_id.clone(), snapshot);
+            self.items.insert(snapshot.provider_id.clone(), snapshot);
         }
 
         let mut file_entries = entries
@@ -282,8 +283,7 @@ impl ProviderPersistentState {
 
         for entry in file_entries {
             let snapshot = self.snapshot_for_entry(root_id, entry);
-            self.items
-                .insert(snapshot.provider_id.clone(), snapshot);
+            self.items.insert(snapshot.provider_id.clone(), snapshot);
         }
     }
 
@@ -326,11 +326,7 @@ impl ProviderPersistentState {
             .or(Some(snapshot))
     }
 
-    pub fn snapshot_for_entry(
-        &self,
-        root_id: Uuid,
-        entry: ProviderEntry,
-    ) -> ProviderItemSnapshot {
+    pub fn snapshot_for_entry(&self, root_id: Uuid, entry: ProviderEntry) -> ProviderItemSnapshot {
         let parent_relative_path = parent_relative_path(&entry.relative_path);
         let parent_provider_id = if parent_relative_path.is_empty() {
             None
@@ -348,9 +344,10 @@ impl ProviderPersistentState {
                     .get(&entry.relative_path)
                     .cloned()
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
-                let provider_id =
-                    ProviderItemIdentifier::Directory { directory_id: directory_id.clone() }
-                        .to_string();
+                let provider_id = ProviderItemIdentifier::Directory {
+                    directory_id: directory_id.clone(),
+                }
+                .to_string();
                 let metadata_version = hash_metadata_version(
                     &provider_id,
                     parent_provider_id.as_deref(),
@@ -377,8 +374,10 @@ impl ProviderPersistentState {
                     .file_id
                     .clone()
                     .unwrap_or_else(|| pending_file_identity_component(&entry.identity));
-                let provider_id =
-                    ProviderItemIdentifier::File { file_id: stable_file_id.clone() }.to_string();
+                let provider_id = ProviderItemIdentifier::File {
+                    file_id: stable_file_id.clone(),
+                }
+                .to_string();
                 let metadata_version = hash_metadata_version(
                     &provider_id,
                     parent_provider_id.as_deref(),

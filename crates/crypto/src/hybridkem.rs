@@ -34,6 +34,7 @@ pub const SHARED_SECRET_LEN: usize = 32;
 /// Domain separation strings for `HKDF`
 const DOMAIN_WELCOME: &[u8] = b"hybridkem-welcome";
 const DOMAIN_GROUPUPDATE: &[u8] = b"hybridkem-groupupdate";
+const DOMAIN_RECOVERY_WRITER_HANDOFF: &[u8] = b"hybridkem-recovery-writer-handoff-v1";
 
 /// `HybridKEM` public key combining `X25519` and `ML-KEM-768`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +78,8 @@ pub enum Context {
     Welcome,
     /// `GroupUpdate` message encryption context
     GroupUpdate,
+    /// Recovery writer handoff encryption context
+    RecoveryWriterHandoff,
 }
 
 impl Context {
@@ -86,6 +89,7 @@ impl Context {
         match self {
             Self::Welcome => DOMAIN_WELCOME,
             Self::GroupUpdate => DOMAIN_GROUPUPDATE,
+            Self::RecoveryWriterHandoff => DOMAIN_RECOVERY_WRITER_HANDOFF,
         }
     }
 }

@@ -12,5 +12,6 @@ pub mod error;
 pub mod file_metadata;
 pub mod group_update;
 pub mod join_card;
+pub mod recovery_handoff;
 pub mod transparency;
 pub mod welcome;

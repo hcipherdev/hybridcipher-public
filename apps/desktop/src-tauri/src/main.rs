@@ -15,6 +15,23 @@ use std::sync::{
 use tauri::{async_runtime::Mutex, Emitter, Manager};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+fn show_main_window<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
+    let Some(window) = app_handle.get_webview_window("main") else {
+        tracing::warn!("Main window not found");
+        return;
+    };
+
+    if let Err(error) = window.unminimize() {
+        tracing::error!("Failed to restore main window: {}", error);
+    }
+    if let Err(error) = window.show() {
+        tracing::error!("Failed to show main window: {}", error);
+    }
+    if let Err(error) = window.set_focus() {
+        tracing::error!("Failed to focus main window: {}", error);
+    }
+}
+
 #[tauri::command]
 async fn submit_feedback(
     title: String,
@@ -139,6 +156,49 @@ fn main() {
                     app.set_menu(menu)?;
                 }
 
+                #[cfg(target_os = "windows")]
+                {
+                    use tauri::{
+                        menu::{MenuBuilder, MenuItemBuilder},
+                        tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+                    };
+
+                    let open_item = MenuItemBuilder::new("Open HybridCipher")
+                        .id("tray_open")
+                        .build(app)?;
+                    let quit_item = MenuItemBuilder::new("Quit HybridCipher")
+                        .id("tray_quit")
+                        .build(app)?;
+                    let tray_menu = MenuBuilder::new(app)
+                        .item(&open_item)
+                        .separator()
+                        .item(&quit_item)
+                        .build()?;
+
+                    let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                        .tooltip("HybridCipher")
+                        .menu(&tray_menu)
+                        .show_menu_on_left_click(false)
+                        .on_tray_icon_event(|tray, event| {
+                            if matches!(
+                                event,
+                                TrayIconEvent::Click {
+                                    button: MouseButton::Left,
+                                    button_state: MouseButtonState::Up,
+                                    ..
+                                }
+                            ) {
+                                show_main_window(tray.app_handle());
+                            }
+                        });
+
+                    if let Some(icon) = app.default_window_icon().cloned() {
+                        tray_builder = tray_builder.icon(icon);
+                    }
+
+                    tray_builder.build(app)?;
+                }
+
                 tracing::info!("Application setup complete");
                 Ok(())
             }
@@ -163,7 +223,7 @@ fn main() {
             let shutting_down = shutting_down.clone();
             move |app_handle, event| {
                 // Handle menu events, particularly Quit
-                if event.id() == "quit" {
+                if event.id() == "quit" || event.id() == "tray_quit" {
                     if shutting_down.swap(true, Ordering::SeqCst) {
                         return;
                     }
@@ -176,6 +236,8 @@ fn main() {
                     } else {
                         app_handle.exit(0);
                     }
+                } else if event.id() == "tray_open" {
+                    show_main_window(app_handle);
                 } else if event.id() == "preferences" {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.emit("open_settings_requested", "settingsAccountSection");
@@ -238,6 +300,9 @@ fn main() {
             remove_group_member,
             get_group_member_details,
             get_security_status,
+            enable_recovery_auto_backup,
+            offer_recovery_writer_handoff,
+            accept_recovery_writer_handoffs,
             get_personal_devices_overview,
             revoke_device,
             mfa_enroll_start,
@@ -311,16 +376,7 @@ fn main() {
                     #[cfg(target_os = "macos")]
                     tauri::RunEvent::Reopen { .. } => {
                         tracing::info!("App reactivated from dock, showing window");
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            if let Err(e) = window.show() {
-                                tracing::error!("Failed to show window on reopen: {}", e);
-                            }
-                            if let Err(e) = window.set_focus() {
-                                tracing::error!("Failed to focus window on reopen: {}", e);
-                            }
-                        } else {
-                            tracing::warn!("Main window not found on reopen");
-                        }
+                        show_main_window(app_handle);
                     }
                     tauri::RunEvent::Exit => {
                         // Best-effort cleanup of mount state files (not data) on exit

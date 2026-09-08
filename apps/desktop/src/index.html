@@ -1235,6 +1235,40 @@
         </div>
     </div>
 
+    <!-- Enable Recovery Auto Backup Modal -->
+    <div class="modal hidden" id="recoveryAutoBackupModal">
+        <div class="modal-backdrop" id="recoveryAutoBackupBackdrop"></div>
+        <div class="modal-content recovery-auto-backup-modal">
+            <div class="modal-header">
+                <h2>Enable automatic backup</h2>
+                <button class="modal-close" id="closeRecoveryAutoBackupModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="recovery-auto-backup-lead">
+                    Enter your account password and saved recovery code once to enable silent recovery backup updates on this device.
+                </p>
+                <form id="recoveryAutoBackupForm">
+                    <div class="form-group">
+                        <label for="recoveryAutoBackupPasswordInput">Account password</label>
+                        <input type="password" id="recoveryAutoBackupPasswordInput"
+                            placeholder="Enter account password" autocomplete="current-password">
+                    </div>
+                    <div class="form-group">
+                        <label for="recoveryAutoBackupCodeInput">Recovery code</label>
+                        <input type="password" id="recoveryAutoBackupCodeInput"
+                            placeholder="XXXXXXXX-XXXXXXXX-..." autocomplete="off">
+                        <span class="form-hint">This code is only used locally to unlock your existing recovery backup.</span>
+                        <span class="form-error hidden" id="recoveryAutoBackupError"></span>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="cancelRecoveryAutoBackupBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitRecoveryAutoBackupBtn">Enable</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <!-- Recovery Code Modal -->
     <div class="modal hidden" id="recoveryCodeModal">
         <div class="modal-backdrop"></div>
@@ -1443,6 +1477,33 @@
                 <div class="form-actions">
                     <button type="button" class="btn btn-secondary" id="cancelListMembersBtn">Close</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Device Verification Modal -->
+    <div class="modal hidden" id="deviceVerifyModal">
+        <div class="modal-backdrop" id="deviceVerifyBackdrop"></div>
+        <div class="modal-content device-verify-modal">
+            <div class="modal-header">
+                <h2>Verify device</h2>
+                <button class="modal-close" id="closeDeviceVerifyModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="device-verify-summary" id="deviceVerifySummary"></div>
+                <form id="deviceVerifyForm">
+                    <div class="form-group">
+                        <label for="deviceVerifyFingerprintInput">Device fingerprint</label>
+                        <input type="text" id="deviceVerifyFingerprintInput"
+                            placeholder="xxxx xxxx xxxx xxxx" autocomplete="off">
+                        <span class="form-hint">Compare this fingerprint with the requesting device before verifying.</span>
+                        <span class="form-error hidden" id="deviceVerifyError"></span>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="cancelDeviceVerifyBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitDeviceVerifyBtn">Verify</button>
+                    </div>
+                </form>
             </div>
         </div>
     </div>

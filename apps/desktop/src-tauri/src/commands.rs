@@ -22,6 +22,7 @@ use crate::{
 };
 use base64::engine::general_purpose;
 use base64::Engine;
+use chrono::Duration as ChronoDuration;
 use dunce;
 use hex;
 use hkdf::Hkdf;
@@ -30,6 +31,11 @@ use hybridcipher_client::{
     state::client::{CoverageFileRecord, CoverageRootStats, CoverageScanSummary},
 };
 use hybridcipher_crypto::account_protection::{decrypt_with_ad, encrypt_with_ad, ProtectedData};
+use hybridcipher_crypto::signatures::SigningKey;
+use hybridcipher_messages::recovery_handoff::{
+    RecoveryWriterHandoffEnvelope, RecoveryWriterHandoffPlain, RECOVERY_WRITER_HANDOFF_PURPOSE,
+    RECOVERY_WRITER_HANDOFF_VERSION,
+};
 use hybridcipher_mount_sync::{
     load_mount_conflict_registry, load_mount_recovery_registry, read_conflict_preview_text,
     sync_mount_conflict_action_requests_dir, sync_mount_conflict_action_results_dir,
@@ -550,24 +556,27 @@ async fn bootstrap_default_group_on_login(
     let token = session.token.clone();
 
     let groups = fetch_group_list(&server_url, &token).await?;
-    let target = groups
-        .groups
-        .iter()
-        .find(|group| group_needs_genesis(group));
-    let Some(group) = target else {
-        return Ok(None);
-    };
-
-    let group_id = group.id;
     let client = state
         .local_client
         .client()
         .await
         .map_err(|e| format!("Local client unavailable: {}", e))?;
+    let target_group_id = groups
+        .groups
+        .iter()
+        .find(|group| group_needs_genesis(group))
+        .map(|group| group.id);
 
-    if let Err(err) = client.use_group(group_id).await {
-        tracing::warn!("Failed to set active group {}: {}", group_id, err);
-    }
+    ensure_client_active_group_from_groups(client.as_ref(), &groups).await?;
+
+    let Some(group_id) = target_group_id else {
+        return Ok(None);
+    };
+
+    client
+        .use_group(group_id)
+        .await
+        .map_err(|err| map_active_group_selection_error(err))?;
 
     client
         .initialize_group_epoch(group_id, 1)
@@ -641,8 +650,79 @@ fn group_needs_genesis(group: &crate::http_client::GroupInfo) -> bool {
         .as_ref()
         .map(|value| value.trim().is_empty())
         .unwrap_or(true);
-    let is_admin = matches!(group.user_role, GroupRole::Admin);
+    let is_admin = matches!(&group.user_role, GroupRole::Admin);
     no_epoch && is_admin
+}
+
+const NO_WORKSPACE_AVAILABLE_MESSAGE: &str =
+    "No workspace is available for this account yet. Create or join a group, then try again.";
+
+fn select_primary_group_id(groups: &GroupListResponse) -> Option<Uuid> {
+    groups.groups.first().map(|group| group.id)
+}
+
+fn is_active_group_context_error(message: &str) -> bool {
+    message.contains("switch-group")
+        || message.contains("without an active group")
+        || message.contains("No active group selected")
+}
+
+fn desktop_safe_client_error(error: impl ToString) -> String {
+    let message = error.to_string();
+    if is_active_group_context_error(&message) {
+        NO_WORKSPACE_AVAILABLE_MESSAGE.to_string()
+    } else {
+        message
+    }
+}
+
+fn map_active_group_selection_error(error: impl ToString) -> String {
+    let message = desktop_safe_client_error(error);
+    if message == NO_WORKSPACE_AVAILABLE_MESSAGE {
+        message
+    } else {
+        format!("Failed to select your workspace: {}", message)
+    }
+}
+
+async fn ensure_client_active_group_from_groups(
+    client: &LocalClient,
+    groups: &GroupListResponse,
+) -> Result<Uuid, String> {
+    if let Some(group_id) = client.active_group_id_opt().await {
+        return Ok(group_id);
+    }
+
+    let group_id = select_primary_group_id(groups)
+        .ok_or_else(|| NO_WORKSPACE_AVAILABLE_MESSAGE.to_string())?;
+
+    client
+        .use_group(group_id)
+        .await
+        .map_err(map_active_group_selection_error)?;
+
+    Ok(group_id)
+}
+
+async fn ensure_local_active_group(state: &AppState) -> Result<Uuid, String> {
+    let client = state.local_client.client().await?;
+    if let Some(group_id) = client.active_group_id_opt().await {
+        return Ok(group_id);
+    }
+
+    let session = state
+        .session
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "No active session found".to_string())?;
+    let server_url = session
+        .server_url
+        .clone()
+        .unwrap_or_else(|| state.client.server_url().to_string());
+    let groups = fetch_group_list(&server_url, &session.token).await?;
+
+    ensure_client_active_group_from_groups(client.as_ref(), &groups).await
 }
 
 fn recovery_artifact_path(
@@ -654,6 +734,17 @@ fn recovery_artifact_path(
     Ok(user_dir.join("recovery_backup.b64"))
 }
 
+fn classify_recovery_backup_presence(
+    local_artifact_exists: bool,
+    remote_result: Result<bool, String>,
+) -> Result<bool, String> {
+    match remote_result {
+        Ok(remote_exists) => Ok(remote_exists),
+        Err(_error) if local_artifact_exists => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 async fn recovery_backup_exists(
     server_url: &str,
     token: &str,
@@ -661,9 +752,7 @@ async fn recovery_backup_exists(
     state: &AppState,
 ) -> Result<bool, String> {
     let path = recovery_artifact_path(state, email, server_url)?;
-    if path.exists() {
-        return Ok(true);
-    }
+    let local_artifact_exists = path.exists();
 
     let endpoint = api_endpoint(server_url, "recovery-artifact");
     let client = reqwest::Client::new();
@@ -674,7 +763,7 @@ async fn recovery_backup_exists(
         .await
         .map_err(|e| format!("Failed to check recovery backup status: {}", e))?;
 
-    match response.status() {
+    let remote_result = match response.status() {
         reqwest::StatusCode::OK => Ok(true),
         reqwest::StatusCode::NOT_FOUND => Ok(false),
         reqwest::StatusCode::UNAUTHORIZED => {
@@ -687,7 +776,133 @@ async fn recovery_backup_exists(
                 status, body
             ))
         }
+    };
+
+    classify_recovery_backup_presence(local_artifact_exists, remote_result)
+}
+
+fn parse_recovery_code_input(input: &str) -> Result<Vec<u8>, String> {
+    let normalized: String = input
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '-')
+        .collect();
+
+    if normalized.len() != RECOVERY_CODE_BYTES * 2 {
+        return Err(format!(
+            "Recovery code must contain exactly {} hexadecimal characters, ignoring dashes.",
+            RECOVERY_CODE_BYTES * 2
+        ));
     }
+
+    let bytes = hex::decode(&normalized)
+        .map_err(|err| format!("Recovery code is not valid hexadecimal: {}", err))?;
+    if bytes.len() != RECOVERY_CODE_BYTES {
+        return Err("Recovery code has an unexpected length.".to_string());
+    }
+    Ok(bytes)
+}
+
+async fn load_or_download_recovery_artifact(
+    server_url: &str,
+    token: &str,
+    email: &str,
+    state: &AppState,
+) -> Result<BackupArtifact, String> {
+    let path = recovery_artifact_path(state, email, server_url)?;
+    if path.exists() {
+        return BackupArtifact::load_from_path(&path);
+    }
+
+    let downloaded = download_recovery_artifact_with_version(server_url, token)
+        .await?
+        .ok_or_else(|| "No recovery backup artifact is available for this account.".to_string())?;
+    downloaded.artifact.save_to_path(&path)?;
+    Ok(downloaded.artifact)
+}
+
+#[derive(Debug, Clone)]
+struct DownloadedRecoveryArtifact {
+    artifact: BackupArtifact,
+    artifact_blob: String,
+    server_version: u32,
+}
+
+#[derive(Deserialize)]
+struct RecoveryArtifactDownloadResponse {
+    artifact_blob: String,
+    version: u32,
+}
+
+async fn download_recovery_artifact_with_version(
+    server_url: &str,
+    token: &str,
+) -> Result<Option<DownloadedRecoveryArtifact>, String> {
+    let endpoint = api_endpoint(server_url, "recovery-artifact");
+    let response = reqwest::Client::new()
+        .get(endpoint)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch recovery backup: {}", e))?;
+
+    match response.status() {
+        reqwest::StatusCode::OK => {}
+        reqwest::StatusCode::NOT_FOUND => return Ok(None),
+        reqwest::StatusCode::UNAUTHORIZED => {
+            return Err("Authentication token rejected while fetching recovery backup.".to_string())
+        }
+        status => {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Recovery backup fetch failed with status {}: {}",
+                status, body
+            ));
+        }
+    }
+
+    let envelope: RecoveryArtifactDownloadResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse recovery backup response: {}", e))?;
+    let artifact = BackupArtifact::from_base64(&envelope.artifact_blob)?;
+    Ok(Some(DownloadedRecoveryArtifact {
+        artifact,
+        artifact_blob: envelope.artifact_blob,
+        server_version: envelope.version,
+    }))
+}
+
+fn recovery_artifact_blob_sha256_hex(encoded_artifact: &str) -> Result<String, String> {
+    let decoded = general_purpose::STANDARD
+        .decode(encoded_artifact.trim())
+        .map_err(|err| format!("Recovery artifact is not valid base64: {}", err))?;
+    Ok(hex::encode(Sha256::digest(&decoded)))
+}
+
+fn merge_recovery_artifacts(server: BackupArtifact, local: BackupArtifact) -> BackupArtifact {
+    let mut merged = if server.version >= local.version {
+        server.clone()
+    } else {
+        local.clone()
+    };
+
+    let mut seen = HashSet::new();
+    for entry in &merged.entries {
+        if let Ok(serialized) = serde_json::to_vec(entry) {
+            seen.insert(serialized);
+        }
+    }
+    for entry in local.entries.into_iter().chain(server.entries.into_iter()) {
+        if let Ok(serialized) = serde_json::to_vec(&entry) {
+            if seen.insert(serialized) {
+                merged.entries.push(entry);
+            }
+        } else {
+            merged.entries.push(entry);
+        }
+    }
+    merged.version = crate::recovery_artifact::BACKUP_VERSION;
+    merged
 }
 
 fn recovery_auto_backup_state(
@@ -706,17 +921,29 @@ fn recovery_auto_backup_state(
         .local_client
         .user_dir_for_session(&session.email, &server_url);
     let writer_blob_path = user_dir.join(WRITER_BLOB_FILE);
-    if !writer_blob_path.exists() {
-        return "missing_writer_blob";
-    }
+    let writer_blob_exists = writer_blob_path.exists();
 
     let storage_id = state
         .local_client
         .user_storage_id_for_session(&session.email, &server_url);
-    match key_bundle::load_writer_key(&storage_id, &session.device_id) {
-        Ok(Some(_)) => "ready",
+    classify_recovery_auto_backup_state(
+        writer_blob_exists,
+        key_bundle::load_writer_key(&storage_id, &session.device_id).map(|key| key.is_some()),
+    )
+}
+
+fn classify_recovery_auto_backup_state(
+    writer_blob_exists: bool,
+    writer_key_state: Result<bool, String>,
+) -> &'static str {
+    if !writer_blob_exists {
+        return "missing_writer_blob";
+    }
+
+    match writer_key_state {
+        Ok(true) => "ready",
+        Ok(false) => "missing_writer_key",
         Err(_) => "secure_storage_unavailable",
-        Ok(None) => "missing_writer_key",
     }
 }
 
@@ -742,7 +969,26 @@ fn persist_recovery_writer_material(
     epoch_key: &[u8; 32],
 ) -> Result<(), String> {
     let writer_key = derive_writer_key(k_file, &session.device_id)?;
-    let blob = encrypt_with_ad(epoch_key, writer_key, WRITER_AAD)
+    persist_recovery_writer_blob_with_key(state, session, &writer_key, epoch_key)
+}
+
+fn persist_recovery_writer_epoch_key(
+    state: &AppState,
+    session: &crate::state::UserSession,
+    epoch_key: &[u8; 32],
+) -> Result<(), String> {
+    let mut writer_key = [0u8; 32];
+    OsRng.fill_bytes(&mut writer_key);
+    persist_recovery_writer_blob_with_key(state, session, &writer_key, epoch_key)
+}
+
+fn persist_recovery_writer_blob_with_key(
+    state: &AppState,
+    session: &crate::state::UserSession,
+    writer_key: &[u8; 32],
+    epoch_key: &[u8; 32],
+) -> Result<(), String> {
+    let blob = encrypt_with_ad(epoch_key, *writer_key, WRITER_AAD)
         .map_err(|e| format!("Failed to seal writer blob: {}", e))?;
 
     let server_url = session
@@ -752,7 +998,7 @@ fn persist_recovery_writer_material(
     let storage_id = state
         .local_client
         .user_storage_id_for_session(&session.email, &server_url);
-    if let Err(err) = key_bundle::store_writer_key(&storage_id, &session.device_id, &writer_key) {
+    if let Err(err) = key_bundle::store_writer_key(&storage_id, &session.device_id, writer_key) {
         tracing::warn!(
             "Could not store writer key in secure storage; silent recovery backup may be unavailable: {}",
             err
@@ -898,10 +1144,21 @@ async fn bootstrap_recovery_backup(
     let epoch_key = artifact.derive_epoch_key_from_file_key(k_file.as_ref(), &hkdf_salt)?;
     let mut k_file_bytes = [0u8; 32];
     k_file_bytes.copy_from_slice(k_file.as_ref());
-    persist_recovery_writer_material(state, &session, &k_file_bytes, &epoch_key)?;
-    artifact.save_to_path(&path)?;
 
-    upload_recovery_artifact(server_url, token, &artifact).await?;
+    upload_recovery_artifact(server_url, token, state, &session, &artifact).await?;
+
+    if let Err(err) = persist_recovery_writer_material(state, &session, &k_file_bytes, &epoch_key) {
+        tracing::warn!(
+            "Recovery backup uploaded, but local writer material could not be persisted: {}",
+            err
+        );
+    }
+    if let Err(err) = artifact.save_to_path(&path) {
+        tracing::warn!(
+            "Recovery backup uploaded, but local artifact could not be persisted: {}",
+            err
+        );
+    }
 
     Ok(formatted_code)
 }
@@ -965,7 +1222,7 @@ async fn auto_provision_recovery_on_login(
             .append_entries_with_epoch_key(&entries, &writer.epoch_key)
             .map_err(|e| format!("Failed to append recovery entries: {}", e))?;
         existing.save_to_path(&artifact_path)?;
-        upload_recovery_artifact(&server_url, &token, &existing).await?;
+        upload_recovery_artifact(&server_url, &token, state, &session, &existing).await?;
         return Ok(None);
     }
 
@@ -991,6 +1248,8 @@ async fn auto_provision_recovery_on_login(
 async fn upload_recovery_artifact(
     server_url: &str,
     token: &str,
+    state: &AppState,
+    session: &crate::state::UserSession,
     artifact: &BackupArtifact,
 ) -> Result<(), String> {
     #[derive(Serialize)]
@@ -1000,31 +1259,73 @@ async fn upload_recovery_artifact(
         expected_version: Option<u32>,
     }
 
+    let client = reqwest::Client::new();
     let endpoint = api_endpoint(server_url, "recovery-artifact");
+    let server_artifact = download_recovery_artifact_with_version(server_url, token).await?;
+    let expected_version = server_artifact
+        .as_ref()
+        .map(|downloaded| downloaded.server_version);
+    let merged = match server_artifact {
+        Some(downloaded) => merge_recovery_artifacts(downloaded.artifact, artifact.clone()),
+        None => artifact.clone(),
+    };
     let payload = UploadRecoveryArtifactRequest {
-        artifact_blob: artifact.to_base64()?,
-        expected_version: None,
+        artifact_blob: merged.to_base64()?,
+        expected_version,
     };
 
-    let client = reqwest::Client::new();
     let response = client
-        .put(endpoint)
+        .put(&endpoint)
         .bearer_auth(token)
         .json(&payload)
         .send()
         .await
         .map_err(|e| format!("Failed to upload recovery backup: {}", e))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+    if response.status().is_success() {
+        let path = recovery_artifact_path(state, &session.email, server_url)?;
+        merged.save_to_path(&path)?;
+        return Ok(());
+    }
+
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        let fresh = download_recovery_artifact_with_version(server_url, token)
+            .await?
+            .ok_or_else(|| {
+                "Recovery backup conflict occurred, but no server artifact was available."
+                    .to_string()
+            })?;
+        let retry_merged = merge_recovery_artifacts(fresh.artifact, merged);
+        let retry_payload = UploadRecoveryArtifactRequest {
+            artifact_blob: retry_merged.to_base64()?,
+            expected_version: Some(fresh.server_version),
+        };
+        let retry = client
+            .put(&endpoint)
+            .bearer_auth(token)
+            .json(&retry_payload)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to retry recovery backup upload: {}", e))?;
+        if retry.status().is_success() {
+            let path = recovery_artifact_path(state, &session.email, server_url)?;
+            retry_merged.save_to_path(&path)?;
+            return Ok(());
+        }
+        let status = retry.status();
+        let body = retry.text().await.unwrap_or_default();
         return Err(format!(
-            "Recovery backup upload failed with status {}: {}",
+            "Recovery backup upload retry failed with status {}: {}",
             status, body
         ));
     }
 
-    Ok(())
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!(
+        "Recovery backup upload failed with status {}: {}",
+        status, body
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1171,14 +1472,14 @@ async fn ensure_session_ready_impl(
                     last_err
                 );
             } else {
-                state.clear_session().await;
+                state.clear_session().await?;
                 return Err(last_err);
             }
         }
     }
 
     if chrono::Utc::now().timestamp() >= session.expires_at {
-        state.clear_session().await;
+        state.clear_session().await?;
         return Ok(None);
     }
 
@@ -1222,7 +1523,7 @@ pub async fn get_session_info(
 pub async fn logout_user(state: State<'_, AppState>) -> Result<CommandResponse<bool>, String> {
     tracing::info!("Logout command called");
 
-    if let Err(err) = state.cloud_provider.stop_all(true, false).await {
+    if let Err(err) = stop_all_desktop_cloud_roots(&state, false).await {
         return Ok(CommandResponse::err(format!(
             "Failed to dehydrate Cloud Files mounts during logout: {}",
             err
@@ -1235,7 +1536,9 @@ pub async fn logout_user(state: State<'_, AppState>) -> Result<CommandResponse<b
     }
 
     // Clear session from memory, disk, and local caches
-    state.clear_session().await;
+    if let Err(err) = state.clear_session().await {
+        return Ok(CommandResponse::err(err));
+    }
 
     Ok(CommandResponse::ok(true))
 }
@@ -1424,6 +1727,7 @@ pub struct StaleDeviceSummary {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UnverifiedDeviceSummary {
+    pub user_id: String,
     pub device_id: String,
     pub email: String,
     pub device_name: Option<String>,
@@ -1744,6 +2048,7 @@ async fn fetch_unverified_device_records_internal(
             Ok(payload
                 .into_iter()
                 .map(|device| UnverifiedDeviceRecord {
+                    user_id: device.user_id.to_string(),
                     device_id: device.device_id.clone(),
                     email: email_map
                         .get(&device.user_id)
@@ -1919,6 +2224,7 @@ pub async fn get_unverified_devices(
     .await?
     .into_iter()
     .map(|device| UnverifiedDeviceSummary {
+        user_id: device.user_id,
         device_id: device.device_id,
         email: device.email,
         device_name: device.device_name,
@@ -2053,6 +2359,65 @@ pub struct SecurityStatus {
     pub recovery_backup_ok: bool,
     pub recovery_auto_backup_ok: bool,
     pub recovery_auto_backup_state: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecoveryWriterHandoffOfferResult {
+    pub status: String,
+    pub target_device_id: String,
+    pub handoff_id: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryWriterHandoffTargetResponse {
+    user_id: String,
+    device_id: String,
+    device_name: Option<String>,
+    invitation_public_key_hex: String,
+    #[serde(rename = "identity_public_key_hex")]
+    _identity_public_key_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreRecoveryWriterHandoffRequest {
+    envelope: RecoveryWriterHandoffEnvelope,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoreRecoveryWriterHandoffResponse {
+    handoff_id: String,
+    #[serde(rename = "created_at")]
+    _created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(rename = "expires_at")]
+    _expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryWriterHandoffListResponse {
+    handoffs: Vec<RecoveryWriterHandoffEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryWriterHandoffEntry {
+    handoff_id: String,
+    #[serde(rename = "source_device_id")]
+    _source_device_id: String,
+    #[serde(rename = "target_device_id")]
+    _target_device_id: String,
+    #[serde(rename = "created_at")]
+    _created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(rename = "expires_at")]
+    _expires_at: chrono::DateTime<chrono::Utc>,
+    envelope: RecoveryWriterHandoffEnvelope,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsumeRecoveryWriterHandoffResponse {
+    #[serde(rename = "handoff_id")]
+    _handoff_id: String,
+    #[serde(rename = "consumed")]
+    _consumed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2560,6 +2925,422 @@ pub async fn get_security_status(
 }
 
 #[tauri::command]
+pub async fn offer_recovery_writer_handoff(
+    target_device_id: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<RecoveryWriterHandoffOfferResult>, String> {
+    let session = require_authenticated_session(&state).await?;
+    let target_device_id = target_device_id.trim().to_string();
+    if target_device_id.is_empty() {
+        return Ok(CommandResponse::err_with_code(
+            "TARGET_DEVICE_REQUIRED",
+            "Target device ID is required.",
+        ));
+    }
+    if session.device_id.trim().is_empty() {
+        return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+            status: "target_not_available".to_string(),
+            target_device_id,
+            handoff_id: None,
+            message: Some("Current session does not have a device ID.".to_string()),
+        }));
+    }
+
+    let writer = match load_recovery_writer_material(&state, &session) {
+        Ok(Some(writer)) => writer,
+        Ok(None) => {
+            return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+                status: "missing_writer_material".to_string(),
+                target_device_id,
+                handoff_id: None,
+                message: Some(
+                    "Automatic recovery backup is not enabled on this device.".to_string(),
+                ),
+            }))
+        }
+        Err(err) => {
+            return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+                status: "missing_writer_material".to_string(),
+                target_device_id,
+                handoff_id: None,
+                message: Some(err),
+            }))
+        }
+    };
+
+    let server_url = current_server_url(&state, &session);
+    let target_endpoint = api_endpoint(
+        &server_url,
+        &format!("recovery-writer-handoffs/targets/{}", target_device_id),
+    );
+    let http = reqwest::Client::new();
+    let target_response = http
+        .get(target_endpoint)
+        .bearer_auth(&session.token)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch recovery handoff target: {}", e))?;
+    if target_response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+            status: "not_same_user".to_string(),
+            target_device_id,
+            handoff_id: None,
+            message: Some("Target device belongs to a different account.".to_string()),
+        }));
+    }
+    if target_response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+            status: "target_not_available".to_string(),
+            target_device_id,
+            handoff_id: None,
+            message: Some("Target device is not available for recovery handoff.".to_string()),
+        }));
+    }
+    if !target_response.status().is_success() {
+        let status = target_response.status();
+        let body = target_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Recovery handoff target lookup failed with status {}: {}",
+            status, body
+        ));
+    }
+    let target: RecoveryWriterHandoffTargetResponse = target_response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse recovery handoff target: {}", e))?;
+    if target.user_id != session.user_id || target.device_id != target_device_id {
+        return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+            status: "not_same_user".to_string(),
+            target_device_id,
+            handoff_id: None,
+            message: Some("Target metadata does not match this account.".to_string()),
+        }));
+    }
+
+    let downloaded =
+        match download_recovery_artifact_with_version(&server_url, &session.token).await? {
+            Some(artifact) => artifact,
+            None => {
+                return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+                    status: "missing_writer_material".to_string(),
+                    target_device_id,
+                    handoff_id: None,
+                    message: Some("No server recovery backup is available.".to_string()),
+                }))
+            }
+        };
+    let artifact_hash = recovery_artifact_blob_sha256_hex(&downloaded.artifact_blob)?;
+    let artifact_path = recovery_artifact_path(&state, &session.email, &server_url)?;
+    downloaded.artifact.save_to_path(&artifact_path)?;
+
+    let target_invitation_public =
+        hex::decode(&target.invitation_public_key_hex).map_err(|err| {
+            format!(
+                "Server returned invalid invitation key for recovery handoff target: {}",
+                err
+            )
+        })?;
+    let device_material = state.client.device_crypto_material(&session.email)?;
+    if device_material.device_id != session.device_id {
+        tracing::warn!(
+            "Local device crypto material ID '{}' differs from session device ID '{}'",
+            device_material.device_id,
+            session.device_id
+        );
+    }
+    let signing_key = SigningKey::from_bytes(&device_material.identity_secret)
+        .map_err(|err| format!("Failed to load source signing key: {}", err))?;
+    let issued_at = chrono::Utc::now();
+    let expires_at = issued_at + ChronoDuration::hours(24);
+    let plain = RecoveryWriterHandoffPlain {
+        version: RECOVERY_WRITER_HANDOFF_VERSION,
+        user_id: session.user_id.clone(),
+        source_device_id: session.device_id.clone(),
+        target_device_id: target_device_id.clone(),
+        issued_at,
+        expires_at,
+        purpose: RECOVERY_WRITER_HANDOFF_PURPOSE.to_string(),
+        recovery_artifact_version: downloaded.server_version,
+        recovery_artifact_sha256: artifact_hash,
+        epoch_key_b64: general_purpose::STANDARD.encode(writer.epoch_key),
+    };
+    let envelope =
+        RecoveryWriterHandoffEnvelope::seal(plain, &target_invitation_public, &signing_key)
+            .map_err(|err| format!("Failed to create recovery handoff: {}", err))?;
+
+    let store_endpoint = api_endpoint(
+        &server_url,
+        &format!("recovery-writer-handoffs/{}", target_device_id),
+    );
+    let response = http
+        .post(store_endpoint)
+        .bearer_auth(&session.token)
+        .json(&StoreRecoveryWriterHandoffRequest { envelope })
+        .send()
+        .await
+        .map_err(|e| format!("Failed to upload recovery handoff: {}", e))?;
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+            status: "not_same_user".to_string(),
+            target_device_id,
+            handoff_id: None,
+            message: Some("Server rejected recovery handoff for this target.".to_string()),
+        }));
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+            status: "target_not_available".to_string(),
+            target_device_id,
+            handoff_id: None,
+            message: Some("Target device disappeared before handoff upload.".to_string()),
+        }));
+    }
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Recovery handoff upload failed with status {}: {}",
+            status, body
+        ));
+    }
+    let stored: StoreRecoveryWriterHandoffResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse recovery handoff response: {}", e))?;
+
+    Ok(CommandResponse::ok(RecoveryWriterHandoffOfferResult {
+        status: "sent".to_string(),
+        target_device_id,
+        handoff_id: Some(stored.handoff_id),
+        message: target
+            .device_name
+            .map(|name| format!("Recovery auto-backup handoff sent to {}.", name)),
+    }))
+}
+
+#[tauri::command]
+pub async fn accept_recovery_writer_handoffs(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<SecurityStatus>, String> {
+    let session = require_authenticated_session(&state).await?;
+    if session.device_id.trim().is_empty() {
+        return Ok(CommandResponse::ok(
+            load_security_status_internal(&state, &session).await?,
+        ));
+    }
+
+    let server_url = current_server_url(&state, &session);
+    let endpoint = api_endpoint(&server_url, "recovery-writer-handoffs");
+    let http = reqwest::Client::new();
+    let response = http
+        .get(endpoint)
+        .bearer_auth(&session.token)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to check recovery handoffs: {}", e))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(CommandResponse::ok(
+            load_security_status_internal(&state, &session).await?,
+        ));
+    }
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Recovery handoff check failed with status {}: {}",
+            status, body
+        ));
+    }
+    let handoff_list: RecoveryWriterHandoffListResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse recovery handoffs: {}", e))?;
+    if handoff_list.handoffs.is_empty() {
+        return Ok(CommandResponse::ok(
+            load_security_status_internal(&state, &session).await?,
+        ));
+    }
+
+    let device_material = state.client.device_crypto_material(&session.email)?;
+    let now = chrono::Utc::now();
+    for handoff in handoff_list.handoffs {
+        let plain = match handoff.envelope.open_and_verify_for(
+            &device_material.invitation_secret,
+            &session.user_id,
+            &session.device_id,
+            now,
+        ) {
+            Ok(plain) => plain,
+            Err(err) => {
+                tracing::warn!(
+                    handoff_id = %handoff.handoff_id,
+                    "Skipping invalid recovery writer handoff: {}",
+                    err
+                );
+                continue;
+            }
+        };
+
+        let downloaded =
+            match download_recovery_artifact_with_version(&server_url, &session.token).await? {
+                Some(artifact) => artifact,
+                None => continue,
+            };
+        let hash = recovery_artifact_blob_sha256_hex(&downloaded.artifact_blob)?;
+        if downloaded.server_version != plain.recovery_artifact_version
+            || !hash.eq_ignore_ascii_case(&plain.recovery_artifact_sha256)
+        {
+            tracing::warn!(
+                handoff_id = %handoff.handoff_id,
+                "Skipping recovery writer handoff because recovery artifact metadata changed"
+            );
+            continue;
+        }
+
+        let epoch_key_bytes = match general_purpose::STANDARD.decode(&plain.epoch_key_b64) {
+            Ok(bytes) if bytes.len() == 32 => bytes,
+            Ok(_) => {
+                tracing::warn!(
+                    handoff_id = %handoff.handoff_id,
+                    "Skipping recovery writer handoff with invalid epoch key length"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    handoff_id = %handoff.handoff_id,
+                    "Skipping recovery writer handoff with invalid epoch key: {}",
+                    err
+                );
+                continue;
+            }
+        };
+        let mut epoch_key = [0u8; 32];
+        epoch_key.copy_from_slice(&epoch_key_bytes);
+
+        let artifact_path = recovery_artifact_path(&state, &session.email, &server_url)?;
+        downloaded.artifact.save_to_path(&artifact_path)?;
+        persist_recovery_writer_epoch_key(&state, &session, &epoch_key)?;
+
+        let consume_endpoint = api_endpoint(
+            &server_url,
+            &format!("recovery-writer-handoffs/{}/consume", handoff.handoff_id),
+        );
+        let consume_response = http
+            .post(consume_endpoint)
+            .bearer_auth(&session.token)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to consume recovery handoff: {}", e))?;
+        if consume_response.status().is_success() {
+            let _parsed: Result<ConsumeRecoveryWriterHandoffResponse, _> =
+                consume_response.json().await;
+        } else {
+            tracing::warn!(
+                handoff_id = %handoff.handoff_id,
+                "Recovery writer handoff accepted locally but consume request returned {}",
+                consume_response.status()
+            );
+        }
+        break;
+    }
+
+    Ok(CommandResponse::ok(
+        load_security_status_internal(&state, &session).await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn enable_recovery_auto_backup(
+    password: String,
+    recovery_code: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<SecurityStatus>, String> {
+    let session = require_authenticated_session(&state).await?;
+    if session.device_id.trim().is_empty() {
+        return Ok(CommandResponse::err_with_code(
+            "MISSING_DEVICE_ID",
+            "This session does not have a device ID, so automatic recovery backup cannot be enabled.",
+        ));
+    }
+    if password.trim().is_empty() {
+        return Ok(CommandResponse::err_with_code(
+            "PASSWORD_REQUIRED",
+            "Account password is required.",
+        ));
+    }
+    if recovery_code.trim().is_empty() {
+        return Ok(CommandResponse::err_with_code(
+            "RECOVERY_CODE_REQUIRED",
+            "Recovery code is required.",
+        ));
+    }
+
+    let server_url = current_server_url(&state, &session);
+    let recovery_secret = match parse_recovery_code_input(&recovery_code) {
+        Ok(secret) => secret,
+        Err(err) => return Ok(CommandResponse::err_with_code("INVALID_RECOVERY_CODE", err)),
+    };
+    let artifact = match load_or_download_recovery_artifact(
+        &server_url,
+        &session.token,
+        &session.email,
+        &state,
+    )
+    .await
+    {
+        Ok(artifact) => artifact,
+        Err(err) => {
+            return Ok(CommandResponse::err_with_code(
+                "RECOVERY_BACKUP_UNAVAILABLE",
+                err,
+            ))
+        }
+    };
+
+    let k_file = match artifact.unwrap_file_key(&password, &recovery_secret) {
+        Ok(key) => key,
+        Err(err) => {
+            return Ok(CommandResponse::err_with_code(
+                "RECOVERY_UNLOCK_FAILED",
+                err,
+            ))
+        }
+    };
+    let hkdf_salt = match general_purpose::STANDARD.decode(&artifact.hkdf_salt_b64) {
+        Ok(salt) => salt,
+        Err(err) => {
+            return Ok(CommandResponse::err_with_code(
+                "RECOVERY_BACKUP_MALFORMED",
+                format!("Invalid HKDF salt encoding: {}", err),
+            ))
+        }
+    };
+    let epoch_key = match artifact.derive_epoch_key_from_file_key(k_file.as_ref(), &hkdf_salt) {
+        Ok(key) => key,
+        Err(err) => {
+            return Ok(CommandResponse::err_with_code(
+                "RECOVERY_BACKUP_MALFORMED",
+                err,
+            ))
+        }
+    };
+    let mut k_file_bytes = [0u8; 32];
+    k_file_bytes.copy_from_slice(k_file.as_ref());
+    if let Err(err) = persist_recovery_writer_material(&state, &session, &k_file_bytes, &epoch_key)
+    {
+        return Ok(CommandResponse::err_with_code(
+            "RECOVERY_AUTO_BACKUP_ENABLE_FAILED",
+            err,
+        ));
+    }
+
+    Ok(CommandResponse::ok(
+        load_security_status_internal(&state, &session).await?,
+    ))
+}
+
+#[tauri::command]
 pub async fn mfa_enroll_start(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MfaEnrollStartResult>, String> {
@@ -2901,11 +3682,174 @@ fn extract_wrapped_exit_status(output: &mut String) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_client::{GroupInfo as HttpGroupInfo, GroupSettings};
     use chrono::{TimeZone, Utc};
     use hybridcipher_client::coverage::{
         CoverageRoot, FileCoverageState, FileIndexEntry, FileOrphanKind,
     };
     use hybridcipher_client::state::client::{CoverageFileRecord, CoverageScanSummary};
+
+    fn test_group(id: Uuid, current_epoch: Option<&str>, user_role: GroupRole) -> HttpGroupInfo {
+        HttpGroupInfo {
+            id,
+            name: format!("Group {}", &id.to_string()[..8]),
+            description: None,
+            creator_id: Uuid::parse_str("99999999-9999-9999-9999-999999999999").unwrap(),
+            created_at: Utc.with_ymd_and_hms(2026, 3, 24, 9, 0, 0).unwrap(),
+            updated_at: Utc.with_ymd_and_hms(2026, 3, 24, 9, 0, 0).unwrap(),
+            current_epoch: current_epoch.map(str::to_string),
+            member_count: 1,
+            settings: GroupSettings::default(),
+            user_role,
+            last_activity: None,
+        }
+    }
+
+    fn test_group_list(groups: Vec<HttpGroupInfo>) -> GroupListResponse {
+        GroupListResponse {
+            total_count: groups.len() as u32,
+            groups,
+            has_more: false,
+            next_cursor: None,
+        }
+    }
+
+    #[test]
+    fn select_primary_group_id_uses_first_server_group_with_epoch() {
+        let first_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let second_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let groups = test_group_list(vec![
+            test_group(first_id, Some("7"), GroupRole::Member),
+            test_group(second_id, Some("3"), GroupRole::Admin),
+        ]);
+
+        assert_eq!(select_primary_group_id(&groups), Some(first_id));
+    }
+
+    #[test]
+    fn group_needs_genesis_only_for_admin_without_epoch() {
+        let admin_empty_epoch = test_group(
+            Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            Some("  "),
+            GroupRole::Admin,
+        );
+        let member_empty_epoch = test_group(
+            Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap(),
+            None,
+            GroupRole::Member,
+        );
+        let admin_with_epoch = test_group(
+            Uuid::parse_str("55555555-5555-5555-5555-555555555555").unwrap(),
+            Some("1"),
+            GroupRole::Admin,
+        );
+
+        assert!(group_needs_genesis(&admin_empty_epoch));
+        assert!(!group_needs_genesis(&member_empty_epoch));
+        assert!(!group_needs_genesis(&admin_with_epoch));
+    }
+
+    #[test]
+    fn select_primary_group_id_returns_none_for_empty_group_list() {
+        let groups = test_group_list(Vec::new());
+
+        assert_eq!(select_primary_group_id(&groups), None);
+    }
+
+    #[test]
+    fn recovery_auto_backup_state_classifier_reports_expected_states() {
+        assert_eq!(
+            classify_recovery_auto_backup_state(false, Ok(true)),
+            "missing_writer_blob"
+        );
+        assert_eq!(
+            classify_recovery_auto_backup_state(true, Ok(false)),
+            "missing_writer_key"
+        );
+        assert_eq!(classify_recovery_auto_backup_state(true, Ok(true)), "ready");
+        assert_eq!(
+            classify_recovery_auto_backup_state(true, Err("locked".to_string())),
+            "secure_storage_unavailable"
+        );
+    }
+
+    #[test]
+    fn parse_recovery_code_input_accepts_grouped_hex() {
+        let parsed = parse_recovery_code_input(
+            "00010203-04050607-08090A0B-0C0D0E0F-10111213-14151617-18191A1B-1C1D1E1F",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.len(), RECOVERY_CODE_BYTES);
+        assert_eq!(parsed[0], 0);
+        assert_eq!(parsed[31], 31);
+    }
+
+    #[test]
+    fn recovery_backup_presence_does_not_trust_stale_local_artifact() {
+        assert_eq!(
+            classify_recovery_backup_presence(true, Ok(false)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn recovery_backup_presence_falls_back_to_local_artifact_on_server_error() {
+        assert_eq!(
+            classify_recovery_backup_presence(true, Err("server unavailable".to_string())),
+            Ok(true)
+        );
+        assert_eq!(
+            classify_recovery_backup_presence(false, Err("server unavailable".to_string())),
+            Err("server unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_recovery_artifacts_preserves_unique_server_and_local_entries() {
+        fn test_entry(seed: u8) -> BackupEntryPlain {
+            BackupEntryPlain {
+                group_id: Uuid::from_u128(0x11111111111111111111111111111110 + seed as u128),
+                epoch_number: seed as u64,
+                epoch_uuid: Uuid::from_u128(0x22222222222222222222222222222220 + seed as u128),
+                created_at: Utc.timestamp_opt(1_700_000_000 + seed as i64, 0).unwrap(),
+                is_active: seed % 2 == 0,
+                encryption_key_b64: format!("entry-key-{seed}"),
+            }
+        }
+
+        fn entry_identity(entry: &crate::recovery_artifact::EncryptedEntry) -> Vec<u8> {
+            serde_json::to_vec(entry).expect("entry serializes")
+        }
+
+        let recovery_code = [9u8; RECOVERY_CODE_BYTES];
+        let epoch_key = [3u8; 32];
+        let mut server = BackupArtifact::new("password", &recovery_code).unwrap();
+        server
+            .append_entries_with_epoch_key(&[test_entry(1)], &epoch_key)
+            .unwrap();
+        let shared_server_entry = server.entries[0].clone();
+
+        let mut local = server.clone();
+        local.entries.clear();
+        local.entries.push(shared_server_entry.clone());
+        local
+            .append_entries_with_epoch_key(&[test_entry(2)], &epoch_key)
+            .unwrap();
+        let local_only_entry = local.entries[1].clone();
+
+        let merged = merge_recovery_artifacts(server, local);
+        let identities = merged
+            .entries
+            .iter()
+            .map(entry_identity)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(merged.version, crate::recovery_artifact::BACKUP_VERSION);
+        assert_eq!(merged.entries.len(), 2);
+        assert!(identities.contains(&entry_identity(&shared_server_entry)));
+        assert!(identities.contains(&entry_identity(&local_only_entry)));
+    }
 
     #[test]
     fn macos_file_provider_backend_serializes_with_stable_label() {
@@ -3114,6 +4058,7 @@ mod tests {
                 last_seen: Some("2026-02-10T08:00:00Z".to_string()),
             }],
             unverified_devices: vec![UnverifiedDeviceRecord {
+                user_id: "33333333-3333-3333-3333-333333333333".to_string(),
                 device_id: "device-tablet".to_string(),
                 email: "user@example.com".to_string(),
                 device_name: Some("Tablet".to_string()),
@@ -3156,6 +4101,43 @@ mod tests {
         );
         assert_eq!(overview.rename_supported, false);
         assert_eq!(overview.revoke_supported, true);
+    }
+
+    #[test]
+    fn build_personal_devices_overview_preserves_unverified_owner_for_registered_device() {
+        let overview = build_personal_devices_overview(PersonalDevicesOverviewInput {
+            current_device_id: Some("device-current".to_string()),
+            registered_devices: vec![RegisteredDeviceRecord {
+                device_id: "device-tablet".to_string(),
+                device_name: None,
+                created_at: "2026-03-20T09:00:00Z".to_string(),
+                last_seen: "2026-03-24T09:30:00Z".to_string(),
+                is_current_device: false,
+                is_verified: true,
+            }],
+            pending_devices: vec![],
+            stale_devices: vec![],
+            unverified_devices: vec![UnverifiedDeviceRecord {
+                user_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                device_id: "device-tablet".to_string(),
+                email: "member@example.com".to_string(),
+                device_name: Some("Member Tablet".to_string()),
+                last_seen: Some("2026-03-24T07:45:00Z".to_string()),
+            }],
+            rename_supported: false,
+            revoke_supported: true,
+        });
+
+        assert_eq!(overview.setup_devices.len(), 1);
+        let device = &overview.setup_devices[0];
+        assert_eq!(device.status, "unverified");
+        assert_eq!(
+            device.user_id.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert_eq!(device.email.as_deref(), Some("member@example.com"));
+        assert_eq!(device.device_name.as_deref(), Some("Member Tablet"));
+        assert_eq!(device.last_seen.as_deref(), Some("2026-03-24T07:45:00Z"));
     }
 
     #[test]
@@ -4572,8 +5554,14 @@ pub async fn restart_application(
 ) -> Result<(), String> {
     tracing::info!("restart_application: starting safe restart with unmount");
 
+    stop_all_desktop_cloud_roots(&state, false)
+        .await
+        .map_err(|err| format!("Refusing to restart while protected folders remain: {err}"))?;
+
     if let Err(e) = state.mount_manager.unmount_all(false).await {
-        tracing::error!("Failed to unmount during restart: {}", e);
+        return Err(format!(
+            "Refusing to restart because mounts could not be stopped safely: {e}"
+        ));
     }
 
     app_handle.restart();
@@ -4658,6 +5646,9 @@ pub async fn refresh_local_client(
         .local_client
         .initialize_for_session(&session, &server_url)
         .await?;
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
 
     Ok(CommandResponse::ok(true))
 }
@@ -4704,6 +5695,9 @@ pub async fn list_enrolled_folders(
 ) -> Result<CommandResponse<Vec<EnrolledFolder>>, String> {
     ensure_authenticated(&state).await?;
     tracing::info!("List enrolled folders command called");
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
 
     let client = match state.local_client.client().await {
         Ok(client) => client,
@@ -4714,7 +5708,7 @@ pub async fn list_enrolled_folders(
         Ok(folders) => Ok(CommandResponse::ok(folders)),
         Err(e) => Ok(CommandResponse::err(format!(
             "Failed to list enrolled folders: {}",
-            e
+            desktop_safe_client_error(e)
         ))),
     }
 }
@@ -4722,10 +5716,12 @@ pub async fn list_enrolled_folders(
 async fn get_enrolled_folders_from_client(
     client: &LocalClient,
 ) -> Result<Vec<EnrolledFolder>, String> {
-    let stats = client
-        .coverage_root_stats()
-        .await
-        .map_err(|e| format!("Failed to load coverage roots: {}", e))?;
+    let stats = client.coverage_root_stats().await.map_err(|e| {
+        format!(
+            "Failed to load coverage roots: {}",
+            desktop_safe_client_error(e)
+        )
+    })?;
 
     let folders = stats.into_iter().map(enrolled_folder_from_stats).collect();
 
@@ -4758,10 +5754,12 @@ async fn find_coverage_root_summary(
         return Err("Folder path is required.".to_string());
     }
 
-    let stats = client
-        .coverage_root_stats()
-        .await
-        .map_err(|e| format!("Failed to load coverage roots: {}", e))?;
+    let stats = client.coverage_root_stats().await.map_err(|e| {
+        format!(
+            "Failed to load coverage roots: {}",
+            desktop_safe_client_error(e)
+        )
+    })?;
 
     stats
         .into_iter()
@@ -4778,10 +5776,12 @@ async fn find_coverage_root_summary_by_id(
 ) -> Result<CoverageRootStats, String> {
     let root_uuid = Uuid::parse_str(root_id.trim())
         .map_err(|err| format!("Protected folder id is not a valid UUID: {}", err))?;
-    let stats = client
-        .coverage_root_stats()
-        .await
-        .map_err(|e| format!("Failed to load coverage roots: {}", e))?;
+    let stats = client.coverage_root_stats().await.map_err(|e| {
+        format!(
+            "Failed to load coverage roots: {}",
+            desktop_safe_client_error(e)
+        )
+    })?;
 
     stats
         .into_iter()
@@ -4795,10 +5795,12 @@ async fn load_folder_coverage_review_internal(
 ) -> Result<FolderCoverageReview, String> {
     let summary = find_coverage_root_summary(client, folder_path).await?;
     let root_id = summary.root.root_id;
-    let records = client
-        .coverage_file_records(None)
-        .await
-        .map_err(|e| format!("Failed to load coverage file records: {}", e))?;
+    let records = client.coverage_file_records(None).await.map_err(|e| {
+        format!(
+            "Failed to load coverage file records: {}",
+            desktop_safe_client_error(e)
+        )
+    })?;
     let filtered_records: Vec<CoverageFileRecord> = records
         .into_iter()
         .filter(|record| record.root.root_id == root_id)
@@ -4813,6 +5815,9 @@ pub async fn get_folder_coverage_review(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<FolderCoverageReview>, String> {
     ensure_authenticated(&state).await?;
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
     let client = state
         .local_client
         .client()
@@ -4832,6 +5837,9 @@ pub async fn run_folder_coverage_action(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<CoverageActionResult>, String> {
     ensure_authenticated(&state).await?;
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
     let client = state
         .local_client
         .client()
@@ -4845,7 +5853,12 @@ pub async fn run_folder_coverage_action(
             let summary = client
                 .coverage_adopt_missing_metadata(Some(root_path.clone()), true)
                 .await
-                .map_err(|e| format!("Failed to restore protection: {}", e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to restore protection: {}",
+                        desktop_safe_client_error(e)
+                    )
+                })?;
 
             CoverageActionResult {
                 action,
@@ -4859,7 +5872,12 @@ pub async fn run_folder_coverage_action(
             let removed = client
                 .coverage_prune_orphans(Some(root_path.clone()), true)
                 .await
-                .map_err(|e| format!("Failed to clean up missing items: {}", e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to clean up missing items: {}",
+                        desktop_safe_client_error(e)
+                    )
+                })?;
 
             CoverageActionResult {
                 action,
@@ -4873,7 +5891,12 @@ pub async fn run_folder_coverage_action(
             let removed = client
                 .coverage_purge_outcasts(None, Some(root_path.clone()), true)
                 .await
-                .map_err(|e| format!("Failed to remove leftover protected data: {}", e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to remove leftover protected data: {}",
+                        desktop_safe_client_error(e)
+                    )
+                })?;
 
             CoverageActionResult {
                 action,
@@ -4887,7 +5910,12 @@ pub async fn run_folder_coverage_action(
             let progress = client
                 .coverage_migrate_orphans_with_progress(None, Some(root_path), true, |_| {})
                 .await
-                .map_err(|e| format!("Failed to repair protection history: {}", e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to repair protection history: {}",
+                        desktop_safe_client_error(e)
+                    )
+                })?;
 
             CoverageActionResult {
                 action,
@@ -5117,6 +6145,9 @@ pub async fn get_coverage_center_snapshot(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<CoverageCenterSnapshot>, String> {
     ensure_authenticated(&state).await?;
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
 
     let settings = load_settings_status_internal(&state).await?;
     let client = state
@@ -5124,10 +6155,12 @@ pub async fn get_coverage_center_snapshot(
         .client()
         .await
         .map_err(|err| format!("Failed to load coverage snapshot client: {}", err))?;
-    let stats = client
-        .coverage_root_stats()
-        .await
-        .map_err(|err| format!("Failed to load coverage snapshot: {}", err))?;
+    let stats = client.coverage_root_stats().await.map_err(|err| {
+        format!(
+            "Failed to load coverage snapshot: {}",
+            desktop_safe_client_error(err)
+        )
+    })?;
 
     Ok(CommandResponse::ok(build_coverage_center_snapshot(
         &stats, &settings,
@@ -5141,6 +6174,9 @@ pub async fn run_coverage_scan(
     app: AppHandle,
 ) -> Result<CommandResponse<CoverageScanResult>, String> {
     ensure_authenticated(&state).await?;
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
 
     let client = state
         .local_client
@@ -5185,7 +6221,7 @@ pub async fn run_coverage_scan(
             Ok(CommandResponse::ok(result))
         }
         Err(err) => {
-            let message = format!("Coverage scan failed: {}", err);
+            let message = format!("Coverage scan failed: {}", desktop_safe_client_error(err));
             let _ = app.emit(
                 "coverage_scan_finished",
                 &CoverageScanFinishedPayload {
@@ -5206,6 +6242,9 @@ pub async fn enroll_folder(
 ) -> Result<CommandResponse<EnrolledFolder>, String> {
     ensure_authenticated(&state).await?;
     tracing::info!("Enroll folder command called: {}", folder_path);
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
 
     let client = match state.local_client.client().await {
         Ok(client) => client,
@@ -5261,7 +6300,7 @@ pub async fn enroll_folder(
         }
         Err(e) => Ok(CommandResponse::err(format!(
             "Failed to enroll folder: {}",
-            e
+            desktop_safe_client_error(e)
         ))),
     }
 }
@@ -5273,6 +6312,9 @@ pub async fn enroll_folder_and_hydrate(
 ) -> Result<CommandResponse<FolderCoverageWorkflowResult>, String> {
     ensure_authenticated(&state).await?;
     tracing::info!("Enroll and hydrate folder command called: {}", folder_path);
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
 
     let client = match state.local_client.client().await {
         Ok(client) => client,
@@ -5338,7 +6380,7 @@ pub async fn enroll_folder_and_hydrate(
         }
         Err(e) => Ok(CommandResponse::err(format!(
             "Failed to protect folder: {}",
-            e
+            desktop_safe_client_error(e)
         ))),
     }
 }
@@ -5350,6 +6392,9 @@ pub async fn unenroll_folder_and_decrypt(
 ) -> Result<CommandResponse<FolderCoverageWorkflowResult>, String> {
     ensure_authenticated(&state).await?;
     tracing::info!("Unenroll and decrypt folder command called: {}", root_id);
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
 
     let client = match state.local_client.client().await {
         Ok(client) => client,
@@ -5392,7 +6437,7 @@ pub async fn unenroll_folder_and_decrypt(
         }
         Err(e) => Ok(CommandResponse::err(format!(
             "Failed to remove protected folder: {}",
-            e
+            desktop_safe_client_error(e)
         ))),
     }
 }
@@ -5643,6 +6688,8 @@ pub struct MountStatusPayload {
     pub backend: String,
     #[serde(default)]
     pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_health: Option<serde_json::Value>,
 }
 
 /// Canonicalize server URL (matches CLI's logic)
@@ -5680,6 +6727,55 @@ fn mount_sync_status_path(user_dir: &PathBuf, root_id: &str) -> PathBuf {
 
 fn mount_states_dir(user_dir: &Path) -> PathBuf {
     user_dir.join("mount_states")
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn map_cloud_provider_health_payload(
+    result: Result<serde_json::Value, String>,
+) -> serde_json::Value {
+    match result {
+        Ok(health) => health,
+        Err(error) => serde_json::json!({
+            "available": false,
+            "healthy": false,
+            "error": error,
+        }),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_provider_health(user_dir: &Path, root_id: &str) -> Option<serde_json::Value> {
+    let result = Uuid::parse_str(root_id)
+        .map_err(|error| format!("invalid Cloud Files root id: {error}"))
+        .and_then(|root_id| {
+            let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+                hybridcipher_windows_cloud_provider::ProviderHostConfig {
+                    user_config_dir: user_dir.to_path_buf(),
+                    pipe_name: None,
+                },
+            );
+            host.check_root_health(root_id)
+                .map_err(|error| error.to_string())
+        })
+        .and_then(|health| serde_json::to_value(health).map_err(|error| error.to_string()));
+    Some(map_cloud_provider_health_payload(result))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_cloud_provider_health(_user_dir: &Path, _root_id: &str) -> Option<serde_json::Value> {
+    None
+}
+
+fn mount_operational_health(
+    user_dir: &Path,
+    root_id: &str,
+    backend: MountBackend,
+) -> Option<serde_json::Value> {
+    if backend.is_windows_cloud_files() {
+        windows_cloud_provider_health(user_dir, root_id)
+    } else {
+        None
+    }
 }
 
 fn mount_conflict_registry_path(user_dir: &Path, root_id: &str) -> PathBuf {
@@ -6034,6 +7130,11 @@ async fn check_mount_status(
                                         mountpoint: mount_state.mountpoint.display().to_string(),
                                         backend: mount_state.backend().as_str().to_string(),
                                         fallback_reason: mount_state.fallback_reason.clone(),
+                                        operational_health: mount_operational_health(
+                                            &user_dir,
+                                            &mount_state.root_id,
+                                            mount_state.backend(),
+                                        ),
                                     }));
                                 }
                             }
@@ -6065,6 +7166,11 @@ async fn check_mount_status(
                             mountpoint: mount_state.mountpoint.display().to_string(),
                             backend: mount_state.backend().as_str().to_string(),
                             fallback_reason: mount_state.fallback_reason.clone(),
+                            operational_health: mount_operational_health(
+                                &user_dir,
+                                &mount_state.root_id,
+                                mount_state.backend(),
+                            ),
                         }));
                     }
                 }
@@ -6118,6 +7224,11 @@ pub async fn check_mount_status_by_root_id(
                         mountpoint: mount_state.mountpoint.display().to_string(),
                         backend: mount_state.backend().as_str().to_string(),
                         fallback_reason: mount_state.fallback_reason.clone(),
+                        operational_health: mount_operational_health(
+                            &user_dir,
+                            &mount_state.root_id,
+                            mount_state.backend(),
+                        ),
                     }));
                 }
             }
@@ -6139,6 +7250,11 @@ pub async fn check_mount_status_by_root_id(
                         mountpoint: mount_state.mountpoint.display().to_string(),
                         backend: mount_state.backend().as_str().to_string(),
                         fallback_reason: mount_state.fallback_reason.clone(),
+                        operational_health: mount_operational_health(
+                            &user_dir,
+                            &mount_state.root_id,
+                            mount_state.backend(),
+                        ),
                     }));
                 }
             }
@@ -6196,6 +7312,9 @@ pub async fn mount_enrolled_folder(
 ) -> Result<CommandResponse<MountStatusPayload>, String> {
     ensure_authenticated(&state).await?;
     tracing::info!("Mount enrolled folder request with root_id: {}", root_id);
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
 
     // Validate root_id format
     let parsed_root_id =
@@ -6325,6 +7444,7 @@ pub async fn mount_enrolled_folder(
                                     mountpoint: provider_url.display().to_string(),
                                     backend: MountBackend::MacOsFileProvider.as_str().to_string(),
                                     fallback_reason: None,
+                                    operational_health: None,
                                 }));
                             }
                         }
@@ -6403,16 +7523,25 @@ pub async fn mount_enrolled_folder(
             .await
         {
             Ok(()) => {
-                let mut ready_state = runtime_state;
-                ready_state.ready = true;
-                write_mount_runtime_state(&mount_state_path, &ready_state).await?;
                 wait_for_mount_ready(&mountpoint, 60)
                     .await
                     .map_err(|e| format!("Mount ready check failed: {}", e))?;
+                let mut ready_state = runtime_state;
+                ready_state.ready = true;
+                write_mount_runtime_state(&mount_state_path, &ready_state).await?;
                 return Ok(CommandResponse::ok(MountStatusPayload {
                     mountpoint: mountpoint.display().to_string(),
                     backend: MountBackend::WindowsCloudFiles.as_str().to_string(),
                     fallback_reason: None,
+                    operational_health: Some(map_cloud_provider_health_payload(
+                        state
+                            .cloud_provider
+                            .check_root_health(parsed_root_id)
+                            .await
+                            .and_then(|health| {
+                                serde_json::to_value(health).map_err(|error| error.to_string())
+                            }),
+                    )),
                 }));
             }
             Err(err) => {
@@ -6582,6 +7711,11 @@ pub async fn mount_enrolled_folder(
         mountpoint: mountpoint_path.display().to_string(),
         backend: mounted_state.backend().as_str().to_string(),
         fallback_reason: mounted_state.fallback_reason.clone(),
+        operational_health: mount_operational_health(
+            &user_dir,
+            &mounted_state.root_id,
+            mounted_state.backend(),
+        ),
     }))
 }
 
@@ -6637,6 +7771,11 @@ async fn load_active_mounts_internal(
                                     backend,
                                     fallback_reason: mount_state.fallback_reason.clone(),
                                     sync_status,
+                                    operational_health: mount_operational_health(
+                                        &user_dir,
+                                        &mount_state.root_id,
+                                        mount_state.backend(),
+                                    ),
                                 });
                             }
                         }
@@ -6671,6 +7810,11 @@ async fn load_active_mounts_internal(
                             backend: mount_state.backend().as_str().to_string(),
                             fallback_reason: mount_state.fallback_reason.clone(),
                             sync_status,
+                            operational_health: mount_operational_health(
+                                &user_dir,
+                                &mount_state.root_id,
+                                mount_state.backend(),
+                            ),
                         });
                     }
                 }
@@ -6832,7 +7976,7 @@ pub async fn revoke_device(
                 err
             );
         }
-        state.clear_session().await;
+        state.clear_session().await?;
     }
 
     Ok(CommandResponse::ok(DeviceRevocationResult {
@@ -7234,6 +8378,175 @@ pub struct MountInfo {
     #[serde(default)]
     pub fallback_reason: Option<String>,
     pub sync_status: Option<MountSyncRuntimeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_health: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod cloud_provider_health_payload_tests {
+    use super::*;
+    use hybridcipher_windows_cloud_provider::{
+        CloudCallbackClass, CloudCallbackHealth, CloudCallbackKind, CloudRootConnectionState,
+        CloudRootHealthResponse, CloudRootOperationalHealth, CloudRootProbeHealth,
+        DurableInspectionSource,
+    };
+
+    #[test]
+    fn cloud_provider_health_mount_payload_preserves_structured_health() {
+        let root_id = uuid::Uuid::new_v4();
+        let observed_at = chrono::Utc::now();
+        let health = CloudRootHealthResponse {
+            root_id,
+            registered: true,
+            operational: Some(CloudRootOperationalHealth {
+                root_id,
+                owner_instance_id: uuid::Uuid::new_v4(),
+                owner_process_id: 4_242,
+                connection_generation: 3,
+                snapshot_revision: 12,
+                lifecycle: CloudRootConnectionState::Running,
+                lifecycle_changed_at: observed_at,
+                last_start_attempt_at: Some(observed_at),
+                last_start_success_at: Some(observed_at),
+                last_start_failure_at: Some(observed_at),
+                last_start_failure: Some("startup retry failed".into()),
+                last_disconnect_failure_at: Some(observed_at),
+                last_disconnect_failure: Some("disconnect confirmation failed".into()),
+                stop_count: 1,
+                last_stopped_at: Some(observed_at),
+                last_heartbeat_at: Some(observed_at),
+                heartbeat_stale_after_millis: 15_000,
+                callback_health: vec![CloudCallbackHealth {
+                    kind: CloudCallbackKind::FetchData,
+                    class: CloudCallbackClass::Actionable,
+                    connection_generation: 3,
+                    attempt_count: 3,
+                    success_count: 2,
+                    failure_count: 1,
+                    in_flight_count: 2,
+                    overdue_in_flight_count: 1,
+                    last_attempt_at: Some(observed_at),
+                    last_success_at: Some(observed_at),
+                    last_failure_at: Some(observed_at),
+                    last_failure: Some("fetch handler failed".into()),
+                    unresolved_failure: Some("fetch remains unresolved".into()),
+                    oldest_in_flight_started_at: Some(observed_at),
+                    earliest_in_flight_deadline_at: Some(observed_at),
+                    callback_success_observed: true,
+                }],
+                active_probe: CloudRootProbeHealth::default(),
+                hydration_success_observed: true,
+                last_hydration_success_at: Some(observed_at),
+                hydration_failure: Some("latest hydration failed".into()),
+                last_hydration_failure_at: Some(observed_at),
+                persistence_error: None,
+                assessed_at: observed_at,
+                healthy: false,
+                unhealthy_evidence: vec!["FetchData callback remains unresolved".into()],
+            }),
+            lifecycle_healthy: true,
+            heartbeat_fresh: true,
+            durable_state_readable: true,
+            safe_to_unmount: false,
+            pending_mutation_count: Some(2),
+            pending_refresh_count: Some(1),
+            conflict_count: Some(0),
+            durable_observed_at: chrono::Utc::now(),
+            registration_source: Some(DurableInspectionSource::Primary),
+            registration_generation: Some(7),
+            health_snapshot_source: Some(DurableInspectionSource::Backup),
+            health_snapshot_generation: Some(6),
+            health_snapshot_revision: Some(11),
+            mutation_journal_source: Some(DurableInspectionSource::Primary),
+            mutation_journal_generation: Some(5),
+            provider_state_source: Some(DurableInspectionSource::Primary),
+            provider_state_generation: Some(4),
+            unhealthy_evidence: Vec::new(),
+        };
+        let mapped = map_cloud_provider_health_payload(
+            serde_json::to_value(health).map_err(|error| error.to_string()),
+        );
+        let payload = MountStatusPayload {
+            mountpoint: "/mount".into(),
+            backend: "windows-cloud-files".into(),
+            fallback_reason: None,
+            operational_health: Some(mapped),
+        };
+
+        let encoded = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(
+            encoded["operational_health"]["registration_generation"],
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            encoded["operational_health"]["safe_to_unmount"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            encoded["operational_health"]["pending_mutation_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            encoded["operational_health"]["health_snapshot_source"],
+            serde_json::json!("backup")
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["lifecycle"],
+            serde_json::json!("Running")
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["hydration_success_observed"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["last_start_failure"],
+            serde_json::json!("startup retry failed")
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["last_disconnect_failure"],
+            serde_json::json!("disconnect confirmation failed")
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["hydration_failure"],
+            serde_json::json!("latest hydration failed")
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["callback_health"][0]
+                ["callback_success_observed"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["callback_health"][0]["in_flight_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["callback_health"][0]
+                ["overdue_in_flight_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["callback_health"][0]["last_failure"],
+            serde_json::json!("fetch handler failed")
+        );
+        assert_eq!(
+            encoded["operational_health"]["operational"]["callback_health"][0]
+                ["unresolved_failure"],
+            serde_json::json!("fetch remains unresolved")
+        );
+    }
+
+    #[test]
+    fn cloud_provider_health_mapper_preserves_accessor_and_serialization_errors() {
+        let mapped = map_cloud_provider_health_payload(Err("health snapshot corrupt".into()));
+
+        assert_eq!(mapped["available"], serde_json::json!(false));
+        assert_eq!(mapped["healthy"], serde_json::json!(false));
+        assert_eq!(
+            mapped["error"],
+            serde_json::json!("health snapshot corrupt")
+        );
+    }
 }
 
 #[tauri::command]
@@ -7258,38 +8571,8 @@ pub async fn unmount_all_mounts(
 ) -> Result<CommandResponse<bool>, String> {
     tracing::info!("Unmount all request received");
     let force = force.unwrap_or(false);
-    let cloud_state_context = match require_authenticated_session(&state).await {
-        Ok(session) => {
-            let server_url = current_server_url(&state, &session);
-            match get_user_dir(&session.email, &server_url) {
-                Ok(user_dir) => {
-                    let records = load_cloud_mount_state_records_for_unmount(&user_dir).await;
-                    Some((user_dir, records))
-                }
-                Err(_) => None,
-            }
-        }
-        Err(_) => None,
-    };
-
-    if let Err(err) = state.cloud_provider.stop_all(true, force).await {
+    if let Err(err) = stop_all_desktop_cloud_roots(&state, force).await {
         return Ok(CommandResponse::err(err));
-    }
-
-    if let Some((user_dir, cloud_state_records)) = cloud_state_context {
-        for (state_path, mount_state) in cloud_state_records {
-            if mount_state.backend().is_macos_file_provider() {
-                #[cfg(target_os = "macos")]
-                if let Ok(root_id) = Uuid::parse_str(&mount_state.root_id) {
-                    if let Err(err) =
-                        unregister_stored_macos_file_provider_domain(&user_dir, root_id)
-                    {
-                        return Ok(CommandResponse::err(err));
-                    }
-                }
-            }
-            let _ = fs::remove_file(state_path).await;
-        }
     }
 
     match state.mount_manager.unmount_all(force).await {
@@ -7327,8 +8610,6 @@ async fn unmount_desktop_cloud_root_if_active(
     root_id: &str,
     force: bool,
 ) -> Result<bool, String> {
-    let parsed_root_id =
-        Uuid::parse_str(root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
     let session = require_authenticated_session(state).await?;
     let server_url = current_server_url(state, &session);
     let user_dir = get_user_dir(&session.email, &server_url)?;
@@ -7337,21 +8618,84 @@ async fn unmount_desktop_cloud_root_if_active(
     else {
         return Ok(false);
     };
+    unmount_desktop_cloud_root_record(state, &user_dir, state_path, mount_state, force).await
+}
+
+async fn unmount_desktop_cloud_root_record(
+    state: &AppState,
+    user_dir: &Path,
+    state_path: PathBuf,
+    mount_state: MountRuntimeState,
+    force: bool,
+) -> Result<bool, String> {
+    let parsed_root_id = Uuid::parse_str(&mount_state.root_id)
+        .map_err(|err| format!("Invalid root_id format: {}", err))?;
     if !(mount_state.backend().is_windows_cloud_files()
         || mount_state.backend().is_macos_file_provider())
     {
         return Ok(false);
     }
-    state
-        .cloud_provider
-        .stop_root(parsed_root_id, true, force)
-        .await?;
+    if state.cloud_provider.is_root_active(parsed_root_id).await {
+        state
+            .cloud_provider
+            .stop_root(parsed_root_id, true, force)
+            .await?;
+    } else if mount_state.backend().is_windows_cloud_files() {
+        #[cfg(target_os = "windows")]
+        {
+            let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+                hybridcipher_windows_cloud_provider::ProviderHostConfig {
+                    user_config_dir: user_dir.to_path_buf(),
+                    pipe_name: None,
+                },
+            );
+            match host
+                .unmount_root_safely(parsed_root_id)
+                .await
+                .map_err(|err| err.to_string())?
+            {
+                hybridcipher_windows_cloud_provider::SafeRootStopOutcome::Cleaned => {}
+                hybridcipher_windows_cloud_provider::SafeRootStopOutcome::RecoveryPreserved {
+                    reason,
+                } => {
+                    return Err(format!(
+                        "Cloud Files cleanup was incomplete; recovery state was preserved: {reason}"
+                    ));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        return Err("Windows Cloud Files cleanup is unavailable on this platform".to_string());
+    }
     if mount_state.backend().is_macos_file_provider() {
         #[cfg(target_os = "macos")]
-        unregister_stored_macos_file_provider_domain(&user_dir, parsed_root_id)?;
+        unregister_stored_macos_file_provider_domain(user_dir, parsed_root_id)?;
     }
-    let _ = fs::remove_file(state_path).await;
+    if state_path.exists() {
+        fs::remove_file(&state_path).await.map_err(|err| {
+            format!(
+                "Mount cleanup completed, but stale status {} could not be removed: {err}",
+                state_path.display()
+            )
+        })?;
+    }
     Ok(true)
+}
+
+async fn stop_all_desktop_cloud_roots(state: &AppState, force: bool) -> Result<(), String> {
+    let session = state.session.lock().await.clone();
+    if let Some(session) = session {
+        let server_url = current_server_url(state, &session);
+        let user_dir = get_user_dir(&session.email, &server_url)?;
+        let records = load_cloud_mount_state_records_for_unmount(&user_dir).await;
+        for (state_path, mount_state) in records {
+            unmount_desktop_cloud_root_record(state, &user_dir, state_path, mount_state, force)
+                .await?;
+        }
+    }
+
+    state.cloud_provider.stop_all(true, force).await
 }
 
 #[tauri::command]
@@ -7361,14 +8705,21 @@ pub async fn exit_application(
 ) -> Result<CommandResponse<bool>, String> {
     tracing::info!("exit_application: starting safe quit with unmount");
 
-    if let Err(e) = state.cloud_provider.stop_all(true, false).await {
+    if let Err(e) = stop_all_desktop_cloud_roots(&state, false).await {
         tracing::error!("Failed to stop Cloud Files roots during exit: {}", e);
+        return Ok(CommandResponse::err(format!(
+            "Application remains open because protected folders are not safe to stop: {}",
+            e
+        )));
     }
 
     // Unmount all folders before exiting
     if let Err(e) = state.mount_manager.unmount_all(false).await {
         tracing::error!("Failed to unmount during exit: {}", e);
-        // Continue with exit anyway - user explicitly requested quit
+        return Ok(CommandResponse::err(format!(
+            "Application remains open because mounts could not be stopped safely: {}",
+            e
+        )));
     } else {
         tracing::info!("exit_application: unmount completed successfully");
     }

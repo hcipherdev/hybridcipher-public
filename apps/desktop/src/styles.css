@@ -2443,6 +2443,7 @@ body {
     z-index: 2250;
 }
 
+#deviceVerifyModal,
 #adminPinVerifyModal,
 #adminEnrolledListModal {
     z-index: 2200;
@@ -2452,6 +2453,7 @@ body {
 #actionPromptModal,
 #mfaPromptModal,
 #mfaSetupModal,
+#recoveryAutoBackupModal,
 #passwordResetModal {
     z-index: 2200;
 }
@@ -2481,6 +2483,53 @@ body {
 
 .admin-pin-verify-modal {
     max-width: 680px;
+}
+
+.device-verify-modal {
+    max-width: 640px;
+}
+
+.recovery-auto-backup-modal {
+    max-width: 620px;
+}
+
+.recovery-auto-backup-lead {
+    margin: 0 0 var(--spacing-md);
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.device-verify-summary {
+    display: grid;
+    gap: 8px;
+    margin-bottom: var(--spacing-md);
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.device-verify-summary-row {
+    display: grid;
+    grid-template-columns: minmax(120px, 0.38fr) minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    font-size: 0.86rem;
+}
+
+.device-verify-summary-label {
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.device-verify-summary-value {
+    min-width: 0;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.status-warning-action {
+    margin-top: 10px;
 }
 
 .admin-enrolled-list-modal {

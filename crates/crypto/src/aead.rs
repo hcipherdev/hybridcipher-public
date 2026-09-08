@@ -49,6 +49,8 @@ pub enum AeadContext {
     Welcome,
     /// `GroupUpdate` message payload encryption
     GroupUpdate,
+    /// Recovery writer handoff payload encryption
+    RecoveryWriterHandoff,
 }
 
 impl AeadContext {
@@ -58,6 +60,7 @@ impl AeadContext {
             Self::FileData => DOMAIN_FILEDATA,
             Self::Welcome => DOMAIN_WELCOME,
             Self::GroupUpdate => DOMAIN_GROUPUPDATE,
+            Self::RecoveryWriterHandoff => b"recovery-writer-handoff:",
         }
     }
 }

@@ -105,3 +105,4 @@ hybridcipher-mount = { path = "../mount" }
 tempfile = "3.0"
 assert_cmd = "2.0"
 predicates = "3.0"
+hybridcipher-windows-cloud-provider = { path = "../windows-cloud-provider" }

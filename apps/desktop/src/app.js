@@ -271,6 +271,27 @@ const buildPersonalDevicesModelValue = typeof uiUtils.buildPersonalDevicesModel 
         reviewDevices: [],
         hasAttention: false,
     });
+const buildDeviceVerificationModelValue = typeof uiUtils.buildDeviceVerificationModel === 'function'
+    ? uiUtils.buildDeviceVerificationModel
+    : ({ device = null, fingerprint = '' } = {}) => {
+        const userIdentifier = String(device?.user_id || device?.email || '').trim();
+        const deviceId = String(device?.device_id || '').trim();
+        const normalizedFingerprint = String(fingerprint || '').trim();
+        return {
+            userIdentifier,
+            deviceId,
+            fingerprint: normalizedFingerprint,
+            canSubmit: Boolean(userIdentifier && deviceId && normalizedFingerprint),
+        };
+    };
+const buildDeviceVerificationCommandValue = typeof uiUtils.buildDeviceVerificationCommand === 'function'
+    ? uiUtils.buildDeviceVerificationCommand
+    : ({ device = null, fingerprint = '', quoteArg = null } = {}) => {
+        const model = buildDeviceVerificationModelValue({ device, fingerprint });
+        if (!model.canSubmit) return null;
+        const quote = typeof quoteArg === 'function' ? quoteArg : value => String(value);
+        return `hybridcipher pin verify ${quote(model.userIdentifier)} ${quote(model.deviceId)} --fingerprint ${quote(model.fingerprint)}`;
+    };
 const terminalUtils = window.HybridCipherTerminalUtils || {};
 const TERMINAL_RENDERER_XTERM = terminalUtils.TERMINAL_RENDERER_XTERM || 'xterm';
 const TERMINAL_RENDERER_FALLBACK = terminalUtils.TERMINAL_RENDERER_FALLBACK || 'fallback';
@@ -556,6 +577,9 @@ class HybridCipherApp {
         this.coverageCommandTrackers = {};
         this.coverageCommandPollIntervalMs = 2500;
         this.coverageCommandTimeoutMs = 10 * 60 * 1000;
+        this.deviceVerifyDevice = null;
+        this.recoveryHandoffCheckInFlight = false;
+        this.lastRecoveryHandoffCheckAt = 0;
         this.adminPinVerifyMembers = [];
         this.legalDocuments = null;
         this.legalDocumentsLoading = false;
@@ -3690,6 +3714,12 @@ class HybridCipherApp {
         document.getElementById('closeRecoveryCodeModalBtn')?.addEventListener('click', () => this.acknowledgeRecoveryCode());
         document.getElementById('ackRecoveryCodeBtn')?.addEventListener('click', () => this.acknowledgeRecoveryCode());
         document.getElementById('copyRecoveryCodeBtn')?.addEventListener('click', () => this.copyRecoveryCode());
+        document.getElementById('closeRecoveryAutoBackupModalBtn')?.addEventListener('click', () => this.closeRecoveryAutoBackupModal());
+        document.getElementById('cancelRecoveryAutoBackupBtn')?.addEventListener('click', () => this.closeRecoveryAutoBackupModal());
+        document.getElementById('recoveryAutoBackupBackdrop')?.addEventListener('click', () => this.closeRecoveryAutoBackupModal());
+        document.getElementById('recoveryAutoBackupPasswordInput')?.addEventListener('input', () => this.updateRecoveryAutoBackupSubmitState());
+        document.getElementById('recoveryAutoBackupCodeInput')?.addEventListener('input', () => this.updateRecoveryAutoBackupSubmitState());
+        document.getElementById('recoveryAutoBackupForm')?.addEventListener('submit', (event) => this.handleRecoveryAutoBackupSubmit(event));
         document.getElementById('closeCreateGroupModalBtn')?.addEventListener('click', () => this.closeCreateGroupModal());
         document.getElementById('cancelCreateGroupBtn')?.addEventListener('click', () => this.closeCreateGroupModal());
         document.getElementById('createGroupForm')?.addEventListener('submit', (e) => this.handleCreateGroupSubmit(e));
@@ -3704,6 +3734,11 @@ class HybridCipherApp {
         document.getElementById('closeListMembersModalBtn')?.addEventListener('click', () => this.closeListMembersModal());
         document.getElementById('cancelListMembersBtn')?.addEventListener('click', () => this.closeListMembersModal());
         document.getElementById('listMembersBackdrop')?.addEventListener('click', () => this.closeListMembersModal());
+        document.getElementById('closeDeviceVerifyModalBtn')?.addEventListener('click', () => this.closeDeviceVerifyModal());
+        document.getElementById('cancelDeviceVerifyBtn')?.addEventListener('click', () => this.closeDeviceVerifyModal());
+        document.getElementById('deviceVerifyBackdrop')?.addEventListener('click', () => this.closeDeviceVerifyModal());
+        document.getElementById('deviceVerifyFingerprintInput')?.addEventListener('input', () => this.updateDeviceVerifySubmitState());
+        document.getElementById('deviceVerifyForm')?.addEventListener('submit', (event) => this.handleDeviceVerifySubmit(event));
         document.getElementById('closeAdminPinVerifyModalBtn')?.addEventListener('click', () => this.closeAdminPinVerifyModal());
         document.getElementById('cancelAdminPinVerifyBtn')?.addEventListener('click', () => this.closeAdminPinVerifyModal());
         document.getElementById('adminPinVerifyBackdrop')?.addEventListener('click', () => this.closeAdminPinVerifyModal());
@@ -10905,6 +10940,7 @@ class HybridCipherApp {
             }
             this.securityStatus = result.data;
             this.updateSecurityBanner();
+            this.maybeAcceptRecoveryWriterHandoff();
         } catch (error) {
             console.error('Failed to refresh security status:', error);
         }
@@ -10937,21 +10973,39 @@ class HybridCipherApp {
         if (!recoveryOk) {
             let title = 'Automatic recovery backup unavailable';
             let text = 'Unlock your OS keychain/keyring and re-run <code>hybridcipher recovery upload</code> to re-enable silent backups.';
+            let action = null;
+            let secondaryAction = null;
 
             if (recoveryState === 'missing_writer_blob') {
                 if (this.securityStatus?.recovery_backup_ok) {
                     title = 'Automatic recovery backup not enabled on this device';
-                    text = 'Run <code>hybridcipher recovery upload</code> once on this device to seed silent backups for future updates.';
+                    text = 'Use a trusted verified device to enable automatic backup here, or use your password and recovery code.';
                 } else {
                     title = 'Recovery backup not set up';
                     text = 'Run <code>hybridcipher recovery upload</code> to create your recovery backup and enable silent backups on this device.';
                 }
+                action = this.securityStatus?.recovery_backup_ok ? {
+                    id: 'check-recovery-handoff',
+                    label: 'Check trusted device handoff'
+                } : null;
+                secondaryAction = this.securityStatus?.recovery_backup_ok ? {
+                    id: 'enable-recovery-auto-backup',
+                    label: 'Use recovery code'
+                } : null;
             } else if (recoveryState === 'missing_writer_key') {
                 title = 'Recovery secure storage entry missing';
-                text = 'Re-run <code>hybridcipher recovery upload</code> on this device to restore the secure writer key used for silent backups.';
+                text = 'Restore the secure writer key from a trusted device handoff, or use your password and recovery code.';
+                action = {
+                    id: 'check-recovery-handoff',
+                    label: 'Check trusted device handoff'
+                };
+                secondaryAction = {
+                    id: 'enable-recovery-auto-backup',
+                    label: 'Use recovery code'
+                };
             }
 
-            this.securityWarnings.push({ title, text });
+            this.securityWarnings.push({ title, text, action, secondaryAction });
         }
 
         const hasWarnings = this.securityWarnings.length > 0;
@@ -11003,6 +11057,21 @@ class HybridCipherApp {
                 <div class="status-warning-title">${warning.title}</div>
                 <div class="status-warning-text">${warning.text}</div>
             `;
+            const actions = [warning.action, warning.secondaryAction].filter(action => action?.id);
+            actions.forEach((warningAction) => {
+                const action = document.createElement('button');
+                action.type = 'button';
+                action.className = 'btn btn-secondary btn-small status-warning-action';
+                action.textContent = warningAction.label || 'Fix';
+                action.addEventListener('click', () => {
+                    if (warningAction.id === 'enable-recovery-auto-backup') {
+                        this.openRecoveryAutoBackupModal();
+                    } else if (warningAction.id === 'check-recovery-handoff') {
+                        this.acceptRecoveryWriterHandoffs();
+                    }
+                });
+                item.appendChild(action);
+            });
             list.appendChild(item);
         });
     }
@@ -11030,6 +11099,146 @@ class HybridCipherApp {
         }
         if (pill) {
             pill.setAttribute('aria-expanded', 'false');
+        }
+    }
+
+    setRecoveryAutoBackupError(message) {
+        const errorEl = document.getElementById('recoveryAutoBackupError');
+        if (!errorEl) return;
+        const text = String(message || '').trim();
+        if (!text) {
+            errorEl.textContent = '';
+            errorEl.style.display = 'none';
+            return;
+        }
+        errorEl.textContent = text;
+        errorEl.style.display = 'block';
+    }
+
+    openRecoveryAutoBackupModal() {
+        const modal = document.getElementById('recoveryAutoBackupModal');
+        if (!modal) return;
+        this.setRecoveryAutoBackupError('');
+        const passwordInput = document.getElementById('recoveryAutoBackupPasswordInput');
+        const codeInput = document.getElementById('recoveryAutoBackupCodeInput');
+        if (passwordInput) passwordInput.value = '';
+        if (codeInput) codeInput.value = '';
+        modal.style.display = 'flex';
+        passwordInput?.focus();
+        this.updateRecoveryAutoBackupSubmitState();
+    }
+
+    closeRecoveryAutoBackupModal() {
+        const modal = document.getElementById('recoveryAutoBackupModal');
+        if (modal) {
+            modal.style.display = 'none';
+        }
+        this.setRecoveryAutoBackupError('');
+        const passwordInput = document.getElementById('recoveryAutoBackupPasswordInput');
+        const codeInput = document.getElementById('recoveryAutoBackupCodeInput');
+        if (passwordInput) passwordInput.value = '';
+        if (codeInput) codeInput.value = '';
+        this.updateRecoveryAutoBackupSubmitState();
+    }
+
+    updateRecoveryAutoBackupSubmitState() {
+        const submitBtn = document.getElementById('submitRecoveryAutoBackupBtn');
+        if (!submitBtn) return;
+        const password = String(document.getElementById('recoveryAutoBackupPasswordInput')?.value || '').trim();
+        const recoveryCode = String(document.getElementById('recoveryAutoBackupCodeInput')?.value || '').trim();
+        submitBtn.disabled = !(password && recoveryCode);
+    }
+
+    async handleRecoveryAutoBackupSubmit(event) {
+        if (event?.preventDefault) {
+            event.preventDefault();
+        }
+
+        const passwordInput = document.getElementById('recoveryAutoBackupPasswordInput');
+        const codeInput = document.getElementById('recoveryAutoBackupCodeInput');
+        const submitBtn = document.getElementById('submitRecoveryAutoBackupBtn');
+        const password = String(passwordInput?.value || '');
+        const recoveryCode = String(codeInput?.value || '').trim();
+
+        if (!password.trim()) {
+            this.setRecoveryAutoBackupError('Account password is required.');
+            return;
+        }
+        if (!recoveryCode) {
+            this.setRecoveryAutoBackupError('Recovery code is required.');
+            return;
+        }
+
+        this.setRecoveryAutoBackupError('');
+        if (submitBtn) submitBtn.disabled = true;
+        try {
+            const result = await invoke('enable_recovery_auto_backup', {
+                password,
+                recoveryCode
+            });
+            if (!result?.success || !result.data) {
+                throw new Error(result?.error || 'Automatic recovery backup could not be enabled.');
+            }
+            this.securityStatus = result.data;
+            this.updateSecurityBanner();
+            this.closeRecoveryAutoBackupModal();
+            this.hideSecurityPanel();
+            this.showNotification('Automatic recovery backup enabled on this device.', 'success');
+            this.refreshWorkspaceHomeStatus({ suppressErrorNotification: true });
+        } catch (error) {
+            console.error('Failed to enable automatic recovery backup:', error);
+            this.setRecoveryAutoBackupError(error?.message || 'Automatic recovery backup could not be enabled.');
+        } finally {
+            this.updateRecoveryAutoBackupSubmitState();
+        }
+    }
+
+    shouldCheckRecoveryWriterHandoff() {
+        if (!this.isLoggedIn || this.recoveryHandoffCheckInFlight) return false;
+        const recoveryOk = Boolean(this.securityStatus?.recovery_auto_backup_ok);
+        const backupOk = Boolean(this.securityStatus?.recovery_backup_ok);
+        const state = String(this.securityStatus?.recovery_auto_backup_state || '').trim().toLowerCase();
+        if (recoveryOk || !backupOk) return false;
+        if (state !== 'missing_writer_blob' && state !== 'missing_writer_key') return false;
+        const now = Date.now();
+        if (now - Number(this.lastRecoveryHandoffCheckAt || 0) < 60000) return false;
+        return true;
+    }
+
+    maybeAcceptRecoveryWriterHandoff() {
+        if (!this.shouldCheckRecoveryWriterHandoff()) return;
+        this.acceptRecoveryWriterHandoffs({ silent: true });
+    }
+
+    async acceptRecoveryWriterHandoffs({ silent = false } = {}) {
+        if (!this.isLoggedIn || this.recoveryHandoffCheckInFlight) return;
+        this.recoveryHandoffCheckInFlight = true;
+        this.lastRecoveryHandoffCheckAt = Date.now();
+        const wasReady = Boolean(this.securityStatus?.recovery_auto_backup_ok);
+        try {
+            const result = await invoke('accept_recovery_writer_handoffs');
+            if (!result?.success || !result.data) {
+                throw new Error(result?.error || 'No trusted-device handoff could be applied.');
+            }
+            this.securityStatus = result.data;
+            this.updateSecurityBanner();
+            const isReady = Boolean(this.securityStatus?.recovery_auto_backup_ok);
+            if (isReady) {
+                this.hideSecurityPanel();
+                this.refreshWorkspaceHomeStatus({ suppressErrorNotification: true });
+                if (!silent && !wasReady) {
+                    this.showNotification('Automatic recovery backup enabled from trusted device handoff.', 'success');
+                }
+            } else if (!silent) {
+                this.showNotification('No trusted-device handoff is available yet. Verify this device from a trusted device, or use your recovery code.', 'info');
+            }
+        } catch (error) {
+            console.error('Failed to accept recovery writer handoff:', error);
+            if (!silent) {
+                this.showNotification(error?.message || 'Trusted-device handoff could not be applied.', 'error');
+            }
+        } finally {
+            this.recoveryHandoffCheckInFlight = false;
         }
     }
 
@@ -13768,20 +13977,114 @@ class HybridCipherApp {
         }
     }
 
-    async verifyUnverifiedDevice(device) {
-        const deviceId = device?.device_id;
-        const userId = device?.email;
-        if (!deviceId) {
-            this.showNotification('Device ID is required.', 'warning');
+    verifyUnverifiedDevice(device) {
+        this.openDeviceVerifyModal(device);
+    }
+
+    setDeviceVerifyError(message) {
+        const errorEl = document.getElementById('deviceVerifyError');
+        if (!errorEl) return;
+        const text = String(message || '').trim();
+        if (!text) {
+            errorEl.textContent = '';
+            errorEl.style.display = 'none';
             return;
         }
-        if (!userId) {
-            this.showNotification('User identifier is required to verify this device.', 'warning');
+        errorEl.textContent = text;
+        errorEl.style.display = 'block';
+    }
+
+    deviceVerifyUserIdentifier(device = this.deviceVerifyDevice) {
+        return buildDeviceVerificationModelValue({ device }).userIdentifier;
+    }
+
+    renderDeviceVerifySummary(device) {
+        const summary = document.getElementById('deviceVerifySummary');
+        if (!summary) return;
+        const rows = [
+            ['User', device?.email || 'Unknown user'],
+            ['User ID', device?.user_id || 'Unavailable'],
+            ['Device name', device?.device_name || 'Unnamed device'],
+            ['Device ID', device?.device_id || 'Unavailable'],
+            ['Last seen', device?.last_seen ? this.formatSettingsTimestamp(device.last_seen) : 'Unknown']
+        ];
+        summary.innerHTML = rows.map(([label, value]) => `
+            <div class="device-verify-summary-row">
+                <span class="device-verify-summary-label">${this.escapeHtml(label)}</span>
+                <span class="device-verify-summary-value">${this.escapeHtml(value)}</span>
+            </div>
+        `).join('');
+    }
+
+    openDeviceVerifyModal(device) {
+        const modal = document.getElementById('deviceVerifyModal');
+        if (!modal) {
+            this.showNotification('Device verification UI is unavailable.', 'error');
             return;
         }
-        const targetDeviceId = String(deviceId).trim();
+
+        this.deviceVerifyDevice = device || null;
+        this.setDeviceVerifyError('');
+        this.renderDeviceVerifySummary(device || {});
+
+        const input = document.getElementById('deviceVerifyFingerprintInput');
+        if (input) {
+            input.value = '';
+        }
+        modal.style.display = 'flex';
+        input?.focus();
+        this.updateDeviceVerifySubmitState();
+    }
+
+    closeDeviceVerifyModal() {
+        const modal = document.getElementById('deviceVerifyModal');
+        if (modal) {
+            modal.style.display = 'none';
+        }
+        this.deviceVerifyDevice = null;
+        this.setDeviceVerifyError('');
+        const input = document.getElementById('deviceVerifyFingerprintInput');
+        if (input) {
+            input.value = '';
+        }
+        this.updateDeviceVerifySubmitState();
+    }
+
+    updateDeviceVerifySubmitState() {
+        const submitBtn = document.getElementById('submitDeviceVerifyBtn');
+        if (!submitBtn) return;
+        const fingerprint = String(document.getElementById('deviceVerifyFingerprintInput')?.value || '').trim();
+        submitBtn.disabled = !buildDeviceVerificationModelValue({
+            device: this.deviceVerifyDevice,
+            fingerprint
+        }).canSubmit;
+    }
+
+    async handleDeviceVerifySubmit(event) {
+        if (event?.preventDefault) {
+            event.preventDefault();
+        }
+
+        const device = this.deviceVerifyDevice;
+        const fingerprint = String(document.getElementById('deviceVerifyFingerprintInput')?.value || '').trim();
+        const verificationModel = buildDeviceVerificationModelValue({ device, fingerprint });
+
+        if (!verificationModel.deviceId) {
+            this.setDeviceVerifyError('Device ID is required.');
+            return;
+        }
+        if (!verificationModel.userIdentifier) {
+            this.setDeviceVerifyError('User identifier is required to verify this device.');
+            return;
+        }
+        if (!verificationModel.fingerprint) {
+            this.setDeviceVerifyError('Fingerprint is required.');
+            return;
+        }
+
         const currentDeviceId = String(this.currentDeviceId || '').trim();
-        if (currentDeviceId && targetDeviceId === currentDeviceId) {
+        if (currentDeviceId && verificationModel.deviceId === currentDeviceId) {
+            this.setDeviceVerifyError('Cannot verify the current device from itself.');
             await this.showActionPrompt(
                 'Cannot verify from this device',
                 'This unverified device is your current device.',
@@ -13794,21 +14097,20 @@ class HybridCipherApp {
             return;
         }
 
-        const fingerprint = await this.promptForText(
-            'Enter the fingerprint for this device.',
-            {
-                title: 'Verify device',
-                placeholder: 'xxxx xxxx xxxx xxxx',
-                submitLabel: 'Verify'
-            }
-        );
-        if (fingerprint === null) return;
-
+        this.setDeviceVerifyError('');
+        const command = buildDeviceVerificationCommandValue({
+            device,
+            fingerprint: verificationModel.fingerprint,
+            quoteArg: value => this.quoteCliArg(value)
+        });
+        if (!command) {
+            this.setDeviceVerifyError('Device verification details are incomplete.');
+            return;
+        }
+        this.closeDeviceVerifyModal();
         this.showActionProgressModal('Verifying...');
         try {
-            const result = await this.runCliCommandRaw(
-                `hybridcipher pin verify ${this.quoteCliArg(userId)} ${this.quoteCliArg(deviceId)} --fingerprint ${this.quoteCliArg(fingerprint)}`
-            );
+            const result = await this.runCliCommandRaw(command);
             if (typeof result.status === 'number' && result.status !== 0) {
                 const message = (result.stderr || result.stdout || '').trim() || 'Device verification failed.';
                 await this.showActionPrompt(
@@ -13822,6 +14124,7 @@ class HybridCipherApp {
                 );
                 return;
             }
+            await this.offerRecoveryWriterHandoffForDevice(verificationModel.deviceId);
             this.showNotification('Device verified successfully.', 'success');
             this.loadUnverifiedDevicesQueue();
             this.refreshPersonalDevicesOverview({ suppressErrorNotification: true });
@@ -13839,6 +14142,30 @@ class HybridCipherApp {
             );
         } finally {
             this.hideActionProgressModal();
+        }
+    }
+
+    async offerRecoveryWriterHandoffForDevice(targetDeviceId) {
+        const deviceId = String(targetDeviceId || '').trim();
+        if (!deviceId) return null;
+        try {
+            const result = await invoke('offer_recovery_writer_handoff', {
+                targetDeviceId: deviceId
+            });
+            if (!result?.success || !result.data) {
+                console.warn('Recovery writer handoff was not offered:', result?.error);
+                return null;
+            }
+            const status = String(result.data.status || '').trim();
+            if (status === 'sent') {
+                this.showNotification('Automatic backup handoff sent to the verified device.', 'success');
+            } else if (status && status !== 'not_same_user' && status !== 'missing_writer_material') {
+                console.info('Recovery writer handoff skipped:', result.data.message || status);
+            }
+            return result.data;
+        } catch (error) {
+            console.warn('Recovery writer handoff offer failed:', error);
+            return null;
         }
     }
 

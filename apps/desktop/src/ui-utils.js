@@ -534,6 +534,30 @@
         };
     }
 
+    function buildDeviceVerificationModel({ device = null, fingerprint = '' } = {}) {
+        const userId = String(device?.user_id || '').trim();
+        const email = String(device?.email || '').trim();
+        const deviceId = String(device?.device_id || '').trim();
+        const normalizedFingerprint = String(fingerprint || '').trim();
+        const userIdentifier = userId || email;
+
+        return {
+            userIdentifier,
+            deviceId,
+            fingerprint: normalizedFingerprint,
+            canSubmit: Boolean(userIdentifier && deviceId && normalizedFingerprint),
+        };
+    }
+
+    function buildDeviceVerificationCommand({ device = null, fingerprint = '', quoteArg = null } = {}) {
+        const model = buildDeviceVerificationModel({ device, fingerprint });
+        if (!model.canSubmit) {
+            return null;
+        }
+        const quote = typeof quoteArg === 'function' ? quoteArg : value => String(value);
+        return `hybridcipher pin verify ${quote(model.userIdentifier)} ${quote(model.deviceId)} --fingerprint ${quote(model.fingerprint)}`;
+    }
+
     function getEmbeddedTerminalHeaderTitle() {
         return 'Embedded Terminal';
     }
@@ -567,6 +591,8 @@
         buildFolderDetailModel,
         buildCoverageCenterModel,
         buildPersonalDevicesModel,
+        buildDeviceVerificationModel,
+        buildDeviceVerificationCommand,
     };
 
     global.HybridCipherUiUtils = api;

@@ -11,8 +11,8 @@ and the optional feedback API helper.
 ## Platform Scope
 
 - The desktop app is configured for macOS, Windows, and Linux bundles.
-- The public rebuild and verification scripts included in this repository are
-  currently macOS-focused.
+- The public rebuild and verification scripts included in this repository cover
+  canonical unsigned macOS and Windows desktop artifacts.
 - On macOS, the installed desktop app can expose the bundled `hybridcipher`
   terminal command at `/usr/local/bin/hybridcipher`.
 
@@ -41,9 +41,8 @@ and the optional feedback API helper.
   identifier, updater endpoint, packaging resources, and icon paths.
 - `../../scripts/macos/public_desktop_verify.sh` is the supported public path
   for building unsigned macOS verification artifacts.
-- `../../scripts/macos/local_desktop_release.sh` is the local macOS release
-  builder for signed/notarized release work when the required signing
-  environment is available.
+- `../../scripts/winos/public_desktop_verify.ps1` is the supported public path
+  for building the unsigned Windows NSIS verification artifact.
 - `npx tauri build` stages the bundled CLI resource into
   `src-tauri/resources/bin/` automatically when a workspace-built
   `target/<profile>/hybridcipher` binary (or `HYBRIDCIPHER_CLI_PATH`) is

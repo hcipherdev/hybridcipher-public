@@ -1,12 +1,36 @@
 use crate::local_client::LocalClient;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tauri::async_runtime::Mutex;
 use uuid::Uuid;
 
+#[cfg(any(test, target_os = "windows"))]
+fn cloud_provider_health_ready(
+    registered: bool,
+    running: bool,
+    heartbeat_fresh: bool,
+    durable_state_readable: bool,
+) -> bool {
+    registered && running && heartbeat_fresh && durable_state_readable
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn cloud_provider_supervisor_requires_recovery(
+    lifecycle_healthy: bool,
+    heartbeat_fresh: bool,
+    operational_healthy: bool,
+) -> bool {
+    !(lifecycle_healthy && heartbeat_fresh && operational_healthy)
+}
+
 #[cfg(target_os = "windows")]
 struct RunningCloudRoot {
     host: hybridcipher_windows_cloud_provider::CloudProviderHost,
-    registration: hybridcipher_windows_cloud_provider::CloudRootRegistration,
+    client: Arc<LocalClient>,
+    operation_lock: Arc<Mutex<()>>,
+    owner_token: Uuid,
+    recovery_exhausted: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -77,6 +101,8 @@ fn unregister_macos_domain_for_desktop<R: MacFileProviderSystemDomainRegistrar>(
 pub struct DesktopCloudProviderManager {
     #[cfg(target_os = "windows")]
     running: Mutex<HashMap<Uuid, RunningCloudRoot>>,
+    #[cfg(target_os = "windows")]
+    supervisor_started: AtomicBool,
     #[cfg(target_os = "macos")]
     running: Mutex<HashMap<Uuid, RunningMacFileProviderRoot>>,
 }
@@ -89,6 +115,8 @@ impl DesktopCloudProviderManager {
         Self {
             #[cfg(target_os = "windows")]
             running: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "windows")]
+            supervisor_started: AtomicBool::new(false),
             #[cfg(target_os = "macos")]
             running: Mutex::new(HashMap::new()),
         }
@@ -144,7 +172,12 @@ impl DesktopCloudProviderManager {
     ) -> Result<(), String> {
         {
             let running = self.running.lock().await;
-            if running.contains_key(&root_id) {
+            if let Some(root) = running.get(&root_id) {
+                if root.recovery_exhausted.load(Ordering::Acquire) {
+                    return Err(format!(
+                        "Cloud Files recovery for root {root_id} exhausted its 3-attempt budget; stop and remount the root to retry"
+                    ));
+                }
                 return Ok(());
             }
         }
@@ -168,20 +201,244 @@ impl DesktopCloudProviderManager {
             encrypted_root,
             display_name,
         };
+        let registration_preexisted = host
+            .registration_exists(root_id)
+            .map_err(|err| err.to_string())?;
         host.register_root(&registration)
             .map_err(|err| err.to_string())?;
-        host.sync_placeholders(&registration)
-            .map_err(|err| err.to_string())?;
-        host.start_root_with_bridge(
-            root_id,
-            hybridcipher_windows_cloud_provider::local_provider_bridge(client),
-        )
-        .await
-        .map_err(|err| err.to_string())?;
+        let start_result = host
+            .start_root_with_bridge(
+                root_id,
+                hybridcipher_windows_cloud_provider::local_provider_bridge(client.clone()),
+            )
+            .await;
+        if let Err(err) = start_result {
+            return Err(host
+                .cleanup_failed_root_start_after_error(
+                    root_id,
+                    registration_preexisted,
+                    err.cleanup_disposition(),
+                    format!("Cloud Files startup failed: {err}"),
+                )
+                .await);
+        }
+        let health = match host.check_root_health(root_id) {
+            Ok(health) => health,
+            Err(error) => {
+                return Err(host
+                    .cleanup_failed_root_readiness_after_error(
+                        root_id,
+                        registration_preexisted,
+                        format!("Cloud Files startup health check failed: {error}"),
+                    )
+                    .await);
+            }
+        };
+        let running = health.operational.as_ref().is_some_and(|operational| {
+            operational.lifecycle
+                == hybridcipher_windows_cloud_provider::CloudRootConnectionState::Running
+        });
+        if !cloud_provider_health_ready(
+            health.registered,
+            running,
+            health.heartbeat_fresh,
+            health.durable_state_readable,
+        ) {
+            let detail = if health.unhealthy_evidence.is_empty() {
+                "Cloud Files root did not publish complete startup health".to_string()
+            } else {
+                health.unhealthy_evidence.join("; ")
+            };
+            return Err(host
+                .cleanup_failed_root_readiness_after_error(
+                    root_id,
+                    registration_preexisted,
+                    format!("Cloud Files startup readiness failed: {detail}"),
+                )
+                .await);
+        }
+
+        if let Err(error) = host.probe_root(root_id).await {
+            return Err(host
+                .cleanup_failed_root_readiness_after_error(
+                    root_id,
+                    registration_preexisted,
+                    format!("Cloud Files active startup probe failed: {error}"),
+                )
+                .await);
+        }
 
         let mut running = self.running.lock().await;
-        running.insert(root_id, RunningCloudRoot { host, registration });
+        running.insert(
+            root_id,
+            RunningCloudRoot {
+                host,
+                client,
+                operation_lock: Arc::new(Mutex::new(())),
+                owner_token: Uuid::new_v4(),
+                recovery_exhausted: Arc::new(AtomicBool::new(false)),
+            },
+        );
         Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn start_windows_health_supervisor(self: &Arc<Self>) {
+        if self
+            .supervisor_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let manager = Arc::downgrade(self);
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    return;
+                };
+                manager.supervise_windows_cloud_roots_once().await;
+            }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn supervise_windows_cloud_roots_once(&self) {
+        let targets = {
+            let running = self.running.lock().await;
+            running
+                .iter()
+                .map(|(root_id, root)| {
+                    (
+                        *root_id,
+                        root.host.clone(),
+                        root.client.clone(),
+                        root.operation_lock.clone(),
+                        root.owner_token,
+                        root.recovery_exhausted.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (root_id, host, client, operation_lock, owner_token, recovery_exhausted) in targets {
+            if recovery_exhausted.load(Ordering::Acquire) {
+                continue;
+            }
+            let _operation = operation_lock.lock().await;
+            let still_managed = self
+                .running
+                .lock()
+                .await
+                .get(&root_id)
+                .is_some_and(|root| root.owner_token == owner_token);
+            if !still_managed {
+                continue;
+            }
+
+            let health_is_good = host.check_root_health(root_id).is_ok_and(|health| {
+                !cloud_provider_supervisor_requires_recovery(
+                    health.lifecycle_healthy,
+                    health.heartbeat_fresh,
+                    health
+                        .operational
+                        .as_ref()
+                        .is_some_and(|operational| operational.healthy),
+                )
+            });
+            let probe = if health_is_good {
+                host.probe_root(root_id).await.map(|_| ())
+            } else {
+                Err(
+                    hybridcipher_windows_cloud_provider::CloudProviderError::Callback(
+                        "Cloud Files lifecycle, heartbeat, or callback health is unhealthy".into(),
+                    ),
+                )
+            };
+            if probe.is_ok() {
+                continue;
+            }
+
+            let mut failures = Vec::new();
+            let mut recovered = false;
+            for attempt in 1..=3u32 {
+                if host.is_root_running(root_id) {
+                    if let Err(error) = host.stop_root(root_id).await {
+                        failures.push(format!("attempt {attempt} stop failed: {error}"));
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            250 * u64::from(attempt),
+                        ))
+                        .await;
+                        continue;
+                    }
+                }
+                let bridge =
+                    hybridcipher_windows_cloud_provider::local_provider_bridge(client.clone());
+                match host.start_root_with_bridge(root_id, bridge).await {
+                    Ok(()) => match host.probe_root(root_id).await {
+                        Ok(_) => {
+                            recovered = true;
+                            break;
+                        }
+                        Err(error) => {
+                            failures.push(format!("attempt {attempt} active probe failed: {error}"))
+                        }
+                    },
+                    Err(error) => failures.push(format!("attempt {attempt} start failed: {error}")),
+                }
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)))
+                        .await;
+                }
+            }
+            if recovered {
+                tracing::info!(root_id = %root_id, "Cloud Files health supervisor recovered the root");
+            } else {
+                recovery_exhausted.store(true, Ordering::Release);
+                tracing::error!(
+                    root_id = %root_id,
+                    "Cloud Files health supervisor exhausted its 3-attempt recovery budget; stop and remount the root to retry: {}",
+                    failures.join("; ")
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub async fn is_root_active(&self, root_id: Uuid) -> bool {
+        self.running.lock().await.contains_key(&root_id)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    pub async fn is_root_active(&self, _root_id: Uuid) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    pub async fn check_root_health(
+        &self,
+        root_id: Uuid,
+    ) -> Result<hybridcipher_windows_cloud_provider::CloudRootHealthResponse, String> {
+        let running = self.running.lock().await;
+        let root = running
+            .get(&root_id)
+            .ok_or_else(|| format!("Cloud Files root {root_id} is not managed by this process"))?;
+        let exhausted = root.recovery_exhausted.load(Ordering::Acquire);
+        let mut health = root
+            .host
+            .check_root_health(root_id)
+            .map_err(|error| error.to_string())?;
+        if exhausted {
+            let evidence = "Cloud Files automatic recovery exhausted its 3-attempt budget; stop and remount the root to retry".to_string();
+            health.unhealthy_evidence.push(evidence.clone());
+            if let Some(operational) = health.operational.as_mut() {
+                operational.healthy = false;
+                operational.unhealthy_evidence.push(evidence);
+            }
+        }
+        Ok(health)
     }
 
     #[cfg(target_os = "macos")]
@@ -364,6 +621,70 @@ impl DesktopCloudProviderManager {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
+    pub async fn reconcile_windows_cloud_roots(
+        &self,
+        user_config_dir: PathBuf,
+        client: Arc<LocalClient>,
+    ) -> Result<(), String> {
+        let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+            hybridcipher_windows_cloud_provider::ProviderHostConfig {
+                user_config_dir: user_config_dir.clone(),
+                pipe_name: None,
+            },
+        );
+        let registrations = host
+            .load_registrations()
+            .map_err(|err| format!("Failed to load Windows Cloud Files registrations: {err}"))?;
+        let mut failures = Vec::new();
+        for registration in registrations {
+            if self
+                .running
+                .lock()
+                .await
+                .contains_key(&registration.root_id)
+            {
+                continue;
+            }
+            let mut last_error = None;
+            for attempt in 1..=3u32 {
+                match self
+                    .start_root(
+                        user_config_dir.clone(),
+                        registration.root_id,
+                        registration.sync_root_path.clone(),
+                        registration.encrypted_root.clone(),
+                        registration.display_name.clone(),
+                        client.clone(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(format!("attempt {attempt}: {error}"));
+                        if attempt < 3 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                250 * u64::from(attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = last_error {
+                failures.push(format!("{}: {}", registration.root_id, error));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub async fn start_root(
         &self,
@@ -384,42 +705,80 @@ impl DesktopCloudProviderManager {
         dehydrate: bool,
         force: bool,
     ) -> Result<(), String> {
-        let running = {
-            let mut running = self.running.lock().await;
-            running.remove(&root_id)
+        let (host, operation_lock, owner_token, recovery_exhausted) = {
+            let roots = self.running.lock().await;
+            let Some(running) = roots.get(&root_id) else {
+                return Ok(());
+            };
+            (
+                running.host.clone(),
+                running.operation_lock.clone(),
+                running.owner_token,
+                running.recovery_exhausted.clone(),
+            )
         };
-        let Some(running) = running else {
+        let _operation = operation_lock.lock().await;
+        if !self
+            .running
+            .lock()
+            .await
+            .get(&root_id)
+            .is_some_and(|root| root.owner_token == owner_token)
+        {
             return Ok(());
-        };
-
+        }
         if !force {
-            let status = running
-                .host
+            let status = host
                 .read_runtime_status(root_id)
                 .map_err(|err| err.to_string())?;
             if !status.safe_to_unmount {
                 let detail = status
                     .last_error
                     .unwrap_or_else(|| "pending Cloud Files mutation work remains".to_string());
-                let mut guard = self.running.lock().await;
-                guard.insert(root_id, running);
                 return Err(format!(
                     "Cloud Files root {} is not safe to unmount: {}",
                     root_id, detail
                 ));
             }
         }
-
-        if dehydrate && !force {
-            running
-                .host
-                .dehydrate_root_path(&running.registration.sync_root_path)
-                .map_err(|err| err.to_string())?;
+        let recovery_preserved_reason = if force {
+            if host.is_root_running(root_id) {
+                host.stop_root(root_id)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            None
+        } else if dehydrate {
+            match host
+                .unmount_root_safely(root_id)
+                .await
+                .map_err(|err| err.to_string())?
+            {
+                hybridcipher_windows_cloud_provider::SafeRootStopOutcome::Cleaned => None,
+                hybridcipher_windows_cloud_provider::SafeRootStopOutcome::RecoveryPreserved {
+                    reason,
+                } => Some(reason),
+            }
+        } else {
+            match host
+                .stop_root_safely(root_id, false)
+                .await
+                .map_err(|err| err.to_string())?
+            {
+                hybridcipher_windows_cloud_provider::SafeRootStopOutcome::Cleaned => None,
+                hybridcipher_windows_cloud_provider::SafeRootStopOutcome::RecoveryPreserved {
+                    reason,
+                } => Some(reason),
+            }
+        };
+        if let Some(reason) = recovery_preserved_reason {
+            recovery_exhausted.store(true, Ordering::Release);
+            return Err(format!(
+                "Cloud Files root {root_id} stopped, but cleanup was skipped to preserve recovery state: {reason}"
+            ));
         }
-        running
-            .host
-            .stop_root(root_id)
-            .map_err(|err| err.to_string())
+        self.running.lock().await.remove(&root_id);
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -517,6 +876,36 @@ impl DesktopCloudProviderManager {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub async fn stop_all(&self, _dehydrate: bool, _force: bool) -> Result<(), String> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_provider_health_readiness_requires_cross_process_durable_truth() {
+        assert!(cloud_provider_health_ready(true, true, true, true));
+        assert!(!cloud_provider_health_ready(false, true, true, true));
+        assert!(!cloud_provider_health_ready(true, false, true, true));
+        assert!(!cloud_provider_health_ready(true, true, false, true));
+        assert!(!cloud_provider_health_ready(true, true, true, false));
+    }
+
+    #[test]
+    fn cloud_provider_supervisor_recovers_only_unhealthy_roots() {
+        assert!(!cloud_provider_supervisor_requires_recovery(
+            true, true, true
+        ));
+        assert!(cloud_provider_supervisor_requires_recovery(
+            false, true, true
+        ));
+        assert!(cloud_provider_supervisor_requires_recovery(
+            true, false, true
+        ));
+        assert!(cloud_provider_supervisor_requires_recovery(
+            true, true, false
+        ));
     }
 }
 

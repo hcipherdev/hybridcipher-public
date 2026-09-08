@@ -55,6 +55,15 @@ struct DeviceKeys {
     expires_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceCryptoMaterial {
+    pub device_id: String,
+    pub identity_public: Vec<u8>,
+    pub identity_secret: Vec<u8>,
+    pub invitation_public: Vec<u8>,
+    pub invitation_secret: Vec<u8>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredInvitationKeyPair {
     device_id: String,
@@ -581,6 +590,20 @@ impl HybridCipherClient {
         }
         *self.device_keys.lock().unwrap() = Some(keys.clone());
         Ok(keys)
+    }
+
+    pub(crate) fn device_crypto_material(
+        &self,
+        email: &str,
+    ) -> Result<DeviceCryptoMaterial, String> {
+        let keys = self.ensure_device_keys(email)?;
+        Ok(DeviceCryptoMaterial {
+            device_id: keys.device_id,
+            identity_public: keys.identity_public,
+            identity_secret: keys.identity_secret,
+            invitation_public: keys.invitation_public,
+            invitation_secret: keys.invitation_secret,
+        })
     }
 
     /// Register a new user with OPAQUE

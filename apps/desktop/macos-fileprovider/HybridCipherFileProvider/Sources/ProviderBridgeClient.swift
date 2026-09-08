@@ -57,7 +57,6 @@ actor ProviderBridgeClient: ProviderEnumeratorBridge {
         let groupIdentifier = ProviderAppGroup.identifier()
         if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
             let candidate = container
-                .appendingPathComponent("s", isDirectory: true)
                 .appendingPathComponent(filename)
             if candidate.path.utf8.count < unixSocketPathLimit {
                 return candidate

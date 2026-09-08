@@ -1,6 +1,6 @@
 [package]
 name = "hybridcipher-desktop"
-version = "0.1.3" # this will be syncd to the version in tauri.conf.json during build
+version = "0.1.5" # this will be syncd to the version in tauri.conf.json during build
 edition = "2021"
 authors = ["HybridCipher Team"]
 description = "Cross-platform desktop application for HybridCipher encrypted file sharing"
@@ -16,7 +16,7 @@ tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
 # Tauri framework
-tauri = { version = "2.11.3", features = [] }
+tauri = { version = "2.11.3", features = ["tray-icon"] }
 tauri-plugin-shell = "2.3"
 tauri-plugin-dialog = "2.4"
 tauri-plugin-fs = "2.4"
@@ -91,6 +91,7 @@ keyring = { version = "3.6", features = ["linux-native"] }
 
 [dev-dependencies]
 tempfile = "3.8"
+hybridcipher-windows-cloud-provider = { path = "../../../crates/windows-cloud-provider" }
 
 [features]
 # Enable additional macOS-specific features

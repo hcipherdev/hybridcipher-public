@@ -8,6 +8,8 @@ const {
     buildFolderCoverageModel,
     buildCoverageCenterModel,
     buildPersonalDevicesModel,
+    buildDeviceVerificationModel,
+    buildDeviceVerificationCommand,
 } = require('./ui-utils');
 
 test('getFolderRowStatusState keeps mounted rows green when no issues exist', () => {
@@ -567,4 +569,68 @@ test('buildPersonalDevicesModel groups current, trusted, setup, and review devic
     assert.deepEqual(model.setupDevices.map(device => device.device_id), ['device-phone', 'device-tablet']);
     assert.deepEqual(model.reviewDevices.map(device => device.device_id), ['device-old']);
     assert.equal(model.hasAttention, true);
+});
+
+test('buildPersonalDevicesModel keeps unverified ownership fields on setup devices', () => {
+    const model = buildPersonalDevicesModel({
+        currentDeviceId: 'device-current',
+        devices: [
+            {
+                device_id: 'device-tablet',
+                user_id: '33333333-3333-3333-3333-333333333333',
+                email: 'member@example.com',
+                device_name: 'Member Tablet',
+                status: 'unverified',
+            },
+        ],
+    });
+
+    assert.equal(model.setupDevices.length, 1);
+    assert.equal(model.setupDevices[0].user_id, '33333333-3333-3333-3333-333333333333');
+    assert.equal(model.setupDevices[0].email, 'member@example.com');
+});
+
+test('buildDeviceVerificationModel prefers user id and blocks missing identifiers', () => {
+    assert.deepEqual(
+        buildDeviceVerificationModel({
+            device: {
+                user_id: '33333333-3333-3333-3333-333333333333',
+                email: 'member@example.com',
+                device_id: 'device-tablet',
+            },
+            fingerprint: ' ABCD ',
+        }),
+        {
+            userIdentifier: '33333333-3333-3333-3333-333333333333',
+            deviceId: 'device-tablet',
+            fingerprint: 'ABCD',
+            canSubmit: true,
+        }
+    );
+
+    assert.equal(
+        buildDeviceVerificationModel({
+            device: { device_id: 'device-tablet' },
+            fingerprint: 'ABCD',
+        }).canSubmit,
+        false
+    );
+});
+
+test('buildDeviceVerificationCommand constructs pin verify command', () => {
+    const command = buildDeviceVerificationCommand({
+        device: {
+            user_id: '',
+            email: 'member@example.com',
+            device_id: 'device tablet',
+        },
+        fingerprint: 'ABCD EFGH',
+        quoteArg: value => `"${String(value).replace(/"/g, '""')}"`,
+    });
+
+    assert.equal(
+        command,
+        'hybridcipher pin verify "member@example.com" "device tablet" --fingerprint "ABCD EFGH"'
+    );
+    assert.equal(buildDeviceVerificationCommand({ device: {}, fingerprint: 'ABCD' }), null);
 });

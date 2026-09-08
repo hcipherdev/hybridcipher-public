@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hybridcipher_mount_sync::{
     encrypted_path_for, load_mount_conflict_registry, load_mount_recovery_registry,
-    parse_encrypted_header_only, ConflictKind, MountConflictRecord, MountCrypto,
-    ConflictResolutionRequest, ConflictResolutionResult, MountRecoveryCopyRecord,
-    MountSafetyReason, MountSyncRuntimeStatus, RecoveryCopyResolutionRequest,
-    RecoveryCopyResolutionResult, SyncTracker,
+    parse_encrypted_header_only, ConflictKind, ConflictResolutionRequest, ConflictResolutionResult,
+    MountConflictRecord, MountCrypto, MountRecoveryCopyRecord, MountSafetyReason,
+    MountSyncRuntimeStatus, RecoveryCopyResolutionRequest, RecoveryCopyResolutionResult,
+    SyncTracker,
 };
 use hybridcipher_provider_core::{
     normalize_relative_path, FileIdentityV1, ProviderBridge, ProviderCoreError, ProviderEntry,
@@ -452,8 +452,12 @@ impl MacFileProviderCacheBridge {
 
         let mut journal = self.load_provider_change_journal()?;
         if !(previous_state.items.is_empty() && journal.latest_anchor == 0) {
-            let touched_containers =
-                record_state_changes(&mut journal, &previous_state, &next_state, PROVIDER_CHANGE_RETENTION);
+            let touched_containers = record_state_changes(
+                &mut journal,
+                &previous_state,
+                &next_state,
+                PROVIDER_CHANGE_RETENTION,
+            );
             if !touched_containers.is_empty() {
                 if let Err(err) = signal_provider_domain(
                     &self.domain_identifier,
@@ -481,7 +485,9 @@ impl MacFileProviderCacheBridge {
         &self,
         anchor: u64,
     ) -> hybridcipher_provider_core::Result<ProviderChangeEnumeration> {
-        Ok(self.load_provider_change_journal()?.enumerate_changes(anchor))
+        Ok(self
+            .load_provider_change_journal()?
+            .enumerate_changes(anchor))
     }
 
     async fn provider_snapshot_for_identifier(
@@ -989,14 +995,14 @@ impl ProviderSocketBridge for MacFileProviderCacheBridge {
             }
         }
         if let Some(file_id) = entry.identity.file_id.clone() {
-            return Ok(state.snapshot_cloned(
-                &ProviderItemIdentifier::File { file_id }.to_string(),
-            ));
+            return Ok(state.snapshot_cloned(&ProviderItemIdentifier::File { file_id }.to_string()));
         }
         Ok(state
             .items
             .values()
-            .find(|snapshot| snapshot.relative_path == normalize_relative_path(target_relative_path))
+            .find(|snapshot| {
+                snapshot.relative_path == normalize_relative_path(target_relative_path)
+            })
             .cloned())
     }
 
@@ -2387,7 +2393,6 @@ fn app_group_socket_path(root_id: Uuid) -> Option<PathBuf> {
         .join("Library")
         .join("Group Containers")
         .join(file_provider_app_group_identifier())
-        .join("s")
         .join(short_socket_filename(root_id));
 
     if path.as_os_str().len() < MACOS_UNIX_SOCKET_PATH_LIMIT {
@@ -2801,8 +2806,8 @@ mod ipc {
     use super::{
         load_mount_conflict_registry, load_mount_recovery_registry,
         macos_file_provider_sync_journal_paths, FileProviderDomainRegistration,
-        MacFileProviderHost, ProviderRuntimePaths, ProviderSocketBridge,
-        ProviderSocketRequest, ProviderSocketResponse, Result,
+        MacFileProviderHost, ProviderRuntimePaths, ProviderSocketBridge, ProviderSocketRequest,
+        ProviderSocketResponse, Result,
     };
     use std::sync::Arc;
     use uuid::Uuid;
@@ -3183,7 +3188,6 @@ mod ipc {
             ))
         }
     }
-
 }
 
 #[cfg(target_os = "macos")]
@@ -3460,7 +3464,7 @@ mod tests {
         assert!(path.components().any(|component| {
             component.as_os_str() == std::ffi::OsStr::new("Group Containers")
         }));
-        assert!(path.ends_with("s/00741c18f05f45f2.sock"));
+        assert!(path.ends_with("00741c18f05f45f2.sock"));
         assert!(
             path.as_os_str().len() < 104,
             "socket path is too long for macOS SUN_LEN: {}",
@@ -3822,19 +3826,16 @@ mod tests {
             },
         )
         .unwrap();
-        host.running_roots
-            .lock()
-            .unwrap()
-            .insert(
+        host.running_roots.lock().unwrap().insert(
+            root_id,
+            FileProviderDomainRegistration {
                 root_id,
-                FileProviderDomainRegistration {
-                    root_id,
-                    domain_identifier: format!("com.hybridcipher.root.{root_id}"),
-                    display_name: "HybridCipher Test".to_string(),
-                    encrypted_root: temp.path().join("encrypted"),
-                    user_visible_url: Some(temp.path().join("visible")),
-                },
-            );
+                domain_identifier: format!("com.hybridcipher.root.{root_id}"),
+                display_name: "HybridCipher Test".to_string(),
+                encrypted_root: temp.path().join("encrypted"),
+                user_visible_url: Some(temp.path().join("visible")),
+            },
+        );
 
         host.stop_root(root_id).unwrap();
 
@@ -3865,19 +3866,16 @@ mod tests {
             },
         )
         .unwrap();
-        host.running_roots
-            .lock()
-            .unwrap()
-            .insert(
+        host.running_roots.lock().unwrap().insert(
+            root_id,
+            FileProviderDomainRegistration {
                 root_id,
-                FileProviderDomainRegistration {
-                    root_id,
-                    domain_identifier: format!("com.hybridcipher.root.{root_id}"),
-                    display_name: "HybridCipher Test".to_string(),
-                    encrypted_root: temp.path().join("encrypted"),
-                    user_visible_url: Some(temp.path().join("visible")),
-                },
-            );
+                domain_identifier: format!("com.hybridcipher.root.{root_id}"),
+                display_name: "HybridCipher Test".to_string(),
+                encrypted_root: temp.path().join("encrypted"),
+                user_visible_url: Some(temp.path().join("visible")),
+            },
+        );
 
         host.stop_root(root_id).unwrap();
 
@@ -3989,10 +3987,12 @@ mod tests {
             &encrypted_root,
             &cache_root,
             &state,
-            Some(&ProviderItemIdentifier::Directory {
-                directory_id: docs_dir_id,
-            }
-            .to_string()),
+            Some(
+                &ProviderItemIdentifier::Directory {
+                    directory_id: docs_dir_id,
+                }
+                .to_string(),
+            ),
         )
         .unwrap();
 
@@ -4188,10 +4188,10 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
         let captured_calls = calls.clone();
         set_domain_signal_handler_for_tests(Arc::new(move |domain_identifier, container_ids| {
-            captured_calls.lock().unwrap().push((
-                domain_identifier.to_string(),
-                container_ids.to_vec(),
-            ));
+            captured_calls
+                .lock()
+                .unwrap()
+                .push((domain_identifier.to_string(), container_ids.to_vec()));
             Ok(())
         }));
 

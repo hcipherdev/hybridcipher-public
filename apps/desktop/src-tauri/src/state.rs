@@ -54,7 +54,7 @@ impl AppState {
     }
 
     /// Clear session (logout)
-    pub async fn clear_session(&self) {
+    pub async fn clear_session(&self) -> Result<(), String> {
         // Get session info before clearing
         let session_info = {
             let session = self.session.lock().await;
@@ -62,6 +62,11 @@ impl AppState {
                 .as_ref()
                 .map(|s| (s.email.clone(), self.client.server_url().to_string()))
         };
+
+        self.cloud_provider
+            .stop_all(true, false)
+            .await
+            .map_err(|err| format!("Refusing to clear session while mounts are unsafe: {err}"))?;
 
         // Clear from memory
         {
@@ -78,15 +83,10 @@ impl AppState {
             }
         }
 
-        if let Err(err) = self.cloud_provider.stop_all(true, false).await {
-            tracing::warn!(
-                "Failed to stop Cloud Files roots during session clear: {}",
-                err
-            );
-        }
         self.mount_manager.clear_manifest_scope().await;
         self.local_client.clear().await;
         self.client.clear_auth_cache();
+        Ok(())
     }
 
     /// Save session with password for first-time login (derives and caches account key)
@@ -383,7 +383,30 @@ impl AppState {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    async fn reconcile_file_provider_roots_after_session_setup(
+        &self,
+        user_session: &UserSession,
+        server_url: &str,
+    ) {
+        let Ok(client) = self.local_client.client().await else {
+            tracing::warn!("Cannot reconcile Windows Cloud Files roots: local client unavailable");
+            return;
+        };
+        let user_dir = self
+            .local_client
+            .user_dir_for_session(&user_session.email, server_url);
+        if let Err(err) = self
+            .cloud_provider
+            .reconcile_windows_cloud_roots(user_dir, client)
+            .await
+        {
+            tracing::warn!("Windows Cloud Files reconciliation failed: {}", err);
+        }
+        self.cloud_provider.start_windows_health_supervisor();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     async fn reconcile_file_provider_roots_after_session_setup(
         &self,
         _user_session: &UserSession,

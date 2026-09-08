@@ -97,6 +97,7 @@ pub struct StaleDeviceRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnverifiedDeviceRecord {
+    pub user_id: String,
     pub device_id: String,
     pub email: String,
     pub device_name: Option<String>,
@@ -118,6 +119,7 @@ pub struct PersonalDevicesOverviewInput {
 pub struct PersonalDeviceRecord {
     pub device_id: String,
     pub device_name: Option<String>,
+    pub user_id: Option<String>,
     pub email: Option<String>,
     pub status: String,
     pub added_at: Option<String>,
@@ -548,6 +550,7 @@ pub fn build_individual_home_status(input: IndividualHomeStatusInput) -> Individ
 fn build_personal_device_record(
     device_id: String,
     device_name: Option<String>,
+    user_id: Option<String>,
     email: Option<String>,
     status: &str,
     added_at: Option<String>,
@@ -558,6 +561,7 @@ fn build_personal_device_record(
     PersonalDeviceRecord {
         device_id,
         device_name,
+        user_id,
         email,
         status: status.to_string(),
         added_at,
@@ -590,6 +594,21 @@ pub fn build_personal_devices_overview(
         .iter()
         .map(|device| device.device_id.as_str())
         .collect::<std::collections::HashSet<_>>();
+    let unverified_details = input
+        .unverified_devices
+        .iter()
+        .map(|device| {
+            (
+                device.device_id.clone(),
+                (
+                    device.user_id.clone(),
+                    device.email.clone(),
+                    device.device_name.clone(),
+                    device.last_seen.clone(),
+                ),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
 
     let current_device_id = input.current_device_id.as_deref().unwrap_or_default();
     let mut seen_ids = std::collections::HashSet::new();
@@ -606,13 +625,24 @@ pub fn build_personal_devices_overview(
         };
 
         let is_current_device = device.is_current_device || device.device_id == current_device_id;
+        let unverified_detail = unverified_details.get(&device.device_id);
         let record = build_personal_device_record(
             device.device_id.clone(),
-            device.device_name.clone(),
-            None,
+            device
+                .device_name
+                .clone()
+                .or_else(|| unverified_detail.and_then(|(_, _, name, _)| name.clone())),
+            unverified_detail.map(|(user_id, _, _, _)| user_id.clone()),
+            unverified_detail.map(|(_, email, _, _)| email.clone()),
             status,
             Some(device.created_at.clone()),
-            Some(device.last_seen.clone()),
+            if status == "unverified" {
+                unverified_detail
+                    .and_then(|(_, _, _, last_seen)| last_seen.clone())
+                    .or_else(|| Some(device.last_seen.clone()))
+            } else {
+                Some(device.last_seen.clone())
+            },
             is_current_device,
             device.is_verified && status != "unverified",
         );
@@ -637,6 +667,7 @@ pub fn build_personal_devices_overview(
         let record = build_personal_device_record(
             device.device_id,
             device.device_name,
+            None,
             Some(device.email),
             "pending",
             device.observed_at.clone(),
@@ -659,6 +690,7 @@ pub fn build_personal_devices_overview(
         let record = build_personal_device_record(
             device.device_id,
             device.device_name,
+            Some(device.user_id),
             Some(device.email),
             "unverified",
             None,
@@ -681,6 +713,7 @@ pub fn build_personal_devices_overview(
         let record = build_personal_device_record(
             device.device_id,
             device.device_name,
+            None,
             Some(device.email),
             "stale",
             None,

@@ -43,9 +43,9 @@ pub fn signal_domain(domain_identifier: &str, container_ids: &[String]) -> Resul
 }
 
 pub fn install_domain_signal_handler() {
-    hybridcipher_macos_file_provider::set_domain_signal_handler(|domain_identifier, container_ids| {
-        signal_domain(domain_identifier, container_ids)
-    });
+    hybridcipher_macos_file_provider::set_domain_signal_handler(
+        |domain_identifier, container_ids| signal_domain(domain_identifier, container_ids),
+    );
 }
 
 fn cstring(label: &str, value: &str) -> Result<CString, String> {

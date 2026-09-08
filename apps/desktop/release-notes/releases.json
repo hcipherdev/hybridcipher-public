@@ -1,6 +1,44 @@
 {
   "releases": [
     {
+      "version": "0.1.5",
+      "published_at": "2026-09-03",
+      "highlights": [
+        "macOS File Provider mounts are more reliable: the app and Finder extension now use a shorter app-group socket path that stays inside the shared container instead of falling back to a sandbox-denied temporary path.",
+        "Protected folders on macOS now wait for the Finder File Provider domain and bridge socket to become healthy before the desktop app reports the mount as ready."
+      ],
+      "important_changes": [
+        "The macOS File Provider socket path now uses `~/Library/Group Containers/<team>.group.com.hybridcipher.macOS/<root>.sock`, removing the extra `s/` directory that could push paths over macOS Unix socket limits.",
+        "Desktop macOS mounts now verify File Provider domain visibility and runtime socket health before marking a protected folder as mounted, and fall back to sync mount when the File Provider runtime is unhealthy.",
+        "Unmount, logout, and quit flows now keep macOS File Provider roots running when pending provider work makes a clean stop unsafe.",
+        "macOS release tooling was clarified with `desktop_release_pkg.sh`, `local_test_build_macos_pkg.sh`, and a new local environment template for signing, notarization, updater keys, and public release metadata."
+      ],
+      "fixes": [
+        "Fixed a macOS File Provider socket path issue that could prevent Finder-backed mounts from listing and hydrating files correctly.",
+        "Fixed desktop mount readiness so macOS File Provider roots are not marked ready until the Finder domain is reachable and the bridge socket passes runtime health checks.",
+        "Updated macOS File Provider evidence checks and documentation to match the new app-group socket location."
+      ]
+    },
+    {
+      "version": "0.1.4",
+      "published_at": "2026-07-05",
+      "highlights": [
+        "macOS desktop release builds now stage and validate the File Provider runtime inside the app bundle, helping installed builds keep Finder-backed protected folders available.",
+        "Desktop login is safer on macOS: Remember Me now keeps only the email address and removes any legacy saved password from local storage."
+      ],
+      "important_changes": [
+        "The macOS installer now registers the bundled File Provider extension after install so protected folder mounts are ready for Finder integration.",
+        "Local macOS release packaging now refuses to publish an app when the File Provider extension is missing or has an unexpected bundle identifier.",
+        "Public macOS source-verification hashes were refreshed for the latest unsigned Apple Silicon and Intel desktop artifacts.",
+        "macOS desktop build dependencies were refreshed, including Tauri, Tauri plugins, reqwest, and AWS-LC."
+      ],
+      "fixes": [
+        "Fixed a macOS release packaging gap where the File Provider runtime could be absent from the final app bundle.",
+        "Fixed macOS build issues caused by the legacy FUSE mount path by limiting FUSE mounts to Linux builds.",
+        "Fixed Remember Me password persistence in the desktop app while preserving email prefill."
+      ]
+    },
+    {
       "version": "0.1.3",
       "published_at": "2026-06-17",
       "highlights": [

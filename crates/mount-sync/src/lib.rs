@@ -688,6 +688,10 @@ impl From<ClientError> for MountSyncError {
 
 #[async_trait]
 pub trait MountCrypto: Send + Sync {
+    fn is_path_excluded(&self, _path: &Path) -> bool {
+        false
+    }
+
     async fn decrypt_file(
         &self,
         encrypted_path: &Path,

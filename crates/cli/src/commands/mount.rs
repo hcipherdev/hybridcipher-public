@@ -228,6 +228,102 @@ pub(crate) struct RootMountStatus {
     pub mountpoint: Option<PathBuf>,
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn format_cloud_provider_mount_status(
+    health: &hybridcipher_windows_cloud_provider::CloudRootHealthResponse,
+) -> Vec<String> {
+    let mut errors = health.unhealthy_evidence.clone();
+    let (
+        lifecycle,
+        hydration_success_observed,
+        probe_success_observed,
+        callback_success_observed,
+        in_flight,
+        overdue,
+    ) = match health.operational.as_ref() {
+        Some(operational) => {
+            if let Some(error) = operational.last_start_failure.as_ref() {
+                errors.push(format!("latest startup error: {error}"));
+            }
+            if let Some(error) = operational.last_disconnect_failure.as_ref() {
+                errors.push(format!("latest disconnect error: {error}"));
+            }
+            if let Some(error) = operational.hydration_failure.as_ref() {
+                errors.push(format!("latest hydration error: {error}"));
+            }
+            for callback in &operational.callback_health {
+                if let Some(error) = callback.last_failure.as_ref() {
+                    errors.push(format!("{:?} callback error: {error}", callback.kind));
+                }
+                if let Some(error) = callback.unresolved_failure.as_ref() {
+                    errors.push(format!(
+                        "{:?} callback unresolved error: {error}",
+                        callback.kind
+                    ));
+                }
+            }
+            (
+                format!("{:?}", operational.lifecycle),
+                operational.hydration_success_observed,
+                operational.active_probe.success_observed,
+                operational
+                    .callback_health
+                    .iter()
+                    .filter(|callback| callback.callback_success_observed)
+                    .map(|callback| format!("{:?}", callback.kind))
+                    .collect::<Vec<_>>(),
+                operational
+                    .callback_health
+                    .iter()
+                    .map(|callback| callback.in_flight_count)
+                    .sum::<u64>(),
+                operational
+                    .callback_health
+                    .iter()
+                    .map(|callback| callback.overdue_in_flight_count)
+                    .sum::<u64>(),
+            )
+        }
+        None => ("unavailable".into(), false, false, Vec::new(), 0, 0),
+    };
+    vec![
+        format!("Lifecycle: {lifecycle}"),
+        format!("Heartbeat fresh: {}", health.heartbeat_fresh),
+        format!("Hydration success observed: {hydration_success_observed}"),
+        format!("Active root probe success observed: {probe_success_observed}"),
+        format!(
+            "Callback success observed: {}",
+            if callback_success_observed.is_empty() {
+                "none".to_string()
+            } else {
+                callback_success_observed.join(", ")
+            }
+        ),
+        format!("Callbacks in-flight/overdue: {in_flight}/{overdue}"),
+        format!(
+            "Durable safety: {} (readable={}, pending mutations={}, pending refresh={}, conflicts={})",
+            health.safe_to_unmount,
+            health.durable_state_readable,
+            health
+                .pending_mutation_count
+                .map_or_else(|| "unknown".into(), |count| count.to_string()),
+            health
+                .pending_refresh_count
+                .map_or_else(|| "unknown".into(), |count| count.to_string()),
+            health
+                .conflict_count
+                .map_or_else(|| "unknown".into(), |count| count.to_string()),
+        ),
+    ]
+    .into_iter()
+    .chain(
+        errors
+            .into_iter()
+            .map(|error| format!("Cloud Files health error: {error}")),
+    )
+    .collect()
+}
+
 impl RootMountStatus {
     fn inactive() -> Self {
         Self {
@@ -859,6 +955,11 @@ pub async fn handle_mount(
                         return Ok(());
                     }
                     Err(err) => {
+                        if unmount_requested {
+                            // Cloud Files cleanup failures must leave the runtime record in place
+                            // so a later unmount can retry dehydration/unregistration safely.
+                            return Err(err);
+                        }
                         if retry_attempts < 3 && !unmount_requested {
                             retry_attempts += 1;
                             mount_ready_shown = false; // Reset ready flag on retry
@@ -1082,6 +1183,19 @@ async fn handle_mount_status(
     if let Some(reason) = state.fallback_reason.as_deref() {
         ui::info(&format!("Fallback reason: {}", reason));
     }
+    #[cfg(target_os = "windows")]
+    if state.backend().is_windows_cloud_files() {
+        let health = cloud_provider_host(session_manager)?
+            .check_root_health(state.root_id)
+            .map_err(|error| CliError::mount(error.to_string()))?;
+        for line in format_cloud_provider_mount_status(&health) {
+            if line.starts_with("Cloud Files health error:") {
+                ui::warning(&line);
+            } else {
+                ui::info(&line);
+            }
+        }
+    }
 
     if let Some(status) = status {
         ui::info(&format!("Safe to unmount: {}", status.safe_to_unmount));
@@ -1206,6 +1320,7 @@ async fn handle_mount_reset(
         ));
     }
     host.reset_root(state.root_id)
+        .await
         .map_err(|err| CliError::mount(err.to_string()))?;
     let state_path = mount_state_path(session_manager, state.root_id)?;
     clear_runtime_state(&state_path)?;
@@ -1631,16 +1746,43 @@ async fn unmount_single_mount(
     state: &MountRuntimeState,
     force: bool,
 ) -> Result<(), CliError> {
-    if state.requested_unmount {
+    let stale = runtime_mount_state_is_stale(state).await;
+    if state.requested_unmount && !stale {
         ui::info("Unmount already requested – waiting for mount process to exit.");
         return Ok(());
     }
 
-    if runtime_mount_state_is_stale(state).await {
+    if stale {
         warn!(
             "Cleaning stale mount state for {} because the recorded host is no longer active",
             state.mountpoint.display()
         );
+        #[cfg(target_os = "windows")]
+        if state.backend().is_windows_cloud_files() {
+            let host = cloud_provider_host(session_manager)?;
+            match host
+                .unmount_root_safely(state.root_id)
+                .await
+                .map_err(|err| CliError::mount(err.to_string()))?
+            {
+                hybridcipher_windows_cloud_provider::SafeRootStopOutcome::Cleaned => {}
+                hybridcipher_windows_cloud_provider::SafeRootStopOutcome::RecoveryPreserved {
+                    reason,
+                } => {
+                    return Err(CliError::mount(format!(
+                        "Cloud Files stale mount cleanup was incomplete; recovery state was preserved: {reason}"
+                    )));
+                }
+            }
+            clear_runtime_state(state_path)?;
+            let sync_status_path = mount_sync_status_path(session_manager, state.root_id)?;
+            clear_mount_sync_status(&sync_status_path)?;
+            ui::success(&format!(
+                "Cleaned stale Cloud Files mount state for {}.",
+                state.mountpoint.display()
+            ));
+            return Ok(());
+        }
         if let Err(err) = cleanup_mountpoint_safe(&state.mountpoint) {
             warn!(
                 "Safe cleanup failed for stale mountpoint {}: {}. Preserving mountpoint contents.",
@@ -1667,17 +1809,6 @@ async fn unmount_single_mount(
             {
                 return Err(CliError::mount(message));
             }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    if state.backend().is_windows_cloud_files() && !force {
-        let host = cloud_provider_host(session_manager)?;
-        if let Err(err) = host.dehydrate_root_path(&state.mountpoint) {
-            return Err(CliError::mount(format!(
-                "Cloud Files dehydration failed before unmount: {}. Re-run with --force to disconnect without dehydration.",
-                err
-            )));
         }
     }
 
@@ -1723,6 +1854,33 @@ async fn unmount_single_mount(
 
         tokio::time::sleep(check_interval).await;
         waited += check_interval;
+    }
+
+    #[cfg(target_os = "windows")]
+    if state.backend().is_windows_cloud_files() && state_path.exists() {
+        if state.host_pid.is_some_and(process_is_running) {
+            return Err(CliError::mount(format!(
+                "Cloud Files mount process did not finish cleanup within {} seconds; mount state was preserved",
+                max_wait.as_secs()
+            )));
+        }
+        let host = cloud_provider_host(session_manager)?;
+        match host
+            .unmount_root_safely(state.root_id)
+            .await
+            .map_err(|err| CliError::mount(err.to_string()))?
+        {
+            hybridcipher_windows_cloud_provider::SafeRootStopOutcome::Cleaned => {
+                mount_exited = true;
+            }
+            hybridcipher_windows_cloud_provider::SafeRootStopOutcome::RecoveryPreserved {
+                reason,
+            } => {
+                return Err(CliError::mount(format!(
+                    "Cloud Files mount cleanup was incomplete; recovery state was preserved: {reason}"
+                )));
+            }
+        }
     }
 
     if mountpoint_has_fuse_mount(&state.mountpoint).await {
@@ -2025,28 +2183,136 @@ async fn run_cloud_files_mount(
         encrypted_root: encrypted_dir,
         display_name: derive_mount_label(&mountpoint, root_id),
     };
+    let registration_preexisted = host
+        .registration_exists(root_id)
+        .map_err(|err| err.to_string())?;
     host.register_root(&registration)
         .map_err(|err| err.to_string())?;
-    host.sync_placeholders(&registration)
-        .map_err(|err| err.to_string())?;
     let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge(Arc::new(client));
-    host.start_root_with_bridge(root_id, bridge)
-        .await
-        .map_err(|err| err.to_string())?;
+    if let Err(error) = host.start_root_with_bridge(root_id, bridge.clone()).await {
+        return Err(host
+            .cleanup_failed_root_start_after_error(
+                root_id,
+                registration_preexisted,
+                error.cleanup_disposition(),
+                format!("Cloud Files startup failed: {error}"),
+            )
+            .await);
+    }
+    let health = match host.check_root_health(root_id) {
+        Ok(health) => health,
+        Err(error) => {
+            return Err(host
+                .cleanup_failed_root_readiness_after_error(
+                    root_id,
+                    registration_preexisted,
+                    format!("Cloud Files startup health check failed: {error}"),
+                )
+                .await);
+        }
+    };
+    let running = health.operational.as_ref().is_some_and(|operational| {
+        operational.lifecycle
+            == hybridcipher_windows_cloud_provider::CloudRootConnectionState::Running
+    });
+    if !(health.registered && running && health.heartbeat_fresh && health.durable_state_readable) {
+        let detail = if health.unhealthy_evidence.is_empty() {
+            "Cloud Files root did not publish complete startup health".to_string()
+        } else {
+            health.unhealthy_evidence.join("; ")
+        };
+        return Err(host
+            .cleanup_failed_root_readiness_after_error(
+                root_id,
+                registration_preexisted,
+                format!("Cloud Files startup readiness failed: {detail}"),
+            )
+            .await);
+    }
+    if let Err(error) = host.probe_root(root_id).await {
+        return Err(host
+            .cleanup_failed_root_readiness_after_error(
+                root_id,
+                registration_preexisted,
+                format!("Cloud Files active startup probe failed: {error}"),
+            )
+            .await);
+    }
     if let Some(ready) = ready {
         ready.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    while stop_rx.changed().await.is_ok() {
-        if *stop_rx.borrow() {
-            host.stop_root(root_id).map_err(|err| err.to_string())?;
-            host.unregister_system_domain(&registration)
-                .and_then(|_| host.unregister_domain_state(root_id))
-                .map_err(|err| err.to_string())?;
-            return Ok(());
+    let mut health_interval = tokio::time::interval(Duration::from_secs(30));
+    health_interval.tick().await;
+    loop {
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    return match host
+                        .unmount_root_safely(root_id)
+                        .await
+                        .map_err(|err| err.to_string())?
+                    {
+                        hybridcipher_windows_cloud_provider::SafeRootStopOutcome::Cleaned => Ok(()),
+                        hybridcipher_windows_cloud_provider::SafeRootStopOutcome::RecoveryPreserved { reason } => Err(format!(
+                            "Cloud Files root stopped, but mount cleanup was incomplete and recovery state was preserved: {reason}"
+                        )),
+                    };
+                }
+            }
+            _ = health_interval.tick() => {
+                let lifecycle_healthy = host
+                    .check_root_health(root_id)
+                    .map(|health| health.lifecycle_healthy && health.heartbeat_fresh)
+                    .unwrap_or(false);
+                let probe_result = if lifecycle_healthy {
+                    host.probe_root(root_id).await.map(|_| ())
+                } else {
+                    Err(hybridcipher_windows_cloud_provider::CloudProviderError::Callback(
+                        "Cloud Files lifecycle or heartbeat became unhealthy".into(),
+                    ))
+                };
+                if let Err(trigger) = probe_result {
+                    tracing::warn!(
+                        root_id = %root_id,
+                        "Cloud Files health supervisor is restarting the root: {trigger}"
+                    );
+                    let mut failures = Vec::new();
+                    let mut recovered = false;
+                    for attempt in 1..=3u32 {
+                        if host.is_root_running(root_id) {
+                            if let Err(error) = host.stop_root(root_id).await {
+                                failures.push(format!("attempt {attempt} stop failed: {error}"));
+                                tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                                continue;
+                            }
+                        }
+                        match host.start_root_with_bridge(root_id, bridge.clone()).await {
+                            Ok(()) => match host.probe_root(root_id).await {
+                                Ok(_) => {
+                                    recovered = true;
+                                    break;
+                                }
+                                Err(error) => failures.push(format!(
+                                    "attempt {attempt} active probe failed: {error}"
+                                )),
+                            },
+                            Err(error) => failures.push(format!(
+                                "attempt {attempt} start failed: {error}"
+                            )),
+                        }
+                        tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                    }
+                    if !recovered {
+                        return Err(format!(
+                            "Cloud Files recovery stopped after 3 attempts: {}",
+                            failures.join("; ")
+                        ));
+                    }
+                }
+            }
         }
     }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -3778,5 +4044,107 @@ mod tests {
         assert!(message.contains("does not preserve hard-link semantics"));
         assert!(message.contains("Break the hard link or replace it with an independent copy"));
         assert!(message.contains("/tmp/mount/document.txt"));
+    }
+
+    #[test]
+    fn mount_status_cloud_provider_health_renders_cross_process_truth() {
+        use hybridcipher_windows_cloud_provider::{
+            CloudCallbackClass, CloudCallbackHealth, CloudCallbackKind, CloudRootConnectionState,
+            CloudRootOperationalHealth, CloudRootProbeHealth,
+        };
+
+        let root_id = Uuid::new_v4();
+        let observed_at = chrono::Utc::now();
+        let health = hybridcipher_windows_cloud_provider::CloudRootHealthResponse {
+            root_id,
+            registered: true,
+            operational: Some(CloudRootOperationalHealth {
+                root_id,
+                owner_instance_id: Uuid::new_v4(),
+                owner_process_id: 4_242,
+                connection_generation: 3,
+                snapshot_revision: 12,
+                lifecycle: CloudRootConnectionState::Running,
+                lifecycle_changed_at: observed_at,
+                last_start_attempt_at: Some(observed_at),
+                last_start_success_at: Some(observed_at),
+                last_start_failure_at: Some(observed_at),
+                last_start_failure: Some("startup retry failed".into()),
+                last_disconnect_failure_at: Some(observed_at),
+                last_disconnect_failure: Some("disconnect confirmation failed".into()),
+                stop_count: 1,
+                last_stopped_at: Some(observed_at),
+                last_heartbeat_at: Some(observed_at),
+                heartbeat_stale_after_millis: 15_000,
+                callback_health: vec![CloudCallbackHealth {
+                    kind: CloudCallbackKind::FetchData,
+                    class: CloudCallbackClass::Actionable,
+                    connection_generation: 3,
+                    attempt_count: 3,
+                    success_count: 2,
+                    failure_count: 1,
+                    in_flight_count: 2,
+                    overdue_in_flight_count: 1,
+                    last_attempt_at: Some(observed_at),
+                    last_success_at: Some(observed_at),
+                    last_failure_at: Some(observed_at),
+                    last_failure: Some("fetch handler failed".into()),
+                    unresolved_failure: Some("fetch remains unresolved".into()),
+                    oldest_in_flight_started_at: Some(observed_at),
+                    earliest_in_flight_deadline_at: Some(observed_at),
+                    callback_success_observed: true,
+                }],
+                active_probe: CloudRootProbeHealth::default(),
+                hydration_success_observed: true,
+                last_hydration_success_at: Some(observed_at),
+                hydration_failure: Some("latest hydration failed".into()),
+                last_hydration_failure_at: Some(observed_at),
+                persistence_error: None,
+                assessed_at: observed_at,
+                healthy: false,
+                unhealthy_evidence: vec!["FetchData callback remains unresolved".into()],
+            }),
+            lifecycle_healthy: true,
+            heartbeat_fresh: true,
+            durable_state_readable: true,
+            safe_to_unmount: false,
+            pending_mutation_count: Some(2),
+            pending_refresh_count: Some(1),
+            conflict_count: Some(3),
+            durable_observed_at: chrono::Utc::now(),
+            registration_source: Some(
+                hybridcipher_windows_cloud_provider::DurableInspectionSource::Primary,
+            ),
+            registration_generation: Some(4),
+            health_snapshot_source: None,
+            health_snapshot_generation: None,
+            health_snapshot_revision: None,
+            mutation_journal_source: Some(
+                hybridcipher_windows_cloud_provider::DurableInspectionSource::Backup,
+            ),
+            mutation_journal_generation: Some(7),
+            provider_state_source: Some(
+                hybridcipher_windows_cloud_provider::DurableInspectionSource::Primary,
+            ),
+            provider_state_generation: Some(8),
+            unhealthy_evidence: vec!["operational health snapshot is missing".into()],
+        };
+
+        let rendered = format_cloud_provider_mount_status(&health).join("\n");
+
+        assert!(rendered.contains("Lifecycle: Running"));
+        assert!(rendered.contains("Heartbeat fresh: true"));
+        assert!(rendered.contains("Hydration success observed: true"));
+        assert!(rendered.contains("Callback success observed: FetchData"));
+        assert!(rendered.contains("Callbacks in-flight/overdue: 2/1"));
+        assert!(rendered.contains("Durable safety: false"));
+        assert!(rendered.contains("pending mutations=2"));
+        assert!(rendered.contains("pending refresh=1"));
+        assert!(rendered.contains("conflicts=3"));
+        assert!(rendered.contains("latest startup error: startup retry failed"));
+        assert!(rendered.contains("latest disconnect error: disconnect confirmation failed"));
+        assert!(rendered.contains("latest hydration error: latest hydration failed"));
+        assert!(rendered.contains("FetchData callback error: fetch handler failed"));
+        assert!(rendered.contains("FetchData callback unresolved error: fetch remains unresolved"));
     }
 }
