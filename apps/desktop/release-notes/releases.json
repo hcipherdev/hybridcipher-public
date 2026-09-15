@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "0.1.6",
+      "published_at": "2026-09-15",
+      "highlights": [
+        "Moving a file or folder to the Trash from Finder now removes it from your protected folder instead of failing to sync.",
+        "The desktop app is simpler for personal use, with protected-folder search in the header, a clearer \"Protection status\" view, and advanced tools tucked into a collapsible Settings section.",
+        "Unmounting is safer and easier to understand: every unmount now asks for confirmation first, and a new Mount session card shows what is still pending before you stop a folder."
+      ],
+      "important_changes": [
+        "Files just created in a Finder-backed protected folder can now be renamed, edited, and moved right away, because the app resolves newly created items to their stable identity.",
+        "The folder view now leads with \"Open mounted folder\"; \"Reveal encrypted source\" and \"Unmount folder…\" moved into a ••• menu, with unmount marked as destructive.",
+        "Unmount warnings now include \"Review mount details\", showing pending encrypted commits, the oldest pending change, affected file paths, the underlying error, and what to do next.",
+        "Renaming or moving a protected file no longer leaves a duplicate encrypted copy behind: the previous encrypted file is moved into retention instead.",
+        "Terminal access, diagnostics, coverage commands, and \"Unmount all\" now live under Advanced tools in Settings, and backend and provider names moved into mount details.",
+        "macOS builds are now produced by a public release workflow, and the packaging script verifies signing identities before building."
+      ],
+      "fixes": [
+        "Fixed Conflict Review showing a stale \"conflicts cleared\" message; it now refreshes mount status and clearly says when unmount is still blocked by other pending work.",
+        "Fixed the folder detail view jumping back to the top every few seconds while the missing-items list was being reviewed.",
+        "Fixed write-back retries so a file's identity is preserved when a pending change is flushed before the next scan.",
+        "Removed a duplicated Device center button and a duplicated unmount-safety statistic, and made zero-issue cards visually quieter."
+      ]
+    },
+    {
       "version": "0.1.5",
       "published_at": "2026-09-03",
       "highlights": [

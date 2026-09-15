@@ -1,6 +1,6 @@
 [package]
 name = "hybridcipher-desktop"
-version = "0.1.5" # this will be syncd to the version in tauri.conf.json during build
+version = "0.1.6" # this will be syncd to the version in tauri.conf.json during build
 edition = "2021"
 authors = ["HybridCipher Team"]
 description = "Cross-platform desktop application for HybridCipher encrypted file sharing"
