@@ -38,6 +38,59 @@ const quoteShellArgValue = typeof securityUtils.quoteShellArg === 'function'
         return `'${text.replace(/'/g, `'\"'\"'`)}'`;
     };
 const uiUtils = window.HybridCipherUiUtils || {};
+const filterProtectedFoldersValue = typeof uiUtils.filterProtectedFolders === 'function'
+    ? uiUtils.filterProtectedFolders
+    : (folders, query) => {
+        const normalizedQuery = String(query || '').trim().toLocaleLowerCase();
+        const safeFolders = Array.isArray(folders) ? folders : [];
+        if (!normalizedQuery) return safeFolders.slice();
+        return safeFolders.filter(folder => {
+            const path = String(folder?.path || '');
+            const basename = path.split(/[\\/]/).filter(Boolean).pop() || '';
+            return [folder?.name, basename, path].some(value =>
+                String(value || '').toLocaleLowerCase().includes(normalizedQuery)
+            );
+        });
+    };
+const buildAppModeUiModelValue = typeof uiUtils.buildAppModeUiModel === 'function'
+    ? uiUtils.buildAppModeUiModel
+    : appMode => ({
+        searchMode: appMode === 'individual' ? 'folders' : 'commands',
+        searchPlaceholder: appMode === 'individual' ? 'Search protected folders…' : 'Search CLI commands…',
+        showTechnicalNavigation: appMode !== 'individual',
+        protectionNavigationLabel: appMode === 'individual' ? 'Protection status' : 'Coverage Center',
+    });
+const shouldExpandAdvancedSettingsValue = typeof uiUtils.shouldExpandAdvancedSettings === 'function'
+    ? uiUtils.shouldExpandAdvancedSettings
+    : sectionId => [
+        'settingsAdvancedTools',
+        'settingsAdvancedMountSection',
+        'settingsAdvancedDeviceSection',
+        'settingsAdvancedTrustSection',
+        'settingsCoverageSection',
+        'settingsTerminalSection',
+    ].includes(String(sectionId || ''));
+const captureKeyedScrollPositionsValue = typeof uiUtils.captureKeyedScrollPositions === 'function'
+    ? uiUtils.captureKeyedScrollPositions
+    : (container, selector = '[data-preserve-scroll-key]') => {
+        if (!container || typeof container.querySelectorAll !== 'function') return {};
+        return Array.from(container.querySelectorAll(selector)).reduce((positions, element) => {
+            const key = String(element?.dataset?.preserveScrollKey || '').trim();
+            if (key) positions[key] = Math.max(0, Number(element.scrollTop || 0));
+            return positions;
+        }, {});
+    };
+const restoreKeyedScrollPositionsValue = typeof uiUtils.restoreKeyedScrollPositions === 'function'
+    ? uiUtils.restoreKeyedScrollPositions
+    : (container, positions = {}, selector = '[data-preserve-scroll-key]') => {
+        if (!container || typeof container.querySelectorAll !== 'function') return;
+        Array.from(container.querySelectorAll(selector)).forEach(element => {
+            const key = String(element?.dataset?.preserveScrollKey || '').trim();
+            if (key && Object.prototype.hasOwnProperty.call(positions, key)) {
+                element.scrollTop = Math.max(0, Number(positions[key] || 0));
+            }
+        });
+    };
 const getMountBackendLabelValue = (backend) => {
     switch (backend) {
         case 'macos-file-provider':
@@ -74,6 +127,26 @@ const getFolderRowStatusStateValue = typeof uiUtils.getFolderRowStatusState === 
             showMountedBadge: true,
             showAlertButton: Boolean(showSafetyAlert),
             healthDotTone: hasConflicts || hasRecoveryCopies ? 'red' : 'green',
+        };
+    };
+const buildMountConflictReviewStateValue = typeof uiUtils.buildMountConflictReviewState === 'function'
+    ? uiUtils.buildMountConflictReviewState
+    : ({ records = [], syncStatus = null } = {}) => {
+        const listedCount = Array.isArray(records) ? records.length : 0;
+        const statusAvailable = Boolean(syncStatus && typeof syncStatus === 'object');
+        const reportedCount = statusAvailable
+            ? Math.max(0, Number(syncStatus.pending_conflict_count || 0))
+            : null;
+        return {
+            listedCount,
+            reportedCount,
+            statusAvailable,
+            mismatch: statusAvailable && listedCount !== reportedCount,
+            isClear: statusAvailable && listedCount === 0 && reportedCount === 0,
+            safeToUnmount: statusAvailable ? syncStatus.safe_to_unmount === true : null,
+            hasOtherBlockingWork: statusAvailable
+                ? syncStatus.safe_to_unmount === false && reportedCount === 0
+                : false,
         };
     };
 const buildPostQuantumStatusModelValue = typeof uiUtils.buildPostQuantumStatusModel === 'function'
@@ -215,10 +288,14 @@ const buildFolderDetailModelValue = typeof uiUtils.buildFolderDetailModel === 'f
         primaryAction: isMounted
             ? { id: 'open-mounted', label: 'Open mounted folder' }
             : { id: 'mount', label: 'Mount folder' },
-        secondaryActions: [],
+        secondaryActions: [
+            { id: 'reveal-protected', label: 'Reveal encrypted source' },
+            ...(isMounted ? [{ id: 'unmount', label: 'Unmount folder…', destructive: true }] : []),
+        ],
         attention: {
             conflicts: 0,
             recoveryCopies: 0,
+            pendingChanges: 0,
             mountStatusLabel: isMounted ? 'Mounted' : 'Not mounted',
             unmountSafetyLabel: isMounted ? 'Checking...' : null,
             safeToUnmount: null,
@@ -425,6 +502,7 @@ class HybridCipherApp {
         this.isLoggedIn = false;
         this.adminPanelVisible = false;
         this.appMode = 'individual';
+        this.folderSearchQuery = '';
         this.activeWorkspaceView = 'home';
         this.rememberMePreference = this.loadRememberPreference();
         this.autoMountLastFolderPreference = this.loadAutoMountLastFolderPreference();
@@ -482,6 +560,7 @@ class HybridCipherApp {
         this.pendingRegistrationEmail = null;
         this.pendingRegistrationPassword = null;
         this.activeQueueDetails = null;
+        this.mountSafetyDetailsOpenByRootId = {};
         this.operationsRefreshIntervalSecs = null;
         this.operationsRefreshTimer = null;
         this.operationsRefreshInFlight = false;
@@ -555,7 +634,8 @@ class HybridCipherApp {
             rootId: null,
             folder: null,
             records: [],
-            selectedConflictId: null
+            selectedConflictId: null,
+            reviewState: null
         };
         this.activeConflictPreview = null;
         this.recoveryCenterState = {
@@ -800,9 +880,23 @@ class HybridCipherApp {
         const appContainer = document.getElementById('appContainer');
         const adminPanelBtn = document.getElementById('adminPanelBtn');
         const sidebarSwitchGroupBtn = document.getElementById('sidebarSwitchGroupBtn');
+        const searchInput = document.getElementById('globalSearch');
+        const protectionLabel = document.getElementById('sidebarCoverageCenterLabel');
+        const uiModel = buildAppModeUiModelValue(this.appMode);
 
         if (appContainer) {
             appContainer.setAttribute('data-app-mode', this.appMode);
+        }
+        if (searchInput) {
+            searchInput.placeholder = uiModel.searchPlaceholder;
+            searchInput.setAttribute('aria-label', uiModel.searchPlaceholder);
+            if (uiModel.searchMode === 'folders') {
+                searchInput.value = this.folderSearchQuery;
+                this.closeCommandPalette();
+            }
+        }
+        if (protectionLabel) {
+            protectionLabel.textContent = uiModel.protectionNavigationLabel;
         }
         if (this.appMode === 'individual') {
             adminPanelBtn?.classList.add('hidden');
@@ -1189,8 +1283,8 @@ class HybridCipherApp {
             <div class="coverage-center-shell">
                 <div class="coverage-center-hero">
                     <div class="coverage-center-copy">
-                        <span class="workspace-home-eyebrow">Coverage center</span>
-                        <h2 class="workspace-home-title">Protection coverage center</h2>
+                        <span class="workspace-home-eyebrow">${this.appMode === 'individual' ? 'Protection status' : 'Coverage center'}</span>
+                        <h2 class="workspace-home-title">${this.appMode === 'individual' ? 'Protection status' : 'Protection coverage center'}</h2>
                         <p class="workspace-home-text">Review scan freshness, folder coverage, and the next fixes from one screen.</p>
                     </div>
                     <div class="workspace-home-summary-card coverage-center-summary-card">
@@ -1717,7 +1811,7 @@ class HybridCipherApp {
 
         return `
             <div class="folder-coverage-review-panel">
-                ${coverage.groups.map(group => `
+                ${coverage.groups.map((group, groupIndex) => `
                     <article class="folder-coverage-group tone-${this.escapeHtmlAttr(group.severity || 'warning')}">
                         <div class="folder-coverage-group-header">
                             <div>
@@ -1737,7 +1831,7 @@ class HybridCipherApp {
                         </div>
                         <p class="folder-coverage-group-reason">${this.escapeHtml(group.reasonText || '')}</p>
                         ${group.files.length ? `
-                            <div class="folder-coverage-file-list">
+                            <div class="folder-coverage-file-list" data-preserve-scroll-key="coverage-group-${this.escapeHtmlAttr(folder?.root_id || folder?.path || 'folder')}-${this.escapeHtmlAttr(group.id || String(groupIndex))}">
                                 ${group.files.map(file => `
                                     <div class="folder-coverage-file-row">
                                         <div class="folder-coverage-file-path">${this.escapeHtml(file.relative_path || 'Unknown path')}</div>
@@ -1751,7 +1845,7 @@ class HybridCipherApp {
                             </div>
                         ` : (
                             group.samplePaths.length ? `
-                                <div class="folder-coverage-file-list">
+                                <div class="folder-coverage-file-list" data-preserve-scroll-key="coverage-group-${this.escapeHtmlAttr(folder?.root_id || folder?.path || 'folder')}-${this.escapeHtmlAttr(group.id || String(groupIndex))}">
                                     ${group.samplePaths.map(path => `
                                         <div class="folder-coverage-file-row">
                                             <div class="folder-coverage-file-path">${this.escapeHtml(path)}</div>
@@ -1770,7 +1864,20 @@ class HybridCipherApp {
         const container = document.getElementById('folderDetailContent');
         if (!container) return;
 
+        const folderRenderKey = String(folder?.root_id || folder?.path || '');
+        const isSameRenderedFolder = Boolean(
+            folderRenderKey && container.dataset.renderedFolderKey === folderRenderKey
+        );
+        const preservedScrollPositions = isSameRenderedFolder
+            ? captureKeyedScrollPositionsValue(container)
+            : {};
+        const folderDetailView = document.getElementById('folderDetailView');
+        const folderDetailScrollTop = isSameRenderedFolder
+            ? Math.max(0, Number(folderDetailView?.scrollTop || 0))
+            : 0;
+
         if (!folder) {
+            delete container.dataset.renderedFolderKey;
             container.innerHTML = `
                 <div class="workspace-empty-state">
                     <h3>Select a protected folder</h3>
@@ -1791,11 +1898,19 @@ class HybridCipherApp {
         });
         const healthLabel = model.healthTone === 'warning'
             ? 'Needs attention'
-            : (model.healthTone === 'safe' ? 'Healthy' : 'Not mounted');
+            : (model.healthTone === 'safe' ? 'Ready to use.' : 'Protected — not mounted.');
         const coverage = model.coverage || buildFolderCoverageModelValue({ folder });
-        const mountStatusLabel = model.backendLabel && model.attention?.mountStatusLabel === 'Mounted'
-            ? `${model.attention.mountStatusLabel} (${model.backendLabel})`
-            : (model.attention?.mountStatusLabel || 'Not mounted');
+        const mountStatusLabel = model.attention?.mountStatusLabel || 'Not mounted';
+        const mountSafetyReasons = isMounted
+            ? this.getMountUnsafeReasons(mountInfo?.syncStatus || mountInfo?.sync_status || null)
+            : [];
+        const mountSafetyIssueCount = mountSafetyReasons.reduce(
+            (total, reason) => total + Math.max(1, Number(reason?.count || 0)),
+            0
+        );
+        const mountSafetyStateKey = String(folder.root_id || folder.path || 'selected-folder');
+        const mountSafetyDetailsOpen = Boolean(this.mountSafetyDetailsOpenByRootId[mountSafetyStateKey]);
+        const mountSafetyPanelId = `mount-safety-details-${mountSafetyStateKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
 
         container.innerHTML = `
             <div class="folder-detail-shell tone-${this.escapeHtmlAttr(model.healthTone || 'idle')}">
@@ -1811,15 +1926,86 @@ class HybridCipherApp {
                     </div>
                 </div>
                 <div class="folder-detail-actions">
-                    <button class="btn btn-primary" type="button" data-folder-detail-action="${this.escapeHtmlAttr(model.primaryAction.id)}">
+                    <button class="btn btn-primary folder-detail-primary-action" type="button" data-folder-detail-action="${this.escapeHtmlAttr(model.primaryAction.id)}">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 7a2 2 0 012-2h5l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
+                        </svg>
                         ${this.escapeHtml(model.primaryAction.label)}
                     </button>
-                    ${model.secondaryActions.map(action => `
-                        <button class="btn btn-secondary" type="button" data-folder-detail-action="${this.escapeHtmlAttr(action.id)}">
-                            ${this.escapeHtml(action.label)}
+                    <div class="folder-detail-menu-shell">
+                        <button class="btn btn-secondary folder-detail-menu-toggle" type="button"
+                            aria-label="More folder actions" aria-haspopup="menu" aria-expanded="false">
+                            <span aria-hidden="true">•••</span>
                         </button>
-                    `).join('')}
+                        <div class="folder-detail-menu hidden" role="menu">
+                            ${model.secondaryActions.map(action => `
+                                ${action.destructive ? '<div class="folder-detail-menu-divider" role="separator"></div>' : ''}
+                                <button class="folder-detail-menu-item ${action.destructive ? 'destructive' : ''}" type="button"
+                                    role="menuitem" data-folder-detail-action="${this.escapeHtmlAttr(action.id)}">
+                                    ${action.id === 'reveal-protected' ? `
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 7a2 2 0 012-2h5l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
+                                        </svg>
+                                    ` : `
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 3v10m-4-4l4 4 4-4M5 17v2h14v-2" />
+                                        </svg>
+                                    `}
+                                    ${this.escapeHtml(action.label)}
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
                 </div>
+                ${model.isMounted ? `
+                    <section class="folder-mount-session tone-${model.attention.safeToUnmount === false ? 'warning' : 'safe'}">
+                        <div class="folder-mount-session-summary">
+                            <div class="folder-mount-session-heading">
+                                <span class="folder-detail-attention-label">Mount session</span>
+                                <strong>${model.attention.safeToUnmount === null
+                                    ? 'Checking unmount safety…'
+                                    : (model.attention.safeToUnmount ? 'Safe to unmount' : 'Attention required before unmounting')}</strong>
+                            </div>
+                            <div class="folder-mount-session-details">
+                                <span>${model.attention.safeToUnmount === null
+                                    ? 'Checking pending changes…'
+                                    : (model.attention.safeToUnmount
+                                        ? 'No pending changes'
+                                        : (mountSafetyIssueCount > 0
+                                            ? `${this.escapeHtml(this.formatCount(mountSafetyIssueCount))} affected ${mountSafetyIssueCount === 1 ? 'item' : 'items'}`
+                                            : 'Resolve the reported folder issues first'))}</span>
+                                ${model.mountpoint ? `<span class="folder-mount-session-path">${this.escapeHtml(model.mountpoint)}</span>` : ''}
+                                ${model.backendLabel ? `<span class="folder-mount-session-backend">Connection: ${this.escapeHtml(model.backendLabel)}</span>` : ''}
+                                ${model.attention.safeToUnmount === false && mountSafetyReasons.length > 0 ? `
+                                    <button class="btn btn-secondary btn-small folder-mount-review-button" type="button"
+                                        data-folder-detail-action="toggle-mount-safety-details"
+                                        aria-expanded="${mountSafetyDetailsOpen ? 'true' : 'false'}"
+                                        aria-controls="${this.escapeHtmlAttr(mountSafetyPanelId)}">
+                                        ${mountSafetyDetailsOpen ? 'Hide details' : `Review ${this.escapeHtml(this.formatCount(mountSafetyIssueCount))} affected ${mountSafetyIssueCount === 1 ? 'item' : 'items'}`}
+                                        <span class="folder-mount-review-chevron" aria-hidden="true">⌄</span>
+                                    </button>
+                                ` : ''}
+                            </div>
+                        </div>
+                        ${mountSafetyDetailsOpen && mountSafetyReasons.length > 0 ? `
+                            <div class="folder-mount-safety-panel" id="${this.escapeHtmlAttr(mountSafetyPanelId)}">
+                                <div class="folder-mount-safety-panel-header">
+                                    <div>
+                                        <h3>Why unmount is blocked</h3>
+                                        <p>Review each condition below before unmounting. The newest local changes may not be encrypted yet.</p>
+                                    </div>
+                                    <button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="refresh-mount-safety">
+                                        Refresh status
+                                    </button>
+                                </div>
+                                <div class="folder-mount-safety-list">
+                                    ${mountSafetyReasons.map(reason => this.renderMountSafetyReasonCard(reason)).join('')}
+                                </div>
+                                <p class="folder-mount-safety-footnote">Avoid force unmount unless you have preserved any local changes you still need.</p>
+                            </div>
+                        ` : ''}
+                    </section>
+                ` : ''}
                 <div class="folder-detail-stats">
                     <div class="folder-detail-stat">
                         <span class="folder-detail-stat-label">Mount status</span>
@@ -1833,12 +2019,6 @@ class HybridCipherApp {
                         <span class="folder-detail-stat-label">Tracked files</span>
                         <span class="folder-detail-stat-value">${this.escapeHtml(this.formatCount(model.trackedFiles))}</span>
                     </div>
-                    ${model.attention.unmountSafetyLabel ? `
-                        <div class="folder-detail-stat">
-                            <span class="folder-detail-stat-label">Unmount safety</span>
-                            <span class="folder-detail-stat-value">${this.escapeHtml(model.attention.unmountSafetyLabel)}</span>
-                        </div>
-                    ` : ''}
                 </div>
                 <section class="folder-protection-card tone-safe">
                     <div class="folder-protection-header">
@@ -1874,7 +2054,7 @@ class HybridCipherApp {
                     ${this.renderFolderCoverageReviewPanel(folder, coverage, coverageState)}
                 </section>
                 <div class="folder-detail-attention-grid">
-                    <article class="folder-detail-attention-card">
+                    <article class="folder-detail-attention-card ${model.attention.conflicts > 0 ? '' : 'is-clear'}">
                         <span class="folder-detail-attention-label">Conflicts</span>
                         <strong>${this.escapeHtml(this.formatCount(model.attention.conflicts))}</strong>
                         <p>${model.attention.conflicts > 0 ? 'Review conflicting local edits before you trust this folder.' : 'No unresolved conflicts are blocking this folder.'}</p>
@@ -1884,7 +2064,7 @@ class HybridCipherApp {
                             </button>
                         ` : ''}
                     </article>
-                    <article class="folder-detail-attention-card">
+                    <article class="folder-detail-attention-card ${model.attention.recoveryCopies > 0 ? '' : 'is-clear'}">
                         <span class="folder-detail-attention-label">Recovery copies</span>
                         <strong>${this.escapeHtml(this.formatCount(model.attention.recoveryCopies))}</strong>
                         <p>${model.attention.recoveryCopies > 0 ? 'Recovered local copies need an explicit keep, merge, or discard decision.' : 'No recovery copies are waiting for review.'}</p>
@@ -1897,6 +2077,7 @@ class HybridCipherApp {
                 </div>
             </div>
         `;
+        container.dataset.renderedFolderKey = folderRenderKey;
 
         container.querySelectorAll('[data-folder-detail-action]').forEach(button => {
             button.addEventListener('click', () => this.handleFolderDetailAction(
@@ -1905,6 +2086,45 @@ class HybridCipherApp {
                 button.dataset
             ));
         });
+
+        restoreKeyedScrollPositionsValue(container, preservedScrollPositions);
+        if (folderDetailView) {
+            folderDetailView.scrollTop = folderDetailScrollTop;
+        }
+
+        const menuToggle = container.querySelector('.folder-detail-menu-toggle');
+        const menu = container.querySelector('.folder-detail-menu');
+        if (menuToggle && menu) {
+            const closeMenu = () => {
+                menu.classList.add('hidden');
+                menuToggle.setAttribute('aria-expanded', 'false');
+                document.removeEventListener('click', closeMenu);
+            };
+            menuToggle.addEventListener('click', event => {
+                event.stopPropagation();
+                const willOpen = menu.classList.contains('hidden');
+                if (!willOpen) {
+                    closeMenu();
+                    return;
+                }
+                menu.classList.remove('hidden');
+                menuToggle.setAttribute('aria-expanded', 'true');
+                document.addEventListener('click', closeMenu);
+                menu.querySelector('[role="menuitem"]')?.focus();
+            });
+            menu.addEventListener('click', event => {
+                event.stopPropagation();
+                if (event.target.closest('[data-folder-detail-action]')) {
+                    closeMenu();
+                }
+            });
+            menu.addEventListener('keydown', event => {
+                if (event.key === 'Escape') {
+                    closeMenu();
+                    menuToggle.focus();
+                }
+            });
+        }
     }
 
     async handleFolderDetailAction(folder, action, dataset = {}) {
@@ -1928,13 +2148,27 @@ class HybridCipherApp {
                     await invoke('open_path_in_shell', { path: folder.path });
                     break;
                 case 'unmount':
-                    await this.executeUnmountCommand(folder);
+                    await this.requestFolderUnmount(folder);
                     break;
                 case 'resolve-conflicts':
                     await this.openConflictCenterForFolder(folder);
                     break;
                 case 'resolve-recovery':
                     await this.openRecoveryCenterForFolder(folder);
+                    break;
+                case 'toggle-mount-safety-details': {
+                    const stateKey = String(folder.root_id || folder.path || 'selected-folder');
+                    this.mountSafetyDetailsOpenByRootId[stateKey] = !this.mountSafetyDetailsOpenByRootId[stateKey];
+                    this.renderFolderDetailView(folder);
+                    break;
+                }
+                case 'refresh-mount-safety':
+                    await this.refreshActiveMounts({
+                        renderFolderList: true,
+                        suppressErrorNotification: false,
+                        suppressRecoveryPrompt: true
+                    });
+                    this.showNotification('Mount safety status refreshed.', 'success');
                     break;
                 case 'review-uncovered-items':
                     await this.openFolderCoverageReview(folder);
@@ -2265,12 +2499,29 @@ class HybridCipherApp {
 
     handleGlobalSearch(event) {
         const query = event?.target?.value ?? '';
+        if (this.appMode === 'individual') {
+            this.folderSearchQuery = query;
+            this.closeCommandPalette();
+            this.renderFolderList();
+            return;
+        }
         this.openCommandPalette();
         this.renderCommandPalette(query);
     }
 
     handleCommandPaletteKeydown(event) {
         if (!event) return;
+
+        if (this.appMode === 'individual') {
+            if (event.key === 'Escape' && this.folderSearchQuery) {
+                event.preventDefault();
+                event.stopPropagation();
+                this.folderSearchQuery = '';
+                event.target.value = '';
+                this.renderFolderList();
+            }
+            return;
+        }
 
         if (!this.commandPaletteOpen && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
             event.preventDefault();
@@ -3156,10 +3407,12 @@ class HybridCipherApp {
         // Header actions
         const globalSearch = document.getElementById('globalSearch');
         globalSearch?.addEventListener('input', (e) => this.handleGlobalSearch(e));
-        globalSearch?.addEventListener('focus', () => this.renderCommandPalette(globalSearch.value));
+        globalSearch?.addEventListener('focus', () => {
+            if (this.appMode !== 'individual') this.renderCommandPalette(globalSearch.value);
+        });
         globalSearch?.addEventListener('click', (e) => {
             e.stopPropagation(); // Prevent document click handler from closing the palette
-            this.renderCommandPalette(globalSearch.value);
+            if (this.appMode !== 'individual') this.renderCommandPalette(globalSearch.value);
         });
         globalSearch?.addEventListener('keydown', (e) => this.handleCommandPaletteKeydown(e));
         document.getElementById('settingsBtn')?.addEventListener('click', () => this.openSettingsModal());
@@ -3452,10 +3705,6 @@ class HybridCipherApp {
         document.getElementById('settingsProcessWelcomeBtn')?.addEventListener('click', () => {
             this.runSettingsCliCommand('hybridcipher process-welcome-messages');
         });
-        document.getElementById('settingsDevicesListBtn')?.addEventListener('click', () => {
-            this.closeSettingsModal();
-            this.showDevicesView();
-        });
         document.getElementById('settingsAuditDevicesBtn')?.addEventListener('click', () => {
             this.runSettingsCliCommand('hybridcipher audit-devices');
         });
@@ -3474,15 +3723,8 @@ class HybridCipherApp {
         document.getElementById('settingsServerTrustHelpBtn')?.addEventListener('click', () => {
             this.runSettingsCliCommand('hybridcipher server-trust -h');
         });
-        document.getElementById('settingsUnmountBtn')?.addEventListener('click', () => {
-            this.runSettingsCliCommand(
-                'hybridcipher unmount --all',
-                {
-                    confirmTitle: 'Unmount all',
-                    confirmMessage:
-                        'This will unmount all active mounts. Unsaved work inside mounted folders may be lost. Proceed?'
-                }
-            );
+        document.getElementById('settingsUnmountBtn')?.addEventListener('click', async () => {
+            await this.requestAllUnmount();
         });
         document.getElementById('settingsAutoMountLastFolder')?.addEventListener('change', (event) => {
             this.saveAutoMountLastFolderPreference(event.target.checked);
@@ -3508,6 +3750,10 @@ class HybridCipherApp {
         });
         document.getElementById('settingsInstallGlobalCliBtn')?.addEventListener('click', async () => {
             await this.installOrRepairGlobalCli();
+        });
+        document.getElementById('settingsOpenTerminalBtn')?.addEventListener('click', () => {
+            this.closeSettingsModal();
+            this.showTerminalView();
         });
 
         // Admin dashboard actions (CLI-driven)
@@ -5278,7 +5524,8 @@ class HybridCipherApp {
                 return;
             }
 
-            const unmounted = await this.executeUnmountCommand(folder, {
+            const unmounted = await this.requestFolderUnmount(folder, {
+                confirm: false,
                 suppressSuccessNotification: true,
                 suppressFailureNotification: true
             });
@@ -5700,6 +5947,112 @@ class HybridCipherApp {
         return reasons;
     }
 
+    renderMountSafetyReasonCard(reason) {
+        if (!reason || typeof reason !== 'object') return '';
+
+        const rawCount = Math.max(0, Number(reason.count || 0));
+        const count = Math.max(1, rawCount);
+        const paths = Array.from(new Set(
+            (Array.isArray(reason.sample_paths) ? reason.sample_paths : []).filter(Boolean)
+        )).slice(0, 5);
+        let title = 'Mount condition needs attention';
+        let summary = this.formatMountSafetyReason(reason) || 'HybridCipher cannot safely interrupt this mount yet.';
+        let guidance = 'Keep the mount running, address the condition, then refresh its status.';
+        let action = '';
+
+        switch (reason.kind) {
+            case 'pending_writeback': {
+                title = `${this.formatCount(count)} pending encrypted ${count === 1 ? 'commit' : 'commits'}`;
+                summary = 'These local changes have not finished writing to encrypted storage, so they are not protected yet.';
+                const error = String(reason.last_error || '').toLowerCase();
+                if (error.includes('plaintext path is unavailable') || error.includes('cannot find the file')) {
+                    guidance = 'A queued operation refers to a local path that no longer exists. Review any related conflict below, keep the mount running, and refresh the status. If it persists, preserve any local files you need before considering force unmount.';
+                } else if (reason.last_error) {
+                    guidance = 'Keep the mount running and refresh its status. If the same error persists, preserve the affected local files before considering force unmount.';
+                } else {
+                    guidance = 'Leave HybridCipher and the mounted folder open while encryption finishes, then refresh the status.';
+                }
+                break;
+            }
+            case 'conflict':
+                title = `${this.formatCount(count)} unresolved ${count === 1 ? 'conflict' : 'conflicts'}`;
+                summary = 'These conflict files remain local-only until you choose which changes to keep or merge.';
+                guidance = 'Open conflict review and resolve every listed file. HybridCipher can protect the result after it is merged back.';
+                action = '<button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="resolve-conflicts">Open conflict review</button>';
+                break;
+            case 'recovery_copies_present':
+                title = `${this.formatCount(count)} recovery ${count === 1 ? 'copy' : 'copies'}`;
+                summary = 'Recovered pending-work copies are local-only and need an explicit decision.';
+                guidance = 'Open recovery review, then keep, merge, or discard each copy.';
+                action = '<button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="resolve-recovery">Open recovery review</button>';
+                break;
+            case 'pending_refresh':
+                title = `${this.formatCount(count)} pending plaintext ${count === 1 ? 'refresh' : 'refreshes'}`;
+                summary = 'HybridCipher is still rebuilding the local mounted view from protected data.';
+                guidance = 'Keep the mount running until the refresh completes, then refresh the status.';
+                break;
+            case 'deleted_open':
+                title = `${this.formatCount(count)} deleted but open ${count === 1 ? 'file' : 'files'}`;
+                summary = 'One or more deleted paths are still held open by an application.';
+                guidance = 'Close editors or other programs using these files, then refresh the status.';
+                break;
+            case 'transactional_blocked':
+                title = `${this.formatCount(count)} unsupported transactional ${count === 1 ? 'item' : 'items'}`;
+                summary = 'Database, package, or bundle-style writes require atomic behavior this sync mount cannot guarantee.';
+                guidance = 'Close the application using the item and move it outside the mounted folder, then refresh the status.';
+                break;
+            case 'hard_link_blocked':
+                title = `${this.formatCount(count)} blocked hard-linked ${count === 1 ? 'file' : 'files'}`;
+                summary = 'The mounted folder cannot preserve hard-link behavior safely.';
+                guidance = 'Replace each hard link with an independent file copy, then refresh the status.';
+                break;
+            case 'low_space_degraded':
+                title = 'Low disk space is blocking safe sync';
+                summary = rawCount > 0
+                    ? `${this.formatCount(count)} ${count === 1 ? 'item is' : 'items are'} waiting while the mount is in ${reason.mode || 'degraded'} mode.`
+                    : `The mount is in ${reason.mode || 'degraded'} mode.`;
+                guidance = 'Free disk space on the mounted and protected-storage drives, then refresh the status.';
+                break;
+            default:
+                break;
+        }
+
+        const oldestAge = reason.kind === 'pending_writeback' && Number(reason.oldest_age_ms || 0) > 0
+            ? `<span><strong>Oldest pending:</strong> ${this.escapeHtml(this.formatRelativeAge(Number(reason.oldest_age_ms)))}</span>`
+            : '';
+        const pathList = paths.length > 0 ? `
+            <div class="folder-mount-safety-paths">
+                <span class="folder-mount-safety-field-label">Affected ${paths.length === 1 ? 'file' : 'files'}</span>
+                <ul>${paths.map(path => `<li>${this.escapeHtml(path)}</li>`).join('')}</ul>
+            </div>
+        ` : '';
+        const errorDetail = reason.last_error ? `
+            <div class="folder-mount-safety-error">
+                <span class="folder-mount-safety-field-label">Last error</span>
+                <code>${this.escapeHtml(reason.last_error)}</code>
+            </div>
+        ` : '';
+
+        return `
+            <article class="folder-mount-safety-reason tone-${reason.last_error ? 'error' : 'warning'}">
+                <div class="folder-mount-safety-reason-header">
+                    <div>
+                        <span class="folder-mount-safety-kind">${this.escapeHtml(String(reason.kind || 'condition').replaceAll('_', ' '))}</span>
+                        <h4>${this.escapeHtml(title)}</h4>
+                    </div>
+                    ${oldestAge}
+                </div>
+                <p>${this.escapeHtml(summary)}</p>
+                ${pathList}
+                ${errorDetail}
+                <div class="folder-mount-safety-next-step">
+                    <div><span class="folder-mount-safety-field-label">What to do</span><p>${this.escapeHtml(guidance)}</p></div>
+                    ${action}
+                </div>
+            </article>
+        `;
+    }
+
     isAutoDrainableMountReason(reason) {
         if (reason?.kind === 'pending_writeback') {
             const error = String(reason.last_error || '').toLowerCase();
@@ -5838,15 +6191,24 @@ class HybridCipherApp {
             : null;
         const detail = this.buildMountSafetyDetail(syncStatus, fallbackDetail);
 
-        await this.showActionPrompt(
+        const shouldReview = await this.showActionPrompt(
             'Unmount safety warning',
             'This mount is not safe to unmount and may cause file loss.',
             {
                 detail,
-                primaryLabel: 'Close',
-                secondaryLabel: ''
+                primaryLabel: 'Review mount details',
+                secondaryLabel: 'Close'
             }
         );
+
+        if (shouldReview && folder) {
+            const stateKey = String(folder.root_id || folder.path || 'selected-folder');
+            this.mountSafetyDetailsOpenByRootId[stateKey] = true;
+            this.selectFolder(folder, { showDetail: true });
+            setTimeout(() => document.getElementById(
+                `mount-safety-details-${stateKey.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+            )?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 0);
+        }
     }
 
     resetConflictWorkflowState() {
@@ -5854,7 +6216,8 @@ class HybridCipherApp {
             rootId: null,
             folder: null,
             records: [],
-            selectedConflictId: null
+            selectedConflictId: null,
+            reviewState: null
         };
         this.activeConflictPreview = null;
         this.recoveryCenterState = {
@@ -6017,6 +6380,17 @@ class HybridCipherApp {
             this.conflictCenterState.folder = this.findFolderByRootId(rootId);
         }
 
+        await this.refreshActiveMounts({
+            renderFolderList: true,
+            suppressErrorNotification: true,
+            suppressRecoveryPrompt: true
+        });
+        const refreshedSyncStatus = this.getMountDetailsForRootId(rootId)?.syncStatus || null;
+        this.conflictCenterState.reviewState = buildMountConflictReviewStateValue({
+            records: this.conflictCenterState.records,
+            syncStatus: refreshedSyncStatus
+        });
+
         if (selectedConflictId) {
             this.conflictCenterState.selectedConflictId = selectedConflictId;
         } else if (this.conflictCenterState.selectedConflictId) {
@@ -6033,9 +6407,15 @@ class HybridCipherApp {
         if (this.conflictCenterState.records.length === 0) {
             this.closeConflictReview();
             if (!suppressNotification) {
-                this.showNotification('No unresolved conflicts remain for this mount.', 'success');
+                if (this.conflictCenterState.reviewState?.mismatch) {
+                    this.showNotification('Conflict details are still synchronizing. Refresh and try again.', 'warning');
+                } else if (this.conflictCenterState.reviewState?.hasOtherBlockingWork) {
+                    this.showNotification('No conflicts remain, but other pending mount work still blocks unmount.', 'warning');
+                } else {
+                    this.showNotification('No unresolved conflicts remain for this mount.', 'success');
+                }
             }
-            return true;
+            return !this.conflictCenterState.reviewState?.mismatch;
         }
 
         const targetConflictId = this.conflictCenterState.selectedConflictId;
@@ -6057,18 +6437,41 @@ class HybridCipherApp {
 
         const folderLabel = this.getConflictCenterFolderLabel(this.conflictCenterState.folder);
         const records = Array.isArray(this.conflictCenterState.records) ? this.conflictCenterState.records : [];
+        const reviewState = this.conflictCenterState.reviewState
+            || buildMountConflictReviewStateValue({ records, syncStatus: null });
         titleEl.textContent = `Resolve conflicts: ${folderLabel}`;
-        summaryEl.textContent = records.length > 0
-            ? `${records.length} unresolved conflict file(s) remain LOCAL-ONLY and still block safe unmount until you resolve them.`
-            : 'No unresolved conflicts remain for this mount.';
+        summaryEl.textContent = reviewState.mismatch
+            ? `Conflict status is updating: Mount session reports ${reviewState.reportedCount}, while Conflict Review currently lists ${reviewState.listedCount}.`
+            : (records.length > 0
+                ? `${records.length} unresolved conflict file(s) remain LOCAL-ONLY and still block safe unmount until you resolve them.`
+                : (reviewState.hasOtherBlockingWork
+                    ? 'No unresolved conflicts remain, but other pending mount work still blocks safe unmount.'
+                    : 'No unresolved conflicts remain for this mount.'));
 
         if (records.length === 0) {
             listEl.innerHTML = `
-                <div class="conflict-center-empty">
-                    <p>All unresolved conflicts have been cleared.</p>
-                    <p class="text-secondary">You can close this window and try unmounting again.</p>
+                <div class="conflict-center-empty ${reviewState.mismatch ? 'warning' : ''}">
+                    <p>${reviewState.mismatch
+                        ? 'Conflict Review and Mount session have not reached the same snapshot yet.'
+                        : 'All unresolved conflicts have been cleared.'}</p>
+                    <p class="text-secondary">${reviewState.mismatch
+                        ? 'Refresh the conflict status. HybridCipher will not claim the folder is clear while the two sources disagree.'
+                        : (reviewState.hasOtherBlockingWork
+                            ? 'Return to Mount session to review the remaining pending operations before unmounting.'
+                            : 'This mount has no remaining conflict files.')}</p>
+                    ${reviewState.mismatch ? `
+                        <button class="btn btn-secondary btn-small" type="button" data-conflict-center-refresh>
+                            Refresh conflict status
+                        </button>
+                    ` : ''}
                 </div>
             `;
+            listEl.querySelector('[data-conflict-center-refresh]')?.addEventListener('click', () => {
+                this.refreshConflictCenter({ suppressNotification: false }).catch(error => {
+                    console.error('Failed to refresh conflict status:', error);
+                    this.showNotification('Failed to refresh conflict status.', 'error');
+                });
+            });
             return;
         }
 
@@ -6893,7 +7296,19 @@ class HybridCipherApp {
             return;
         }
 
-        folderList.innerHTML = this.enrolledFolders.map(folder => {
+        const visibleFolders = this.appMode === 'individual'
+            ? filterProtectedFoldersValue(this.enrolledFolders, this.folderSearchQuery)
+            : this.enrolledFolders;
+        if (visibleFolders.length === 0) {
+            folderList.innerHTML = `
+                <div class="empty-state folder-search-empty">
+                    <p>No protected folders match your search.</p>
+                </div>
+            `;
+            return;
+        }
+
+        folderList.innerHTML = visibleFolders.map(folder => {
             const isMounted = this.isFolderMounted(folder);
             const displayName = folder.name || this.basename(folder.path);
             const escapedDisplayName = this.escapeHtml(displayName);
@@ -6945,15 +7360,6 @@ class HybridCipherApp {
             // Single click to select and open the folder detail pane
             item.addEventListener('click', () => {
                 this.selectFolder(path, { showDetail: true });
-            });
-
-            // Double click to mount
-            item.addEventListener('dblclick', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (folder) {
-                    this.mountFolderFromContext(folder);
-                }
             });
 
             // Right click for context menu
@@ -9875,6 +10281,71 @@ class HybridCipherApp {
         }
     }
 
+    async requestFolderUnmount(folder, options = {}) {
+        const {
+            confirm = true,
+            suppressSuccessNotification = false,
+            suppressFailureNotification = false,
+        } = options;
+        if (!folder?.root_id) {
+            if (!suppressFailureNotification) this.showNotification('No folder selected', 'error');
+            return false;
+        }
+
+        const folderLabel = folder.name || this.basename(folder.path || 'this folder');
+        const mountpoint = this.getMountpointForRootId(folder.root_id);
+        if (confirm) {
+            const confirmed = await this.showConfirmDialog(
+                'Unmount folder',
+                `Unmount "${folderLabel}"${mountpoint ? ` from:\n${mountpoint}` : ''}?\n\nThe folder remains protected. You can mount it again later.`
+            );
+            if (!confirmed) return false;
+        }
+
+        const decision = await this.promptUnsafeUnmountDecision({
+            rootIds: [folder.root_id],
+            title: 'Unmount folder',
+            message: 'HybridCipher will wait briefly for pending encrypted commits before unmounting this folder.',
+            forceLabel: 'Force unmount'
+        });
+        if (decision === 'cancel') return false;
+
+        return this.executeUnmountCommand(folder, {
+            force: decision === 'force',
+            suppressSuccessNotification,
+            suppressFailureNotification,
+        });
+    }
+
+    async requestAllUnmount(options = {}) {
+        const {
+            confirm = true,
+            suppressSuccessNotification = false,
+            suppressFailureNotification = false,
+        } = options;
+        if (confirm) {
+            const confirmed = await this.showConfirmDialog(
+                'Unmount all folders',
+                'Unmount every active folder?\n\nThe folders remain protected. You can mount them again later.'
+            );
+            if (!confirmed) return false;
+        }
+
+        const decision = await this.promptUnsafeUnmountDecision({
+            rootIds: null,
+            title: 'Unmount all folders',
+            message: 'HybridCipher will wait briefly for pending encrypted commits before unmounting all folders.',
+            forceLabel: 'Force unmount'
+        });
+        if (decision === 'cancel') return false;
+
+        return this.executeUnmountAllCommand({
+            force: decision === 'force',
+            suppressSuccessNotification,
+            suppressFailureNotification,
+        });
+    }
+
     async executeUnmountCommand(folder, options = {}) {
         const {
             force = false,
@@ -9937,7 +10408,8 @@ class HybridCipherApp {
                     });
                     this.updateTerminalCwdDisplay();
                     if (!suppressSuccessNotification) {
-                        this.showNotification('Unmounted successfully', 'success');
+                        const folderLabel = folder.name || this.basename(folder.path || 'The folder');
+                        this.showNotification(`${folderLabel} is protected and no longer mounted. You can mount it again later.`, 'success');
                     }
                     return true;
                 } else {
@@ -10008,7 +10480,7 @@ class HybridCipherApp {
             });
             this.updateTerminalCwdDisplay();
             if (!suppressSuccessNotification) {
-                this.showNotification('All mounts unmounted', 'success');
+                this.showNotification('All folders remain protected and are no longer mounted. You can mount them again later.', 'success');
             }
             return true;
         } catch (error) {
@@ -10663,46 +11135,15 @@ class HybridCipherApp {
     async unmountFolder() {
         if (!this.currentMountPath) return;
 
-        // Try to unmount the selected folder by root_id if available
         if (this.selectedFolder && this.selectedFolder.root_id) {
-            const decision = await this.promptUnsafeUnmountDecision({
-                rootIds: [this.selectedFolder.root_id],
-                title: 'Unmount safety warning',
-                message: 'HybridCipher will wait briefly for pending encrypted commits before unmounting this folder.',
-                forceLabel: 'Force unmount'
-            });
-            if (decision === 'cancel') {
-                return;
-            }
-            await this.executeUnmountCommand(this.selectedFolder, {
-                force: decision === 'force'
-            });
+            await this.requestFolderUnmount(this.selectedFolder);
         } else {
-            // Fallback to unmount all if we don't have root_id
-            const decision = await this.promptUnsafeUnmountDecision({
-                rootIds: null,
-                title: 'Unmount safety warning',
-                message: 'HybridCipher will wait briefly for pending encrypted commits before unmounting active folders.',
-                forceLabel: 'Force unmount'
-            });
-            if (decision === 'cancel') {
-                return;
-            }
-            await this.executeUnmountAllCommand({ force: decision === 'force' });
+            await this.requestAllUnmount();
         }
     }
 
     async unmountAllFolders() {
-        const decision = await this.promptUnsafeUnmountDecision({
-            rootIds: null,
-            title: 'Unmount all folders',
-            message: 'HybridCipher will wait briefly for pending encrypted commits before unmounting all folders.',
-            forceLabel: 'Force unmount'
-        });
-        if (decision === 'cancel') {
-            return;
-        }
-        await this.executeUnmountAllCommand({ force: decision === 'force' });
+        await this.requestAllUnmount();
     }
 
     startMountProgress() {
@@ -10851,14 +11292,6 @@ class HybridCipherApp {
     }
 
     async handleContextMenuAction(action, folder) {
-        const cliActions = ['unmount-cli'];
-        if (cliActions.includes(action)) {
-            if (this.adminPanelVisible) {
-                this.setAdminPanelVisible(false);
-            }
-            await this.createTerminalTab();
-        }
-
         switch (action) {
             case 'mount':
                 this.mountFolderFromContext(folder);
@@ -10879,7 +11312,7 @@ class HybridCipherApp {
                 await this.openRecoveryCenterForFolder(folder);
                 break;
             case 'unmount-cli':
-                await this.executeUnmountCommand(folder);
+                await this.requestFolderUnmount(folder);
                 break;
             default:
                 console.warn('Unknown context menu action:', action);
@@ -11745,8 +12178,13 @@ class HybridCipherApp {
         this.refreshGlobalCliInstallStatus();
         document.getElementById('settingsModal').style.display = 'flex';
         if (sectionId) {
+            const advancedTools = document.getElementById('settingsAdvancedTools');
+            const target = document.getElementById(sectionId);
+            if (advancedTools && (shouldExpandAdvancedSettingsValue(sectionId) || advancedTools.contains(target))) {
+                advancedTools.open = true;
+            }
             requestAnimationFrame(() => {
-                document.getElementById(sectionId)?.scrollIntoView({
+                target?.scrollIntoView({
                     behavior: 'smooth',
                     block: 'start'
                 });

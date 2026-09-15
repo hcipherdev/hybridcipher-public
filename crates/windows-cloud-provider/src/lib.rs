@@ -2668,6 +2668,12 @@ pub struct DehydrateRootSummary {
     pub updated_at: DateTime<Utc>,
 }
 
+type CloudCleanupPathFilter = dyn Fn(&Path) -> bool + Send + Sync;
+
+fn no_cloud_cleanup_path_filter(_path: &Path) -> bool {
+    false
+}
+
 fn validate_dehydrate_summary(summary: &DehydrateRootSummary) -> Result<()> {
     if summary.failed_count == 0
         && summary.dehydrated_count == summary.attempted_count
@@ -2773,10 +2779,14 @@ fn paths_equal_for_platform(left: &Path, right: &Path) -> bool {
     }
 }
 
-async fn wait_for_root_dehydrated(sync_root_path: &Path, timeout: Duration) -> Result<()> {
+async fn wait_for_root_dehydrated_filtered(
+    sync_root_path: &Path,
+    timeout: Duration,
+    cleanup_path_filter: &CloudCleanupPathFilter,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        match platform::verify_root_dehydrated(sync_root_path) {
+        match platform::verify_root_dehydrated_filtered(sync_root_path, cleanup_path_filter) {
             Ok(()) => return Ok(()),
             Err(err) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2936,14 +2946,18 @@ fn validate_replay_plaintext_paths(record: &CloudMutationRecord, sync_root: &Pat
         }
         CloudMutationKind::Delete => Ok(()),
         CloudMutationKind::Rename => match (
+            record.plaintext_path.as_deref(),
             record.target_plaintext_path.as_deref(),
             record.target_relative_path.as_deref(),
         ) {
-            (Some(path), Some(target)) => {
+            (Some(path), _, Some(_target)) => {
+                validate_replay_plaintext_path(record, sync_root, path, &record.relative_path)
+            }
+            (None, Some(path), Some(target)) => {
                 validate_replay_plaintext_path(record, sync_root, path, target)
             }
-            (None, Some(_)) => Ok(()),
-            (_, None) => Err(unsafe_replay_error(
+            (None, None, Some(_)) => Ok(()),
+            (_, _, None) => Err(unsafe_replay_error(
                 record,
                 "pending rename is missing target_relative_path",
             )),
@@ -2983,10 +2997,15 @@ fn replay_expected_version(
                 "mutation identity path does not match the journal path",
             ));
         }
-        if validated.kind != ProviderEntryKind::File || validated.file_id.is_none() {
+        let replayable_identity = match (&record.kind, validated.kind) {
+            (CloudMutationKind::Rename, ProviderEntryKind::Directory) => true,
+            (_, ProviderEntryKind::File) => validated.file_id.is_some(),
+            _ => false,
+        };
+        if !replayable_identity {
             return Err(unsafe_replay_error(
                 record,
-                "existing-object replay requires a stable file identity",
+                "existing-object replay requires a stable supported identity",
             ));
         }
     }
@@ -3002,8 +3021,8 @@ fn replay_expected_version(
         }
         CloudMutationKind::Rename => {
             record.identity.is_some()
-                && record.plaintext_path.is_none()
                 && record.target_relative_path.is_some()
+                && !(record.plaintext_path.is_some() && record.target_plaintext_path.is_some())
         }
     };
     if !shape_is_valid {
@@ -3019,6 +3038,11 @@ fn replay_expected_version(
     ) {
         (None, None, CloudMutationKind::Writeback) => Ok(ExpectedProviderVersion::Absent),
         (Some(_), Some(version), _) => Ok(ExpectedProviderVersion::Exact(version.clone())),
+        (Some(identity), None, CloudMutationKind::Rename)
+            if identity.kind == ProviderEntryKind::Directory =>
+        {
+            Ok(ExpectedProviderVersion::Unchecked)
+        }
         _ => Err(unsafe_replay_error(
             record,
             "mutation record has no valid exact or expected-absent precondition",
@@ -3060,6 +3084,17 @@ impl StartupRecoveryActivity {
             Err(CloudProviderError::StartupRecoveryUnavailable)
         }
     }
+}
+
+#[cfg(any(test, target_os = "windows"))]
+async fn begin_provider_shutdown_barrier(
+    activity: &StartupRecoveryActivity,
+    operation_lock: &tokio::sync::Mutex<()>,
+) {
+    // Queue behind work that already passed the running-state check. Once the
+    // lock is ours, switching the gate prevents later callbacks from starting.
+    let _operation = operation_lock.lock().await;
+    activity.begin_shutdown();
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4327,6 +4362,10 @@ impl CloudRootConnection {
         let inner = &mut self.inner;
         self.health_owner.shutdown_with(|| inner.disconnect()).await
     }
+
+    fn shutdown_barrier(&self) -> platform::CloudRootShutdownBarrier {
+        self.inner.shutdown_barrier()
+    }
 }
 
 impl Drop for CloudRootConnection {
@@ -4363,8 +4402,35 @@ impl CloudProviderHost {
         }
     }
 
+    pub fn with_provider_bridge(
+        config: ProviderHostConfig,
+        bridge: Arc<dyn ProviderBridge>,
+    ) -> Self {
+        Self::with_bridge_factory(config, Arc::new(move |_| bridge.clone()))
+    }
+
     pub fn config(&self) -> &ProviderHostConfig {
         &self.config
+    }
+
+    fn cleanup_path_filter(
+        &self,
+        registration: &CloudRootRegistration,
+    ) -> Arc<CloudCleanupPathFilter> {
+        let Some(factory) = &self.bridge_factory else {
+            return Arc::new(no_cloud_cleanup_path_filter);
+        };
+        let bridge = factory(registration);
+        let encrypted_root = registration.encrypted_root.clone();
+        let sync_root_path = registration.sync_root_path.clone();
+        Arc::new(move |path: &Path| {
+            path.strip_prefix(&sync_root_path)
+                .ok()
+                .filter(|relative_path| !relative_path.as_os_str().is_empty())
+                .is_some_and(|relative_path| {
+                    bridge.is_path_excluded(&encrypted_root, relative_path)
+                })
+        })
     }
 
     pub fn status(&self) -> CloudProviderStatus {
@@ -4737,9 +4803,81 @@ impl CloudProviderHost {
             )));
         }
 
-        if self.root_is_running(root_id)? {
-            self.stop_root(root_id).await?;
+        let cleanup_path_filter = self.cleanup_path_filter(&registration);
+        let shutdown_barrier = if dehydrate {
+            self.connections
+                .lock()
+                .map_err(|_| {
+                    CloudProviderError::Callback("connection registry lock poisoned".into())
+                })?
+                .get(&root_id)
+                .map(CloudRootConnection::shutdown_barrier)
+        } else {
+            None
+        };
+        let dehydrated_while_connected = shutdown_barrier.is_some();
+
+        if let Some(barrier) = shutdown_barrier.as_ref() {
+            // Wait for any callback that already passed the running-state check,
+            // then reject new mutation/hydration work without disconnecting the
+            // CFAPI callback channel. Hydrated placeholders need that channel to
+            // deliver and ACK NOTIFY_DEHYDRATE.
+            barrier.begin().await?;
+
+            let drained_status = match self.read_runtime_status(root_id) {
+                Ok(status) => status,
+                Err(err) => {
+                    barrier.resume();
+                    return Err(CloudProviderError::Callback(format!(
+                        "pre-disconnect safety state could not be read; Cloud Files provider remains connected: {err}"
+                    )));
+                }
+            };
+            if !drained_status.safe_to_unmount {
+                barrier.resume();
+                return Err(CloudProviderError::Callback(
+                    "new durable mutation or conflict state appeared while callbacks drained; Cloud Files provider remains connected"
+                        .into(),
+                ));
+            }
+
+            let dehydration = platform::dehydrate_root_filtered(
+                &registration.sync_root_path,
+                cleanup_path_filter.as_ref(),
+            )
+            .and_then(|summary| validate_dehydrate_summary(&summary));
+            if let Err(err) = dehydration {
+                barrier.resume();
+                return Err(CloudProviderError::Callback(format!(
+                    "dehydration failed before disconnect; Cloud Files provider remains connected: {err}"
+                )));
+            }
+            if let Err(err) = wait_for_root_dehydrated_filtered(
+                &registration.sync_root_path,
+                Duration::from_secs(3),
+                cleanup_path_filter.as_ref(),
+            )
+            .await
+            {
+                barrier.resume();
+                return Err(CloudProviderError::Callback(format!(
+                    "dehydration verification failed before disconnect; Cloud Files provider remains connected: {err}"
+                )));
+            }
         }
+
+        if self.root_is_running(root_id)? {
+            if let Err(err) = self.stop_root(root_id).await {
+                if let Some(barrier) = shutdown_barrier.as_ref() {
+                    barrier.resume();
+                }
+                return Err(err);
+            }
+        }
+        // The barrier owns a callback-context reference, including the shared
+        // writer lease. Release it once disconnect is confirmed so quiescence
+        // observes only genuinely active provider work.
+        drop(shutdown_barrier);
 
         if !wait_for_writer_quiescence(&_writer, Duration::from_secs(2)).await {
             return Ok(SafeRootStopOutcome::RecoveryPreserved {
@@ -4764,16 +4902,23 @@ impl CloudProviderHost {
                     .into(),
             });
         }
-        if dehydrate {
-            let dehydration = platform::dehydrate_root(&registration.sync_root_path)
-                .and_then(|summary| validate_dehydrate_summary(&summary));
+        if dehydrate && !dehydrated_while_connected {
+            let dehydration = platform::dehydrate_root_filtered(
+                &registration.sync_root_path,
+                cleanup_path_filter.as_ref(),
+            )
+            .and_then(|summary| validate_dehydrate_summary(&summary));
             if let Err(err) = dehydration {
                 return Ok(SafeRootStopOutcome::RecoveryPreserved {
-                    reason: format!("dehydration failed after disconnect: {err}"),
+                    reason: format!("dehydration requires a connected Cloud Files provider: {err}"),
                 });
             }
-            if let Err(err) =
-                wait_for_root_dehydrated(&registration.sync_root_path, Duration::from_secs(3)).await
+            if let Err(err) = wait_for_root_dehydrated_filtered(
+                &registration.sync_root_path,
+                Duration::from_secs(3),
+                cleanup_path_filter.as_ref(),
+            )
+            .await
             {
                 return Ok(SafeRootStopOutcome::RecoveryPreserved {
                     reason: format!("dehydration verification failed after disconnect: {err}"),
@@ -4810,7 +4955,11 @@ impl CloudProviderHost {
                 reason: format!("Cloud Files health-state cleanup failed: {err}"),
             });
         }
-        if let Err(err) = platform::clear_dehydrated_root(&registration.sync_root_path) {
+        let cleanup_path_filter = self.cleanup_path_filter(&registration);
+        if let Err(err) = platform::clear_dehydrated_root_filtered(
+            &registration.sync_root_path,
+            cleanup_path_filter.as_ref(),
+        ) {
             return Ok(SafeRootStopOutcome::RecoveryPreserved {
                 reason: format!("dehydrated placeholder cleanup failed: {err}"),
             });
@@ -5451,7 +5600,10 @@ impl CloudProviderHost {
                                     &registration.encrypted_root,
                                     identity,
                                     target_relative,
-                                    record.target_plaintext_path.as_deref(),
+                                    record
+                                        .plaintext_path
+                                        .as_deref()
+                                        .or(record.target_plaintext_path.as_deref()),
                                     &expected_version,
                                 )
                                 .await
@@ -5886,6 +6038,50 @@ mod tests {
 
         assert!(error.to_string().contains("ordinary file remains"));
         assert_eq!(fs::read(&ordinary).unwrap(), b"recovery data");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dehydration_skips_excluded_ordinary_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root_mount");
+        let excluded = root.join(".obsidian").join("app.json");
+        fs::create_dir_all(excluded.parent().unwrap()).unwrap();
+        fs::write(&excluded, br#"{"theme":"dark"}"#).unwrap();
+
+        let summary = platform::dehydrate_root_filtered(&root, &|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .contains("/.obsidian/")
+        })
+        .unwrap();
+
+        assert_eq!(summary.attempted_count, 0);
+        assert_eq!(summary.dehydrated_count, 0);
+        assert_eq!(summary.failed_count, 0);
+        assert!(excluded.exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dehydrated_root_cleanup_removes_excluded_ordinary_cache_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root_mount");
+        let excluded_dir = root.join(".obsidian");
+        let excluded = excluded_dir.join("app.json");
+        fs::create_dir_all(&excluded_dir).unwrap();
+        fs::write(&excluded, br#"{"theme":"dark"}"#).unwrap();
+
+        platform::clear_dehydrated_root_filtered(&root, &|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .contains("/.obsidian")
+        })
+        .unwrap();
+
+        assert!(root.exists());
+        assert!(!excluded_dir.exists());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
     }
 
     #[cfg(target_os = "windows")]
@@ -8902,6 +9098,99 @@ mod tests {
     }
 
     #[test]
+    fn rename_replay_accepts_source_plaintext_path_before_target_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let sync_root = temp.path().join("sync");
+        let source = sync_root.join("docs/report.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"rename source").unwrap();
+        let root_id = Uuid::new_v4();
+        let version = ProviderContentVersion::from_components(
+            "file-1",
+            Some(root_id),
+            7,
+            Some(2),
+            4,
+            64,
+            Some(&[9; 12]),
+            None,
+        );
+        let mut record = CloudMutationRecord::new(
+            CloudMutationKind::Rename,
+            root_id,
+            "docs/report.txt",
+            Some(test_identity(root_id)),
+        );
+        record.target_relative_path = Some("docs/renamed.txt".to_string());
+        record.plaintext_path = Some(source);
+        record.expected_version = Some(version);
+
+        validate_replay_plaintext_paths(&record, &sync_root).unwrap();
+        assert!(matches!(
+            replay_expected_version(&record, root_id).unwrap(),
+            ExpectedProviderVersion::Exact(_)
+        ));
+    }
+
+    #[test]
+    fn rename_replay_accepts_target_plaintext_path_after_local_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let sync_root = temp.path().join("sync");
+        let target = sync_root.join("docs/renamed.txt");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"renamed source").unwrap();
+        let root_id = Uuid::new_v4();
+        let version = ProviderContentVersion::from_components(
+            "file-1",
+            Some(root_id),
+            7,
+            Some(2),
+            4,
+            64,
+            Some(&[9; 12]),
+            None,
+        );
+        let mut record = CloudMutationRecord::new(
+            CloudMutationKind::Rename,
+            root_id,
+            "docs/report.txt",
+            Some(test_identity(root_id)),
+        );
+        record.target_relative_path = Some("docs/renamed.txt".to_string());
+        record.target_plaintext_path = Some(target);
+        record.expected_version = Some(version);
+
+        validate_replay_plaintext_paths(&record, &sync_root).unwrap();
+        assert!(matches!(
+            replay_expected_version(&record, root_id).unwrap(),
+            ExpectedProviderVersion::Exact(_)
+        ));
+    }
+
+    #[test]
+    fn directory_rename_replay_uses_unchecked_precondition() {
+        let root_id = Uuid::new_v4();
+        let mut record = CloudMutationRecord::new(
+            CloudMutationKind::Rename,
+            root_id,
+            "docs",
+            Some(hybridcipher_provider_core::FileIdentityV1::new(
+                root_id,
+                ProviderEntryKind::Directory,
+                "docs",
+                None,
+                None,
+            )),
+        );
+        record.target_relative_path = Some("archive".to_string());
+
+        assert!(matches!(
+            replay_expected_version(&record, root_id).unwrap(),
+            ExpectedProviderVersion::Unchecked
+        ));
+    }
+
+    #[test]
     fn v2_identity_is_stable_across_rename() {
         let root_id = Uuid::new_v4();
         let identity =
@@ -9313,6 +9602,43 @@ mod tests {
     }
 
     #[test]
+    fn committed_inventory_upsert_clears_dirty_state_after_local_writeback() {
+        let root_id = Uuid::new_v4();
+        let mut state = CloudRootPersistentState::empty(root_id);
+        let first = hybridcipher_provider_core::ProviderEntry::cache_file_with_identity(
+            root_id,
+            "docs/report.txt",
+            PathBuf::from("report.txt.encrypted"),
+            4,
+            64,
+            Utc::now(),
+            None,
+            Some("stable-file-id".to_string()),
+            Some(7),
+        );
+        let committed = hybridcipher_provider_core::ProviderEntry::cache_file_with_identity(
+            root_id,
+            "docs/report.txt",
+            PathBuf::from("report.txt.encrypted"),
+            99,
+            128,
+            Utc::now(),
+            None,
+            Some("stable-file-id".to_string()),
+            Some(8),
+        );
+
+        state.upsert_inventory_entry(&first).unwrap();
+        state.items.get_mut("stable-file-id").unwrap().dirty = true;
+        state.upsert_committed_inventory_entry(&committed).unwrap();
+
+        let item = &state.items["stable-file-id"];
+        assert!(!item.dirty);
+        assert_eq!(item.content_version, committed.content_version());
+        assert_eq!(item.relative_path, "docs/report.txt");
+    }
+
+    #[test]
     fn local_directory_rename_migrates_descendants_without_changing_ids() {
         let root_id = Uuid::new_v4();
         let mut state = CloudRootPersistentState::empty(root_id);
@@ -9544,6 +9870,33 @@ mod tests {
         let retained = lease.clone();
         assert!(!wait_for_writer_quiescence(&lease, Duration::from_millis(20)).await);
         drop(retained);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_barrier_drains_active_work_before_rejecting_new_callbacks() {
+        let activity = Arc::new(StartupRecoveryActivity::default());
+        activity.mark_running();
+        let operation_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let active_operation = operation_lock.lock().await;
+        let barrier_activity = activity.clone();
+        let barrier_lock = operation_lock.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let barrier = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            begin_provider_shutdown_barrier(&barrier_activity, &barrier_lock).await;
+        });
+
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!barrier.is_finished());
+        activity.ensure_running().unwrap();
+
+        drop(active_operation);
+        barrier.await.unwrap();
+        assert!(activity.ensure_running().is_err());
+
+        activity.mark_running();
+        activity.ensure_running().unwrap();
     }
 
     #[test]
@@ -11610,8 +11963,8 @@ mod ipc {
 #[cfg(target_os = "windows")]
 mod platform {
     use super::{
-        actionable_callback_handler_outcome, complete_callback_once,
-        drain_provider_background_tasks, plan_remote_reconciliation,
+        actionable_callback_handler_outcome, begin_provider_shutdown_barrier,
+        complete_callback_once, drain_provider_background_tasks, plan_remote_reconciliation,
         startup_error_after_disconnect, validate_hydration_request, CallbackHealthObservation,
         CloudCallbackKind, CloudMutationJournal, CloudMutationKind, CloudMutationRecord,
         CloudObjectIdentityV2, CloudPlaceholderEntry, CloudProviderError, CloudProviderHost,
@@ -11633,7 +11986,7 @@ mod platform {
         ffi::c_void,
         ffi::OsStr,
         fs::{self, File, OpenOptions},
-        io::{Read, Seek, SeekFrom, Write},
+        io::{Read, Seek, SeekFrom},
         mem::size_of,
         os::windows::ffi::OsStrExt,
         os::windows::fs::MetadataExt,
@@ -11646,8 +11999,8 @@ mod platform {
     use uuid::Uuid;
     use windows::core::{GUID, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{
-        FreeLibrary, ERROR_ALREADY_EXISTS, ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_IO_PENDING,
-        HANDLE, NTSTATUS, STATUS_CLOUD_FILE_INVALID_REQUEST, STATUS_CLOUD_FILE_REQUEST_ABORTED,
+        FreeLibrary, ERROR_ALREADY_EXISTS, ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, HANDLE, NTSTATUS,
+        STATUS_CLOUD_FILE_INVALID_REQUEST, STATUS_CLOUD_FILE_REQUEST_ABORTED,
         STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS, WIN32_ERROR,
     };
     use windows::Win32::Storage::CloudFilters::{
@@ -11659,41 +12012,43 @@ mod platform {
         CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
         CF_CALLBACK_TYPE_CANCEL_FETCH_PLACEHOLDERS, CF_CALLBACK_TYPE_FETCH_DATA,
         CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS, CF_CALLBACK_TYPE_NONE,
-        CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE, CF_CALLBACK_TYPE_NOTIFY_DELETE,
-        CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION, CF_CALLBACK_TYPE_NOTIFY_RENAME,
-        CF_CALLBACK_TYPE_VALIDATE_DATA, CF_CONNECT_FLAG_BLOCK_SELF_IMPLICIT_HYDRATION,
-        CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH, CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
-        CF_CREATE_FLAG_NONE, CF_DEHYDRATE_FLAG_NONE, CF_FS_METADATA, CF_HARDLINK_POLICY_NONE,
-        CF_HYDRATION_POLICY, CF_HYDRATION_POLICY_MODIFIER_STREAMING_ALLOWED,
-        CF_HYDRATION_POLICY_PROGRESSIVE, CF_INSYNC_POLICY_TRACK_ALL, CF_IN_SYNC_STATE_IN_SYNC,
+        CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE, CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE_COMPLETION,
+        CF_CALLBACK_TYPE_NOTIFY_DELETE, CF_CALLBACK_TYPE_NOTIFY_DELETE_COMPLETION,
+        CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
+        CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION, CF_CALLBACK_TYPE_VALIDATE_DATA,
+        CF_CONNECT_FLAG_BLOCK_SELF_IMPLICIT_HYDRATION, CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
+        CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO, CF_CREATE_FLAG_NONE, CF_DEHYDRATE_FLAG_NONE,
+        CF_FS_METADATA, CF_HARDLINK_POLICY_NONE, CF_HYDRATION_POLICY,
+        CF_HYDRATION_POLICY_MODIFIER_STREAMING_ALLOWED, CF_HYDRATION_POLICY_PROGRESSIVE,
+        CF_INSYNC_POLICY_TRACK_ALL, CF_IN_SYNC_STATE_IN_SYNC, CF_OPEN_FILE_FLAGS,
         CF_OPEN_FILE_FLAG_DELETE_ACCESS, CF_OPEN_FILE_FLAG_EXCLUSIVE,
         CF_OPEN_FILE_FLAG_WRITE_ACCESS, CF_OPERATION_ACK_DATA_FLAG_NONE,
-        CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE, CF_OPERATION_ACK_DELETE_FLAG_NONE,
-        CF_OPERATION_ACK_RENAME_FLAG_NONE, CF_OPERATION_INFO, CF_OPERATION_PARAMETERS,
-        CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_0, CF_OPERATION_PARAMETERS_0_2,
-        CF_OPERATION_PARAMETERS_0_4, CF_OPERATION_PARAMETERS_0_5, CF_OPERATION_PARAMETERS_0_6,
+        CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE, CF_OPERATION_ACK_DELETE_FLAG_NONE, CF_OPERATION_INFO,
+        CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_0,
+        CF_OPERATION_PARAMETERS_0_2, CF_OPERATION_PARAMETERS_0_4, CF_OPERATION_PARAMETERS_0_5,
         CF_OPERATION_PARAMETERS_0_7, CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-        CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE, CF_OPERATION_TYPE_ACK_DATA,
-        CF_OPERATION_TYPE_ACK_DEHYDRATE, CF_OPERATION_TYPE_ACK_DELETE,
-        CF_OPERATION_TYPE_ACK_RENAME, CF_OPERATION_TYPE_TRANSFER_DATA,
-        CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS, CF_PLACEHOLDER_BASIC_INFO,
+        CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
+        CF_OPERATION_TYPE_ACK_DATA, CF_OPERATION_TYPE_ACK_DEHYDRATE, CF_OPERATION_TYPE_ACK_DELETE,
+        CF_OPERATION_TYPE_TRANSFER_DATA, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
+        CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
         CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE,
-        CF_PLACEHOLDER_CREATE_INFO, CF_PLACEHOLDER_INFO_BASIC,
+        CF_PLACEHOLDER_CREATE_INFO, CF_PLACEHOLDER_INFO_BASIC, CF_PLACEHOLDER_INFO_STANDARD,
         CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT, CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH,
-        CF_POPULATION_POLICY, CF_POPULATION_POLICY_FULL, CF_POPULATION_POLICY_MODIFIER_NONE,
-        CF_PROVIDER_STATUS_IDLE, CF_PROVIDER_STATUS_POPULATE_CONTENT,
-        CF_PROVIDER_STATUS_TERMINATED, CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT,
+        CF_PLACEHOLDER_STANDARD_INFO, CF_POPULATION_POLICY, CF_POPULATION_POLICY_FULL,
+        CF_POPULATION_POLICY_MODIFIER_NONE, CF_PROVIDER_STATUS_IDLE,
+        CF_PROVIDER_STATUS_POPULATE_CONTENT, CF_PROVIDER_STATUS_TERMINATED,
+        CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT,
         CF_REGISTER_FLAG_MARK_IN_SYNC_ON_ROOT, CF_REGISTER_FLAG_UPDATE, CF_SET_IN_SYNC_FLAG_NONE,
         CF_SYNC_POLICIES, CF_SYNC_REGISTRATION, CF_UPDATE_FLAG_DEHYDRATE,
-        CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_VERIFY_IN_SYNC,
+        CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION, CF_UPDATE_FLAG_MARK_IN_SYNC,
+        CF_UPDATE_FLAG_VERIFY_IN_SYNC,
     };
     use windows::Win32::Storage::FileSystem::{
-        FileDispositionInfo, FileStandardInfo, GetFileInformationByHandleEx, ReadFile,
+        FileDispositionInfo, FileStandardInfo, GetFileInformationByHandleEx,
         SetFileInformationByHandle, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_STANDARD_INFO,
     };
     use windows::Win32::System::LibraryLoader::LoadLibraryW;
-    use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED, OVERLAPPED_0_0};
 
     const HYBRIDCIPHER_PROVIDER_ID: GUID = GUID::from_u128(0x9c9eb75e_7e0b_47f4_8f33_546c1a3a38c4);
     const WINDOWS_TICKS_PER_SECOND: i64 = 10_000_000;
@@ -12036,10 +12391,7 @@ mod platform {
         placeholder: &OwnedPlaceholder,
         handle: HANDLE,
     ) -> windows::core::Result<()> {
-        let mut flags = CF_UPDATE_FLAG_MARK_IN_SYNC;
-        if placeholder.kind == ProviderEntryKind::File && !placeholder.dirty {
-            flags |= CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_VERIFY_IN_SYNC;
-        }
+        let flags = placeholder_update_flags(placeholder.kind, placeholder.dirty);
         unsafe {
             CfUpdatePlaceholder(
                 handle,
@@ -12052,6 +12404,26 @@ mod platform {
                 None,
             )
         }
+    }
+
+    fn placeholder_update_flags(
+        kind: ProviderEntryKind,
+        dirty: bool,
+    ) -> windows::Win32::Storage::CloudFilters::CF_UPDATE_FLAGS {
+        let mut flags = CF_UPDATE_FLAG_MARK_IN_SYNC;
+        match kind {
+            ProviderEntryKind::Directory => {
+                // The complete directory inventory is already materialized by reconciliation.
+                // Upgrade older partial placeholders so nested file operations no longer trigger
+                // an empty FETCH_PLACEHOLDERS loop.
+                flags |= CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION;
+            }
+            ProviderEntryKind::File if !dirty => {
+                flags |= CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_VERIFY_IN_SYNC;
+            }
+            ProviderEntryKind::File => {}
+        }
+        flags
     }
 
     fn directory_is_empty(path: &Path) -> Result<bool> {
@@ -12080,6 +12452,13 @@ mod platform {
     }
 
     pub fn dehydrate_root(sync_root_path: &Path) -> Result<DehydrateRootSummary> {
+        dehydrate_root_filtered(sync_root_path, &super::no_cloud_cleanup_path_filter)
+    }
+
+    pub fn dehydrate_root_filtered(
+        sync_root_path: &Path,
+        cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<DehydrateRootSummary> {
         ensure_existing_dir(sync_root_path, "sync root")?;
         let mut summary = DehydrateRootSummary {
             sync_root_path: sync_root_path.to_path_buf(),
@@ -12089,19 +12468,35 @@ mod platform {
             failures: Vec::new(),
             updated_at: chrono::Utc::now(),
         };
-        dehydrate_tree(sync_root_path, &mut summary)?;
+        dehydrate_tree(sync_root_path, &mut summary, cleanup_path_filter)?;
         summary.updated_at = chrono::Utc::now();
         Ok(summary)
     }
 
+    #[allow(dead_code)]
     pub fn verify_root_dehydrated(sync_root_path: &Path) -> Result<()> {
-        ensure_existing_dir(sync_root_path, "sync root")?;
-        verify_dehydrated_tree(sync_root_path)
+        verify_root_dehydrated_filtered(sync_root_path, &super::no_cloud_cleanup_path_filter)
     }
 
+    pub fn verify_root_dehydrated_filtered(
+        sync_root_path: &Path,
+        cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<()> {
+        ensure_existing_dir(sync_root_path, "sync root")?;
+        verify_dehydrated_tree(sync_root_path, cleanup_path_filter)
+    }
+
+    #[allow(dead_code)]
     pub fn clear_dehydrated_root(sync_root_path: &Path) -> Result<()> {
-        verify_root_dehydrated(sync_root_path)?;
-        clear_dehydrated_tree(sync_root_path)
+        clear_dehydrated_root_filtered(sync_root_path, &super::no_cloud_cleanup_path_filter)
+    }
+
+    pub fn clear_dehydrated_root_filtered(
+        sync_root_path: &Path,
+        cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<()> {
+        verify_root_dehydrated_filtered(sync_root_path, cleanup_path_filter)?;
+        clear_dehydrated_tree(sync_root_path, cleanup_path_filter)
     }
 
     pub fn active_probe(sync_root_path: &Path) -> Result<CloudRootProbeKind> {
@@ -12229,7 +12624,7 @@ mod platform {
             sync_root_path: registration.sync_root_path.clone(),
             connection_key: Some(connection_key),
             backing: NativeConnectionBacking::new(ConnectedCloudRootBacking {
-                callback_table,
+                _callback_table: callback_table,
                 context: context.clone(),
             }),
             _watchers: Vec::new(),
@@ -12280,13 +12675,20 @@ mod platform {
         Ok(connected)
     }
 
-    fn dehydrate_tree(path: &Path, summary: &mut DehydrateRootSummary) -> Result<()> {
+    fn dehydrate_tree(
+        path: &Path,
+        summary: &mut DehydrateRootSummary,
+        cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<()> {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let path = entry.path();
+            if cleanup_path_filter(&path) {
+                continue;
+            }
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                dehydrate_tree(&path, summary)?;
+                dehydrate_tree(&path, summary, cleanup_path_filter)?;
                 continue;
             }
             if !file_type.is_file() {
@@ -12315,10 +12717,16 @@ mod platform {
         Ok(())
     }
 
-    fn verify_dehydrated_tree(path: &Path) -> Result<()> {
+    fn verify_dehydrated_tree(
+        path: &Path,
+        cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<()> {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let child = entry.path();
+            if cleanup_path_filter(&child) {
+                continue;
+            }
             let file_type = entry.file_type()?;
             let metadata = fs::symlink_metadata(&child)?;
             if file_type.is_symlink() {
@@ -12338,7 +12746,7 @@ mod platform {
                         )));
                     }
                 }
-                verify_dehydrated_tree(&child)?;
+                verify_dehydrated_tree(&child, cleanup_path_filter)?;
                 continue;
             }
             if !file_type.is_file() {
@@ -12362,33 +12770,65 @@ mod platform {
         verify_dehydrated_file_with_oplock(path, &placeholder)
     }
 
+    /// Largest `AllocationSize` NTFS can report for a stream whose bytes live
+    /// inside its MFT record. Resident attribute values are rounded up to an
+    /// 8-byte boundary, so a placeholder that once held a small file keeps that
+    /// rounded allocation after dehydration even though no file data remains.
+    fn resident_allocation_bound(end_of_file: i64) -> i64 {
+        end_of_file.saturating_add(7) & !7
+    }
+
     fn verify_dehydrated_file_with_oplock(
         path: &Path,
         placeholder: &CloudFileOplock,
     ) -> Result<()> {
-        let in_sync = placeholder.is_in_sync().map_err(|err| {
+        // A successful placeholder query is also the test for "is this still an
+        // ordinary file someone dropped into the mount".
+        let residency = placeholder.data_residency().map_err(|err| {
             CloudProviderError::Callback(format!(
                 "ordinary file remains in Cloud Files mount after dehydration: {} ({err})",
                 path.display()
             ))
         })?;
-        if !in_sync {
+        if !residency.in_sync {
             return Err(CloudProviderError::Callback(format!(
                 "out-of-sync placeholder remains in Cloud Files mount after dehydration: {}",
                 path.display()
             )));
         }
-        let allocation_size = placeholder.allocation_size()?;
-        if allocation_size != 0 {
+        // `OnDiskDataSize` is Cloud Files' own count of file bytes still on
+        // disk, which is the authoritative dehydration test. `AllocationSize`
+        // is not: NTFS keeps a small file's bytes resident in the MFT record,
+        // and dehydration has no clusters to release there, so allocation stays
+        // at the 8-byte-rounded file size forever.
+        if residency.on_disk_data_size != 0 || residency.modified_data_size != 0 {
             return Err(CloudProviderError::Callback(format!(
-                "resident file remains in Cloud Files mount after dehydration: {} ({allocation_size} allocated bytes)",
-                path.display()
+                "resident file remains in Cloud Files mount after dehydration: {} ({} on-disk data bytes, {} modified data bytes)",
+                path.display(),
+                residency.on_disk_data_size,
+                residency.modified_data_size,
+            )));
+        }
+        // Cloud Files reports no file data left. Still refuse an allocation
+        // larger than MFT residency can account for, so a placeholder that
+        // under-reports its on-disk data cannot slip plaintext past cleanup.
+        let allocation = placeholder.file_allocation()?;
+        let resident_bound = resident_allocation_bound(allocation.end_of_file);
+        if allocation.allocation_size > resident_bound {
+            return Err(CloudProviderError::Callback(format!(
+                "unexpected disk allocation remains in Cloud Files mount after dehydration: {} ({} allocated bytes exceed the {resident_bound}-byte resident bound for a {}-byte file)",
+                path.display(),
+                allocation.allocation_size,
+                allocation.end_of_file,
             )));
         }
         Ok(())
     }
 
-    fn clear_dehydrated_tree(path: &Path) -> Result<()> {
+    fn clear_dehydrated_tree(
+        path: &Path,
+        cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<()> {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let child = entry.path();
@@ -12399,6 +12839,10 @@ mod platform {
                     "refusing to clear symlink or junction from Cloud Files mount: {}",
                     child.display()
                 )));
+            }
+            if cleanup_path_filter(&child) {
+                clear_excluded_cache_tree(&child)?;
+                continue;
             }
             if file_type.is_dir() {
                 if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
@@ -12411,7 +12855,7 @@ mod platform {
                         )));
                     }
                 }
-                clear_dehydrated_tree(&child)?;
+                clear_dehydrated_tree(&child, cleanup_path_filter)?;
                 fs::remove_dir(&child)?;
                 continue;
             }
@@ -12421,11 +12865,56 @@ mod platform {
                     child.display()
                 )));
             }
-            let placeholder = CloudFileOplock::acquire_exclusive(&child)?;
+            let placeholder = CloudFileOplock::acquire_exclusive_for_delete(&child)?;
             verify_dehydrated_file_with_oplock(&child, &placeholder)?;
             placeholder.delete()?;
         }
         Ok(())
+    }
+
+    fn clear_excluded_cache_tree(path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(CloudProviderError::InvalidPath(format!(
+                "refusing to clear symlink or junction from Cloud Files mount: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                let canonical_path = fs::canonicalize(path)?;
+                let lexical_path = path
+                    .parent()
+                    .map(fs::canonicalize)
+                    .transpose()?
+                    .unwrap_or_else(|| PathBuf::from(""))
+                    .join(path.file_name().ok_or_else(|| {
+                        CloudProviderError::InvalidPath(format!(
+                            "refusing to clear unnamed reparse directory: {}",
+                            path.display()
+                        ))
+                    })?);
+                if !super::paths_equal_for_platform(&canonical_path, &lexical_path) {
+                    return Err(CloudProviderError::InvalidPath(format!(
+                        "refusing to traverse reparse directory outside its Cloud Files path: {}",
+                        path.display()
+                    )));
+                }
+            }
+            for entry in fs::read_dir(path)? {
+                clear_excluded_cache_tree(&entry?.path())?;
+            }
+            fs::remove_dir(path)?;
+            return Ok(());
+        }
+        if metadata.is_file() {
+            fs::remove_file(path)?;
+            return Ok(());
+        }
+        Err(CloudProviderError::InvalidPath(format!(
+            "refusing to clear unsupported entry from Cloud Files mount: {}",
+            path.display()
+        )))
     }
 
     fn cldapi_available() -> windows::core::Result<bool> {
@@ -12461,8 +12950,29 @@ mod platform {
         drop_fallback_attempted: bool,
     }
 
+    #[derive(Clone)]
+    pub struct CloudRootShutdownBarrier {
+        context: Arc<CallbackContext>,
+    }
+
+    impl CloudRootShutdownBarrier {
+        pub async fn begin(&self) -> Result<()> {
+            begin_provider_shutdown_barrier(
+                &self.context.startup_activity,
+                &self.context.operation_lock,
+            )
+            .await;
+            Ok(())
+        }
+
+        pub fn resume(&self) {
+            self.context.startup_activity.mark_running();
+        }
+    }
+
     struct ConnectedCloudRootBacking {
-        callback_table: Vec<CF_CALLBACK_REGISTRATION>,
+        // Keep the registration array alive for the full native connection lifetime.
+        _callback_table: Vec<CF_CALLBACK_REGISTRATION>,
         context: Arc<CallbackContext>,
     }
 
@@ -12473,6 +12983,12 @@ mod platform {
 
         pub fn sync_root_path(&self) -> &Path {
             &self.sync_root_path
+        }
+
+        pub fn shutdown_barrier(&self) -> CloudRootShutdownBarrier {
+            CloudRootShutdownBarrier {
+                context: self.backing.as_ref().context.clone(),
+            }
         }
 
         pub async fn disconnect(&mut self) -> Result<()> {
@@ -12692,10 +13208,10 @@ mod platform {
             })
         }
 
-        fn upsert_entry(&self, entry: ProviderEntry) -> Result<CloudObjectIdentityV2> {
+        fn upsert_committed_entry(&self, entry: ProviderEntry) -> Result<CloudObjectIdentityV2> {
             let identity = self
                 .state_store
-                .transaction(|state| state.upsert_inventory_entry(&entry))?;
+                .transaction(|state| state.upsert_committed_inventory_entry(&entry))?;
             let mut inventory = self.inventory_by_object_id.lock().map_err(|_| {
                 CloudProviderError::Callback("provider inventory lock poisoned".to_string())
             })?;
@@ -12968,7 +13484,7 @@ mod platform {
                     dispositions.insert(object_id.clone(), LocalRefreshDisposition::Safe);
                     continue;
                 }
-                match CloudFileOplock::acquire_exclusive(&path) {
+                match CloudFileOplock::acquire_exclusive_for_delete(&path) {
                     Ok(guard) => match guard.is_in_sync() {
                         Ok(true) => {
                             dispositions.insert(object_id.clone(), LocalRefreshDisposition::Safe);
@@ -13007,7 +13523,7 @@ mod platform {
         }
 
         async fn ingest_local_tree_locked(&self) -> Result<()> {
-            let paths = collect_non_placeholder_paths(&self.registration.sync_root_path)?;
+            let paths = self.collect_local_mutation_paths()?;
             let mut recovery_errors = Vec::new();
             for path in paths {
                 let relative_path =
@@ -13028,6 +13544,15 @@ mod platform {
                     continue;
                 }
 
+                if let Some(identity) = self.known_local_placeholder_identity(&path)? {
+                    if self
+                        .ingest_local_placeholder_rename(&path, &relative_path, identity)
+                        .await?
+                    {
+                        continue;
+                    }
+                }
+
                 if let Some(existing) = self
                     .state_store
                     .load()?
@@ -13045,14 +13570,13 @@ mod platform {
                         super::existing_file_ingestion_expected_version(&existing)?;
                     let existing_entry = self.entry_for_identity(&existing.identity)?;
                     let ingestion_guard = IngestionStateGuard::begin(&self.state_store)?;
-                    let ingestion: Result<(ProviderEntry, CloudFileOplock)> = async {
+                    let ingestion: Result<ProviderEntry> = async {
                         wait_for_stable_file(&path).await?;
-                        let oplock = CloudFileOplock::acquire_exclusive(&path)?;
                         let snapshot_path = self
                             .runtime_paths
                             .cache_dir
                             .join(format!(".ingestion-{}.plain", Uuid::new_v4()));
-                        oplock.snapshot_to_path(&snapshot_path)?;
+                        snapshot_plain_file_to_path(&path, &snapshot_path)?;
                         let entry = self
                             .bridge
                             .writeback_file_checked(
@@ -13066,14 +13590,21 @@ mod platform {
                             .await;
                         let _ = fs::remove_file(&snapshot_path);
                         let entry = entry?;
-                        Ok((entry, oplock))
+                        Ok(entry)
                     }
                     .await;
                     match ingestion {
-                        Ok((entry, oplock)) => {
+                        Ok(entry) => {
                             self.remove_identity(&existing.identity)?;
-                            let identity = self.upsert_entry(entry)?;
-                            if let Err(err) = oplock.convert_to_placeholder(&identity) {
+                            let committed_entry = entry.clone();
+                            let identity = self.upsert_committed_entry(entry)?;
+                            if let Err(err) = apply_local_placeholder_commit(
+                                &self.registration.sync_root_path,
+                                &path,
+                                &committed_entry,
+                                &identity,
+                                None,
+                            ) {
                                 self.record_conflict(
                                     &identity,
                                     &relative_path,
@@ -13142,12 +13673,11 @@ mod platform {
                 } else {
                     async {
                         wait_for_stable_file(&path).await?;
-                        let oplock = CloudFileOplock::acquire_exclusive(&path)?;
                         let snapshot_path = self
                             .runtime_paths
                             .cache_dir
                             .join(format!(".ingestion-{}.plain", Uuid::new_v4()));
-                        oplock.snapshot_to_path(&snapshot_path)?;
+                        snapshot_plain_file_to_path(&path, &snapshot_path)?;
                         let entry = self
                             .bridge
                             .writeback_file_checked(
@@ -13161,18 +13691,22 @@ mod platform {
                             .await;
                         let _ = fs::remove_file(&snapshot_path);
                         let entry = entry?;
-                        Ok((entry, Some(oplock)))
+                        Ok((entry, None))
                     }
                     .await
                 };
 
                 match ingestion {
                     Ok((entry, oplock)) => {
-                        let identity = self.upsert_entry(entry)?;
-                        let conversion = match oplock.as_ref() {
-                            Some(oplock) => oplock.convert_to_placeholder(&identity),
-                            None => convert_local_to_placeholder(&path, &identity),
-                        };
+                        let committed_entry = entry.clone();
+                        let identity = self.upsert_committed_entry(entry)?;
+                        let conversion = apply_local_placeholder_commit(
+                            &self.registration.sync_root_path,
+                            &path,
+                            &committed_entry,
+                            &identity,
+                            oplock.as_ref(),
+                        );
                         if let Err(err) = conversion {
                             self.record_conflict(
                                 &identity,
@@ -13237,6 +13771,225 @@ mod platform {
                 );
                 self.write_runtime_status(Some(message.clone()))?;
                 Err(CloudProviderError::Callback(message))
+            }
+        }
+
+        fn collect_local_mutation_paths(&self) -> Result<Vec<PathBuf>> {
+            let state = self.state_store.load()?;
+            let sync_root = &self.registration.sync_root_path;
+            super::collect_ingestion_candidates(sync_root, &|path, metadata| {
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
+                    return false;
+                }
+                let Some(relative_path) = relative_path_from_full_path(sync_root, path) else {
+                    return true;
+                };
+                let guard = match CloudFileOplock::acquire_exclusive(path) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::debug!(
+                            "Deferring Cloud Files ingestion scan for {} because placeholder metadata could not be read: {}",
+                            path.display(),
+                            err
+                        );
+                        return true;
+                    }
+                };
+                let moved_known_placeholder = guard
+                    .identity()
+                    .ok()
+                    .filter(|identity| identity.root_id == self.registration.root_id)
+                    .and_then(|identity| state.items.get(&identity.object_id))
+                    .is_some_and(|item| item.relative_path != relative_path);
+                if moved_known_placeholder {
+                    return false;
+                }
+                if metadata.is_dir() {
+                    return true;
+                }
+                match guard.is_in_sync() {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(err) => {
+                        tracing::debug!(
+                            "Deferring Cloud Files ingestion scan for {} because placeholder sync state could not be read: {}",
+                            path.display(),
+                            err
+                        );
+                        true
+                    }
+                }
+            })
+        }
+
+        fn known_local_placeholder_identity(
+            &self,
+            path: &Path,
+        ) -> Result<Option<CloudObjectIdentityV2>> {
+            let metadata = fs::symlink_metadata(path)?;
+            if !(metadata.is_file() || metadata.is_dir())
+                || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
+            {
+                return Ok(None);
+            }
+            let guard = match CloudFileOplock::acquire_exclusive(path) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    tracing::debug!(
+                        "Could not inspect local placeholder identity for {}: {}",
+                        path.display(),
+                        err
+                    );
+                    return Ok(None);
+                }
+            };
+            match guard.identity() {
+                Ok(identity) if identity.root_id == self.registration.root_id => Ok(Some(identity)),
+                Ok(_) => Ok(None),
+                Err(err) => {
+                    tracing::debug!(
+                        "Could not decode local placeholder identity for {}: {}",
+                        path.display(),
+                        err
+                    );
+                    Ok(None)
+                }
+            }
+        }
+
+        async fn ingest_local_placeholder_rename(
+            &self,
+            path: &Path,
+            target_relative_path: &str,
+            identity: CloudObjectIdentityV2,
+        ) -> Result<bool> {
+            let Some(current_item) = self
+                .state_store
+                .load()?
+                .items
+                .get(&identity.object_id)
+                .cloned()
+            else {
+                return Ok(false);
+            };
+            if current_item.relative_path == target_relative_path {
+                return Ok(false);
+            }
+
+            let existing_entry = self.entry_for_identity(&identity)?;
+            let expected_version = self.expected_version_for(&identity)?;
+            let mut record = CloudMutationRecord::new(
+                CloudMutationKind::Rename,
+                self.registration.root_id,
+                current_item.relative_path.clone(),
+                Some(existing_entry.identity.clone()),
+            );
+            record.target_relative_path = Some(target_relative_path.to_string());
+            if identity.kind == ProviderEntryKind::File {
+                record.target_plaintext_path = Some(path.to_path_buf());
+            }
+            record.expected_version = match &expected_version {
+                ExpectedProviderVersion::Exact(version) => Some(version.clone()),
+                ExpectedProviderVersion::Unchecked | ExpectedProviderVersion::Absent => None,
+            };
+            let mutation_id = self.add_pending_mutation(record)?;
+
+            match self
+                .bridge
+                .rename_entry_checked(
+                    self.registration.root_id,
+                    &self.registration.encrypted_root,
+                    &existing_entry.identity,
+                    target_relative_path,
+                    (identity.kind == ProviderEntryKind::File).then_some(path),
+                    &expected_version,
+                )
+                .await
+            {
+                Ok(Some(entry)) => {
+                    self.remove_identity(&identity)?;
+                    let committed_entry = entry.clone();
+                    let committed_identity = self.upsert_committed_entry(entry)?;
+                    if let Err(err) = apply_local_placeholder_commit(
+                        &self.registration.sync_root_path,
+                        path,
+                        &committed_entry,
+                        &committed_identity,
+                        None,
+                    ) {
+                        tracing::debug!(
+                            "Could not refresh locally renamed placeholder identity for {}: {}",
+                            target_relative_path,
+                            err
+                        );
+                    }
+                    self.clear_pending_mutation(mutation_id)?;
+                    Ok(true)
+                }
+                Ok(None) => {
+                    if identity.kind == ProviderEntryKind::Directory {
+                        self.state_store.transaction(|state| {
+                            state.migrate_directory_path(
+                                &current_item.relative_path,
+                                target_relative_path,
+                            )
+                        })?;
+                        let mut inventory = self.inventory_by_object_id.lock().map_err(|_| {
+                            CloudProviderError::Callback("provider inventory lock poisoned".into())
+                        })?;
+                        if let Some(current) = inventory.get_mut(&identity.object_id) {
+                            current.relative_path = target_relative_path.to_string();
+                            current.encrypted_path = self
+                                .registration
+                                .encrypted_root
+                                .join(target_relative_path.replace('/', "\\"));
+                            current.identity = FileIdentityV1::new(
+                                self.registration.root_id,
+                                current.kind,
+                                target_relative_path,
+                                current.identity.file_id.clone(),
+                                current.identity.epoch_id,
+                            );
+                        }
+                        if let Err(err) = CloudFileOplock::acquire_exclusive(path)
+                            .and_then(|placeholder| placeholder.mark_in_sync())
+                        {
+                            tracing::debug!(
+                                "Could not mark locally renamed directory placeholder in-sync for {}: {}",
+                                target_relative_path,
+                                err
+                            );
+                        }
+                    }
+                    self.clear_pending_mutation(mutation_id)?;
+                    Ok(true)
+                }
+                Err(err @ ProviderCoreError::ContentConflict { .. }) => {
+                    if let ProviderCoreError::ContentConflict {
+                        expected, actual, ..
+                    } = &err
+                    {
+                        self.record_conflict(
+                            &identity,
+                            &current_item.relative_path,
+                            Some(path.to_path_buf()),
+                            expected.clone(),
+                            actual.clone(),
+                        )?;
+                    }
+                    self.mark_pending_mutation_error(mutation_id, &err.to_string())?;
+                    Err(err.into())
+                }
+                Err(err) => {
+                    self.mark_pending_mutation_error(mutation_id, &err.to_string())?;
+                    tracing::warn!(
+                        "Cloud Files local rename ingestion failed for {} -> {}: {}",
+                        current_item.relative_path,
+                        target_relative_path,
+                        err
+                    );
+                    Err(err.into())
+                }
             }
         }
 
@@ -13400,10 +14153,38 @@ mod platform {
         ))
     }
 
-    fn collect_non_placeholder_paths(root: &Path) -> Result<Vec<PathBuf>> {
-        super::collect_ingestion_candidates(root, &|_path, metadata| {
-            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
-        })
+    fn apply_local_placeholder_commit(
+        sync_root_path: &Path,
+        path: &Path,
+        entry: &ProviderEntry,
+        identity: &CloudObjectIdentityV2,
+        oplock: Option<&CloudFileOplock>,
+    ) -> Result<()> {
+        let is_reparse_point =
+            fs::symlink_metadata(path)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+        if !is_reparse_point {
+            return match oplock {
+                Some(oplock) => oplock.convert_to_placeholder(identity),
+                None => convert_local_to_placeholder(path, identity),
+            };
+        }
+
+        let (_base, relative_name, full_path, display_path) =
+            placeholder_location(sync_root_path, entry)?;
+        let placeholder = OwnedPlaceholder::new(
+            &CloudPlaceholderEntry {
+                entry: entry.clone(),
+                identity: identity.clone(),
+                dirty: true,
+            },
+            relative_name,
+            full_path,
+            display_path,
+        )?;
+        match oplock {
+            Some(oplock) => update_existing_placeholder_with_handle(&placeholder, oplock),
+            None => update_existing_placeholder(&placeholder),
+        }
     }
 
     async fn wait_for_stable_file(path: &Path) -> Result<()> {
@@ -13424,7 +14205,48 @@ mod platform {
         )))
     }
 
+    fn snapshot_plain_file_to_path(source: &Path, destination: &Path) -> Result<()> {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let result = (|| -> Result<()> {
+            let before = plain_file_fingerprint(source)?;
+            let mut input = File::open(source)?;
+            let mut output = File::create(destination)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+            let after = plain_file_fingerprint(source)?;
+            if before != after {
+                return Err(CloudProviderError::Callback(format!(
+                    "local file changed while snapshotting for ingestion: {}",
+                    source.display()
+                )));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(destination);
+        }
+        result
+    }
+
+    fn plain_file_fingerprint(path: &Path) -> Result<(u64, Option<std::time::SystemTime>)> {
+        let metadata = fs::metadata(path)?;
+        Ok((metadata.len(), metadata.modified().ok()))
+    }
+
     struct CloudFileOplock(HANDLE);
+
+    struct PlaceholderDataResidency {
+        on_disk_data_size: i64,
+        modified_data_size: i64,
+        in_sync: bool,
+    }
+
+    struct FileAllocation {
+        allocation_size: i64,
+        end_of_file: i64,
+    }
 
     struct ProtectedHandleReference(HANDLE);
 
@@ -13440,68 +14262,27 @@ mod platform {
 
     impl CloudFileOplock {
         fn acquire_exclusive(path: &Path) -> Result<Self> {
-            let path_wide = to_wide(path.as_os_str());
-            let handle = unsafe {
-                CfOpenFileWithOplock(
-                    PCWSTR(path_wide.as_ptr()),
-                    CF_OPEN_FILE_FLAG_EXCLUSIVE
-                        | CF_OPEN_FILE_FLAG_WRITE_ACCESS
-                        | CF_OPEN_FILE_FLAG_DELETE_ACCESS,
-                )?
-            };
-            Ok(Self(handle))
+            Self::open(path, Self::exclusive_write_flags())
         }
 
-        fn snapshot_to_path(&self, destination: &Path) -> Result<()> {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let result = unsafe {
-                if !CfReferenceProtectedHandle(self.0) {
-                    Err(CloudProviderError::Callback(
-                        "failed to reference protected Cloud Files handle for ingestion".into(),
-                    ))
-                } else {
-                    let _reference = ProtectedHandleReference(self.0);
-                    let win32_handle = CfGetWin32HandleFromProtectedHandle(self.0);
-                    (|| -> Result<()> {
-                        let mut output = File::create(destination)?;
-                        let mut offset = 0u64;
-                        let mut buffer = vec![0u8; 1024 * 1024];
-                        loop {
-                            let mut overlapped = OVERLAPPED::default();
-                            overlapped.Anonymous.Anonymous = OVERLAPPED_0_0 {
-                                Offset: offset as u32,
-                                OffsetHigh: (offset >> 32) as u32,
-                            };
-                            let read = ReadFile(
-                                win32_handle,
-                                Some(&mut buffer),
-                                None,
-                                Some(&mut overlapped),
-                            );
-                            if let Err(err) = read {
-                                if !windows_error_matches(&err, ERROR_IO_PENDING) {
-                                    return Err(err.into());
-                                }
-                            }
-                            let mut transferred = 0u32;
-                            GetOverlappedResult(win32_handle, &overlapped, &mut transferred, true)?;
-                            if transferred == 0 {
-                                break;
-                            }
-                            output.write_all(&buffer[..transferred as usize])?;
-                            offset = offset.saturating_add(transferred as u64);
-                        }
-                        output.sync_all()?;
-                        Ok(())
-                    })()
-                }
-            };
-            if result.is_err() {
-                let _ = fs::remove_file(destination);
-            }
-            result
+        fn acquire_exclusive_for_delete(path: &Path) -> Result<Self> {
+            Self::open(path, Self::exclusive_delete_flags())
+        }
+
+        fn exclusive_write_flags() -> CF_OPEN_FILE_FLAGS {
+            // Local ingestion only snapshots and converts through this handle.
+            // Asking for delete access can be denied for ordinary newly-created files.
+            CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS
+        }
+
+        fn exclusive_delete_flags() -> CF_OPEN_FILE_FLAGS {
+            Self::exclusive_write_flags() | CF_OPEN_FILE_FLAG_DELETE_ACCESS
+        }
+
+        fn open(path: &Path, flags: CF_OPEN_FILE_FLAGS) -> Result<Self> {
+            let path_wide = to_wide(path.as_os_str());
+            let handle = unsafe { CfOpenFileWithOplock(PCWSTR(path_wide.as_ptr()), flags)? };
+            Ok(Self(handle))
         }
 
         fn delete(self) -> Result<()> {
@@ -13559,7 +14340,60 @@ mod platform {
             }
         }
 
-        fn allocation_size(&self) -> Result<i64> {
+        fn identity(&self) -> Result<CloudObjectIdentityV2> {
+            let byte_len = size_of::<CF_PLACEHOLDER_BASIC_INFO>()
+                + CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize;
+            let mut buffer = vec![0u64; byte_len.div_ceil(size_of::<u64>())];
+            unsafe {
+                CfGetPlaceholderInfo(
+                    self.0,
+                    CF_PLACEHOLDER_INFO_BASIC,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * size_of::<u64>()) as u32,
+                    None,
+                )?;
+                let info = &*(buffer.as_ptr().cast::<CF_PLACEHOLDER_BASIC_INFO>());
+                let identity_length = info.FileIdentityLength as usize;
+                let identity_offset = std::mem::offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
+                let buffer_length = buffer.len() * size_of::<u64>();
+                let max_identity_length = buffer_length.saturating_sub(identity_offset);
+                if identity_length == 0 || identity_length > max_identity_length {
+                    return Err(CloudProviderError::Callback(format!(
+                        "placeholder identity length {} exceeds buffer capacity {}",
+                        identity_length, max_identity_length
+                    )));
+                }
+                let identity_bytes =
+                    std::slice::from_raw_parts(info.FileIdentity.as_ptr(), identity_length);
+                CloudObjectIdentityV2::from_bytes(identity_bytes)
+            }
+        }
+
+        /// Cloud Files' own account of how much file data a placeholder still
+        /// keeps on disk. `CfGetPlaceholderInfo` fails for anything that is not
+        /// a placeholder, so a successful call also proves the entry is one.
+        fn data_residency(&self) -> Result<PlaceholderDataResidency> {
+            let byte_len = size_of::<CF_PLACEHOLDER_STANDARD_INFO>()
+                + CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH as usize;
+            let mut buffer = vec![0u64; byte_len.div_ceil(size_of::<u64>())];
+            unsafe {
+                CfGetPlaceholderInfo(
+                    self.0,
+                    CF_PLACEHOLDER_INFO_STANDARD,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * size_of::<u64>()) as u32,
+                    None,
+                )?;
+                let info = &*(buffer.as_ptr().cast::<CF_PLACEHOLDER_STANDARD_INFO>());
+                Ok(PlaceholderDataResidency {
+                    on_disk_data_size: info.OnDiskDataSize,
+                    modified_data_size: info.ModifiedDataSize,
+                    in_sync: info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC,
+                })
+            }
+        }
+
+        fn file_allocation(&self) -> Result<FileAllocation> {
             unsafe {
                 if !CfReferenceProtectedHandle(self.0) {
                     return Err(CloudProviderError::Callback(
@@ -13576,7 +14410,10 @@ mod platform {
                     (&mut info as *mut FILE_STANDARD_INFO).cast(),
                     size_of::<FILE_STANDARD_INFO>() as u32,
                 )?;
-                Ok(info.AllocationSize)
+                Ok(FileAllocation {
+                    allocation_size: info.AllocationSize,
+                    end_of_file: info.EndOfFile,
+                })
             }
         }
 
@@ -13626,6 +14463,10 @@ mod platform {
                 Callback: Some(cancel_fetch_placeholders_callback),
             },
             CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION,
+                Callback: Some(open_completion_callback),
+            },
+            CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
                 Callback: Some(close_completion_callback),
             },
@@ -13634,12 +14475,16 @@ mod platform {
                 Callback: Some(dehydrate_callback),
             },
             CF_CALLBACK_REGISTRATION {
+                Type: CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE_COMPLETION,
+                Callback: Some(dehydrate_completion_callback),
+            },
+            CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NOTIFY_DELETE,
                 Callback: Some(delete_callback),
             },
             CF_CALLBACK_REGISTRATION {
-                Type: CF_CALLBACK_TYPE_NOTIFY_RENAME,
-                Callback: Some(rename_callback),
+                Type: CF_CALLBACK_TYPE_NOTIFY_DELETE_COMPLETION,
+                Callback: Some(delete_completion_callback),
             },
             CF_CALLBACK_REGISTRATION {
                 Type: CF_CALLBACK_TYPE_NONE,
@@ -13813,6 +14658,10 @@ mod platform {
                 )
                 .ok()
         });
+        // The provider reconciles the complete remote namespace before serving the mount, so
+        // there are no missing children to transfer. Mark this legacy directory placeholder as
+        // fully populated while completing the request; otherwise Windows will ask again on each
+        // nested path lookup and can leave Explorer's create/rename operation unresolved.
         let execute_error = unsafe { execute_transfer_placeholders(info, STATUS_SUCCESS, 0) }.err();
         if let Some(err) = &execute_error {
             tracing::warn!("Cloud Files placeholder completion failed: {err}");
@@ -13839,6 +14688,14 @@ mod platform {
             CloudCallbackKind::Close,
             |context, info| unsafe { context.handle_close_completion(info) },
         );
+    }
+
+    unsafe extern "system" fn open_completion_callback(
+        _callback_info: *const CF_CALLBACK_INFO,
+        _callback_parameters: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        // Completion notifications are advisory; the pre-operation callbacks
+        // carry the mutations that need provider-side acknowledgement.
     }
 
     unsafe extern "system" fn dehydrate_callback(
@@ -13870,6 +14727,13 @@ mod platform {
                 Utc::now(),
             );
         }
+    }
+
+    unsafe extern "system" fn dehydrate_completion_callback(
+        _callback_info: *const CF_CALLBACK_INFO,
+        _callback_parameters: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        // The pre-dehydrate callback ACKs the operation synchronously.
     }
 
     unsafe extern "system" fn delete_callback(
@@ -13923,55 +14787,11 @@ mod platform {
         }
     }
 
-    unsafe extern "system" fn rename_callback(
-        callback_info: *const CF_CALLBACK_INFO,
-        callback_parameters: *const CF_CALLBACK_PARAMETERS,
+    unsafe extern "system" fn delete_completion_callback(
+        _callback_info: *const CF_CALLBACK_INFO,
+        _callback_parameters: *const CF_CALLBACK_PARAMETERS,
     ) {
-        if callback_info.is_null() {
-            return;
-        }
-        let info = unsafe { &*callback_info };
-        let context = unsafe { callback_context(info) };
-        let observation = context.as_ref().and_then(|context| {
-            context
-                .begin_health_observation(CloudCallbackKind::Rename, Duration::from_secs(60))
-                .ok()
-        });
-        let result = unsafe {
-            context
-                .as_ref()
-                .ok_or_else(|| {
-                    CloudProviderError::Callback("callback context is unavailable".into())
-                })
-                .and_then(|context| context.handle_rename(info, callback_parameters))
-        };
-        let mut execute_error = None;
-        let mut selected_status = STATUS_CLOUD_FILE_UNSUCCESSFUL.0;
-        let handler_error =
-            complete_callback_once(result, STATUS_CLOUD_FILE_UNSUCCESSFUL, |status| {
-                selected_status = status.0;
-                execute_error = unsafe { execute_ack_rename(info, status).err() }
-            });
-        if let Some(err) = &handler_error {
-            tracing::warn!("Cloud Files rename callback failed: {err}");
-        }
-        if let Some(err) = &execute_error {
-            tracing::warn!("Cloud Files rename completion failed: {err}");
-        }
-        if let Some(observation) = observation {
-            observation.finish_at(
-                actionable_callback_handler_outcome(
-                    handler_error.as_ref().map(ToString::to_string),
-                    selected_status,
-                ),
-                Some(
-                    execute_error
-                        .as_ref()
-                        .map_or(Ok(()), |error| Err(error.to_string())),
-                ),
-                Utc::now(),
-            );
-        }
+        // The encrypted delete is committed before ACK_DELETE succeeds.
     }
 
     unsafe extern "system" fn cancel_fetch_data_callback(
@@ -14028,8 +14848,7 @@ mod platform {
                 Duration::from_secs(60),
             )
             .ok();
-        // The provider completes placeholder enumeration synchronously and has no
-        // outstanding enumeration state to discard.
+        // Placeholder enumeration completes synchronously and has no outstanding state to cancel.
         if let Some(observation) = observation {
             observation.finish_at(Ok(()), None, Utc::now());
         }
@@ -14235,6 +15054,20 @@ mod platform {
                             .unwrap_or_default()
                     });
             let existing_entry = self.entry_for_identity(&identity)?;
+            if normalize_relative_path(&existing_entry.relative_path)
+                != normalize_relative_path(&relative_path)
+                && self.runtime.block_on(self.ingest_local_placeholder_rename(
+                    &full_path,
+                    &relative_path,
+                    identity.clone(),
+                ))?
+            {
+                // A close notification may race ahead of the filesystem watcher after a
+                // local move. Treat the stable-object path change as the rename itself;
+                // attempting ordinary writeback with the old path-bound V1 identity is
+                // invalid and would strand a pending mutation.
+                return Ok(());
+            }
             let existing_identity = existing_entry.identity.clone();
             let expected_version = self.expected_version_for(&identity)?;
             self.state_store.transaction(|state| {
@@ -14292,7 +15125,7 @@ mod platform {
             };
             self.remove_identity(&identity)?;
             self.remove_cache_for_identity(&identity);
-            let _ = self.upsert_entry(writeback)?;
+            let _ = self.upsert_committed_entry(writeback)?;
             CloudFileOplock::acquire_exclusive(&full_path)?.mark_in_sync()?;
             self.clear_pending_mutation(mutation_id)?;
             Ok(())
@@ -14365,137 +15198,6 @@ mod platform {
                         err
                     );
                     error_status(&err.to_string())
-                }
-            };
-            Ok(status)
-        }
-
-        unsafe fn handle_rename(
-            &self,
-            info: &CF_CALLBACK_INFO,
-            callback_parameters: *const CF_CALLBACK_PARAMETERS,
-        ) -> Result<NTSTATUS> {
-            if callback_parameters.is_null() {
-                return Ok(STATUS_CLOUD_FILE_INVALID_REQUEST);
-            }
-            self.startup_activity.ensure_wait_allowed()?;
-            let _operation = self.runtime.block_on(self.operation_lock.lock());
-            self.startup_activity.ensure_running()?;
-            let identity = self.resolve_callback_identity(info)?;
-            let entry = self.entry_for_identity(&identity)?;
-            let expected_version = self.expected_version_for(&identity)?;
-            let params = (*callback_parameters).Anonymous.Rename;
-            let target_path = pcwstr_to_path(params.TargetPath);
-            let target_relative = target_path
-                .as_ref()
-                .and_then(|path| {
-                    relative_path_from_full_path(&self.registration.sync_root_path, path)
-                })
-                .ok_or_else(|| {
-                    CloudProviderError::Callback(format!(
-                        "rename target path is outside sync root for {}",
-                        entry.relative_path
-                    ))
-                });
-
-            let status = match target_relative {
-                Ok(target_relative) => {
-                    let mut record = CloudMutationRecord::new(
-                        CloudMutationKind::Rename,
-                        self.registration.root_id,
-                        entry.relative_path.clone(),
-                        Some(entry.identity.clone()),
-                    );
-                    record.target_relative_path = Some(target_relative.clone());
-                    record.target_plaintext_path = target_path.clone();
-                    record.expected_version = match &expected_version {
-                        ExpectedProviderVersion::Exact(version) => Some(version.clone()),
-                        ExpectedProviderVersion::Unchecked | ExpectedProviderVersion::Absent => {
-                            None
-                        }
-                    };
-                    let mutation_id = self.add_pending_mutation(record)?;
-                    match self.runtime.block_on(async {
-                        self.bridge
-                            .rename_entry_checked(
-                                self.registration.root_id,
-                                &self.registration.encrypted_root,
-                                &entry.identity,
-                                &target_relative,
-                                target_path.as_deref(),
-                                &expected_version,
-                            )
-                            .await
-                    }) {
-                        Ok(Some(entry)) => {
-                            self.remove_identity(&identity)?;
-                            self.remove_cache_for_identity(&identity);
-                            let _ = self.upsert_entry(entry)?;
-                            self.clear_pending_mutation(mutation_id)?;
-                            STATUS_SUCCESS
-                        }
-                        Ok(None) => {
-                            if identity.kind == ProviderEntryKind::Directory {
-                                self.state_store.transaction(|state| {
-                                    state.migrate_directory_path(
-                                        &entry.relative_path,
-                                        &target_relative,
-                                    )
-                                })?;
-                                let mut inventory =
-                                    self.inventory_by_object_id.lock().map_err(|_| {
-                                        CloudProviderError::Callback(
-                                            "provider inventory lock poisoned".into(),
-                                        )
-                                    })?;
-                                if let Some(current) = inventory.get_mut(&identity.object_id) {
-                                    current.relative_path = target_relative.clone();
-                                    current.encrypted_path = self
-                                        .registration
-                                        .encrypted_root
-                                        .join(target_relative.replace('/', "\\"));
-                                    current.identity = FileIdentityV1::new(
-                                        self.registration.root_id,
-                                        current.kind,
-                                        target_relative.clone(),
-                                        current.identity.file_id.clone(),
-                                        current.identity.epoch_id,
-                                    );
-                                }
-                            }
-                            self.clear_pending_mutation(mutation_id)?;
-                            STATUS_SUCCESS
-                        }
-                        Err(err @ ProviderCoreError::ContentConflict { .. }) => {
-                            if let ProviderCoreError::ContentConflict {
-                                expected, actual, ..
-                            } = &err
-                            {
-                                self.record_conflict(
-                                    &identity,
-                                    &entry.relative_path,
-                                    target_path.clone(),
-                                    expected.clone(),
-                                    actual.clone(),
-                                )?;
-                            }
-                            self.mark_pending_mutation_error(mutation_id, &err.to_string())?;
-                            error_status(&err.to_string())
-                        }
-                        Err(err) => {
-                            self.mark_pending_mutation_error(mutation_id, &err.to_string())?;
-                            tracing::warn!(
-                                "Cloud Files rename failed for {}: {}",
-                                entry.relative_path,
-                                err
-                            );
-                            error_status(&err.to_string())
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!("Cloud Files rename target mapping failed: {}", err);
-                    STATUS_CLOUD_FILE_INVALID_REQUEST
                 }
             };
             Ok(status)
@@ -14589,7 +15291,7 @@ mod platform {
     ) -> Result<()> {
         let op_info = operation_info(info, CF_OPERATION_TYPE_TRANSFER_DATA);
         let mut params = CF_OPERATION_PARAMETERS {
-            ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
+            ParamSize: cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_0>(),
             Anonymous: CF_OPERATION_PARAMETERS_0 {
                 TransferData: CF_OPERATION_PARAMETERS_0_0 {
                     Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
@@ -14616,7 +15318,7 @@ mod platform {
     ) -> Result<()> {
         let op_info = operation_info(info, CF_OPERATION_TYPE_ACK_DATA);
         let mut params = CF_OPERATION_PARAMETERS {
-            ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
+            ParamSize: cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_2>(),
             Anonymous: CF_OPERATION_PARAMETERS_0 {
                 AckData: CF_OPERATION_PARAMETERS_0_2 {
                     Flags: CF_OPERATION_ACK_DATA_FLAG_NONE,
@@ -14637,10 +15339,10 @@ mod platform {
     ) -> Result<()> {
         let op_info = operation_info(info, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
         let mut params = CF_OPERATION_PARAMETERS {
-            ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
+            ParamSize: cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_4>(),
             Anonymous: CF_OPERATION_PARAMETERS_0 {
                 TransferPlaceholders: CF_OPERATION_PARAMETERS_0_4 {
-                    Flags: CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+                    Flags: transfer_placeholders_flags(),
                     CompletionStatus: status,
                     PlaceholderTotalCount: total_count,
                     PlaceholderArray: std::ptr::null_mut(),
@@ -14653,10 +15355,15 @@ mod platform {
         Ok(())
     }
 
+    fn transfer_placeholders_flags(
+    ) -> windows::Win32::Storage::CloudFilters::CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS {
+        CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION
+    }
+
     unsafe fn execute_ack_dehydrate(info: &CF_CALLBACK_INFO, status: NTSTATUS) -> Result<()> {
         let op_info = operation_info(info, CF_OPERATION_TYPE_ACK_DEHYDRATE);
         let mut params = CF_OPERATION_PARAMETERS {
-            ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
+            ParamSize: cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_5>(),
             Anonymous: CF_OPERATION_PARAMETERS_0 {
                 AckDehydrate: CF_OPERATION_PARAMETERS_0_5 {
                     Flags: CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE,
@@ -14673,7 +15380,7 @@ mod platform {
     unsafe fn execute_ack_delete(info: &CF_CALLBACK_INFO, status: NTSTATUS) -> Result<()> {
         let op_info = operation_info(info, CF_OPERATION_TYPE_ACK_DELETE);
         let mut params = CF_OPERATION_PARAMETERS {
-            ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
+            ParamSize: cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_7>(),
             Anonymous: CF_OPERATION_PARAMETERS_0 {
                 AckDelete: CF_OPERATION_PARAMETERS_0_7 {
                     Flags: CF_OPERATION_ACK_DELETE_FLAG_NONE,
@@ -14685,19 +15392,8 @@ mod platform {
         Ok(())
     }
 
-    unsafe fn execute_ack_rename(info: &CF_CALLBACK_INFO, status: NTSTATUS) -> Result<()> {
-        let op_info = operation_info(info, CF_OPERATION_TYPE_ACK_RENAME);
-        let mut params = CF_OPERATION_PARAMETERS {
-            ParamSize: size_of::<CF_OPERATION_PARAMETERS>() as u32,
-            Anonymous: CF_OPERATION_PARAMETERS_0 {
-                AckRename: CF_OPERATION_PARAMETERS_0_6 {
-                    Flags: CF_OPERATION_ACK_RENAME_FLAG_NONE,
-                    CompletionStatus: status,
-                },
-            },
-        };
-        unsafe { CfExecute(&op_info, &mut params)? };
-        Ok(())
+    fn cf_operation_param_size<T>() -> u32 {
+        (std::mem::offset_of!(CF_OPERATION_PARAMETERS, Anonymous) + size_of::<T>()) as u32
     }
 
     unsafe fn operation_info(
@@ -14800,8 +15496,7 @@ mod platform {
                 },
                 FileIdentity: placeholder.identity.as_ptr().cast(),
                 FileIdentityLength: placeholder.identity.len() as u32,
-                Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC
-                    | CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE,
+                Flags: placeholder_create_flags(entry.entry.kind),
                 Result: Default::default(),
                 CreateUsn: 0,
             };
@@ -14811,6 +15506,20 @@ mod platform {
         fn relative_path(&self) -> String {
             self.display_path.clone()
         }
+    }
+
+    fn placeholder_create_flags(
+        kind: ProviderEntryKind,
+    ) -> windows::Win32::Storage::CloudFilters::CF_PLACEHOLDER_CREATE_FLAGS {
+        let mut flags =
+            CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC | CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE;
+        if kind == ProviderEntryKind::Directory {
+            // Reconciliation creates every known child up front, so tell Windows this directory
+            // is complete. Leaving it partial causes nested creates and renames to wait on
+            // FETCH_PLACEHOLDERS even though the children are already on disk.
+            flags |= CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION;
+        }
+        flags
     }
 
     fn windows_error_matches(err: &windows::core::Error, code: WIN32_ERROR) -> bool {
@@ -14883,6 +15592,62 @@ mod platform {
         use super::*;
 
         #[test]
+        fn resident_allocation_bound_rounds_up_to_eight_bytes() {
+            assert_eq!(resident_allocation_bound(0), 0);
+            assert_eq!(resident_allocation_bound(1), 8);
+            assert_eq!(resident_allocation_bound(8), 8);
+            assert_eq!(resident_allocation_bound(9), 16);
+            assert_eq!(resident_allocation_bound(57), 64);
+            assert_eq!(resident_allocation_bound(700), 704);
+        }
+
+        #[test]
+        fn resident_allocation_bound_separates_mft_leftovers_from_cluster_backed_data() {
+            // Regression: a 57-byte file that dehydrated to zero on-disk data
+            // still reports 64 allocated bytes, because NTFS kept the stream
+            // resident in its MFT record and dehydration has no clusters to
+            // release. The previous `AllocationSize != 0` gate blocked unmount
+            // on that file forever.
+            assert!(64 <= resident_allocation_bound(57));
+            // A placeholder that is genuinely still hydrated holds whole
+            // clusters, which residency cannot account for.
+            assert!(4096 > resident_allocation_bound(398));
+            assert!(4096 > resident_allocation_bound(3181));
+        }
+
+        #[test]
+        fn small_files_report_allocation_the_resident_bound_can_explain() {
+            use std::os::windows::io::AsRawHandle;
+
+            let temp = tempfile::tempdir().unwrap();
+            for size in [0usize, 1, 8, 57, 100, 500, 688, 700] {
+                let path = temp.path().join(format!("resident-{size}.bin"));
+                std::fs::write(&path, vec![0u8; size]).unwrap();
+                let file = std::fs::File::open(&path).unwrap();
+                let mut info = FILE_STANDARD_INFO::default();
+                unsafe {
+                    GetFileInformationByHandleEx(
+                        HANDLE(file.as_raw_handle()),
+                        FileStandardInfo,
+                        (&mut info as *mut FILE_STANDARD_INFO).cast(),
+                        size_of::<FILE_STANDARD_INFO>() as u32,
+                    )
+                    .unwrap();
+                }
+                // Either the volume kept the stream resident, in which case the
+                // bound covers it, or it handed out whole sectors. Anything else
+                // means the bound formula no longer models this filesystem.
+                assert!(
+                    info.AllocationSize <= resident_allocation_bound(info.EndOfFile)
+                        || info.AllocationSize % 512 == 0,
+                    "{size}-byte file reported {} allocated bytes for a {}-byte stream, which neither MFT residency nor sector allocation explains",
+                    info.AllocationSize,
+                    info.EndOfFile,
+                );
+            }
+        }
+
+        #[test]
         fn reconciliation_guard_clears_durable_marker_when_dropped() {
             let temp = tempfile::tempdir().unwrap();
             let root_id = Uuid::new_v4();
@@ -14917,6 +15682,112 @@ mod platform {
                 PathBuf::from(r"C:\Users\Admin\file.txt")
             );
         }
+
+        #[test]
+        fn cf_operation_param_size_uses_selected_union_member() {
+            let full_size = size_of::<CF_OPERATION_PARAMETERS>() as u32;
+            let delete_size = cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_7>();
+
+            assert_eq!(
+                delete_size as usize,
+                std::mem::offset_of!(CF_OPERATION_PARAMETERS, Anonymous)
+                    + size_of::<CF_OPERATION_PARAMETERS_0_7>()
+            );
+            assert!(delete_size < full_size);
+            assert_eq!(
+                cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_5>() as usize,
+                std::mem::offset_of!(CF_OPERATION_PARAMETERS, Anonymous)
+                    + size_of::<CF_OPERATION_PARAMETERS_0_5>()
+            );
+            assert_eq!(
+                cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_0>() as usize,
+                std::mem::offset_of!(CF_OPERATION_PARAMETERS, Anonymous)
+                    + size_of::<CF_OPERATION_PARAMETERS_0_0>()
+            );
+            assert!(cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_0>() < full_size);
+        }
+
+        #[test]
+        fn callback_table_supports_population_fallback_and_post_scan_renames() {
+            use windows::Win32::Storage::CloudFilters::{
+                CF_CALLBACK_TYPE_CANCEL_FETCH_PLACEHOLDERS, CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
+                CF_CALLBACK_TYPE_NOTIFY_RENAME, CF_CALLBACK_TYPE_NOTIFY_RENAME_COMPLETION,
+            };
+
+            let registrations = callback_registrations();
+            assert!(registrations
+                .iter()
+                .any(|entry| entry.Type == CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS
+                    && entry.Callback.is_some()));
+            assert!(registrations.iter().any(|entry| entry.Type
+                == CF_CALLBACK_TYPE_CANCEL_FETCH_PLACEHOLDERS
+                && entry.Callback.is_some()));
+            assert!(!registrations
+                .iter()
+                .any(|entry| entry.Type == CF_CALLBACK_TYPE_NOTIFY_RENAME
+                    && entry.Callback.is_some()));
+            assert!(!registrations.iter().any(|entry| entry.Type
+                == CF_CALLBACK_TYPE_NOTIFY_RENAME_COMPLETION
+                && entry.Callback.is_some()));
+        }
+
+        #[test]
+        fn directory_placeholders_disable_on_demand_population() {
+            let directory_create = placeholder_create_flags(ProviderEntryKind::Directory);
+            let file_create = placeholder_create_flags(ProviderEntryKind::File);
+            assert_ne!(
+                directory_create.0 & CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION.0,
+                0
+            );
+            assert_eq!(
+                file_create.0 & CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION.0,
+                0
+            );
+
+            let directory_update = placeholder_update_flags(ProviderEntryKind::Directory, false);
+            let file_update = placeholder_update_flags(ProviderEntryKind::File, false);
+            assert_ne!(
+                directory_update.0 & CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION.0,
+                0
+            );
+            assert_eq!(
+                file_update.0 & CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION.0,
+                0
+            );
+            assert_ne!(
+                transfer_placeholders_flags().0
+                    & CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION.0,
+                0
+            );
+        }
+
+        #[test]
+        fn ingestion_oplock_does_not_request_delete_access() {
+            let flags = CloudFileOplock::exclusive_write_flags();
+            assert_ne!(flags.0 & CF_OPEN_FILE_FLAG_EXCLUSIVE.0, 0);
+            assert_ne!(flags.0 & CF_OPEN_FILE_FLAG_WRITE_ACCESS.0, 0);
+            assert_eq!(flags.0 & CF_OPEN_FILE_FLAG_DELETE_ACCESS.0, 0);
+        }
+
+        #[test]
+        fn plain_file_ingestion_snapshot_copies_ordinary_file() {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("new-local-file.txt");
+            let destination = temp.path().join("cache").join("snapshot.plain");
+            fs::write(&source, b"ordinary file bytes").unwrap();
+
+            snapshot_plain_file_to_path(&source, &destination).unwrap();
+
+            assert_eq!(fs::read(&destination).unwrap(), b"ordinary file bytes");
+        }
+
+        #[test]
+        fn delete_oplock_requests_delete_access_explicitly() {
+            let flags = CloudFileOplock::exclusive_delete_flags();
+            assert_ne!(flags.0 & CF_OPEN_FILE_FLAG_EXCLUSIVE.0, 0);
+            assert_ne!(flags.0 & CF_OPEN_FILE_FLAG_WRITE_ACCESS.0, 0);
+            assert_ne!(flags.0 & CF_OPEN_FILE_FLAG_DELETE_ACCESS.0, 0);
+        }
     }
 }
 
@@ -14934,6 +15805,17 @@ mod platform {
 
     pub struct ConnectedCloudRoot;
 
+    #[derive(Clone)]
+    pub struct CloudRootShutdownBarrier;
+
+    impl CloudRootShutdownBarrier {
+        pub async fn begin(&self) -> Result<()> {
+            Err(CloudProviderError::UnsupportedPlatform)
+        }
+
+        pub fn resume(&self) {}
+    }
+
     impl ConnectedCloudRoot {
         pub fn root_id(&self) -> Uuid {
             Uuid::nil()
@@ -14941,6 +15823,10 @@ mod platform {
 
         pub fn sync_root_path(&self) -> &Path {
             Path::new("")
+        }
+
+        pub fn shutdown_barrier(&self) -> CloudRootShutdownBarrier {
+            CloudRootShutdownBarrier
         }
 
         pub async fn disconnect(&mut self) -> Result<()> {
@@ -14975,11 +15861,34 @@ mod platform {
         Err(CloudProviderError::UnsupportedPlatform)
     }
 
+    pub fn dehydrate_root_filtered(
+        _sync_root_path: &Path,
+        _cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<DehydrateRootSummary> {
+        Err(CloudProviderError::UnsupportedPlatform)
+    }
+
+    #[allow(dead_code)]
     pub fn verify_root_dehydrated(_sync_root_path: &Path) -> Result<()> {
         Err(CloudProviderError::UnsupportedPlatform)
     }
 
+    pub fn verify_root_dehydrated_filtered(
+        _sync_root_path: &Path,
+        _cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<()> {
+        Err(CloudProviderError::UnsupportedPlatform)
+    }
+
+    #[allow(dead_code)]
     pub fn clear_dehydrated_root(_sync_root_path: &Path) -> Result<()> {
+        Err(CloudProviderError::UnsupportedPlatform)
+    }
+
+    pub fn clear_dehydrated_root_filtered(
+        _sync_root_path: &Path,
+        _cleanup_path_filter: &super::CloudCleanupPathFilter,
+    ) -> Result<()> {
         Err(CloudProviderError::UnsupportedPlatform)
     }
 

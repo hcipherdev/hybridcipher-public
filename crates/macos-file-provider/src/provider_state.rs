@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use tracing::warn;
 use uuid::Uuid;
 
 pub(crate) const PROVIDER_STATE_VERSION: u16 = 2;
@@ -283,7 +284,18 @@ impl ProviderPersistentState {
 
         for entry in file_entries {
             let snapshot = self.snapshot_for_entry(root_id, entry);
-            self.items.insert(snapshot.provider_id.clone(), snapshot);
+            if let Some(previous) = self
+                .items
+                .insert(snapshot.provider_id.clone(), snapshot.clone())
+            {
+                warn!(
+                    "Provider state saw duplicate item identity {} at {} and {}; keeping {}",
+                    snapshot.provider_id,
+                    previous.relative_path,
+                    snapshot.relative_path,
+                    snapshot.relative_path
+                );
+            }
         }
     }
 
@@ -400,6 +412,41 @@ impl ProviderPersistentState {
             }
         }
     }
+}
+
+pub(crate) fn resolve_snapshot_for_identifier(
+    state: &ProviderPersistentState,
+    identifier: &str,
+) -> Option<ProviderItemSnapshot> {
+    let normalized = identifier.trim();
+    if let Some(snapshot) = state.snapshot(normalized) {
+        return Some(snapshot.clone());
+    }
+
+    if let Ok(ProviderItemIdentifier::File { file_id }) = ProviderItemIdentifier::parse(normalized)
+    {
+        if let Some(path_hash) = file_id.strip_prefix(PENDING_FILE_ID_PREFIX) {
+            return state
+                .items
+                .values()
+                .find(|snapshot| {
+                    snapshot.kind == ProviderEntryKind::File
+                        && snapshot.identity.path_hash_hex == path_hash
+                })
+                .cloned();
+        }
+    }
+
+    if !normalized.starts_with(ProviderItemIdentifier::PREFIX) {
+        let relative_path = normalize_relative_path(normalized);
+        return state
+            .items
+            .values()
+            .find(|snapshot| snapshot.relative_path == relative_path)
+            .cloned();
+    }
+
+    None
 }
 
 pub(crate) fn record_state_changes(

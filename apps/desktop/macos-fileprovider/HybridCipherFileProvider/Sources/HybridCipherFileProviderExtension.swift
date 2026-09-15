@@ -95,7 +95,9 @@ final class HybridCipherFileProviderExtension: NSObject, NSFileProviderReplicate
                     kind: kind(for: itemTemplate),
                     contentsURL: url
                 )
-                let snapshot = try await performAction(action, fallbackIdentifier: relativePath)
+                guard let snapshot = try await performAction(action, fallbackIdentifier: relativePath) else {
+                    throw NSFileProviderError(.cannotSynchronize)
+                }
                 completionHandler(FileProviderItem(snapshot: snapshot), [], false, nil)
                 progress.completedUnitCount = 1
             } catch {
@@ -117,15 +119,21 @@ final class HybridCipherFileProviderExtension: NSObject, NSFileProviderReplicate
         let progress = Progress(totalUnitCount: 1)
         Task {
             do {
-                let relativePath = try await relativePath(for: item)
                 let metadataOnlyChange =
                     changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier)
+                let parentIdentifier = changedFields.contains(.parentItemIdentifier)
+                    ? item.parentItemIdentifier.rawValue
+                    : nil
+                let relativePath = parentIdentifier == fileProviderTrashContainerIdentifier
+                    ? item.filename
+                    : try await relativePath(for: item)
                 let action = try ProviderOperationPlanner.modifyAction(
                     identifier: item.itemIdentifier.rawValue,
                     relativePath: relativePath,
                     kind: kind(for: item),
                     contentsURL: newContents,
-                    metadataOnlyChange: metadataOnlyChange
+                    metadataOnlyChange: metadataOnlyChange,
+                    parentIdentifier: parentIdentifier
                 )
                 if case .noop = action {
                     completionHandler(item, [], false, nil)
@@ -133,7 +141,7 @@ final class HybridCipherFileProviderExtension: NSObject, NSFileProviderReplicate
                     return
                 }
                 let snapshot = try await performAction(action, fallbackIdentifier: item.itemIdentifier.rawValue)
-                completionHandler(FileProviderItem(snapshot: snapshot), [], false, nil)
+                completionHandler(snapshot.map(FileProviderItem.init(snapshot:)), [], false, nil)
                 progress.completedUnitCount = 1
             } catch {
                 completionHandler(nil, changedFields, false, providerCompatibleError(error))
@@ -199,7 +207,7 @@ final class HybridCipherFileProviderExtension: NSObject, NSFileProviderReplicate
     private func performAction(
         _ action: ProviderOperationAction,
         fallbackIdentifier: String
-    ) async throws -> ProviderItemSnapshot {
+    ) async throws -> ProviderItemSnapshot? {
         switch action {
         case .createDirectory(let relativePath):
             guard let snapshot = try await bridge.createDirectory(relativePath: relativePath) else {
@@ -219,6 +227,9 @@ final class HybridCipherFileProviderExtension: NSObject, NSFileProviderReplicate
                 throw NSFileProviderError(.cannotSynchronize)
             }
             return snapshot
+        case .delete(let identifier):
+            try await bridge.delete(identifier: identifier)
+            return nil
         case .rename(let identifier, let targetRelativePath):
             if let snapshot = try await bridge.rename(
                 identifier: identifier,

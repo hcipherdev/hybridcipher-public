@@ -1,8 +1,6 @@
 import FileProvider
 import Foundation
 
-private let trashContainerIdentifier = "NSFileProviderTrashContainerItemIdentifier"
-
 final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     private let containerIdentifier: NSFileProviderItemIdentifier
     private let bridge: any ProviderEnumeratorBridge
@@ -22,7 +20,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         Task {
             do {
                 if containerIdentifier == .workingSet ||
-                    containerIdentifier.rawValue == trashContainerIdentifier
+                    containerIdentifier.rawValue == fileProviderTrashContainerIdentifier
                 {
                     observer.didEnumerate([])
                     observer.finishEnumerating(upTo: nil)

@@ -12,6 +12,7 @@ struct ProviderOperationPlannerTestRunner {
     static func main() throws {
         testCreateDirectoryWithoutContentsUsesDirectoryAction()
         testMetadataOnlyRenameUsesRenameAction()
+        testMoveToTrashUsesDeleteAction()
     }
 
     static func testCreateDirectoryWithoutContentsUsesDirectoryAction() {
@@ -45,6 +46,27 @@ struct ProviderOperationPlannerTestRunner {
             require(targetRelativePath == "renamed.txt", "rename should use the new relative path")
         default:
             require(false, "metadata-only rename should not become a no-op")
+        }
+    }
+
+    static func testMoveToTrashUsesDeleteAction() {
+        let action = try! ProviderOperationPlanner.modifyAction(
+            identifier: "hc:v2:file:pending:path-hash",
+            relativePath: "draft.txt",
+            kind: .file,
+            contentsURL: nil,
+            metadataOnlyChange: true,
+            parentIdentifier: fileProviderTrashContainerIdentifier
+        )
+
+        switch action {
+        case .delete(let identifier):
+            require(
+                identifier == "hc:v2:file:pending:path-hash",
+                "trash moves should preserve the provider identifier for deletion"
+            )
+        default:
+            require(false, "moving an item to File Provider Trash should become a delete")
         }
     }
 }

@@ -100,6 +100,21 @@ impl CloudRootPersistentState {
         &mut self,
         entry: &ProviderEntry,
     ) -> Result<CloudObjectIdentityV2> {
+        self.upsert_inventory_entry_with_policy(entry, true)
+    }
+
+    pub fn upsert_committed_inventory_entry(
+        &mut self,
+        entry: &ProviderEntry,
+    ) -> Result<CloudObjectIdentityV2> {
+        self.upsert_inventory_entry_with_policy(entry, false)
+    }
+
+    fn upsert_inventory_entry_with_policy(
+        &mut self,
+        entry: &ProviderEntry,
+        preserve_dirty_local_state: bool,
+    ) -> Result<CloudObjectIdentityV2> {
         if entry.root_id != self.root_id {
             return Err(CloudProviderError::Callback(format!(
                 "inventory entry {} belongs to the wrong root",
@@ -139,7 +154,7 @@ impl CloudRootPersistentState {
         }
         let identity = CloudObjectIdentityV2::new(self.root_id, entry.kind, object_id.clone());
         let previous = self.items.get(&object_id);
-        let dirty = previous.map(|item| item.dirty).unwrap_or(false);
+        let dirty = preserve_dirty_local_state && previous.map(|item| item.dirty).unwrap_or(false);
         let content_version = if dirty {
             previous.and_then(|item| item.content_version.clone())
         } else {

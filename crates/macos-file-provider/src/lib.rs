@@ -43,8 +43,9 @@ pub use hybridcipher_provider_core::{
     local_provider_bridge, ClientMountCrypto, LocalProviderBridge, LocalProviderClient,
 };
 use provider_state::{
-    record_state_changes, ProviderChangeEnumeration, ProviderChangeJournal, ProviderChangeRecord,
-    ProviderItemIdentifier, ProviderItemSnapshot, ProviderPersistentState,
+    record_state_changes, resolve_snapshot_for_identifier, ProviderChangeEnumeration,
+    ProviderChangeJournal, ProviderChangeRecord, ProviderItemIdentifier, ProviderItemSnapshot,
+    ProviderPersistentState,
 };
 #[cfg(test)]
 use provider_state::{ProviderChangeKind, ROOT_CONTAINER_SIGNAL_IDENTIFIER};
@@ -494,7 +495,10 @@ impl MacFileProviderCacheBridge {
         &self,
         identifier: &str,
     ) -> hybridcipher_provider_core::Result<Option<ProviderItemSnapshot>> {
-        Ok(self.load_provider_state()?.snapshot_cloned(identifier))
+        Ok(resolve_snapshot_for_identifier(
+            &self.load_provider_state()?,
+            identifier,
+        ))
     }
 }
 
@@ -3914,6 +3918,44 @@ mod tests {
             ProviderItemIdentifier::parse(&directory_identifier.to_string()).unwrap(),
             directory_identifier
         );
+    }
+
+    #[test]
+    fn pending_file_provider_identifier_resolves_to_stable_file_snapshot() {
+        let root_id = Uuid::new_v4();
+        let encrypted_root = PathBuf::from("/tmp/encrypted");
+        let cache_root = PathBuf::from("/tmp/cache");
+        let entry = ProviderEntry::cache_file_with_identity(
+            root_id,
+            "Codebutler/tewte.md",
+            encrypted_root.join("Codebutler/tewte.md.encrypted"),
+            5,
+            770,
+            Utc::now(),
+            None,
+            Some("stable-file-id".to_string()),
+            Some(1),
+        );
+        let pending_identity = FileIdentityV1::new(
+            root_id,
+            ProviderEntryKind::File,
+            "Codebutler/tewte.md",
+            None,
+            None,
+        );
+        let pending_identifier = ProviderItemIdentifier::File {
+            file_id: format!("pending:{}", pending_identity.path_hash_hex),
+        }
+        .to_string();
+        let mut state = ProviderPersistentState::new(root_id);
+        state.rebuild_items(root_id, &encrypted_root, &cache_root, &[entry]);
+
+        let snapshot = resolve_snapshot_for_identifier(&state, &pending_identifier)
+            .expect("pending provider identifier should resolve by path hash");
+
+        assert_eq!(snapshot.relative_path, "Codebutler/tewte.md");
+        assert_eq!(snapshot.provider_id, "hc:v2:file:stable-file-id");
+        assert_eq!(snapshot.identity.file_id.as_deref(), Some("stable-file-id"));
     }
 
     #[test]

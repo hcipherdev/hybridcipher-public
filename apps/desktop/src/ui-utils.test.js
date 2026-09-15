@@ -2,7 +2,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+    captureKeyedScrollPositions,
+    restoreKeyedScrollPositions,
+    filterProtectedFolders,
+    buildAppModeUiModel,
+    shouldExpandAdvancedSettings,
     getFolderRowStatusState,
+    buildMountConflictReviewState,
     buildWorkspaceHomeModel,
     buildFolderDetailModel,
     buildFolderCoverageModel,
@@ -11,6 +17,129 @@ const {
     buildDeviceVerificationModel,
     buildDeviceVerificationCommand,
 } = require('./ui-utils');
+
+test('filterProtectedFolders matches display names, basenames, and full paths', () => {
+    const folders = [
+        { name: 'Tax Records', path: 'C:\\Protected\\finance-2026' },
+        { name: '', path: 'D:\\Vaults\\Family Photos' },
+        { name: 'Projects', path: '/home/user/secure/client-work' },
+    ];
+
+    assert.deepEqual(filterProtectedFolders(folders, ''), folders);
+    assert.deepEqual(filterProtectedFolders(folders, '   '), folders);
+    assert.deepEqual(filterProtectedFolders(folders, 'tAx'), [folders[0]]);
+    assert.deepEqual(filterProtectedFolders(folders, 'PROTECTED\\FINANCE'), [folders[0]]);
+    assert.deepEqual(filterProtectedFolders(folders, 'family photos'), [folders[1]]);
+    assert.deepEqual(filterProtectedFolders(folders, 'SECURE/CLIENT'), [folders[2]]);
+    assert.deepEqual(filterProtectedFolders(folders, 'missing'), []);
+});
+
+test('individual mode uses folder search and hides technical navigation', () => {
+    assert.deepEqual(buildAppModeUiModel('individual'), {
+        searchMode: 'folders',
+        searchPlaceholder: 'Search protected folders…',
+        showTechnicalNavigation: false,
+        protectionNavigationLabel: 'Protection status',
+    });
+    assert.deepEqual(buildAppModeUiModel('team'), {
+        searchMode: 'commands',
+        searchPlaceholder: 'Search CLI commands…',
+        showTechnicalNavigation: true,
+        protectionNavigationLabel: 'Coverage Center',
+    });
+});
+
+test('advanced settings targets expand the disclosure', () => {
+    assert.equal(shouldExpandAdvancedSettings('settingsAdvancedMountSection'), true);
+    assert.equal(shouldExpandAdvancedSettings('settingsCoverageSection'), true);
+    assert.equal(shouldExpandAdvancedSettings('settingsTerminalSection'), true);
+    assert.equal(shouldExpandAdvancedSettings('settingsRecoverySection'), false);
+    assert.equal(shouldExpandAdvancedSettings(null), false);
+});
+
+test('keyed scroll positions survive a rendered list replacement', () => {
+    const previousItems = [
+        { dataset: { preserveScrollKey: 'coverage-group-missing' }, scrollTop: 176 },
+        { dataset: { preserveScrollKey: 'coverage-group-outcasts' }, scrollTop: 24 },
+    ];
+    const nextItems = [
+        { dataset: { preserveScrollKey: 'coverage-group-missing' }, scrollTop: 0 },
+        { dataset: { preserveScrollKey: 'coverage-group-outcasts' }, scrollTop: 0 },
+        { dataset: { preserveScrollKey: 'coverage-group-new' }, scrollTop: 0 },
+    ];
+    const previousContainer = { querySelectorAll: () => previousItems };
+    const nextContainer = { querySelectorAll: () => nextItems };
+
+    const positions = captureKeyedScrollPositions(previousContainer);
+    restoreKeyedScrollPositions(nextContainer, positions);
+
+    assert.deepEqual(positions, {
+        'coverage-group-missing': 176,
+        'coverage-group-outcasts': 24,
+    });
+    assert.deepEqual(nextItems.map(item => item.scrollTop), [176, 24, 0]);
+});
+
+test('buildMountConflictReviewState detects a stale mount conflict count', () => {
+    assert.deepEqual(
+        buildMountConflictReviewState({
+            records: [],
+            syncStatus: {
+                pending_conflict_count: 1,
+                safe_to_unmount: false,
+                unsafe_reasons: [{ kind: 'conflict', count: 1 }],
+            },
+        }),
+        {
+            listedCount: 0,
+            reportedCount: 1,
+            statusAvailable: true,
+            mismatch: true,
+            isClear: false,
+            safeToUnmount: false,
+            hasOtherBlockingWork: false,
+        }
+    );
+});
+
+test('buildMountConflictReviewState keeps pending writebacks separate from cleared conflicts', () => {
+    assert.deepEqual(
+        buildMountConflictReviewState({
+            records: [],
+            syncStatus: {
+                pending_conflict_count: 0,
+                pending_writeback_count: 8,
+                safe_to_unmount: false,
+                unsafe_reasons: [{ kind: 'pending_writeback', count: 8 }],
+            },
+        }),
+        {
+            listedCount: 0,
+            reportedCount: 0,
+            statusAvailable: true,
+            mismatch: false,
+            isClear: true,
+            safeToUnmount: false,
+            hasOtherBlockingWork: true,
+        }
+    );
+});
+
+test('buildMountConflictReviewState reports a fully clear mount consistently', () => {
+    const state = buildMountConflictReviewState({
+        records: [],
+        syncStatus: {
+            pending_conflict_count: 0,
+            safe_to_unmount: true,
+            unsafe_reasons: [],
+        },
+    });
+
+    assert.equal(state.isClear, true);
+    assert.equal(state.mismatch, false);
+    assert.equal(state.hasOtherBlockingWork, false);
+    assert.equal(state.safeToUnmount, true);
+});
 
 test('getFolderRowStatusState keeps mounted rows green when no issues exist', () => {
     assert.deepEqual(
@@ -215,6 +344,8 @@ test('buildFolderDetailModel promotes conflict resolution and mounted-folder act
                 safe_to_unmount: false,
                 pending_conflict_count: 2,
                 recovered_pending_copy_count: 1,
+                pending_writeback_count: 3,
+                pending_refresh_count: 1,
             },
         },
         isMounted: true,
@@ -223,9 +354,13 @@ test('buildFolderDetailModel promotes conflict resolution and mounted-folder act
     assert.equal(model.healthTone, 'warning');
     assert.equal(model.primaryAction.id, 'open-mounted');
     assert.equal(model.secondaryActions.some(action => action.id === 'unmount'), true);
+    assert.equal(model.secondaryActions.find(action => action.id === 'unmount').label, 'Unmount folder…');
+    assert.equal(model.secondaryActions.find(action => action.id === 'unmount').destructive, true);
+    assert.equal(model.secondaryActions.find(action => action.id === 'reveal-protected').label, 'Reveal encrypted source');
     assert.equal(model.secondaryActions.some(action => action.id === 'reveal-mounted'), false);
     assert.equal(model.attention.conflicts, 2);
     assert.equal(model.attention.recoveryCopies, 1);
+    assert.equal(model.attention.pendingChanges, 4);
     assert.equal(model.showResolveConflicts, true);
     assert.equal(model.showResolveRecoveryCopies, true);
     assert.equal(model.protection.isPostQuantumProtected, true);

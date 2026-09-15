@@ -747,6 +747,10 @@ body {
     display: none !important;
 }
 
+[data-app-mode="individual"] .individual-technical-nav {
+    display: none !important;
+}
+
 .btn-tertiary {
     width: 100%;
     margin-top: var(--spacing-sm);
@@ -1731,6 +1735,16 @@ body {
     color: var(--text-secondary);
 }
 
+.conflict-center-empty.warning {
+    border-style: solid;
+    border-color: rgba(251, 146, 60, 0.38);
+    background: rgba(251, 146, 60, 0.08);
+}
+
+.conflict-center-empty .btn {
+    margin-top: var(--spacing-sm);
+}
+
 .conflict-record-card {
     width: 100%;
     text-align: left;
@@ -2433,6 +2447,70 @@ body {
     font-size: 0.78rem;
     line-height: 1.45;
     white-space: normal;
+}
+
+.settings-advanced-tools {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: rgba(255, 255, 255, 0.015);
+}
+
+.settings-advanced-tools > summary {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: var(--spacing-md);
+    color: var(--text-primary);
+    font-weight: 600;
+    cursor: pointer;
+    list-style: none;
+}
+
+.settings-advanced-tools > summary::-webkit-details-marker {
+    display: none;
+}
+
+.settings-advanced-tools > summary::after {
+    content: '⌄';
+    position: absolute;
+    top: var(--spacing-md);
+    right: var(--spacing-md);
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    transition: transform 0.18s ease;
+}
+
+.settings-advanced-tools[open] > summary::after {
+    transform: rotate(180deg);
+}
+
+.settings-advanced-summary-help {
+    padding-right: 2rem;
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    font-weight: 400;
+}
+
+.settings-advanced-grid {
+    display: grid;
+    gap: var(--spacing-md);
+    padding: 0 var(--spacing-md) var(--spacing-md);
+}
+
+.settings-advanced-grid .settings-section {
+    background: rgba(0, 0, 0, 0.12);
+}
+
+.settings-advanced-tools .btn-danger {
+    border-color: rgba(248, 113, 113, 0.4);
+    background: rgba(239, 68, 68, 0.12);
+    color: #fecaca;
+}
+
+.settings-advanced-tools .btn-danger:hover {
+    border-color: rgba(248, 113, 113, 0.6);
+    background: rgba(239, 68, 68, 0.2);
 }
 
 #settingsEnrollmentModal {
@@ -3820,8 +3898,299 @@ body {
     font-weight: 700;
 }
 
+.folder-detail-shell.tone-idle .folder-detail-health-label {
+    background: rgba(148, 163, 184, 0.14);
+    color: var(--text-secondary);
+}
+
 .folder-detail-actions {
     flex-wrap: wrap;
+    align-items: center;
+}
+
+.folder-detail-primary-action {
+    min-width: 12rem;
+    justify-content: center;
+}
+
+.folder-detail-menu-shell {
+    position: relative;
+}
+
+.folder-detail-menu-toggle {
+    width: 2.75rem;
+    min-width: 2.75rem;
+    height: 2.5rem;
+    padding: 0;
+    justify-content: center;
+    letter-spacing: 0.08em;
+}
+
+.folder-detail-menu {
+    position: absolute;
+    z-index: 30;
+    top: calc(100% + 0.5rem);
+    right: 0;
+    width: max-content;
+    min-width: 14rem;
+    padding: 0.4rem;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-lg);
+    background: #111a2d;
+    box-shadow: var(--shadow-lg);
+}
+
+.folder-detail-menu.hidden {
+    display: none;
+}
+
+.folder-detail-menu-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    padding: 0.7rem 0.75rem;
+    border: 0;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.folder-detail-menu-item:hover,
+.folder-detail-menu-item:focus-visible {
+    outline: none;
+    background: rgba(255, 255, 255, 0.07);
+}
+
+.folder-detail-menu-item.destructive {
+    color: #fca5a5;
+}
+
+.folder-detail-menu-item.destructive:hover,
+.folder-detail-menu-item.destructive:focus-visible {
+    background: rgba(239, 68, 68, 0.12);
+    color: #fecaca;
+}
+
+.folder-detail-menu-divider {
+    height: 1px;
+    margin: 0.35rem 0.5rem;
+    background: var(--border-light);
+}
+
+.folder-mount-session {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-lg);
+    padding: var(--spacing-md) var(--spacing-lg);
+    border: 1px solid rgba(46, 230, 214, 0.2);
+    border-radius: var(--radius-lg);
+    background: rgba(10, 18, 40, 0.42);
+}
+
+.folder-mount-session.tone-warning {
+    border-color: rgba(251, 146, 60, 0.36);
+    background: rgba(251, 146, 60, 0.07);
+}
+
+.folder-mount-session-summary {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--spacing-lg);
+    width: 100%;
+}
+
+.folder-mount-session-heading,
+.folder-mount-session-details {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}
+
+.folder-mount-session-heading strong {
+    font-size: 1rem;
+}
+
+.folder-mount-session-details {
+    align-items: flex-end;
+    color: var(--text-secondary);
+    text-align: right;
+}
+
+.folder-mount-review-button {
+    margin-top: 0.35rem;
+}
+
+.folder-mount-review-chevron {
+    display: inline-block;
+    margin-left: 0.3rem;
+    font-size: 1rem;
+    transition: transform 0.18s ease;
+}
+
+.folder-mount-review-button[aria-expanded="true"] .folder-mount-review-chevron {
+    transform: rotate(180deg);
+}
+
+.folder-mount-session-path {
+    max-width: min(34rem, 48vw);
+    overflow: hidden;
+    color: var(--text-tertiary);
+    font-size: 0.82rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.folder-mount-session-backend {
+    color: var(--text-tertiary);
+    font-size: 0.78rem;
+}
+
+.folder-mount-safety-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-md);
+    width: 100%;
+    padding-top: var(--spacing-md);
+    border-top: 1px solid rgba(251, 146, 60, 0.25);
+}
+
+.folder-mount-safety-panel-header,
+.folder-mount-safety-reason-header,
+.folder-mount-safety-next-step {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: var(--spacing-md);
+}
+
+.folder-mount-safety-panel-header h3,
+.folder-mount-safety-reason h4,
+.folder-mount-safety-panel-header p,
+.folder-mount-safety-reason p,
+.folder-mount-safety-footnote {
+    margin: 0;
+}
+
+.folder-mount-safety-panel-header h3 {
+    margin-bottom: 0.25rem;
+    font-size: 1rem;
+}
+
+.folder-mount-safety-panel-header p,
+.folder-mount-safety-reason > p,
+.folder-mount-safety-next-step p,
+.folder-mount-safety-footnote {
+    color: var(--text-secondary);
+    font-size: 0.86rem;
+    line-height: 1.5;
+}
+
+.folder-mount-safety-list {
+    display: grid;
+    gap: var(--spacing-sm);
+}
+
+.folder-mount-safety-reason {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-md);
+    border: 1px solid rgba(251, 146, 60, 0.24);
+    border-radius: var(--radius-md);
+    background: rgba(7, 13, 29, 0.46);
+}
+
+.folder-mount-safety-reason.tone-error {
+    border-color: rgba(248, 113, 113, 0.34);
+}
+
+.folder-mount-safety-kind,
+.folder-mount-safety-field-label {
+    display: block;
+    color: var(--text-tertiary);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.folder-mount-safety-reason h4 {
+    margin-top: 0.18rem;
+    font-size: 0.98rem;
+}
+
+.folder-mount-safety-reason-header > span {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    white-space: nowrap;
+}
+
+.folder-mount-safety-paths ul {
+    display: grid;
+    gap: 0.25rem;
+    margin: 0.35rem 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.folder-mount-safety-paths li,
+.folder-mount-safety-error code {
+    overflow-wrap: anywhere;
+    color: var(--text-primary);
+    font-family: var(--font-mono, monospace);
+    font-size: 0.8rem;
+}
+
+.folder-mount-safety-error {
+    padding: var(--spacing-sm) var(--spacing-md);
+    border-left: 3px solid rgba(248, 113, 113, 0.72);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: rgba(127, 29, 29, 0.15);
+}
+
+.folder-mount-safety-error code {
+    display: block;
+    margin-top: 0.35rem;
+    color: #fecaca;
+    white-space: normal;
+}
+
+.folder-mount-safety-next-step {
+    align-items: flex-end;
+    padding-top: var(--spacing-sm);
+    border-top: 1px solid var(--border-light);
+}
+
+.folder-mount-safety-next-step > div {
+    flex: 1;
+}
+
+.folder-mount-safety-footnote {
+    color: #fdba74;
+}
+
+@media (max-width: 760px) {
+    .folder-mount-session-summary,
+    .folder-mount-safety-panel-header,
+    .folder-mount-safety-reason-header,
+    .folder-mount-safety-next-step {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .folder-mount-session-details {
+        align-items: flex-start;
+        text-align: left;
+    }
+
+    .folder-mount-session-path {
+        max-width: 70vw;
+    }
 }
 
 .folder-detail-stats {
@@ -3868,6 +4237,12 @@ body {
     display: flex;
     flex-direction: column;
     gap: var(--spacing-sm);
+}
+
+.folder-detail-attention-card.is-clear {
+    border-color: rgba(255, 255, 255, 0.05);
+    background: rgba(10, 18, 40, 0.22);
+    opacity: 0.72;
 }
 
 .folder-detail-attention-card p,

@@ -154,7 +154,8 @@
                     <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none">
                         <path stroke="currentColor" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
                     </svg>
-                    <input type="text" id="globalSearch" placeholder="Search CLI commands..." autocomplete="off" />
+                    <input type="text" id="globalSearch" placeholder="Search protected folders…"
+                        aria-label="Search protected folders" autocomplete="off" />
                     <div class="command-palette" id="commandPalette" role="listbox" aria-hidden="true"></div>
                 </div>
             </div>
@@ -203,7 +204,6 @@
                     <div class="sidebar-header">
                         <div>
                             <h2 class="sidebar-title">Protected Folders</h2>
-                            <p class="sidebar-hint">Double click to mount</p>
                             <p class="sidebar-mount-summary" id="sidebarMountSummary">0 protected • 0 mounted</p>
                         </div>
                         <button class="btn-icon btn-small" id="refreshFoldersBtn" title="Refresh">
@@ -228,7 +228,7 @@
                                 <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
                                     d="M3 12h3m4 0h3m4 0h3M12 3v3m0 12v3M6.5 6.5l2 2m6 6l2 2m0-10l-2 2m-6 6l-2 2" />
                             </svg>
-                            Coverage Center
+                            <span id="sidebarCoverageCenterLabel">Coverage Center</span>
                         </button>
                         <button class="btn btn-add-folder" id="addFolderBtn">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
@@ -257,7 +257,7 @@
                             </svg>
                             Home
                         </button>
-                        <button class="btn btn-secondary sidebar-terminal-btn" id="sidebarTerminalBtn" type="button"
+                        <button class="btn btn-secondary sidebar-terminal-btn individual-technical-nav" id="sidebarTerminalBtn" type="button"
                             title="Open terminal" aria-pressed="false">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
                                 <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
@@ -816,7 +816,7 @@
                                         </svg>
                                         Add protected folder
                                     </button>
-                                    <button class="btn btn-secondary" id="homeOpenTerminalBtn" type="button">
+                                    <button class="btn btn-secondary individual-technical-nav" id="homeOpenTerminalBtn" type="button">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
                                             <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
                                                 d="M4 5h16a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2z" />
@@ -1931,9 +1931,6 @@
                                 type="button" aria-expanded="false" aria-controls="settingsEnrollmentModal">
                                 Remove protected folder
                             </button>
-                            <button class="btn btn-secondary settings-action" id="settingsUnmountBtn" type="button">
-                                Unmount all
-                            </button>
                         </div>
                     </section>
 
@@ -1958,42 +1955,17 @@
                                 <span class="settings-action-title">Complete device setup</span>
                                 <span class="settings-action-help">Finish access setup on this device after approval.</span>
                             </button>
-                            <button class="btn btn-secondary settings-action" id="settingsDevicesListBtn" type="button">
-                                Device center
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsAuditDevicesBtn"
-                                type="button">
-                                Audit devices
-                            </button>
                         </div>
                     </section>
 
                     <section class="settings-section" id="settingsSecuritySection">
                         <div class="settings-section-header">
                             <h3>Security</h3>
-                            <p>Protect sign-ins and inspect advanced trust checks when needed.</p>
+                            <p>Protect sign-ins with multi-factor authentication.</p>
                         </div>
                         <div class="settings-actions">
                             <button class="btn settings-action mfa-enable-btn" id="settingsMfaEnableBtn" type="button">
                                 Enable MFA
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsServerTrustShowBtn"
-                                type="button">
-                                Server trust status
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsServerTrustCheckpointBtn"
-                                type="button">
-                                Trust checkpoint
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsPinListBtn" type="button">
-                                Pin list
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsPinHelpBtn" type="button">
-                                Pin help
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsServerTrustHelpBtn"
-                                type="button">
-                                Server trust help
                             </button>
                         </div>
                     </section>
@@ -2017,43 +1989,6 @@
                             <button class="btn btn-secondary settings-action" id="settingsRecoveryFetchBtn"
                                 type="button">
                                 Fetch recovery backup
-                            </button>
-                        </div>
-                    </section>
-
-                    <section class="settings-section" id="settingsCoverageSection">
-                        <div class="settings-section-header">
-                            <h3>Coverage</h3>
-                            <p>Check folder visibility, scan now, and sync protected folders from your other devices.</p>
-                        </div>
-                        <div class="settings-info">
-                            <div class="settings-info-item">
-                                <span class="settings-info-label">Last scan</span>
-                                <span class="settings-info-value" id="settingsCoverageLastScan">—</span>
-                            </div>
-                            <div class="settings-info-item">
-                                <span class="settings-info-label">Desktop coverage</span>
-                                <span class="settings-info-value settings-status"
-                                    id="settingsCoverageIpcStatus">—</span>
-                            </div>
-                        </div>
-                        <div class="settings-actions">
-                            <button class="btn btn-primary settings-action" id="settingsCoverageScanBtn" type="button">
-                                Scan now
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsCoverageStatusBtn"
-                                type="button">
-                                Coverage status
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsAuditSampleBtn" type="button">
-                                Sample audit
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsAuditFullBtn" type="button">
-                                Full audit
-                            </button>
-                            <button class="btn btn-secondary settings-action" id="settingsRecoverMarkersBtn"
-                                type="button">
-                                Sync protected folders
                             </button>
                         </div>
                     </section>
@@ -2118,27 +2053,96 @@
                         </div>
                     </section>
 
-                    <section class="settings-section" id="settingsTerminalSection">
-                        <div class="settings-section-header">
-                            <h3>Terminal Tools</h3>
-                            <p>Install or repair the terminal command that points to this app’s bundled CLI.</p>
+                    <details class="settings-advanced-tools" id="settingsAdvancedTools">
+                        <summary>
+                            <span>Advanced tools</span>
+                            <span class="settings-advanced-summary-help">Mount management, diagnostics, audits, and terminal access</span>
+                        </summary>
+                        <div class="settings-advanced-grid">
+                            <section class="settings-section" id="settingsAdvancedMountSection">
+                                <div class="settings-section-header">
+                                    <h3>Mount management</h3>
+                                    <p>Safely disconnect every mounted folder after checking pending changes and conflicts.</p>
+                                </div>
+                                <div class="settings-actions">
+                                    <button class="btn btn-danger settings-action" id="settingsUnmountBtn" type="button">
+                                        Unmount all…
+                                    </button>
+                                </div>
+                            </section>
+
+                            <section class="settings-section" id="settingsAdvancedDeviceSection">
+                                <div class="settings-section-header">
+                                    <h3>Device diagnostics</h3>
+                                    <p>Run the low-level device audit command.</p>
+                                </div>
+                                <div class="settings-actions">
+                                    <button class="btn btn-secondary settings-action" id="settingsAuditDevicesBtn" type="button">
+                                        Audit devices
+                                    </button>
+                                </div>
+                            </section>
+
+                            <section class="settings-section" id="settingsAdvancedTrustSection">
+                                <div class="settings-section-header">
+                                    <h3>Server trust</h3>
+                                    <p>Inspect trust checkpoints, pins, and diagnostic command help.</p>
+                                </div>
+                                <div class="settings-actions">
+                                    <button class="btn btn-secondary settings-action" id="settingsServerTrustShowBtn" type="button">Server trust status</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsServerTrustCheckpointBtn" type="button">Trust checkpoint</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsPinListBtn" type="button">Pin list</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsPinHelpBtn" type="button">Pin help</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsServerTrustHelpBtn" type="button">Server trust help</button>
+                                </div>
+                            </section>
+
+                            <section class="settings-section" id="settingsCoverageSection">
+                                <div class="settings-section-header">
+                                    <h3>Coverage diagnostics</h3>
+                                    <p>Run low-level coverage scans, audits, and marker recovery commands.</p>
+                                </div>
+                                <div class="settings-info">
+                                    <div class="settings-info-item">
+                                        <span class="settings-info-label">Last scan</span>
+                                        <span class="settings-info-value" id="settingsCoverageLastScan">—</span>
+                                    </div>
+                                    <div class="settings-info-item">
+                                        <span class="settings-info-label">Desktop coverage</span>
+                                        <span class="settings-info-value settings-status" id="settingsCoverageIpcStatus">—</span>
+                                    </div>
+                                </div>
+                                <div class="settings-actions">
+                                    <button class="btn btn-primary settings-action" id="settingsCoverageScanBtn" type="button">Scan now</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsCoverageStatusBtn" type="button">Coverage status</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsAuditSampleBtn" type="button">Sample audit</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsAuditFullBtn" type="button">Full audit</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsRecoverMarkersBtn" type="button">Sync protected folders</button>
+                                </div>
+                            </section>
+
+                            <section class="settings-section" id="settingsTerminalSection">
+                                <div class="settings-section-header">
+                                    <h3>Terminal tools</h3>
+                                    <p>Open the embedded terminal or install its command-line tool.</p>
+                                </div>
+                                <div class="settings-info">
+                                    <div class="settings-info-item">
+                                        <span class="settings-info-label">Global command</span>
+                                        <span class="settings-info-value" id="settingsGlobalCliStatus">—</span>
+                                    </div>
+                                    <div class="settings-info-item">
+                                        <span class="settings-info-label">Install path</span>
+                                        <span class="settings-info-value" id="settingsGlobalCliPath">/usr/local/bin/hybridcipher</span>
+                                    </div>
+                                </div>
+                                <div class="settings-actions">
+                                    <button class="btn btn-secondary settings-action" id="settingsOpenTerminalBtn" type="button">Open terminal</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsInstallGlobalCliBtn" type="button">Install terminal command</button>
+                                </div>
+                            </section>
                         </div>
-                        <div class="settings-info">
-                            <div class="settings-info-item">
-                                <span class="settings-info-label">Global command</span>
-                                <span class="settings-info-value" id="settingsGlobalCliStatus">—</span>
-                            </div>
-                            <div class="settings-info-item">
-                                <span class="settings-info-label">Install path</span>
-                                <span class="settings-info-value" id="settingsGlobalCliPath">/usr/local/bin/hybridcipher</span>
-                            </div>
-                        </div>
-                        <div class="settings-actions">
-                            <button class="btn btn-secondary settings-action" id="settingsInstallGlobalCliBtn" type="button">
-                                Install terminal command
-                            </button>
-                        </div>
-                    </section>
+                    </details>
                 </div>
 
             </div>

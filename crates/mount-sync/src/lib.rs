@@ -5746,6 +5746,346 @@ impl SyncTracker {
         self.decrypted_directory_metadata_hashes.remove(path);
     }
 
+    fn cleanup_duplicate_encrypted_file_ids(
+        &mut self,
+        encrypted_root: &Path,
+        mount_root: &Path,
+    ) -> Result<usize, MountSyncError> {
+        let groups = self.encrypted_file_id_groups(encrypted_root)?;
+        let mut retired = 0;
+
+        for (file_id, encrypted_paths) in groups {
+            if encrypted_paths.len() < 2 {
+                continue;
+            }
+
+            let Some((canonical_mount_path, canonical_encrypted_path)) = self
+                .canonical_duplicate_encrypted_path(
+                    &file_id,
+                    encrypted_root,
+                    mount_root,
+                    &encrypted_paths,
+                )
+            else {
+                warn!(
+                    "Duplicate encrypted paths share file_id {}, but no safe canonical mounted path was available; leaving all copies active",
+                    file_id
+                );
+                continue;
+            };
+
+            for encrypted_path in encrypted_paths {
+                if encrypted_path == canonical_encrypted_path {
+                    continue;
+                }
+
+                if self.retire_duplicate_encrypted_path(
+                    &file_id,
+                    &encrypted_path,
+                    &canonical_mount_path,
+                    &canonical_encrypted_path,
+                )? {
+                    retired += 1;
+                }
+            }
+        }
+
+        Ok(retired)
+    }
+
+    fn encrypted_file_id_groups(
+        &self,
+        encrypted_root: &Path,
+    ) -> Result<HashMap<String, Vec<PathBuf>>, MountSyncError> {
+        let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        if !encrypted_root.exists() {
+            return Ok(groups);
+        }
+
+        let mut stack = vec![encrypted_root.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(MountSyncError::Io(err)),
+            };
+
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = entry.metadata()?;
+
+                if metadata.is_dir() {
+                    if path.file_name().and_then(|name| name.to_str())
+                        == Some(ENCRYPTED_TMP_DIR_NAME)
+                    {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+
+                if !metadata.is_file()
+                    || path.extension().and_then(|ext| ext.to_str()) != Some("encrypted")
+                    || is_directory_metadata_file(&path)
+                {
+                    continue;
+                }
+
+                match parse_encrypted_header_only(&path) {
+                    Ok((file_id, _, _)) => {
+                        groups.entry(file_id).or_default().push(path);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Skipping encrypted duplicate scan for {} because its header could not be read: {}",
+                            path.display(),
+                            err
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(groups)
+    }
+
+    fn canonical_duplicate_encrypted_path(
+        &self,
+        file_id: &str,
+        encrypted_root: &Path,
+        mount_root: &Path,
+        encrypted_paths: &[PathBuf],
+    ) -> Option<(PathBuf, PathBuf)> {
+        let canonical_mount_path = self.file_id_to_mount_path.get(file_id)?.clone();
+        if !canonical_mount_path.starts_with(mount_root) || !canonical_mount_path.exists() {
+            return None;
+        }
+
+        let canonical_encrypted_path =
+            encrypted_path_for(encrypted_root, mount_root, &canonical_mount_path).ok()?;
+        if !canonical_encrypted_path.exists()
+            || !encrypted_paths
+                .iter()
+                .any(|path| path == &canonical_encrypted_path)
+        {
+            return None;
+        }
+
+        let canonical_file_id = parse_encrypted_header_only(&canonical_encrypted_path)
+            .ok()
+            .map(|(file_id, _, _)| file_id)?;
+        if canonical_file_id != file_id {
+            return None;
+        }
+
+        Some((canonical_mount_path, canonical_encrypted_path))
+    }
+
+    fn existing_file_id_for_writeback(
+        &mut self,
+        encrypted_root: &Path,
+        mount_root: &Path,
+        decrypted_path: &Path,
+        encrypted_path: &Path,
+    ) -> Result<Option<String>, MountSyncError> {
+        if !encrypted_path.exists() {
+            return Ok(None);
+        }
+
+        let existing_file_id = match parse_encrypted_file_with_root(encrypted_root, encrypted_path)
+        {
+            Ok(parsed) => parsed.metadata.file_id,
+            Err(err) => {
+                warn!(
+                    "Failed to parse existing encrypted file {} for stable file_id: {}",
+                    encrypted_path.display(),
+                    err
+                );
+                return Ok(None);
+            }
+        };
+
+        let Some(existing_mount_path) = self.file_id_to_mount_path.get(&existing_file_id).cloned()
+        else {
+            return Ok(Some(existing_file_id));
+        };
+
+        if existing_mount_path.as_path() == decrypted_path || !existing_mount_path.exists() {
+            return Ok(Some(existing_file_id));
+        }
+
+        let canonical_encrypted_path =
+            encrypted_path_for(encrypted_root, mount_root, &existing_mount_path)?;
+        if canonical_encrypted_path.exists()
+            && self.retire_duplicate_encrypted_path(
+                &existing_file_id,
+                encrypted_path,
+                &existing_mount_path,
+                &canonical_encrypted_path,
+            )?
+        {
+            return Ok(None);
+        }
+
+        if let Some(retention_folder) = self.deletion_config.retention_folder.clone() {
+            info!(
+                "Moving encrypted path {} to retention before writeback because file_id {} already belongs to mounted file {}",
+                encrypted_path.display(),
+                existing_file_id,
+                existing_mount_path.display()
+            );
+            self.move_to_retention(encrypted_path, &retention_folder)?;
+            self.clear_retired_encrypted_path_tracking(encrypted_path);
+            return Ok(None);
+        }
+
+        Err(MountSyncError::UnstableFile(format!(
+            "Existing encrypted path {} still belongs to mounted file {}; deferring encryption of {} until the existing encrypted version can be preserved",
+            encrypted_path.display(),
+            existing_mount_path.display(),
+            decrypted_path.display()
+        )))
+    }
+
+    fn retire_duplicate_encrypted_path(
+        &mut self,
+        file_id: &str,
+        duplicate_encrypted_path: &Path,
+        canonical_mount_path: &Path,
+        canonical_encrypted_path: &Path,
+    ) -> Result<bool, MountSyncError> {
+        if duplicate_encrypted_path == canonical_encrypted_path {
+            return Ok(false);
+        }
+        if !duplicate_encrypted_path.exists() {
+            self.clear_retired_encrypted_path_tracking(duplicate_encrypted_path);
+            return Ok(false);
+        }
+        if !canonical_encrypted_path.exists() {
+            warn!(
+                "Not retiring duplicate encrypted path {} for file_id {} because canonical encrypted path {} is missing",
+                duplicate_encrypted_path.display(),
+                file_id,
+                canonical_encrypted_path.display()
+            );
+            return Ok(false);
+        }
+
+        let duplicate_file_id = match parse_encrypted_header_only(duplicate_encrypted_path) {
+            Ok((file_id, _, _)) => file_id,
+            Err(err) => {
+                warn!(
+                    "Not retiring duplicate encrypted path {} because its header could not be read: {}",
+                    duplicate_encrypted_path.display(),
+                    err
+                );
+                return Ok(false);
+            }
+        };
+        let canonical_file_id = match parse_encrypted_header_only(canonical_encrypted_path) {
+            Ok((file_id, _, _)) => file_id,
+            Err(err) => {
+                warn!(
+                    "Not retiring duplicate encrypted path {} because canonical header {} could not be read: {}",
+                    duplicate_encrypted_path.display(),
+                    canonical_encrypted_path.display(),
+                    err
+                );
+                return Ok(false);
+            }
+        };
+        if duplicate_file_id != file_id || canonical_file_id != file_id {
+            warn!(
+                "Not retiring duplicate encrypted path {} because file_id proof failed (duplicate={}, canonical={}, expected={})",
+                duplicate_encrypted_path.display(),
+                duplicate_file_id,
+                canonical_file_id,
+                file_id
+            );
+            return Ok(false);
+        }
+
+        if let Some(retention_folder) = self.deletion_config.retention_folder.clone() {
+            self.move_to_retention(duplicate_encrypted_path, &retention_folder)?;
+            info!(
+                "Retired duplicate encrypted path {} for file_id {} after confirming canonical path {} for mounted file {}",
+                duplicate_encrypted_path.display(),
+                file_id,
+                canonical_encrypted_path.display(),
+                canonical_mount_path.display()
+            );
+        } else {
+            warn!(
+                "Retention folder not configured; leaving duplicate encrypted path {} for file_id {} active after confirming canonical path {}",
+                duplicate_encrypted_path.display(),
+                file_id,
+                canonical_encrypted_path.display()
+            );
+            return Ok(false);
+        }
+
+        self.clear_retired_encrypted_path_tracking(duplicate_encrypted_path);
+        Ok(true)
+    }
+
+    fn clear_retired_encrypted_path_tracking(&mut self, encrypted_path: &Path) {
+        self.encrypted_signatures.remove(encrypted_path);
+        self.encrypted_directory_signatures.remove(encrypted_path);
+        self.path_mapping.remove(encrypted_path);
+
+        if self.pending_deletions.remove(encrypted_path).is_some() {
+            self.pending_deletions_dirty = true;
+        }
+        if self.pending_metadata.remove(encrypted_path).is_some() {
+            self.pending_metadata_dirty = true;
+        }
+
+        let pending_orphan_count = self.pending_orphans.len();
+        self.pending_orphans
+            .retain(|_, pending| pending.encrypted_path != encrypted_path);
+        if self.pending_orphans.len() != pending_orphan_count {
+            self.pending_orphans_dirty = true;
+        }
+
+        let pending_writeback_count = self.pending_writebacks.len();
+        self.pending_writebacks.retain(|mount_path, pending| {
+            pending.encrypted_path != encrypted_path || mount_path.exists()
+        });
+        if self.pending_writebacks.len() != pending_writeback_count {
+            self.pending_writebacks_dirty = true;
+        }
+
+        let pending_refresh_count = self.pending_refreshes.len();
+        self.pending_refreshes
+            .retain(|_, pending| pending.encrypted_path != encrypted_path);
+        if self.pending_refreshes.len() != pending_refresh_count {
+            self.pending_refreshes_dirty = true;
+        }
+
+        let mut pending_open_unlinked_changed = false;
+        for pending in self.pending_open_unlinked.values_mut() {
+            if pending.encrypted_path.as_deref() == Some(encrypted_path) {
+                pending.encrypted_path = None;
+                pending.encrypted_version_exists = false;
+                pending_open_unlinked_changed = true;
+            }
+        }
+        if pending_open_unlinked_changed {
+            self.pending_open_unlinked_dirty = true;
+        }
+
+        let pending_local_deletes_count = self.pending_local_deletes.len();
+        self.pending_local_deletes
+            .retain(|path| path.as_path() != encrypted_path);
+        if self.pending_local_deletes.len() != pending_local_deletes_count {
+            debug!(
+                "Cleared retired duplicate encrypted path {} from pending local deletes",
+                encrypted_path.display()
+            );
+        }
+    }
+
     fn is_local_mount_directory_dirty(&self, path: &Path) -> bool {
         let current_hash = capture_platform_metadata_hash(path);
         match (
@@ -6215,6 +6555,7 @@ impl SyncTracker {
             &protected_missing_paths,
         )
         .await?;
+        self.cleanup_duplicate_encrypted_file_ids(encrypted_root, mount_root)?;
 
         // Process pending deletions if mount is healthy
         if self.mount_readonly_active {
@@ -7065,6 +7406,20 @@ impl SyncTracker {
         let parsed = parse_encrypted_file_with_root(encrypted_root, encrypted_path)?;
         let file_id = &parsed.metadata.file_id;
         let tracked_mount_path = self.file_id_to_mount_path.get(file_id).cloned();
+        if let Some(tracked) = tracked_mount_path.as_ref() {
+            let canonical_encrypted_path = encrypted_path_for(encrypted_root, mount_root, tracked)?;
+            if canonical_encrypted_path.as_path() != encrypted_path
+                && canonical_encrypted_path.exists()
+                && self.retire_duplicate_encrypted_path(
+                    file_id,
+                    encrypted_path,
+                    tracked,
+                    &canonical_encrypted_path,
+                )?
+            {
+                return Ok(DecryptOutcome::Ready(tracked.clone()));
+            }
+        }
         if let Some(pending) = self.pending_deletions.get(encrypted_path) {
             debug!(
                 "Encrypted file {} is still pending deletion; skipping plaintext restore to {}",
@@ -8670,9 +9025,6 @@ impl SyncTracker {
             ))
         })?;
 
-        let pre_meta = fs::metadata(decrypted_path)?;
-        let pre_signature = FileSignature::from_metadata(&pre_meta);
-
         // Use normalized relative path so file IDs remain stable across devices
         let aad_label = normalize_relative_path(relative);
 
@@ -8692,34 +9044,19 @@ impl SyncTracker {
             }
         }
 
-        let existing_file_id = if encrypted_path.exists() {
-            match parse_encrypted_file_with_root(encrypted_root, encrypted_path) {
-                Ok(parsed) => Some(parsed.metadata.file_id),
-                Err(err) => {
-                    warn!(
-                        "Failed to parse existing encrypted file {} for stable file_id: {}",
-                        encrypted_path.display(),
-                        err
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let existing_file_id = self.existing_file_id_for_writeback(
+            encrypted_root,
+            mount_root,
+            decrypted_path,
+            encrypted_path,
+        )?;
 
         if desired_file_id.is_none() {
-            if let Some(ref file_id) = existing_file_id {
-                if let Err(err) = write_file_id_xattr(decrypted_path, file_id) {
-                    debug!(
-                        "Failed to persist file_id xattr for {}: {}",
-                        decrypted_path.display(),
-                        err
-                    );
-                }
-            }
             desired_file_id = existing_file_id.clone();
         }
+
+        let pre_meta = fs::metadata(decrypted_path)?;
+        let pre_signature = FileSignature::from_metadata(&pre_meta);
 
         let original_name = read_original_name_xattr(decrypted_path).or_else(|| {
             decrypted_path
@@ -10836,6 +11173,183 @@ mod tests {
             .map_err(|err| MountSyncError::Format(err.to_string()))
     }
 
+    fn test_file_signature(path: &Path) -> FileSignature {
+        FileSignature::from_metadata(&fs::metadata(path).unwrap())
+    }
+
+    fn active_retention_files(retention_root: &Path) -> Vec<PathBuf> {
+        let mut files = fs::read_dir(retention_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) != Some("json"))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn duplicate_encrypted_paths_for_same_live_file_move_old_path_to_retention() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        let config_root = temp.path().join("config");
+        fs::create_dir_all(encrypted_root.join("API_keys")).unwrap();
+        fs::create_dir_all(mount_root.join("API_keys")).unwrap();
+        fs::create_dir_all(&config_root).unwrap();
+
+        let file_id = "same-renamed-file-id";
+        let canonical_mount_path = mount_root.join("API_keys/Untitled2.md");
+        fs::write(&canonical_mount_path, b"renamed note").unwrap();
+        let _ = write_file_id_xattr(&canonical_mount_path, file_id);
+
+        let old_encrypted_path = encrypted_root.join("API_keys/Untitled.md.encrypted");
+        let canonical_encrypted_path = encrypted_root.join("API_keys/Untitled2.md.encrypted");
+        write_test_encrypted_file(&old_encrypted_path, file_id, "API_keys/Untitled.md").unwrap();
+        write_test_encrypted_file(&canonical_encrypted_path, file_id, "API_keys/Untitled2.md")
+            .unwrap();
+
+        let mut tracker = SyncTracker::new();
+        tracker.set_retention_folder(&config_root);
+        tracker
+            .file_id_to_mount_path
+            .insert(file_id.to_string(), canonical_mount_path.clone());
+        tracker
+            .path_mapping
+            .insert(old_encrypted_path.clone(), canonical_mount_path.clone());
+        tracker.path_mapping.insert(
+            canonical_encrypted_path.clone(),
+            canonical_mount_path.clone(),
+        );
+        tracker.decrypted_signatures.insert(
+            canonical_mount_path.clone(),
+            test_file_signature(&canonical_mount_path),
+        );
+        tracker.encrypted_signatures.insert(
+            old_encrypted_path.clone(),
+            test_file_signature(&old_encrypted_path),
+        );
+        tracker.encrypted_signatures.insert(
+            canonical_encrypted_path.clone(),
+            test_file_signature(&canonical_encrypted_path),
+        );
+
+        let retired = tracker
+            .cleanup_duplicate_encrypted_file_ids(&encrypted_root, &mount_root)
+            .unwrap();
+
+        assert_eq!(retired, 1);
+        assert!(!old_encrypted_path.exists());
+        assert!(canonical_encrypted_path.exists());
+        assert!(!tracker.path_mapping.contains_key(&old_encrypted_path));
+        assert_eq!(
+            tracker.path_mapping.get(&canonical_encrypted_path),
+            Some(&canonical_mount_path)
+        );
+        assert_eq!(
+            tracker.file_id_to_mount_path.get(file_id),
+            Some(&canonical_mount_path)
+        );
+
+        let retained = active_retention_files(&config_root.join("retention"));
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .ends_with("Untitled.md.encrypted"));
+    }
+
+    #[tokio::test]
+    async fn new_file_at_stale_encrypted_path_gets_fresh_file_id() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        let config_root = temp.path().join("config");
+        fs::create_dir_all(encrypted_root.join("API_keys")).unwrap();
+        fs::create_dir_all(mount_root.join("API_keys")).unwrap();
+        fs::create_dir_all(&config_root).unwrap();
+
+        let renamed_file_id = "same-renamed-file-id";
+        let canonical_mount_path = mount_root.join("API_keys/Untitled2.md");
+        let fresh_mount_path = mount_root.join("API_keys/Untitled.md");
+        fs::write(&canonical_mount_path, b"renamed note").unwrap();
+        fs::write(&fresh_mount_path, b"brand new note").unwrap();
+        let _ = write_file_id_xattr(&canonical_mount_path, renamed_file_id);
+
+        let stale_encrypted_path = encrypted_root.join("API_keys/Untitled.md.encrypted");
+        let canonical_encrypted_path = encrypted_root.join("API_keys/Untitled2.md.encrypted");
+        write_test_encrypted_file(
+            &stale_encrypted_path,
+            renamed_file_id,
+            "API_keys/Untitled.md",
+        )
+        .unwrap();
+        write_test_encrypted_file(
+            &canonical_encrypted_path,
+            renamed_file_id,
+            "API_keys/Untitled2.md",
+        )
+        .unwrap();
+
+        let mut tracker = SyncTracker::new();
+        tracker.set_retention_folder(&config_root);
+        tracker.decrypted_signatures.insert(
+            canonical_mount_path.clone(),
+            test_file_signature(&canonical_mount_path),
+        );
+        tracker
+            .file_id_to_mount_path
+            .insert(renamed_file_id.to_string(), canonical_mount_path.clone());
+        tracker
+            .path_mapping
+            .insert(stale_encrypted_path.clone(), canonical_mount_path.clone());
+        tracker.path_mapping.insert(
+            canonical_encrypted_path.clone(),
+            canonical_mount_path.clone(),
+        );
+        tracker
+            .encrypted_signatures
+            .insert(stale_encrypted_path.clone(), ZERO_SIGNATURE);
+        tracker.encrypted_signatures.insert(
+            canonical_encrypted_path.clone(),
+            test_file_signature(&canonical_encrypted_path),
+        );
+
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+        assert!(!stale_encrypted_path.exists());
+        assert!(canonical_encrypted_path.exists());
+
+        tracker.pending_temp.insert(
+            fresh_mount_path.clone(),
+            Instant::now() - Duration::from_secs(TEMP_FILE_GRACE_SECS + 1),
+        );
+        tracker
+            .sync(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(stale_encrypted_path.exists());
+        let fresh_parsed = parse_encrypted_file(&stale_encrypted_path).unwrap();
+        assert_ne!(fresh_parsed.metadata.file_id, renamed_file_id);
+        assert_eq!(fresh_parsed.metadata.file_path, "API_keys/Untitled.md");
+
+        let canonical_parsed = parse_encrypted_file(&canonical_encrypted_path).unwrap();
+        assert_eq!(canonical_parsed.metadata.file_id, renamed_file_id);
+        assert_eq!(canonical_parsed.metadata.file_path, "API_keys/Untitled2.md");
+
+        let retained = active_retention_files(&config_root.join("retention"));
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .ends_with("Untitled.md.encrypted"));
+    }
+
     #[tokio::test]
     async fn dirty_plaintext_is_reencrypted_instead_of_marked_orphan() {
         let temp = TempDir::new().unwrap();
@@ -11376,6 +11890,42 @@ mod tests {
 
         assert!(!tracker.pending_writebacks.contains_key(&mount_path));
         assert!(encrypted_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fast_drain_retry_restores_file_id_without_self_instability() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+
+        let mount_path = mount_root.join("document.txt");
+        fs::write(&mount_path, b"local edits").unwrap();
+        let encrypted_path = encrypted_root.join("document.txt.encrypted");
+        write_test_encrypted_file(&encrypted_path, "file-1", "document.txt").unwrap();
+
+        let signature = FileSignature::from_metadata(&fs::metadata(&mount_path).unwrap());
+        let mut tracker = SyncTracker::new();
+        tracker.record_pending_writeback(&mount_path, &encrypted_path, None);
+        tracker.pending_stable.insert(
+            mount_path.clone(),
+            StableEntry {
+                signature,
+                first_seen: Instant::now() - Duration::from_millis(400),
+            },
+        );
+
+        tracker
+            .retry_pending_writebacks_before_scan(&MockCrypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(!tracker.pending_writebacks.contains_key(&mount_path));
+        assert_eq!(read_file_id_xattr(&mount_path).as_deref(), Some("file-1"));
+        let parsed = parse_encrypted_file_with_root(&encrypted_root, &encrypted_path).unwrap();
+        assert_eq!(parsed.metadata.file_id, "file-1");
     }
 
     #[tokio::test]

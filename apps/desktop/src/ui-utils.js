@@ -14,6 +14,33 @@
         return count === 1 ? singular : plural;
     }
 
+    function captureKeyedScrollPositions(container, selector = '[data-preserve-scroll-key]') {
+        if (!container || typeof container.querySelectorAll !== 'function') {
+            return {};
+        }
+
+        return Array.from(container.querySelectorAll(selector)).reduce((positions, element) => {
+            const key = String(element?.dataset?.preserveScrollKey || '').trim();
+            if (key) {
+                positions[key] = Math.max(0, Number(element.scrollTop || 0));
+            }
+            return positions;
+        }, {});
+    }
+
+    function restoreKeyedScrollPositions(container, positions = {}, selector = '[data-preserve-scroll-key]') {
+        if (!container || typeof container.querySelectorAll !== 'function') {
+            return;
+        }
+
+        Array.from(container.querySelectorAll(selector)).forEach(element => {
+            const key = String(element?.dataset?.preserveScrollKey || '').trim();
+            if (key && Object.prototype.hasOwnProperty.call(positions, key)) {
+                element.scrollTop = Math.max(0, Number(positions[key] || 0));
+            }
+        });
+    }
+
     function getMountBackendLabel(backend) {
         switch (backend) {
             case 'macos-file-provider':
@@ -356,12 +383,15 @@
             ? 'warning'
             : (isMounted ? 'safe' : 'idle');
 
+        const pendingChanges = toCount(syncStatus.pending_writeback_count)
+            + toCount(syncStatus.pending_refresh_count)
+            + toCount(syncStatus.pending_open_unlinked_count);
         const secondaryActions = [
-            { id: 'reveal-protected', label: 'Reveal on disk' },
+            { id: 'reveal-protected', label: 'Reveal encrypted source' },
         ];
         if (isMounted) {
             secondaryActions.push(
-                { id: 'unmount', label: 'Unmount' },
+                { id: 'unmount', label: 'Unmount folder…', destructive: true },
             );
         }
 
@@ -386,6 +416,7 @@
             attention: {
                 conflicts,
                 recoveryCopies,
+                pendingChanges,
                 mountStatusLabel: isMounted ? 'Mounted' : 'Not mounted',
                 unmountSafetyLabel: !isMounted
                     ? null
@@ -562,6 +593,45 @@
         return 'Embedded Terminal';
     }
 
+    function filterProtectedFolders(folders, query) {
+        const safeFolders = Array.isArray(folders) ? folders : [];
+        const normalizedQuery = String(query || '').trim().toLocaleLowerCase();
+        if (!normalizedQuery) {
+            return safeFolders.slice();
+        }
+
+        return safeFolders.filter(folder => {
+            const path = String(folder?.path || '');
+            const basename = path.split(/[\\/]/).filter(Boolean).pop() || '';
+            return [folder?.name, basename, path].some(value =>
+                String(value || '').toLocaleLowerCase().includes(normalizedQuery)
+            );
+        });
+    }
+
+    function buildAppModeUiModel(appMode) {
+        const isIndividual = appMode === 'individual';
+        return {
+            searchMode: isIndividual ? 'folders' : 'commands',
+            searchPlaceholder: isIndividual ? 'Search protected folders…' : 'Search CLI commands…',
+            showTechnicalNavigation: !isIndividual,
+            protectionNavigationLabel: isIndividual ? 'Protection status' : 'Coverage Center',
+        };
+    }
+
+    const ADVANCED_SETTINGS_SECTION_IDS = new Set([
+        'settingsAdvancedTools',
+        'settingsAdvancedMountSection',
+        'settingsAdvancedDeviceSection',
+        'settingsAdvancedTrustSection',
+        'settingsCoverageSection',
+        'settingsTerminalSection',
+    ]);
+
+    function shouldExpandAdvancedSettings(sectionId) {
+        return ADVANCED_SETTINGS_SECTION_IDS.has(String(sectionId || ''));
+    }
+
     function getFolderRowStatusState({ isMounted = false, syncStatus = null, showSafetyAlert = false } = {}) {
         if (!isMounted) {
             return {
@@ -582,9 +652,40 @@
         };
     }
 
+    function buildMountConflictReviewState({ records = [], syncStatus = null } = {}) {
+        const listedCount = Array.isArray(records) ? records.length : 0;
+        const statusAvailable = Boolean(syncStatus && typeof syncStatus === 'object');
+        const reportedCount = statusAvailable
+            ? Math.max(0, toCount(syncStatus.pending_conflict_count))
+            : null;
+        const mismatch = statusAvailable && listedCount !== reportedCount;
+        const otherUnsafeReasons = statusAvailable && Array.isArray(syncStatus.unsafe_reasons)
+            ? syncStatus.unsafe_reasons.filter(reason => reason?.kind !== 'conflict')
+            : [];
+        const hasOtherBlockingWork = statusAvailable
+            ? syncStatus.safe_to_unmount === false && (reportedCount === 0 || otherUnsafeReasons.length > 0)
+            : false;
+
+        return {
+            listedCount,
+            reportedCount,
+            statusAvailable,
+            mismatch,
+            isClear: statusAvailable && !mismatch && listedCount === 0,
+            safeToUnmount: statusAvailable ? syncStatus.safe_to_unmount === true : null,
+            hasOtherBlockingWork,
+        };
+    }
+
     const api = {
+        captureKeyedScrollPositions,
+        restoreKeyedScrollPositions,
+        filterProtectedFolders,
+        buildAppModeUiModel,
+        shouldExpandAdvancedSettings,
         getEmbeddedTerminalHeaderTitle,
         getFolderRowStatusState,
+        buildMountConflictReviewState,
         buildPostQuantumStatusModel,
         buildWorkspaceHomeModel,
         buildFolderCoverageModel,

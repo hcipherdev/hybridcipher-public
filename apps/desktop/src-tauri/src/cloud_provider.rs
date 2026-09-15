@@ -182,11 +182,13 @@ impl DesktopCloudProviderManager {
             }
         }
 
-        let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+        let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge(client.clone());
+        let host = hybridcipher_windows_cloud_provider::CloudProviderHost::with_provider_bridge(
             hybridcipher_windows_cloud_provider::ProviderHostConfig {
                 user_config_dir,
                 pipe_name: None,
             },
+            bridge.clone(),
         );
         let status = host.status();
         if !status.native_callbacks_ready {
@@ -206,12 +208,7 @@ impl DesktopCloudProviderManager {
             .map_err(|err| err.to_string())?;
         host.register_root(&registration)
             .map_err(|err| err.to_string())?;
-        let start_result = host
-            .start_root_with_bridge(
-                root_id,
-                hybridcipher_windows_cloud_provider::local_provider_bridge(client.clone()),
-            )
-            .await;
+        let start_result = host.start_root_with_bridge(root_id, bridge).await;
         if let Err(err) = start_result {
             return Err(host
                 .cleanup_failed_root_start_after_error(

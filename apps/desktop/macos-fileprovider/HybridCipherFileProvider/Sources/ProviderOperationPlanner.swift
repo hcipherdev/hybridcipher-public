@@ -1,5 +1,7 @@
 import Foundation
 
+let fileProviderTrashContainerIdentifier = "NSFileProviderTrashContainerItemIdentifier"
+
 enum ProviderOperationPlannerError: LocalizedError {
     case missingFileContents(String)
 
@@ -14,6 +16,7 @@ enum ProviderOperationPlannerError: LocalizedError {
 enum ProviderOperationAction {
     case createDirectory(relativePath: String)
     case writeback(identifier: String, relativePath: String, contentsURL: URL)
+    case delete(identifier: String)
     case rename(identifier: String, targetRelativePath: String)
     case noop
 }
@@ -46,10 +49,15 @@ enum ProviderOperationPlanner {
         relativePath: String,
         kind: ProviderEntryKind,
         contentsURL: URL?,
-        metadataOnlyChange: Bool
+        metadataOnlyChange: Bool,
+        parentIdentifier: String? = nil
     ) throws -> ProviderOperationAction {
         let normalizedIdentifier = normalizeRelativePath(identifier)
         let normalizedRelativePath = normalizeRelativePath(relativePath)
+
+        if metadataOnlyChange && parentIdentifier == fileProviderTrashContainerIdentifier {
+            return .delete(identifier: normalizedIdentifier)
+        }
 
         if let contentsURL {
             return .writeback(

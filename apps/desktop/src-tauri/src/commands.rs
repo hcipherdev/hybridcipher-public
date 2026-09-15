@@ -8643,12 +8643,18 @@ async fn unmount_desktop_cloud_root_record(
     } else if mount_state.backend().is_windows_cloud_files() {
         #[cfg(target_os = "windows")]
         {
-            let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
-                hybridcipher_windows_cloud_provider::ProviderHostConfig {
-                    user_config_dir: user_dir.to_path_buf(),
-                    pipe_name: None,
-                },
-            );
+            let config = hybridcipher_windows_cloud_provider::ProviderHostConfig {
+                user_config_dir: user_dir.to_path_buf(),
+                pipe_name: None,
+            };
+            let host = if let Some(client) = state.local_client.client_opt().await {
+                hybridcipher_windows_cloud_provider::CloudProviderHost::with_provider_bridge(
+                    config,
+                    hybridcipher_windows_cloud_provider::local_provider_bridge(client),
+                )
+            } else {
+                hybridcipher_windows_cloud_provider::CloudProviderHost::new(config)
+            };
             match host
                 .unmount_root_safely(parsed_root_id)
                 .await
