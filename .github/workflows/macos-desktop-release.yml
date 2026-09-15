@@ -1,0 +1,329 @@
+name: macOS Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag, for example desktop-v0.1.5. Leave empty to derive it from apps/desktop/src-tauri/Cargo.toml."
+        required: false
+        type: string
+      release_name:
+        description: "Release title. Leave empty to use HybridCipher Desktop <tag>."
+        required: false
+        type: string
+      public_release_repo:
+        description: "Destination release repo as owner/repo. Leave empty to use the PUBLIC_RELEASE_REPO repository variable or the script default."
+        required: false
+        type: string
+      release_notes_file:
+        description: "Optional checked-in Markdown release notes file. Leave empty to generate notes from apps/desktop/release-notes/releases.json."
+        required: false
+        type: string
+      mode:
+        description: "macOS build mode."
+        required: true
+        default: silicon
+        type: choice
+        options:
+          - silicon
+          - full
+          - custom
+      desktop_targets:
+        description: "Only used when mode=custom, for example: aarch64-apple-darwin x86_64-apple-darwin."
+        required: false
+        type: string
+      runner_label:
+        description: "Standard GitHub-hosted macOS runner label."
+        required: true
+        default: macos-15
+        type: choice
+        options:
+          - macos-15
+          - macos-15-intel
+          - macos-latest
+      publish_public_release:
+        description: "Create or update the release in the destination release repo."
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-desktop-release-${{ inputs.release_tag || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish macOS desktop release
+    runs-on: ${{ inputs.runner_label }}
+    environment: release
+    timeout-minutes: 240
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout public source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust desktop targets
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+          DESKTOP_TARGETS_INPUT: ${{ inputs.desktop_targets }}
+        run: |
+          set -euo pipefail
+          case "$MODE_INPUT" in
+            silicon)
+              rustup target add aarch64-apple-darwin
+              ;;
+            full)
+              rustup target add aarch64-apple-darwin x86_64-apple-darwin
+              ;;
+            custom)
+              if [ -z "$DESKTOP_TARGETS_INPUT" ]; then
+                echo "::error::desktop_targets is required when mode=custom"
+                exit 1
+              fi
+              rustup target add $DESKTOP_TARGETS_INPUT
+              ;;
+            *)
+              echo "::error::Unsupported mode: $MODE_INPUT"
+              exit 1
+              ;;
+          esac
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-desktop-release
+          prefix-key: v1-${{ runner.os }}-${{ inputs.runner_label }}-${{ inputs.mode }}
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+
+      - name: Prepare release environment
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          RELEASE_NAME_INPUT: ${{ inputs.release_name }}
+          PUBLIC_RELEASE_REPO_INPUT: ${{ inputs.public_release_repo }}
+          PUBLIC_RELEASE_REPO_VAR: ${{ vars.PUBLIC_RELEASE_REPO }}
+          RELEASE_NOTES_FILE_INPUT: ${{ inputs.release_notes_file }}
+          MODE_INPUT: ${{ inputs.mode }}
+          DESKTOP_TARGETS_INPUT: ${{ inputs.desktop_targets }}
+          PUBLISH_PUBLIC_RELEASE_INPUT: ${{ inputs.publish_public_release }}
+          RELEASES_REPO_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+
+          require_value() {
+            local name="$1"
+            local value="${2:-}"
+            if [ -z "$value" ]; then
+              echo "::error::Missing required secret or value: $name"
+              return 1
+            fi
+            return 0
+          }
+
+          missing=0
+          require_value TAURI_SIGNING_PRIVATE_KEY "$TAURI_SIGNING_PRIVATE_KEY" || missing=1
+          require_value TAURI_SIGNING_PRIVATE_KEY_PASSWORD "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" || missing=1
+          require_value APPLE_CERTIFICATE_BASE64 "$APPLE_CERTIFICATE_BASE64" || missing=1
+          require_value APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD" || missing=1
+          require_value APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY" || missing=1
+          require_value APPLE_INSTALLER_IDENTITY "$APPLE_INSTALLER_IDENTITY" || missing=1
+          require_value APPLE_API_KEY "$APPLE_API_KEY" || missing=1
+          require_value APPLE_API_KEY_ID "$APPLE_API_KEY_ID" || missing=1
+          require_value APPLE_API_ISSUER "$APPLE_API_ISSUER" || missing=1
+          if [ "$PUBLISH_PUBLIC_RELEASE_INPUT" = "true" ]; then
+            require_value RELEASES_REPO_TOKEN "$RELEASES_REPO_TOKEN" || missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          cargo_version="$(awk -F '"' '/^version = / { print $2; exit }' apps/desktop/src-tauri/Cargo.toml)"
+          if [ -z "$cargo_version" ]; then
+            echo "::error::Failed to detect desktop version from apps/desktop/src-tauri/Cargo.toml"
+            exit 1
+          fi
+
+          tauri_version="$(python3 - <<'PY'
+          import json
+          with open("apps/desktop/src-tauri/tauri.conf.json", "r", encoding="utf-8") as fh:
+              print(json.load(fh).get("version", ""))
+          PY
+          )"
+          if [ -z "$tauri_version" ]; then
+            echo "::error::Failed to detect desktop version from apps/desktop/src-tauri/tauri.conf.json"
+            exit 1
+          fi
+
+          release_tag="$RELEASE_TAG_INPUT"
+          if [ -z "$release_tag" ]; then
+            release_tag="desktop-v${cargo_version}"
+          fi
+          tag_version="$(printf '%s' "$release_tag" | sed -E 's/^desktop-v//; s/^v//')"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Version mismatch: release tag $release_tag implies $tag_version but Cargo.toml is $cargo_version"
+            exit 1
+          fi
+
+          release_notes_file="$RELEASE_NOTES_FILE_INPUT"
+          if [ -n "$release_notes_file" ]; then
+            if [ ! -f "$release_notes_file" ]; then
+              echo "::error::Configured release_notes_file does not exist: $release_notes_file"
+              exit 1
+            fi
+          else
+            release_notes_file="$RUNNER_TEMP/hybridcipher-release-notes.md"
+            python3 - "$cargo_version" "apps/desktop/release-notes/releases.json" "$release_notes_file" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          version = sys.argv[1]
+          source = pathlib.Path(sys.argv[2])
+          output = pathlib.Path(sys.argv[3])
+          payload = json.loads(source.read_text(encoding="utf-8"))
+          release = next((item for item in payload.get("releases", []) if item.get("version") == version), None)
+          if release is None:
+              raise SystemExit(f"apps/desktop/release-notes/releases.json has no entry for version {version}")
+
+          def section(title, values):
+              if not values:
+                  return []
+              return [f"## {title}", "", *[f"- {value}" for value in values], ""]
+
+          lines = [
+              f"# HybridCipher Desktop {version}",
+              "",
+              f"Published: {release.get('published_at', 'TBD')}",
+              "",
+          ]
+          lines += section("Highlights", release.get("highlights", []))
+          lines += section("Important Changes", release.get("important_changes", []))
+          lines += section("Fixes", release.get("fixes", []))
+          output.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+          PY
+          fi
+
+          cert_p12="$RUNNER_TEMP/hybridcipher-apple-certificate.p12"
+          tauri_key_file="$RUNNER_TEMP/hybridcipher-tauri-signing-private-key"
+          apple_api_key_file="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          release_env="$RUNNER_TEMP/hybridcipher-desktop-release.env"
+
+          CERT_P12="$cert_p12" python3 - <<'PY'
+          import base64
+          import os
+          import pathlib
+
+          pathlib.Path(os.environ["CERT_P12"]).write_bytes(
+              base64.b64decode(os.environ["APPLE_CERTIFICATE_BASE64"])
+          )
+          PY
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$tauri_key_file"
+          printf '%s' "$APPLE_API_KEY" > "$apple_api_key_file"
+
+          write_env_var() {
+            local name="$1"
+            local value="${2:-}"
+            printf '%s=' "$name" >> "$release_env"
+            printf '%q' "$value" >> "$release_env"
+            printf '\n' >> "$release_env"
+          }
+
+          write_env_var TAURI_SIGNING_PRIVATE_KEY_FILE "$tauri_key_file"
+          write_env_var TAURI_SIGNING_PRIVATE_KEY_PASSWORD "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          write_env_var APPLE_CERTIFICATE_P12_FILE "$cert_p12"
+          write_env_var APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD"
+          write_env_var APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY"
+          write_env_var APPLE_INSTALLER_IDENTITY "$APPLE_INSTALLER_IDENTITY"
+          write_env_var APPLE_API_KEY_FILE "$apple_api_key_file"
+          write_env_var APPLE_API_KEY_ID "$APPLE_API_KEY_ID"
+          write_env_var APPLE_API_ISSUER "$APPLE_API_ISSUER"
+          write_env_var RELEASE_TAG "$release_tag"
+          write_env_var RELEASE_NAME "${RELEASE_NAME_INPUT:-HybridCipher Desktop ${release_tag}}"
+          write_env_var RELEASE_NOTES_FILE "$release_notes_file"
+          write_env_var MODE "$MODE_INPUT"
+          if [ -n "$DESKTOP_TARGETS_INPUT" ]; then
+            write_env_var DESKTOP_TARGETS "$DESKTOP_TARGETS_INPUT"
+          fi
+          if [ "$PUBLISH_PUBLIC_RELEASE_INPUT" = "true" ]; then
+            write_env_var PUBLISH_PUBLIC_RELEASE "1"
+            write_env_var GH_TOKEN "$RELEASES_REPO_TOKEN"
+          else
+            write_env_var PUBLISH_PUBLIC_RELEASE "0"
+          fi
+          public_release_repo="${PUBLIC_RELEASE_REPO_INPUT:-${PUBLIC_RELEASE_REPO_VAR:-}}"
+          if [ -n "$public_release_repo" ]; then
+            write_env_var PUBLIC_RELEASE_REPO "$public_release_repo"
+          fi
+
+          {
+            echo "ENV_FILE=$release_env"
+            echo "HYBRIDCIPHER_RELEASE_SECRET_FILES=$cert_p12:$tauri_key_file:$apple_api_key_file:$release_env"
+          } >> "$GITHUB_ENV"
+
+          echo "Prepared release $release_tag for desktop version $cargo_version"
+          echo "Release notes: $release_notes_file"
+
+      - name: Validate macOS File Provider source
+        run: |
+          set -euo pipefail
+          chmod +x scripts/macos/validate_file_provider_runtime.sh
+          scripts/macos/validate_file_provider_runtime.sh
+
+      - name: Build, sign, notarize, and publish
+        run: |
+          set -euo pipefail
+          chmod +x scripts/macos/desktop_release_pkg.sh scripts/macos/build_file_provider_extension.sh
+          scripts/macos/desktop_release_pkg.sh
+
+      - name: Upload workflow artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-desktop-release-${{ inputs.release_tag || github.sha }}
+          path: |
+            target/**/release/bundle/**/*.pkg
+            target/**/release/bundle/**/*.app.tar.gz
+            target/**/release/bundle/**/*.app.tar.gz.sig
+            target/**/release/bundle/**/*.sha256
+            target/**/release/bundle/**/*.dmg
+          if-no-files-found: warn
+
+      - name: Clean up release secrets
+        if: always()
+        run: |
+          set -euo pipefail
+          IFS=':' read -r -a secret_files <<< "${HYBRIDCIPHER_RELEASE_SECRET_FILES:-}"
+          for file in "${secret_files[@]}"; do
+            if [ -n "$file" ] && [ -e "$file" ]; then
+              rm -f "$file"
+            fi
+          done
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8
+          rm -f "$RUNNER_TEMP"/hybridcipher-apple-certificate.p12
+          rm -f "$RUNNER_TEMP"/hybridcipher-tauri-signing-private-key
