@@ -209,16 +209,16 @@ where
         let short = root_id.to_string();
         format!("HybridCipher {}", &short[..8])
     });
-    let registration = CloudRootRegistration {
+    let registration = CloudRootRegistration::shell_integrated(
         root_id,
-        sync_root_path: sync_root_path.ok_or_else(|| {
+        sync_root_path.ok_or_else(|| {
             CloudProviderError::InvalidCommand("--sync-root is required".to_string())
         })?,
-        encrypted_root: encrypted_root.ok_or_else(|| {
+        encrypted_root.ok_or_else(|| {
             CloudProviderError::InvalidCommand("--encrypted-root is required".to_string())
         })?,
         display_name,
-    };
+    )?;
 
     Ok((user_config_dir, registration, sync_placeholders))
 }

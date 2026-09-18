@@ -1256,3 +1256,5 @@ async fn persist_index_entries_treats_encrypted_suffix_as_same_file() {
     assert_eq!(entry.state, FileCoverageState::Tracked);
     assert_eq!(entry.root_id, root.root_id);
 }
+#[path = "security_regression.rs"]
+mod security_regression;

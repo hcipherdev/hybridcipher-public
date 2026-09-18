@@ -20,10 +20,19 @@ use std::{
 };
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
+
+mod compatibility;
+#[cfg(any(test, feature = "native-verification"))]
+pub mod compatibility_fixtures;
+#[cfg(test)]
+mod compatibility_tests;
+pub use compatibility::{VaultCompatibility, VaultCompatibilityStatus};
+pub use hybridcipher_client::file::content_manifest::LegacyReadPolicy;
 
 pub use hybridcipher_mount_sync::{
     LowSpaceMode, MountConflictRecord, MountRecoveryCopyRecord, MountSafetyReason,
-    MountSyncRuntimeStatus,
+    MountSyncRuntimeStatus, PendingOperationSummary, ProviderFileErrorCode,
 };
 
 const IDENTITY_VERSION: u16 = 1;
@@ -61,8 +70,27 @@ pub enum ProviderCoreError {
 }
 
 impl ProviderCoreError {
+    pub fn is_file_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Crypto(_) | Self::MetadataParse { .. } | Self::ContentConflict { .. }
+        ) || matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }
+    pub fn is_legacy_consent_required(&self) -> bool {
+        matches!(
+            self,
+            Self::Crypto(MountSyncError::LegacyCompatibilityRequired)
+        )
+    }
+    pub fn is_integrity_failure(&self) -> bool {
+        matches!(self, Self::Crypto(MountSyncError::FileIntegrity(_)))
+    }
     pub fn is_path_excluded(&self) -> bool {
         matches!(self, Self::Crypto(MountSyncError::PathExcluded(_)))
+    }
+
+    pub fn is_range_unsupported(&self) -> bool {
+        matches!(self, Self::Crypto(MountSyncError::RangeUnsupported(_)))
     }
 }
 
@@ -591,6 +619,14 @@ impl EncryptedInventory {
 
 #[async_trait]
 pub trait ProviderBridge: Send + Sync {
+    fn compatibility_status(&self) -> Option<VaultCompatibilityStatus> {
+        None
+    }
+    fn set_legacy_compatibility(&self, _enabled: bool) -> Result<VaultCompatibilityStatus> {
+        Err(ProviderCoreError::MutationUnsupported(
+            "vault compatibility".into(),
+        ))
+    }
     fn is_path_excluded(&self, _encrypted_root: &Path, _relative_path: &Path) -> bool {
         false
     }
@@ -598,6 +634,18 @@ pub trait ProviderBridge: Send + Sync {
     async fn inventory(&self, root_id: Uuid, encrypted_root: &Path) -> Result<Vec<ProviderEntry>>;
 
     async fn hydrate_file(&self, entry: &ProviderEntry) -> Result<Vec<u8>>;
+
+    async fn hydrate_file_range(
+        &self,
+        entry: &ProviderEntry,
+        offset: u64,
+        length: usize,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let _ = (entry, offset, length);
+        Err(ProviderCoreError::Crypto(MountSyncError::RangeUnsupported(
+            "the configured provider bridge does not implement range hydration".to_string(),
+        )))
+    }
 
     async fn hydrate_file_to_path(&self, entry: &ProviderEntry, output_path: &Path) -> Result<()> {
         let bytes = self.hydrate_file(entry).await?;
@@ -773,7 +821,14 @@ pub trait ProviderBridge: Send + Sync {
         });
         let source = match resolve_checked_delete_entry(&inventory, source_identity) {
             Ok(Some(source)) => source,
-            Ok(None) if target_is_same_object => return Ok(target.cloned()),
+            Ok(None) if target_is_same_object => {
+                validate_expected_content_version(
+                    target_relative_path,
+                    expected_version,
+                    target.and_then(|entry| entry.content_version()).as_ref(),
+                )?;
+                return Ok(target.cloned());
+            }
             Ok(None) => {
                 return Err(ProviderCoreError::ContentConflict {
                     path: normalize_relative_path(&source_identity.relative_path),
@@ -781,7 +836,6 @@ pub trait ProviderBridge: Send + Sync {
                     actual: None,
                 })
             }
-            Err(_) if target_is_same_object => return Ok(target.cloned()),
             Err(err) => return Err(err),
         };
         validate_expected_content_version(
@@ -790,8 +844,22 @@ pub trait ProviderBridge: Send + Sync {
             source.content_version().as_ref(),
         )?;
         if target_is_same_object {
-            self.delete_entry(encrypted_root, &source.identity).await?;
-            return Ok(target.cloned());
+            let target = target.expect("same-object target exists");
+            validate_expected_content_version(
+                target_relative_path,
+                expected_version,
+                target.content_version().as_ref(),
+            )?;
+            if source.encrypted_path != target.encrypted_path {
+                self.delete_entry_checked(
+                    root_id,
+                    encrypted_root,
+                    &source.identity,
+                    expected_version,
+                )
+                .await?;
+            }
+            return Ok(Some(target.clone()));
         }
         if inventory.iter().any(|entry| {
             entry.relative_path == normalize_relative_path(target_relative_path)
@@ -821,11 +889,15 @@ pub trait ProviderBridge: Send + Sync {
 
 pub struct LocalProviderBridge {
     crypto: Arc<dyn MountCrypto>,
+    compatibility: Option<Arc<VaultCompatibility>>,
 }
 
 impl LocalProviderBridge {
     pub fn new(crypto: Arc<dyn MountCrypto>) -> Self {
-        Self { crypto }
+        Self {
+            crypto,
+            compatibility: None,
+        }
     }
 
     fn path_or_ancestor_is_excluded(&self, encrypted_root: &Path, relative_path: &Path) -> bool {
@@ -847,11 +919,15 @@ impl LocalProviderBridge {
 
 pub struct ClientMountCrypto {
     client: Arc<LocalProviderClient>,
+    compatibility: Option<Arc<VaultCompatibility>>,
 }
 
 impl ClientMountCrypto {
     pub fn new(client: Arc<LocalProviderClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            compatibility: None,
+        }
     }
 }
 
@@ -866,6 +942,17 @@ impl MountCrypto for ClientMountCrypto {
         _encrypted_path: &Path,
         metadata: &EncryptedFileMetadata,
     ) -> std::result::Result<Vec<u8>, MountSyncError> {
+        if self
+            .compatibility
+            .as_ref()
+            .is_some_and(|p| p.policy() == LegacyReadPolicy::AllowLegacyUnverified)
+        {
+            return self
+                .client
+                .recover_legacy_file_unverified(metadata)
+                .await
+                .map_err(MountSyncError::from);
+        }
         self.client
             .decrypt_file(metadata)
             .await
@@ -879,7 +966,40 @@ impl MountCrypto for ClientMountCrypto {
         metadata: &EncryptedFileMetadata,
     ) -> std::result::Result<(), MountSyncError> {
         self.client
-            .decrypt_file_streaming_to_path(encrypted_path, metadata, output_path)
+            .decrypt_file_streaming_to_path_with_policy(
+                encrypted_path,
+                metadata,
+                output_path,
+                self.compatibility
+                    .as_ref()
+                    .map_or(LegacyReadPolicy::Strict, |policy| policy.policy()),
+            )
+            .await
+            .map_err(MountSyncError::from)
+    }
+
+    async fn decrypt_file_range(
+        &self,
+        encrypted_path: &Path,
+        metadata: &EncryptedFileMetadata,
+        offset: u64,
+        length: usize,
+    ) -> std::result::Result<Zeroizing<Vec<u8>>, MountSyncError> {
+        if metadata.header_version.unwrap_or(1)
+            != hybridcipher_client::file::content_manifest::VERSION
+            || metadata.content_chunk_size.is_none()
+        {
+            return Err(MountSyncError::RangeUnsupported(
+                "legacy files are not independently chunk authenticated".to_string(),
+            ));
+        }
+        if metadata.sparse_metadata.is_some() {
+            return Err(MountSyncError::RangeUnsupported(
+                "sparse logical ranges require extent reconstruction".to_string(),
+            ));
+        }
+        self.client
+            .decrypt_file_range(encrypted_path, metadata, offset, length)
             .await
             .map_err(MountSyncError::from)
     }
@@ -979,8 +1099,31 @@ pub fn local_provider_bridge(client: Arc<LocalProviderClient>) -> Arc<dyn Provid
     Arc::new(LocalProviderBridge::new(crypto))
 }
 
+pub fn local_provider_bridge_with_compatibility(
+    client: Arc<LocalProviderClient>,
+    compatibility: Arc<VaultCompatibility>,
+) -> Arc<dyn ProviderBridge> {
+    let crypto = Arc::new(ClientMountCrypto {
+        client,
+        compatibility: Some(compatibility.clone()),
+    });
+    Arc::new(LocalProviderBridge {
+        crypto,
+        compatibility: Some(compatibility),
+    })
+}
+
 #[async_trait]
 impl ProviderBridge for LocalProviderBridge {
+    fn compatibility_status(&self) -> Option<VaultCompatibilityStatus> {
+        self.compatibility.as_ref().map(|p| p.status())
+    }
+    fn set_legacy_compatibility(&self, enabled: bool) -> Result<VaultCompatibilityStatus> {
+        self.compatibility
+            .as_ref()
+            .ok_or_else(|| ProviderCoreError::MutationUnsupported("vault compatibility".into()))?
+            .set_enabled(enabled)
+    }
     fn is_path_excluded(&self, encrypted_root: &Path, relative_path: &Path) -> bool {
         self.path_or_ancestor_is_excluded(encrypted_root, relative_path)
     }
@@ -1048,6 +1191,9 @@ impl ProviderBridge for LocalProviderBridge {
                 )));
             }
         }
+        if let Some(policy) = &self.compatibility {
+            policy.observe(&entries);
+        }
         Ok(entries)
     }
 
@@ -1058,10 +1204,36 @@ impl ProviderBridge for LocalProviderBridge {
                 entry.relative_path
             ))
         })?;
-        Ok(self
+        let result = self
             .crypto
             .decrypt_file(&entry.encrypted_path, metadata)
-            .await?)
+            .await;
+        if let Some(policy) = &self.compatibility {
+            policy.record_read_result(&result);
+        }
+        result.map_err(ProviderCoreError::from)
+    }
+
+    async fn hydrate_file_range(
+        &self,
+        entry: &ProviderEntry,
+        offset: u64,
+        length: usize,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let metadata = entry.metadata.as_ref().ok_or_else(|| {
+            ProviderCoreError::InvalidIdentity(format!(
+                "{} is not a file entry",
+                entry.relative_path
+            ))
+        })?;
+        let result = self
+            .crypto
+            .decrypt_file_range(&entry.encrypted_path, metadata, offset, length)
+            .await;
+        if let Some(policy) = &self.compatibility {
+            policy.record_read_result(&result);
+        }
+        result.map_err(ProviderCoreError::from)
     }
 
     async fn hydrate_file_to_path(&self, entry: &ProviderEntry, output_path: &Path) -> Result<()> {
@@ -1074,10 +1246,14 @@ impl ProviderBridge for LocalProviderBridge {
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        self.crypto
+        let result = self
+            .crypto
             .decrypt_file_streaming(&entry.encrypted_path, output_path, metadata)
-            .await?;
-        Ok(())
+            .await;
+        if let Some(policy) = &self.compatibility {
+            policy.record_read_result(&result);
+        }
+        result.map_err(ProviderCoreError::from)
     }
 
     async fn writeback_file(
@@ -1090,6 +1266,7 @@ impl ProviderBridge for LocalProviderBridge {
     ) -> Result<ProviderEntry> {
         writeback_plaintext_file(
             self.crypto.as_ref(),
+            self.compatibility.as_deref(),
             root_id,
             encrypted_root,
             relative_path,
@@ -1119,6 +1296,7 @@ impl ProviderBridge for LocalProviderBridge {
         };
         writeback_plaintext_file_checked(
             self.crypto.as_ref(),
+            self.compatibility.as_deref(),
             root_id,
             encrypted_root,
             relative_path,
@@ -1131,6 +1309,21 @@ impl ProviderBridge for LocalProviderBridge {
 
     async fn delete_entry(&self, encrypted_root: &Path, identity: &FileIdentityV1) -> Result<()> {
         let encrypted_path = encrypted_path_for_identity(encrypted_root, identity)?;
+        if let Some(policy) = &self.compatibility {
+            if encrypted_path.is_dir() {
+                for entry in EncryptedInventory::new(identity.root_id, &encrypted_path).scan()? {
+                    if entry.kind == ProviderEntryKind::File {
+                        if let Some(backup) =
+                            policy.preserve(identity.root_id, &entry.encrypted_path)?
+                        {
+                            backup.verify_current()?;
+                        }
+                    }
+                }
+            } else if let Some(backup) = policy.preserve(identity.root_id, &encrypted_path)? {
+                backup.verify_current()?;
+            }
+        }
         match identity.kind {
             ProviderEntryKind::Directory => {
                 if encrypted_path.exists() {
@@ -1191,8 +1384,16 @@ impl ProviderBridge for LocalProviderBridge {
     ) -> Result<Option<ProviderEntry>> {
         if source_identity.kind == ProviderEntryKind::File {
             if let Some(target_plaintext_path) = target_plaintext_path {
+                let old_path = encrypted_path_for_identity(encrypted_root, source_identity)?;
+                let backup = self
+                    .compatibility
+                    .as_ref()
+                    .map(|p| p.preserve(root_id, &old_path))
+                    .transpose()?
+                    .flatten();
                 let entry = writeback_plaintext_file(
                     self.crypto.as_ref(),
+                    self.compatibility.as_deref(),
                     root_id,
                     encrypted_root,
                     target_relative_path,
@@ -1200,7 +1401,9 @@ impl ProviderBridge for LocalProviderBridge {
                     Some(source_identity),
                 )
                 .await?;
-                let old_path = encrypted_path_for_identity(encrypted_root, source_identity)?;
+                if let Some(backup) = backup {
+                    backup.verify_current()?;
+                }
                 if old_path != entry.encrypted_path && old_path.exists() {
                     fs::remove_file(old_path)?;
                 }
@@ -1252,7 +1455,14 @@ impl ProviderBridge for LocalProviderBridge {
         });
         let source = match resolve_checked_delete_entry(&inventory, source_identity) {
             Ok(Some(source)) => source,
-            Ok(None) if target_is_same_object => return Ok(target.cloned()),
+            Ok(None) if target_is_same_object => {
+                validate_expected_content_version(
+                    target_relative_path,
+                    expected_version,
+                    target.and_then(|entry| entry.content_version()).as_ref(),
+                )?;
+                return Ok(target.cloned());
+            }
             Ok(None) => {
                 return Err(ProviderCoreError::ContentConflict {
                     path: normalize_relative_path(&source_identity.relative_path),
@@ -1260,7 +1470,6 @@ impl ProviderBridge for LocalProviderBridge {
                     actual: None,
                 })
             }
-            Err(_) if target_is_same_object => return Ok(target.cloned()),
             Err(err) => return Err(err),
         };
         validate_expected_content_version(
@@ -1269,8 +1478,22 @@ impl ProviderBridge for LocalProviderBridge {
             source.content_version().as_ref(),
         )?;
         if target_is_same_object {
-            self.delete_entry(encrypted_root, &source.identity).await?;
-            return Ok(target.cloned());
+            let target = target.expect("same-object target exists");
+            validate_expected_content_version(
+                target_relative_path,
+                expected_version,
+                target.content_version().as_ref(),
+            )?;
+            if source.encrypted_path != target.encrypted_path {
+                self.delete_entry_checked(
+                    root_id,
+                    encrypted_root,
+                    &source.identity,
+                    expected_version,
+                )
+                .await?;
+            }
+            return Ok(Some(target.clone()));
         }
         if let Some(target) = target {
             return Err(ProviderCoreError::ContentConflict {
@@ -1282,17 +1505,45 @@ impl ProviderBridge for LocalProviderBridge {
 
         if source_identity.kind == ProviderEntryKind::File {
             if let Some(target_plaintext_path) = target_plaintext_path {
+                let source_path = encrypted_path_for_identity(encrypted_root, &source.identity)?;
+                let target_path = encrypted_path_for(
+                    encrypted_root,
+                    Path::new(""),
+                    Path::new(&normalized_target),
+                )?;
+                let same_physical_path = fs::canonicalize(&source_path)
+                    .ok()
+                    .zip(fs::canonicalize(&target_path).ok())
+                    .is_some_and(|(a, b)| a == b);
+                let backup = self
+                    .compatibility
+                    .as_ref()
+                    .map(|p| p.preserve(root_id, &source_path))
+                    .transpose()?
+                    .flatten();
+                let target_expected = if same_physical_path {
+                    expected_version.clone()
+                } else {
+                    ExpectedProviderVersion::Absent
+                };
                 let entry = writeback_plaintext_file_checked(
                     self.crypto.as_ref(),
+                    self.compatibility.as_deref(),
                     root_id,
                     encrypted_root,
                     &normalized_target,
                     target_plaintext_path,
                     Some(&source.identity),
-                    &ExpectedProviderVersion::Absent,
+                    &target_expected,
                 )
                 .await?;
                 let old_path = encrypted_path_for_identity(encrypted_root, &source.identity)?;
+                if same_physical_path {
+                    return Ok(Some(entry));
+                }
+                if let Some(backup) = backup {
+                    backup.verify_current()?;
+                }
                 let source_now = content_version_at_path(encrypted_root, &old_path)?;
                 validate_expected_content_version(
                     &source_identity.relative_path,
@@ -1484,37 +1735,29 @@ async fn authenticate_directory_sidecar(
 
 async fn writeback_plaintext_file(
     crypto: &dyn MountCrypto,
+    compatibility: Option<&VaultCompatibility>,
     root_id: Uuid,
     encrypted_root: &Path,
     relative_path: &str,
     plaintext_path: &Path,
     existing_identity: Option<&FileIdentityV1>,
 ) -> Result<ProviderEntry> {
-    let normalized_relative_path = normalize_relative_path(relative_path);
-    let encrypted_path = encrypted_path_for(
-        encrypted_root,
-        Path::new(""),
-        &PathBuf::from(normalized_relative_path.replace('/', "\\")),
-    )?;
-    let streaming = encrypt_plaintext_to_path(
+    writeback_plaintext_file_checked(
         crypto,
-        &normalized_relative_path,
-        plaintext_path,
-        &encrypted_path,
-        existing_identity,
-    )
-    .await?;
-    store_streaming_coverage(crypto, &streaming).await?;
-    Ok(ProviderEntry::file(
+        compatibility,
         root_id,
-        normalized_relative_path,
-        encrypted_path,
-        streaming.metadata,
-    ))
+        encrypted_root,
+        relative_path,
+        plaintext_path,
+        existing_identity,
+        &ExpectedProviderVersion::Unchecked,
+    )
+    .await
 }
 
 async fn writeback_plaintext_file_checked(
     crypto: &dyn MountCrypto,
+    compatibility: Option<&VaultCompatibility>,
     root_id: Uuid,
     encrypted_root: &Path,
     relative_path: &str,
@@ -1536,6 +1779,10 @@ async fn writeback_plaintext_file_checked(
     )?;
 
     let staging_dir = encrypted_root.join(ENCRYPTED_TMP_DIR_NAME);
+    let backup = compatibility
+        .map(|p| p.preserve(root_id, &encrypted_path))
+        .transpose()?
+        .flatten();
     fs::create_dir_all(&staging_dir)?;
     let staging_path = staging_dir.join(format!("checked-{}.encrypted", Uuid::new_v4()));
     let streaming = match encrypt_plaintext_to_path(
@@ -1565,6 +1812,12 @@ async fn writeback_plaintext_file_checked(
     }
     if let Some(parent) = encrypted_path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    if let Some(backup) = backup {
+        if let Err(error) = backup.verify_current() {
+            let _ = fs::remove_file(&staging_path);
+            return Err(error);
+        }
     }
     replace_encrypted_file(&staging_path, &encrypted_path)?;
     store_streaming_coverage(crypto, &streaming).await?;
@@ -1686,6 +1939,13 @@ fn replace_encrypted_file(source: &Path, destination: &Path) -> Result<()> {
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
+    let source = fs::canonicalize(source)?;
+    let destination = fs::canonicalize(destination.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Destination has no parent")
+    })?)?
+    .join(destination.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Destination has no filename")
+    })?);
     let source = source
         .as_os_str()
         .encode_wide()
@@ -1702,7 +1962,7 @@ fn replace_encrypted_file(source: &Path, destination: &Path) -> Result<()> {
             PCWSTR(destination.as_ptr()),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        .map_err(|_| io::Error::last_os_error())?;
     }
     Ok(())
 }

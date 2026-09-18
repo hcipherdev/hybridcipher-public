@@ -1455,8 +1455,7 @@ impl SessionManager {
 
     fn cache_account_key(&self, user_dir: &Path, key_bytes: &[u8; 32]) -> Result<(), CliError> {
         let cache_path = self.account_key_cache_path(user_dir);
-        let encoded = general_purpose::STANDARD.encode(key_bytes);
-        std::fs::write(&cache_path, encoded)
+        hybridcipher_crypto::local_key_cache::save(&cache_path, key_bytes)
             .map_err(|e| CliError::session(format!("Failed to cache account key: {}", e)))?;
 
         #[cfg(unix)]
@@ -1479,20 +1478,9 @@ impl SessionManager {
             return Ok(None);
         }
 
-        let encoded = std::fs::read_to_string(&cache_path)
-            .map_err(|e| CliError::session(format!("Failed to read account key cache: {}", e)))?;
-
-        match general_purpose::STANDARD.decode(encoded.trim()) {
-            Ok(bytes) if bytes.len() == 32 => {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                Ok(Some(key))
-            }
-            Ok(_) | Err(_) => {
-                let _ = std::fs::remove_file(&cache_path);
-                Ok(None)
-            }
-        }
+        hybridcipher_crypto::local_key_cache::load(&cache_path)
+            .map(Some)
+            .map_err(|e| CliError::session(format!("Failed to unlock account key cache: {e}")))
     }
 
     fn clear_account_key_cache_path(&self, user_dir: &Path) -> Result<(), CliError> {

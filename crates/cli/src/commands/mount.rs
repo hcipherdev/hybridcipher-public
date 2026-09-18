@@ -2164,6 +2164,10 @@ async fn run_cloud_files_mount(
     mut stop_rx: watch::Receiver<bool>,
     ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), String> {
+    let compatibility = Arc::new(
+        hybridcipher_windows_cloud_provider::VaultCompatibility::load(&user_config_dir, root_id)
+            .map_err(|e| e.to_string())?,
+    );
     let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
         hybridcipher_windows_cloud_provider::ProviderHostConfig {
             user_config_dir,
@@ -2177,18 +2181,40 @@ async fn run_cloud_files_mount(
         }));
     }
 
-    let registration = hybridcipher_windows_cloud_provider::CloudRootRegistration {
-        root_id,
-        sync_root_path: mountpoint.clone(),
-        encrypted_root: encrypted_dir,
-        display_name: derive_mount_label(&mountpoint, root_id),
+    let vault_name = encrypted_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Vault");
+    let base_display_name = format!("HybridCipher — {vault_name}");
+    let display_name = if host
+        .load_registrations()
+        .map_err(|err| err.to_string())?
+        .iter()
+        .any(|existing| existing.root_id != root_id && existing.display_name == base_display_name)
+    {
+        let short = root_id.simple().to_string();
+        format!("{base_display_name} ({})", &short[..8])
+    } else {
+        base_display_name
     };
+    let registration =
+        hybridcipher_windows_cloud_provider::CloudRootRegistration::shell_integrated(
+            root_id,
+            mountpoint.clone(),
+            encrypted_dir,
+            display_name,
+        )
+        .map_err(|err| err.to_string())?;
     let registration_preexisted = host
         .registration_exists(root_id)
         .map_err(|err| err.to_string())?;
     host.register_root(&registration)
         .map_err(|err| err.to_string())?;
-    let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge(Arc::new(client));
+    let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge_with_compatibility(
+        Arc::new(client),
+        compatibility,
+    );
     if let Err(error) = host.start_root_with_bridge(root_id, bridge.clone()).await {
         return Err(host
             .cleanup_failed_root_start_after_error(

@@ -5,11 +5,13 @@ use hybridcipher_client::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Each field is loaded from a separate request, so each can independently be
+/// `None` — meaning "could not be determined", never "disabled".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IndividualSecuritySnapshot {
-    pub mfa_enabled: bool,
-    pub recovery_backup_ok: bool,
-    pub recovery_auto_backup_ok: bool,
+    pub mfa_enabled: Option<bool>,
+    pub recovery_backup_ok: Option<bool>,
+    pub recovery_auto_backup_ok: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -41,12 +43,16 @@ pub struct FolderAttentionSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndividualHomeStatusInput {
     pub security: IndividualSecuritySnapshot,
-    pub settings: IndividualSettingsSnapshot,
+    /// `None` when the coverage/settings status could not be loaded for this refresh.
+    pub settings: Option<IndividualSettingsSnapshot>,
     pub protected_count: usize,
     pub mounted_count: usize,
     pub current_device: Option<CurrentDeviceSnapshot>,
     pub device_counts: DeviceCountSnapshot,
     pub folder_attention: FolderAttentionSnapshot,
+    /// Human-readable labels for the sections that failed to load, so the UI can
+    /// say "unknown" instead of reporting missing data as a protection failure.
+    pub unavailable_sections: Vec<String>,
     pub now: DateTime<Utc>,
 }
 
@@ -59,14 +65,19 @@ pub struct IndividualHomeStatus {
     pub post_quantum_primary_text: String,
     pub post_quantum_secondary_text: String,
     pub post_quantum_explainer_available: bool,
-    pub mfa_enabled: bool,
-    pub recovery_backup_ok: bool,
-    pub recovery_auto_backup_ok: bool,
+    /// `None` means "could not be determined", not "disabled".
+    pub mfa_enabled: Option<bool>,
+    pub recovery_backup_ok: Option<bool>,
+    pub recovery_auto_backup_ok: Option<bool>,
+    /// `false` means the scan status could not be read. When `true`, a `None`
+    /// `last_scan_at` genuinely means "never scanned".
+    pub scan_status_available: bool,
     pub last_scan_at: Option<String>,
     pub last_backup_upload_at: Option<String>,
     pub current_device: Option<CurrentDeviceSnapshot>,
     pub device_counts: DeviceCountSnapshot,
     pub folder_attention: FolderAttentionSnapshot,
+    pub unavailable_sections: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,21 +496,38 @@ pub fn build_folder_coverage_review(
 }
 
 pub fn build_individual_home_status(input: IndividualHomeStatusInput) -> IndividualHomeStatus {
-    let scan_is_stale = match parse_timestamp(input.settings.coverage_last_scan.as_deref()) {
-        Some(last_scan) => input.now.signed_duration_since(last_scan).num_hours() > 36,
-        None => true,
-    };
+    let scan_status_available = input.settings.is_some();
+    let last_scan_at = input
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.coverage_last_scan.clone());
+    let last_backup_upload_at = input
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.registry_last_upload.clone());
+
+    // An unavailable scan status is unknown, not stale: only flag staleness when
+    // we actually managed to read the coverage status.
+    let scan_is_stale = scan_status_available
+        && match parse_timestamp(last_scan_at.as_deref()) {
+            Some(last_scan) => input.now.signed_duration_since(last_scan).num_hours() > 36,
+            None => true,
+        };
     let device_review_needed = input.device_counts.pending > 0
         || input.device_counts.stale > 0
         || input.device_counts.unverified > 0;
     let folder_review_needed =
         input.folder_attention.conflicts > 0 || input.folder_attention.recovery_copies > 0;
 
+    let mfa_enabled = input.security.mfa_enabled;
+    let recovery_backup_ok = input.security.recovery_backup_ok;
+    let recovery_auto_backup_ok = input.security.recovery_auto_backup_ok;
+
     let mut attention_count = 0usize;
-    if !input.security.mfa_enabled {
+    if mfa_enabled == Some(false) {
         attention_count += 1;
     }
-    if !input.security.recovery_backup_ok || !input.security.recovery_auto_backup_ok {
+    if recovery_backup_ok == Some(false) || recovery_auto_backup_ok == Some(false) {
         attention_count += 1;
     }
     if scan_is_stale {
@@ -508,9 +536,7 @@ pub fn build_individual_home_status(input: IndividualHomeStatusInput) -> Individ
     if input
         .current_device
         .as_ref()
-        .map(|device| device.is_verified)
-        .unwrap_or(false)
-        == false
+        .is_some_and(|device| !device.is_verified)
     {
         attention_count += 1;
     }
@@ -518,6 +544,9 @@ pub fn build_individual_home_status(input: IndividualHomeStatusInput) -> Individ
         attention_count += 1;
     }
     if folder_review_needed {
+        attention_count += 1;
+    }
+    if !input.unavailable_sections.is_empty() {
         attention_count += 1;
     }
 
@@ -536,14 +565,16 @@ pub fn build_individual_home_status(input: IndividualHomeStatusInput) -> Individ
         post_quantum_primary_text,
         post_quantum_secondary_text,
         post_quantum_explainer_available,
-        mfa_enabled: input.security.mfa_enabled,
-        recovery_backup_ok: input.security.recovery_backup_ok,
-        recovery_auto_backup_ok: input.security.recovery_auto_backup_ok,
-        last_scan_at: input.settings.coverage_last_scan,
-        last_backup_upload_at: input.settings.registry_last_upload,
+        mfa_enabled,
+        recovery_backup_ok,
+        recovery_auto_backup_ok,
+        scan_status_available,
+        last_scan_at,
+        last_backup_upload_at,
         current_device: input.current_device,
         device_counts: input.device_counts,
         folder_attention: input.folder_attention,
+        unavailable_sections: input.unavailable_sections,
     }
 }
 

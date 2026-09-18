@@ -61,7 +61,7 @@ pub struct AdminGroupSummary {
 pub async fn get_group_summaries(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<AdminGroupSummary>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
 
     let session = {
         let guard = state.session.lock().await;

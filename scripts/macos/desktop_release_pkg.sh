@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# previous file name is scripts/macos/desktop_release_pkg.sh
-### !!!! IMPORTANT !!!! ### don't forget to update apps/desktop/release-notes/releases.json
-### update apps/desktop/release-notes/releases.json before new version release
 set -euo pipefail
 
 # HybridCipher desktop release builder/publisher for macOS.

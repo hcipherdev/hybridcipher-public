@@ -68,19 +68,18 @@ impl AppState {
             .await
             .map_err(|err| format!("Refusing to clear session while mounts are unsafe: {err}"))?;
 
+        // Fail visibly if persistent credentials cannot be removed. Keep the
+        // session identity available so the user can retry logout.
+        if let Some((email, server_url)) = session_info.as_ref() {
+            let session_store = crate::session::SessionStore::new()?;
+            session_store.delete_session(email, server_url)?;
+            session_store.clear_active_user()?;
+        }
+
         // Clear from memory
         {
             let mut session = self.session.lock().await;
             *session = None;
-        }
-
-        // Delete from disk and clear active_user.json
-        if let Some((email, server_url)) = session_info {
-            if let Ok(session_store) = crate::session::SessionStore::new() {
-                let _ = session_store.delete_session(&email, &server_url);
-                let _ = session_store.clear_active_user();
-                tracing::info!("Deleted session and cleared active user for: {}", email);
-            }
         }
 
         self.mount_manager.clear_manifest_scope().await;

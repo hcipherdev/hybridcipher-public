@@ -199,6 +199,10 @@ impl SessionStore {
         fs::create_dir_all(base_dir.join(USERS_DIR))
             .map_err(|e| format!("Failed to create users directory: {}", e))?;
 
+        #[cfg(windows)]
+        hybridcipher_crypto::local_key_cache::migrate_users_directory(&base_dir.join(USERS_DIR))
+            .map_err(|e| format!("Failed to protect legacy account-key caches: {e}"))?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -281,20 +285,8 @@ impl SessionStore {
     /// Load account key from cache
     fn load_account_key(&self, user_dir: &PathBuf) -> Result<[u8; 32], String> {
         let cache_path = user_dir.join(ACCOUNT_KEY_CACHE_FILE);
-        let encoded = fs::read_to_string(&cache_path)
-            .map_err(|e| format!("Failed to read account key cache: {}", e))?;
-
-        let decoded = STANDARD
-            .decode(encoded.trim())
-            .map_err(|e| format!("Failed to decode account key: {}", e))?;
-
-        if decoded.len() != 32 {
-            return Err("Account key has invalid length".to_string());
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        Ok(key)
+        hybridcipher_crypto::local_key_cache::load(&cache_path)
+            .map_err(|e| format!("Failed to unlock account key cache: {}", e))
     }
 
     /// Check if account key is cached for a user
@@ -343,9 +335,7 @@ impl SessionStore {
             .map_err(|e| format!("Failed to create user directory: {}", e))?;
 
         let cache_path = user_dir.join(ACCOUNT_KEY_CACHE_FILE);
-        let encoded = STANDARD.encode(key);
-
-        fs::write(&cache_path, encoded)
+        hybridcipher_crypto::local_key_cache::save(&cache_path, key)
             .map_err(|e| format!("Failed to write account key cache: {}", e))?;
 
         #[cfg(unix)]
@@ -746,6 +736,7 @@ impl SessionStore {
 
     /// Delete session from disk
     pub fn delete_session(&self, email: &str, server_url: &str) -> Result<(), String> {
+        let user_dir = self.user_dir(email, server_url);
         let session_path = self.session_file_path(email, server_url);
 
         if session_path.exists() {
@@ -760,6 +751,13 @@ impl SessionStore {
                 .map_err(|e| format!("Failed to delete session file: {}", e))?;
 
             tracing::info!("Session deleted for user: {}", email);
+        }
+
+        let cache_path = user_dir.join(ACCOUNT_KEY_CACHE_FILE);
+        match fs::remove_file(cache_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Failed to remove cached account key: {e}")),
         }
 
         // Clear active user if it matches
@@ -906,6 +904,28 @@ fn canonicalize_server_url(server_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn security_regression_windows_account_cache_logout() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore {
+            base_dir: root.path().to_path_buf(),
+            global_dir: root.path().join("global"),
+        };
+        fs::create_dir(&store.global_dir).unwrap();
+        let email = "fixture@example.invalid";
+        let server = "https://fixture.example.invalid";
+        store.cache_account_key(email, server, &[71; 32]).unwrap();
+        let user_dir = store.user_dir(email, server);
+        let cache = user_dir.join(ACCOUNT_KEY_CACHE_FILE);
+        assert!(fs::read_to_string(&cache)
+            .unwrap()
+            .starts_with("hybridcipher-dpapi-v1:"));
+        assert_eq!(store.load_account_key(&user_dir).unwrap(), [71; 32]);
+        store.delete_session(email, server).unwrap();
+        assert!(!cache.exists());
+    }
 
     #[test]
     fn test_session_validity() {

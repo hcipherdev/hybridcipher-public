@@ -10,9 +10,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 pub use hybridcipher_provider_core::{
-    local_provider_bridge, ClientMountCrypto, ExpectedProviderVersion, LocalProviderBridge,
-    LocalProviderClient, MountSafetyReason, MountSyncRuntimeStatus, ProviderBridge,
-    ProviderContentVersion, ProviderEntryKind,
+    local_provider_bridge, local_provider_bridge_with_compatibility, ClientMountCrypto,
+    ExpectedProviderVersion, LocalProviderBridge, LocalProviderClient, MountSafetyReason,
+    MountSyncRuntimeStatus, ProviderBridge, ProviderContentVersion, ProviderEntryKind,
+    VaultCompatibility, VaultCompatibilityStatus,
 };
 use hybridcipher_provider_core::{
     EncryptedInventory, FileIdentityV1, ProviderCoreError, ProviderEntry, Result as ProviderResult,
@@ -36,7 +37,12 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod journal_schema2;
+mod pending;
 mod state;
+#[cfg(all(target_os = "windows", feature = "native-verification"))]
+pub mod verification;
+pub use pending::{PendingOperationResolution, PendingOperationState};
 pub use state::{
     versioned_cache_path, CloudConflictRecord, CloudItemState, CloudRootPersistentState,
     DurableInspectionSource,
@@ -332,6 +338,37 @@ impl CloudRootProbeHealth {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudTransferHealthState {
+    #[default]
+    NamespaceReady,
+    HydrationNotObserved,
+    TransferHealthy,
+    TransferDegraded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloudHydrationExecuteResult {
+    pub offset: i64,
+    pub length: i64,
+    pub completion_status: i32,
+    pub cf_execute_succeeded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloudHydrationTransferTelemetry {
+    pub requested_offset: i64,
+    pub requested_length: i64,
+    pub transferred_bytes: u64,
+    pub elapsed_millis: u64,
+    pub cancellation_observed: bool,
+    pub completed_at: DateTime<Utc>,
+    pub execute_results: Vec<CloudHydrationExecuteResult>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CloudRootProbeResult {
@@ -375,6 +412,9 @@ pub struct CloudRootOperationalHealth {
     pub last_hydration_success_at: Option<DateTime<Utc>>,
     pub hydration_failure: Option<String>,
     pub last_hydration_failure_at: Option<DateTime<Utc>>,
+    pub transfer_health_state: CloudTransferHealthState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hydration_transfer: Option<CloudHydrationTransferTelemetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistence_error: Option<String>,
     pub assessed_at: DateTime<Utc>,
@@ -466,6 +506,7 @@ struct RootHealthTelemetryState {
     last_hydration_success_at: Option<DateTime<Utc>>,
     hydration_failure: Option<String>,
     last_hydration_failure_at: Option<DateTime<Utc>>,
+    last_hydration_transfer: Option<CloudHydrationTransferTelemetry>,
     health_path: Option<PathBuf>,
     persistence_error: Option<String>,
 }
@@ -496,10 +537,6 @@ impl RootHealthTelemetryState {
             })
             .collect();
         self.active_probe = CloudRootProbeHealth::default();
-        self.hydration_success_observed = false;
-        self.last_hydration_success_at = None;
-        self.hydration_failure = None;
-        self.last_hydration_failure_at = None;
     }
 }
 
@@ -551,6 +588,7 @@ impl RootHealthTelemetry {
             last_hydration_success_at: None,
             hydration_failure: None,
             last_hydration_failure_at: None,
+            last_hydration_transfer: None,
             health_path: None,
             persistence_error: None,
         };
@@ -602,10 +640,11 @@ impl RootHealthTelemetry {
                 callbacks: BTreeMap::new(),
                 active_probe: CloudRootProbeHealth::default(),
                 next_observation_id: 0,
-                hydration_success_observed: false,
-                last_hydration_success_at: None,
-                hydration_failure: None,
-                last_hydration_failure_at: None,
+                hydration_success_observed: prior.hydration_success_observed,
+                last_hydration_success_at: prior.last_hydration_success_at,
+                hydration_failure: prior.hydration_failure,
+                last_hydration_failure_at: prior.last_hydration_failure_at,
+                last_hydration_transfer: prior.last_hydration_transfer,
                 health_path: Some(health_path),
                 persistence_error: None,
             },
@@ -640,6 +679,7 @@ impl RootHealthTelemetry {
                     last_hydration_success_at: None,
                     hydration_failure: None,
                     last_hydration_failure_at: None,
+                    last_hydration_transfer: None,
                     health_path: state.health_path.clone(),
                     persistence_error: None,
                 }
@@ -1112,6 +1152,25 @@ impl RootHealthTelemetry {
         .is_ok_and(|mutation| mutation.value.is_some())
     }
 
+    fn record_hydration_transfer(
+        &self,
+        generation: u64,
+        transfer: CloudHydrationTransferTelemetry,
+    ) -> Result<bool> {
+        let completed_at = transfer.completed_at;
+        let mutation = self.mutate_and_publish(completed_at, |state| {
+            if state.connection_generation != generation {
+                return Ok(None);
+            }
+            state.last_hydration_transfer = Some(transfer);
+            Ok(Some(()))
+        })?;
+        if let Some(error) = mutation.persistence_error {
+            return Err(error);
+        }
+        Ok(mutation.value.is_some())
+    }
+
     fn begin_active_probe(&self, now: DateTime<Utc>) -> Result<u64> {
         let mutation = self.mutate_and_publish(now, |state| {
             if state.lifecycle != CloudRootConnectionState::Running {
@@ -1279,6 +1338,16 @@ impl RootHealthTelemetry {
             unhealthy_evidence.push(format!("health snapshot persistence failed: {error}"));
         }
 
+        let transfer_health_state = if state.hydration_failure.is_some() {
+            CloudTransferHealthState::TransferDegraded
+        } else if state.hydration_success_observed {
+            CloudTransferHealthState::TransferHealthy
+        } else if state.active_probe.success_observed {
+            CloudTransferHealthState::HydrationNotObserved
+        } else {
+            CloudTransferHealthState::NamespaceReady
+        };
+
         CloudRootOperationalHealth {
             root_id: state.root_id,
             owner_instance_id: state.owner_instance_id,
@@ -1304,6 +1373,8 @@ impl RootHealthTelemetry {
             last_hydration_success_at: state.last_hydration_success_at,
             hydration_failure: state.hydration_failure.clone(),
             last_hydration_failure_at: state.last_hydration_failure_at,
+            transfer_health_state,
+            last_hydration_transfer: state.last_hydration_transfer.clone(),
             persistence_error: state.persistence_error.clone(),
             assessed_at: now,
             healthy: unhealthy_evidence.is_empty(),
@@ -1513,6 +1584,19 @@ enum CallbackOutcome {
 struct CallbackOutcomeAdapter;
 
 #[cfg(any(test, target_os = "windows"))]
+fn callback_status_is_cancelled(selected_status: i32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return selected_status == windows::Win32::Foundation::STATUS_CLOUD_FILE_REQUEST_ABORTED.0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = selected_status;
+        false
+    }
+}
+
+#[cfg(any(test, target_os = "windows"))]
 fn actionable_callback_handler_outcome(
     handler_failure: Option<String>,
     selected_status: i32,
@@ -1523,6 +1607,10 @@ fn actionable_callback_handler_outcome(
     // NT_SUCCESS treats every nonnegative NTSTATUS as success, including
     // informational statuses. Negative values are warnings/errors.
     if selected_status >= 0 {
+        Ok(())
+    } else if callback_status_is_cancelled(selected_status) {
+        // A caller closing the handle or cancelling a subrange is normal control
+        // flow. Keep it in hydration telemetry without degrading provider health.
         Ok(())
     } else {
         Err(format!(
@@ -1685,6 +1773,17 @@ impl CallbackHealthObservation {
             self.generation,
             self.observation_id,
             outcome,
+            finished_at,
+        );
+        self.finished = true;
+    }
+
+    fn finish_observed_at(mut self, finished_at: DateTime<Utc>) {
+        self.telemetry.finish_callback(
+            self.kind,
+            self.generation,
+            self.observation_id,
+            CallbackOutcome::Observed,
             finished_at,
         );
         self.finished = true;
@@ -1952,7 +2051,8 @@ fn write_json_file_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 const LEGACY_CLOUD_HEALTH_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
-const CLOUD_HEALTH_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+const LEGACY_CLOUD_HEALTH_SNAPSHOT_SCHEMA_VERSION_V2: u16 = 2;
+const CLOUD_HEALTH_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 const DEFAULT_HEALTH_HEARTBEAT_STALE_AFTER_MILLIS: u64 = 30_000;
 
 fn default_health_heartbeat_stale_after_millis() -> u64 {
@@ -2024,10 +2124,129 @@ impl From<LegacyPersistedRootOperationalHealthV1> for CloudRootOperationalHealth
             last_hydration_success_at: snapshot.last_hydration_success_at,
             hydration_failure: snapshot.hydration_failure,
             last_hydration_failure_at: snapshot.last_hydration_failure_at,
+            transfer_health_state: CloudTransferHealthState::NamespaceReady,
+            last_hydration_transfer: None,
             persistence_error: snapshot.persistence_error,
             assessed_at: snapshot.assessed_at,
             healthy: snapshot.healthy,
             unhealthy_evidence: snapshot.unhealthy_evidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedRootOperationalHealthV2 {
+    root_id: Uuid,
+    owner_instance_id: Uuid,
+    owner_process_id: u32,
+    connection_generation: u64,
+    snapshot_revision: u64,
+    lifecycle: CloudRootConnectionState,
+    lifecycle_changed_at: DateTime<Utc>,
+    last_start_attempt_at: Option<DateTime<Utc>>,
+    last_start_success_at: Option<DateTime<Utc>>,
+    last_start_failure_at: Option<DateTime<Utc>>,
+    last_start_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_disconnect_failure_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_disconnect_failure: Option<String>,
+    stop_count: u64,
+    last_stopped_at: Option<DateTime<Utc>>,
+    last_heartbeat_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_health_heartbeat_stale_after_millis")]
+    heartbeat_stale_after_millis: u64,
+    callback_health: Vec<CloudCallbackHealth>,
+    #[serde(default, skip_serializing_if = "CloudRootProbeHealth::is_empty")]
+    active_probe: CloudRootProbeHealth,
+    hydration_success_observed: bool,
+    last_hydration_success_at: Option<DateTime<Utc>>,
+    hydration_failure: Option<String>,
+    last_hydration_failure_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    persistence_error: Option<String>,
+    assessed_at: DateTime<Utc>,
+    healthy: bool,
+    unhealthy_evidence: Vec<String>,
+}
+
+impl From<LegacyPersistedRootOperationalHealthV2> for CloudRootOperationalHealth {
+    fn from(snapshot: LegacyPersistedRootOperationalHealthV2) -> Self {
+        let transfer_health_state = if snapshot.hydration_failure.is_some() {
+            CloudTransferHealthState::TransferDegraded
+        } else if snapshot.hydration_success_observed {
+            CloudTransferHealthState::TransferHealthy
+        } else if snapshot.active_probe.success_observed {
+            CloudTransferHealthState::HydrationNotObserved
+        } else {
+            CloudTransferHealthState::NamespaceReady
+        };
+        Self {
+            root_id: snapshot.root_id,
+            owner_instance_id: snapshot.owner_instance_id,
+            owner_process_id: snapshot.owner_process_id,
+            connection_generation: snapshot.connection_generation,
+            snapshot_revision: snapshot.snapshot_revision,
+            lifecycle: snapshot.lifecycle,
+            lifecycle_changed_at: snapshot.lifecycle_changed_at,
+            last_start_attempt_at: snapshot.last_start_attempt_at,
+            last_start_success_at: snapshot.last_start_success_at,
+            last_start_failure_at: snapshot.last_start_failure_at,
+            last_start_failure: snapshot.last_start_failure,
+            last_disconnect_failure_at: snapshot.last_disconnect_failure_at,
+            last_disconnect_failure: snapshot.last_disconnect_failure,
+            stop_count: snapshot.stop_count,
+            last_stopped_at: snapshot.last_stopped_at,
+            last_heartbeat_at: snapshot.last_heartbeat_at,
+            heartbeat_stale_after_millis: snapshot.heartbeat_stale_after_millis,
+            callback_health: snapshot.callback_health,
+            active_probe: snapshot.active_probe,
+            hydration_success_observed: snapshot.hydration_success_observed,
+            last_hydration_success_at: snapshot.last_hydration_success_at,
+            hydration_failure: snapshot.hydration_failure,
+            last_hydration_failure_at: snapshot.last_hydration_failure_at,
+            transfer_health_state,
+            last_hydration_transfer: None,
+            persistence_error: snapshot.persistence_error,
+            assessed_at: snapshot.assessed_at,
+            healthy: snapshot.healthy,
+            unhealthy_evidence: snapshot.unhealthy_evidence,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<&CloudRootOperationalHealth> for LegacyPersistedRootOperationalHealthV2 {
+    fn from(snapshot: &CloudRootOperationalHealth) -> Self {
+        Self {
+            root_id: snapshot.root_id,
+            owner_instance_id: snapshot.owner_instance_id,
+            owner_process_id: snapshot.owner_process_id,
+            connection_generation: snapshot.connection_generation,
+            snapshot_revision: snapshot.snapshot_revision,
+            lifecycle: snapshot.lifecycle,
+            lifecycle_changed_at: snapshot.lifecycle_changed_at,
+            last_start_attempt_at: snapshot.last_start_attempt_at,
+            last_start_success_at: snapshot.last_start_success_at,
+            last_start_failure_at: snapshot.last_start_failure_at,
+            last_start_failure: snapshot.last_start_failure.clone(),
+            last_disconnect_failure_at: snapshot.last_disconnect_failure_at,
+            last_disconnect_failure: snapshot.last_disconnect_failure.clone(),
+            stop_count: snapshot.stop_count,
+            last_stopped_at: snapshot.last_stopped_at,
+            last_heartbeat_at: snapshot.last_heartbeat_at,
+            heartbeat_stale_after_millis: snapshot.heartbeat_stale_after_millis,
+            callback_health: snapshot.callback_health.clone(),
+            active_probe: snapshot.active_probe.clone(),
+            hydration_success_observed: snapshot.hydration_success_observed,
+            last_hydration_success_at: snapshot.last_hydration_success_at,
+            hydration_failure: snapshot.hydration_failure.clone(),
+            last_hydration_failure_at: snapshot.last_hydration_failure_at,
+            persistence_error: snapshot.persistence_error.clone(),
+            assessed_at: snapshot.assessed_at,
+            healthy: snapshot.healthy,
+            unhealthy_evidence: snapshot.unhealthy_evidence.clone(),
         }
     }
 }
@@ -2040,6 +2259,16 @@ struct LegacyPersistedHealthSnapshotEnvelopeV1 {
     persisted_revision: u64,
     checksum_hex: String,
     snapshot: LegacyPersistedRootOperationalHealthV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedHealthSnapshotEnvelopeV2 {
+    schema_version: u16,
+    persisted_generation: u64,
+    persisted_revision: u64,
+    checksum_hex: String,
+    snapshot: LegacyPersistedRootOperationalHealthV2,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2065,6 +2294,15 @@ fn health_snapshot_checksum(snapshot: &CloudRootOperationalHealth) -> Result<Str
 
 fn legacy_health_snapshot_checksum(
     snapshot: &LegacyPersistedRootOperationalHealthV1,
+) -> Result<String> {
+    Ok(Sha256::digest(serde_json::to_vec(snapshot)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn legacy_health_snapshot_v2_checksum(
+    snapshot: &LegacyPersistedRootOperationalHealthV2,
 ) -> Result<String> {
     Ok(Sha256::digest(serde_json::to_vec(snapshot)?)
         .iter()
@@ -2100,7 +2338,7 @@ fn parse_health_snapshot_validated(
                 .is_none_or(|snapshot| !snapshot.contains_key("heartbeat_stale_after_millis"))
             {
                 return Err(CloudProviderError::Callback(
-                    "Cloud Files health v2 snapshot is missing heartbeat stale-after".into(),
+                    "Cloud Files health v3 snapshot is missing heartbeat stale-after".into(),
                 ));
             }
             let envelope: CloudHealthSnapshotEnvelope = serde_json::from_slice(data)?;
@@ -2115,6 +2353,20 @@ fn parse_health_snapshot_validated(
                 ));
             }
             envelope.snapshot
+        }
+        LEGACY_CLOUD_HEALTH_SNAPSHOT_SCHEMA_VERSION_V2 => {
+            let envelope: LegacyPersistedHealthSnapshotEnvelopeV2 = serde_json::from_slice(data)?;
+            if envelope.persisted_generation != envelope.snapshot.connection_generation
+                || envelope.persisted_revision != envelope.snapshot.snapshot_revision
+                || envelope.snapshot.root_id != expected_root_id
+                || legacy_health_snapshot_v2_checksum(&envelope.snapshot)? != envelope.checksum_hex
+            {
+                return Err(CloudProviderError::Callback(
+                    "Cloud Files v2 health snapshot checksum, owner root, generation, or revision mismatch"
+                        .into(),
+                ));
+            }
+            envelope.snapshot.into()
         }
         LEGACY_CLOUD_HEALTH_SNAPSHOT_SCHEMA_VERSION => {
             let envelope: LegacyPersistedHealthSnapshotEnvelopeV1 = serde_json::from_slice(data)?;
@@ -2498,6 +2750,19 @@ fn replace_file_durable(source: &Path, destination: &Path) -> Result<()> {
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
+    let source = fs::canonicalize(source)?;
+    let destination = fs::canonicalize(destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Destination has no parent",
+        )
+    })?)?
+    .join(destination.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Destination has no filename",
+        )
+    })?);
     let source = source
         .as_os_str()
         .encode_wide()
@@ -2539,15 +2804,75 @@ pub struct ProviderHostConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudRootRegistrationKind {
+    LegacyCfApi,
+    ShellIntegrated,
+}
+
+impl Default for CloudRootRegistrationKind {
+    fn default() -> Self {
+        Self::LegacyCfApi
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CloudRootRegistration {
     pub root_id: Uuid,
     pub sync_root_path: PathBuf,
     pub encrypted_root: PathBuf,
     pub display_name: String,
+    #[serde(default)]
+    pub registration_kind: CloudRootRegistrationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_sync_root_id: Option<String>,
 }
 
-const CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION: u16 = 1;
+impl CloudRootRegistration {
+    pub fn legacy_cfapi(
+        root_id: Uuid,
+        sync_root_path: PathBuf,
+        encrypted_root: PathBuf,
+        display_name: String,
+    ) -> Self {
+        Self {
+            root_id,
+            sync_root_path,
+            encrypted_root,
+            display_name,
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
+        }
+    }
+
+    pub fn shell_integrated(
+        root_id: Uuid,
+        sync_root_path: PathBuf,
+        encrypted_root: PathBuf,
+        display_name: String,
+    ) -> Result<Self> {
+        Ok(Self {
+            root_id,
+            sync_root_path,
+            encrypted_root,
+            display_name,
+            registration_kind: CloudRootRegistrationKind::ShellIntegrated,
+            shell_sync_root_id: Some(platform::current_user_shell_sync_root_id(root_id)?),
+        })
+    }
+}
+
+const CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION: u16 = 2;
+const LEGACY_CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Serialize)]
+struct LegacyCloudRootRegistrationV1<'a> {
+    root_id: Uuid,
+    sync_root_path: &'a Path,
+    encrypted_root: &'a Path,
+    display_name: &'a str,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2577,6 +2902,26 @@ fn registration_checksum(registration: &CloudRootRegistration, generation: u64) 
     .collect())
 }
 
+fn legacy_registration_checksum(
+    registration: &CloudRootRegistration,
+    generation: u64,
+) -> Result<String> {
+    let legacy = LegacyCloudRootRegistrationV1 {
+        root_id: registration.root_id,
+        sync_root_path: &registration.sync_root_path,
+        encrypted_root: &registration.encrypted_root,
+        display_name: &registration.display_name,
+    };
+    Ok(Sha256::digest(serde_json::to_vec(&(
+        LEGACY_CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION,
+        generation,
+        legacy,
+    ))?)
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect())
+}
+
 fn encode_registration(registration: &CloudRootRegistration, generation: u64) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(&CloudRootRegistrationEnvelope {
         schema_version: CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION,
@@ -2592,16 +2937,27 @@ fn parse_registration(
 ) -> Result<(CloudRootRegistration, u64, bool)> {
     match serde_json::from_slice::<CloudRootRegistrationEnvelope>(data) {
         Ok(envelope) => {
-            if envelope.schema_version != CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION
-                || envelope.registration.root_id != expected_root_id
-                || registration_checksum(&envelope.registration, envelope.generation)?
-                    != envelope.checksum_hex
-            {
+            let checksum_matches = match envelope.schema_version {
+                CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION => {
+                    registration_checksum(&envelope.registration, envelope.generation)?
+                        == envelope.checksum_hex
+                }
+                LEGACY_CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION => {
+                    legacy_registration_checksum(&envelope.registration, envelope.generation)?
+                        == envelope.checksum_hex
+                }
+                _ => false,
+            };
+            if envelope.registration.root_id != expected_root_id || !checksum_matches {
                 return Err(CloudProviderError::Callback(
                     "Cloud Files registration schema, root, or checksum mismatch".into(),
                 ));
             }
-            Ok((envelope.registration, envelope.generation, false))
+            Ok((
+                envelope.registration,
+                envelope.generation,
+                envelope.schema_version != CLOUD_ROOT_REGISTRATION_SCHEMA_VERSION,
+            ))
         }
         Err(envelope_error) => {
             let registration = serde_json::from_slice::<CloudRootRegistration>(data)
@@ -2832,6 +3188,18 @@ pub struct CloudMutationRecord {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub state: PendingOperationState,
+    #[serde(default)]
+    pub merged_records: u32,
+    #[serde(default)]
+    pub retry_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub committed_version: Option<ProviderContentVersion>,
+    #[serde(default)]
+    pub observed_local_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<hybridcipher_provider_core::ProviderFileErrorCode>,
 }
 
 impl CloudMutationRecord {
@@ -2857,8 +3225,43 @@ impl CloudMutationRecord {
             last_error: None,
             created_at: now,
             updated_at: now,
+            state: PendingOperationState::Ready,
+            merged_records: 0,
+            retry_after: None,
+            committed_version: None,
+            observed_local_state: None,
+            error_code: None,
         }
     }
+}
+
+fn same_pending_rename(left: &CloudMutationRecord, right: &CloudMutationRecord) -> bool {
+    left.kind == CloudMutationKind::Rename
+        && right.kind == CloudMutationKind::Rename
+        && left.root_id == right.root_id
+        && left.relative_path == right.relative_path
+        && left.target_relative_path == right.target_relative_path
+        && left.plaintext_path == right.plaintext_path
+        && left.target_plaintext_path == right.target_plaintext_path
+        && left.identity == right.identity
+        && left.expected_version == right.expected_version
+        && left
+            .committed_version
+            .as_ref()
+            .zip(right.committed_version.as_ref())
+            .is_none_or(|(a, b)| a == b)
+        && left
+            .identity
+            .as_ref()
+            .is_some_and(|id| id.file_id.is_some())
+}
+
+fn coalesce_matching_pending_renames(
+    records: &mut Vec<CloudMutationRecord>,
+    candidate: &CloudMutationRecord,
+) -> Option<Uuid> {
+    pending::compact(records);
+    pending::matching_operation(records, candidate).map(|index| records[index].id)
 }
 
 fn unsafe_replay_error(
@@ -3054,6 +3457,7 @@ fn replay_expected_version(
 #[cfg(any(test, target_os = "windows"))]
 struct StartupRecoveryActivity {
     state: AtomicU8,
+    changed: tokio::sync::Notify,
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -3063,10 +3467,12 @@ impl StartupRecoveryActivity {
 
     fn mark_running(&self) {
         self.state.store(Self::RUNNING, Ordering::Release);
+        self.changed.notify_waiters();
     }
 
     fn begin_shutdown(&self) {
         self.state.store(Self::SHUTTING_DOWN, Ordering::Release);
+        self.changed.notify_waiters();
     }
 
     fn ensure_wait_allowed(&self) -> Result<()> {
@@ -3082,6 +3488,21 @@ impl StartupRecoveryActivity {
             Ok(())
         } else {
             Err(CloudProviderError::StartupRecoveryUnavailable)
+        }
+    }
+
+    async fn wait_until_running(&self) -> Result<()> {
+        loop {
+            // Enable the waiter before observing the state so a transition cannot
+            // be lost between the state check and awaiting the notification.
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.state.load(Ordering::Acquire) {
+                Self::RUNNING => return Ok(()),
+                Self::SHUTTING_DOWN => return Err(CloudProviderError::StartupRecoveryUnavailable),
+                _ => notified.await,
+            }
         }
     }
 }
@@ -3129,7 +3550,7 @@ struct CloudMutationJournalEnvelope {
     journal: CloudMutationJournal,
 }
 
-const CLOUD_MUTATION_JOURNAL_SCHEMA_VERSION: u16 = 2;
+const CLOUD_MUTATION_JOURNAL_SCHEMA_VERSION: u16 = 3;
 
 fn mutation_journal_checksum(journal: &CloudMutationJournal) -> Result<String> {
     Ok(Sha256::digest(serde_json::to_vec(journal)?)
@@ -3139,6 +3560,9 @@ fn mutation_journal_checksum(journal: &CloudMutationJournal) -> Result<String> {
 }
 
 fn parse_checked_mutation_journal(data: &[u8], root_id: Uuid) -> Result<CloudMutationJournal> {
+    if serde_json::from_slice::<serde_json::Value>(data)?["schema_version"].as_u64() == Some(2) {
+        return journal_schema2::decode(data, root_id);
+    }
     let envelope: CloudMutationJournalEnvelope = serde_json::from_slice(data)?;
     if envelope.schema_version != CLOUD_MUTATION_JOURNAL_SCHEMA_VERSION
         || envelope.generation != envelope.journal.generation
@@ -3209,43 +3633,84 @@ fn inspect_mutation_journal_sources(
 /// Production callers must validate and hold the exact root writer lease before invoking this
 /// helper. Read-only status and health APIs use `inspect_mutation_journal_sources` instead.
 fn recover_mutation_journal_for_writer(path: &Path, root_id: Uuid) -> Result<CloudMutationJournal> {
-    if !path.exists() {
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("journal.json");
-        let backup_path = path.with_file_name(format!("{file_name}.bak"));
-        if backup_path.exists() {
-            let journal = parse_mutation_journal(&fs::read(&backup_path)?, root_id)?;
-            write_mutation_journal(path, &journal)?;
-            return Ok(journal);
-        }
+    let backup = path.with_file_name(format!(
+        "{}.bak",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("journal.json")
+    ));
+    if !path.exists() && !backup.exists() {
         return Ok(CloudMutationJournal::empty(root_id));
     }
-    match fs::read(path).and_then(|bytes| {
-        parse_mutation_journal(&bytes, root_id)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
-    }) {
-        Ok(journal) => Ok(journal),
-        Err(primary_error) => {
-            let file_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("journal.json");
-            let backup_path = path.with_file_name(format!("{file_name}.bak"));
-            let journal = parse_mutation_journal(&fs::read(&backup_path)?, root_id)?;
-            tracing::warn!(
-                "Recovered Cloud Files mutation journal {} from backup: {}",
-                path.display(),
-                primary_error
-            );
-            quarantine_corrupt_file(path)?;
-            write_mutation_journal(path, &journal)?;
-            Ok(journal)
+    let (mut journal, original, from_backup) = match inspect_mutation_journal_sources(path, root_id)
+    {
+        Ok(Some(value)) => {
+            let from_backup = value.source == DurableInspectionSource::Backup;
+            let bytes = fs::read(if from_backup { &backup } else { path })?;
+            (value.value, bytes, from_backup)
         }
+        _ => {
+            let primary = fs::read(path).ok().and_then(|bytes| {
+                parse_mutation_journal(&bytes, root_id)
+                    .ok()
+                    .map(|value| (value, bytes, false))
+            });
+            match primary {
+                Some(value) => value,
+                None => {
+                    let bytes = fs::read(&backup)?;
+                    (parse_mutation_journal(&bytes, root_id)?, bytes, true)
+                }
+            }
+        }
+    };
+    let old_sequence = journal.next_sequence;
+    journal.next_sequence = old_sequence.max(
+        journal
+            .records
+            .iter()
+            .map(|r| r.sequence)
+            .max()
+            .unwrap_or(0),
+    );
+    let migrated = serde_json::from_slice::<serde_json::Value>(&original)?["schema_version"]
+        .as_u64()
+        != Some(3);
+    let changed = pending::compact(&mut journal.records);
+    if migrated || changed || from_backup || old_sequence != journal.next_sequence {
+        let parent = fs::canonicalize(
+            path.parent()
+                .ok_or_else(|| CloudProviderError::InvalidPath("Journal has no parent".into()))?,
+        )?;
+        let snapshot = parent
+            .join(path.file_name().unwrap())
+            .with_extension(format!("recovery-{:x}.json", Sha256::digest(&original)));
+        // The root writer lease excludes competing migrations. Publish and flush
+        // the original snapshot before replacing any recoverable journal bytes.
+        if snapshot.exists() {
+            if fs::read(&snapshot)? != original {
+                return Err(CloudProviderError::Callback(
+                    "Journal recovery snapshot does not match its digest".into(),
+                ));
+            }
+        } else {
+            write_health_bytes_atomic(&snapshot, &original)?;
+        }
+        if from_backup
+            && path.exists()
+            && fs::read(path)
+                .ok()
+                .and_then(|bytes| parse_mutation_journal(&bytes, root_id).ok())
+                .is_none()
+        {
+            quarantine_corrupt_file(path)?;
+        }
+        journal.updated_at = Utc::now();
+        write_mutation_journal(path, &journal)?;
+        journal.generation = journal.generation.saturating_add(1);
     }
+    Ok(journal)
 }
-
 fn write_mutation_journal(path: &Path, journal: &CloudMutationJournal) -> Result<()> {
     let mut journal = journal.clone();
     journal.generation = journal.generation.saturating_add(1);
@@ -3368,7 +3833,16 @@ fn prepare_plaintext_cache_for_startup(paths: &CloudRuntimePaths) -> Result<()> 
         fs::remove_dir_all(&paths.cache_dir)?;
     }
     fs::create_dir_all(&paths.cache_dir)?;
+    platform::restrict_hydration_temp_directory(&paths.cache_dir)?;
     Ok(())
+}
+
+/// Removes every Explorer sync-root registration owned by HybridCipher for the current user.
+///
+/// This is intentionally independent of the durable per-root registry so uninstall can clean up
+/// an Explorer entry even when the application registry was damaged or already removed.
+pub fn unregister_all_hybridcipher_shell_roots() -> Result<usize> {
+    platform::unregister_all_shell_roots()
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -3390,9 +3864,9 @@ fn complete_callback_once<T, E>(
 }
 
 #[cfg(any(test, target_os = "windows"))]
-const MAX_HYDRATABLE_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const HYDRATION_TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(any(test, target_os = "windows"))]
-const MAX_HYDRATION_RANGE_BYTES: usize = 16 * 1024 * 1024;
+const HYDRATION_TRANSFER_ALIGNMENT_BYTES: usize = 4096;
 
 #[cfg(any(test, target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3407,21 +3881,16 @@ fn validate_hydration_request(
     offset: i64,
     requested_length: i64,
 ) -> Result<HydrationRequest> {
-    if logical_size > MAX_HYDRATABLE_FILE_BYTES {
-        return Err(CloudProviderError::Callback(format!(
-            "Cloud Files hydration is limited to {MAX_HYDRATABLE_FILE_BYTES} bytes per file"
-        )));
-    }
     let offset = u64::try_from(offset).map_err(|_| {
         CloudProviderError::Callback("Cloud Files hydration offset is negative".into())
     })?;
     let length = usize::try_from(requested_length).map_err(|_| {
         CloudProviderError::Callback("Cloud Files hydration length is negative or too large".into())
     })?;
-    if length == 0 || length > MAX_HYDRATION_RANGE_BYTES {
-        return Err(CloudProviderError::Callback(format!(
-            "Cloud Files hydration range must be between 1 and {MAX_HYDRATION_RANGE_BYTES} bytes"
-        )));
+    if length == 0 {
+        return Err(CloudProviderError::Callback(
+            "Cloud Files hydration range must be nonzero".into(),
+        ));
     }
     let end = offset.checked_add(length as u64).ok_or_else(|| {
         CloudProviderError::Callback("Cloud Files hydration range overflows".into())
@@ -3431,7 +3900,64 @@ fn validate_hydration_request(
             "Cloud Files hydration range {offset}..{end} exceeds logical file size {logical_size}"
         )));
     }
+    let alignment = HYDRATION_TRANSFER_ALIGNMENT_BYTES as u64;
+    if offset % alignment != 0 {
+        return Err(CloudProviderError::Callback(format!(
+            "Cloud Files hydration offset {offset} is not 4-KiB aligned"
+        )));
+    }
+    if end != logical_size && (length as u64) % alignment != 0 {
+        return Err(CloudProviderError::Callback(format!(
+            "Cloud Files hydration length {length} is not 4-KiB aligned and does not end at EOF"
+        )));
+    }
     Ok(HydrationRequest { offset, length })
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn hydration_completion_range(file_size: i64, offset: i64, length: i64) -> (i64, i64) {
+    let alignment = HYDRATION_TRANSFER_ALIGNMENT_BYTES as i64;
+    if offset >= 0
+        && length > 0
+        && offset < file_size.max(1)
+        && offset % alignment == 0
+        && offset
+            .checked_add(length)
+            .is_some_and(|end| length % alignment == 0 || end >= file_size.max(0))
+    {
+        return (offset, length);
+    }
+
+    // Malformed callback parameters still need a valid nonzero failure completion.
+    // Use the aligned page containing the requested offset, clamped to the file.
+    let safe_size = file_size.max(1);
+    let clamped_offset = offset.max(0).min(safe_size - 1);
+    let aligned_offset = clamped_offset - clamped_offset % alignment;
+    (aligned_offset, alignment)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn hydration_transfer_ranges(request: HydrationRequest) -> Result<Vec<HydrationRequest>> {
+    let mut ranges = Vec::new();
+    let mut offset = request.offset;
+    let mut remaining = request.length;
+    while remaining > 0 {
+        let mut length = remaining.min(HYDRATION_TRANSFER_CHUNK_BYTES);
+        if length < remaining {
+            length -= length % HYDRATION_TRANSFER_ALIGNMENT_BYTES;
+        }
+        if length == 0 {
+            return Err(CloudProviderError::Callback(
+                "Cloud Files hydration transfer could not make aligned progress".into(),
+            ));
+        }
+        ranges.push(HydrationRequest { offset, length });
+        offset = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| CloudProviderError::Callback("hydration range overflows".into()))?;
+        remaining -= length;
+    }
+    Ok(ranges)
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -3453,25 +3979,34 @@ struct HydrationCancellationEntry {
     transfer_key: i64,
     offset: i64,
     length: i64,
-    cancelled: Arc<AtomicBool>,
-    notify: Arc<tokio::sync::Notify>,
+    state: Arc<HydrationCancellationState>,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+struct HydrationCancellationState {
+    offset: i64,
+    length: i64,
+    cancelled_ranges: Mutex<Vec<(i64, i64)>>,
+    notify: tokio::sync::Notify,
 }
 
 #[cfg(any(test, target_os = "windows"))]
 struct HydrationCancellationToken {
     id: u64,
     registry: std::sync::Weak<HydrationCancellationRegistryInner>,
-    cancelled: Arc<AtomicBool>,
-    #[cfg(target_os = "windows")]
-    notify: Arc<tokio::sync::Notify>,
+    state: Arc<HydrationCancellationState>,
 }
 
 #[cfg(any(test, target_os = "windows"))]
 impl HydrationCancellationRegistry {
     fn register(&self, transfer_key: i64, offset: i64, length: i64) -> HydrationCancellationToken {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(HydrationCancellationState {
+            offset,
+            length,
+            cancelled_ranges: Mutex::new(Vec::new()),
+            notify: tokio::sync::Notify::new(),
+        });
         self.inner
             .active
             .lock()
@@ -3481,15 +4016,12 @@ impl HydrationCancellationRegistry {
                 transfer_key,
                 offset,
                 length,
-                cancelled: cancelled.clone(),
-                notify: notify.clone(),
+                state: state.clone(),
             });
         HydrationCancellationToken {
             id,
             registry: Arc::downgrade(&self.inner),
-            cancelled,
-            #[cfg(target_os = "windows")]
-            notify,
+            state,
         }
     }
 
@@ -3514,9 +4046,15 @@ impl HydrationCancellationRegistry {
                     .filter(|_| entry.offset >= 0 && entry.length > 0)
                     .is_some_and(|request_end| entry.offset < cancel_end && offset < request_end)
         }) {
-            if !entry.cancelled.swap(true, Ordering::AcqRel) {
+            let intersection_start = entry.offset.max(offset);
+            let request_end = entry.offset.saturating_add(entry.length);
+            let intersection_end = request_end.min(cancel_end);
+            if entry
+                .state
+                .record_cancelled_range(intersection_start, intersection_end)
+            {
                 cancelled_count += 1;
-                entry.notify.notify_waiters();
+                entry.state.notify.notify_waiters();
             }
         }
         cancelled_count
@@ -3535,23 +4073,78 @@ impl HydrationCancellationRegistry {
 #[cfg(any(test, target_os = "windows"))]
 impl HydrationCancellationToken {
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.state.is_fully_cancelled()
+    }
+
+    fn cancelled_ranges(&self, offset: i64, length: i64) -> Vec<(i64, i64)> {
+        self.state.cancelled_ranges(offset, length)
     }
 
     #[cfg(target_os = "windows")]
     async fn cancelled(&self) {
         loop {
-            let notified = self.notify.notified();
+            let notified = self.state.notify.notified();
             if self.is_cancelled() {
                 return;
             }
             notified.await;
         }
     }
+}
 
-    #[cfg(target_os = "windows")]
-    fn cancellation_signal(&self) -> Arc<AtomicBool> {
-        self.cancelled.clone()
+#[cfg(any(test, target_os = "windows"))]
+impl HydrationCancellationState {
+    fn record_cancelled_range(&self, start: i64, end: i64) -> bool {
+        if start < 0 || end <= start {
+            return false;
+        }
+        let mut ranges = self
+            .cancelled_ranges
+            .lock()
+            .expect("hydration cancellation range lock poisoned");
+        let before = ranges.clone();
+        ranges.push((start, end));
+        ranges.sort_unstable_by_key(|range| range.0);
+        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
+        for (range_start, range_end) in ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if range_start <= last.1 {
+                    last.1 = last.1.max(range_end);
+                    continue;
+                }
+            }
+            merged.push((range_start, range_end));
+        }
+        let changed = merged != before;
+        *ranges = merged;
+        changed
+    }
+
+    fn cancelled_ranges(&self, offset: i64, length: i64) -> Vec<(i64, i64)> {
+        let Some(end) = offset
+            .checked_add(length)
+            .filter(|_| offset >= 0 && length > 0)
+        else {
+            return Vec::new();
+        };
+        self.cancelled_ranges
+            .lock()
+            .expect("hydration cancellation range lock poisoned")
+            .iter()
+            .filter_map(|(start, range_end)| {
+                let clipped_start = (*start).max(offset);
+                let clipped_end = (*range_end).min(end);
+                (clipped_end > clipped_start).then_some((clipped_start, clipped_end))
+            })
+            .collect()
+    }
+
+    fn is_fully_cancelled(&self) -> bool {
+        self.cancelled_ranges(self.offset, self.length)
+            .first()
+            .is_some_and(|(start, end)| {
+                *start <= self.offset && *end >= self.offset.saturating_add(self.length)
+            })
     }
 }
 
@@ -3568,36 +4161,35 @@ impl Drop for HydrationCancellationToken {
 }
 
 #[cfg(any(test, target_os = "windows"))]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct HydrationWorkerGate {
-    active: Arc<AtomicBool>,
-}
-
-#[cfg(any(test, target_os = "windows"))]
-struct HydrationWorkerPermit {
-    active: Arc<AtomicBool>,
+    permits: Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(any(test, target_os = "windows"))]
 impl HydrationWorkerGate {
-    fn try_begin(&self) -> Result<HydrationWorkerPermit> {
-        self.active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                CloudProviderError::Callback(
-                    "a previous Cloud Files hydration worker is still cleaning up".into(),
-                )
-            })?;
-        Ok(HydrationWorkerPermit {
-            active: self.active.clone(),
+    async fn begin(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| CloudProviderError::Callback("hydration worker queue closed".into()))
+    }
+
+    #[cfg(test)]
+    fn try_begin(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.permits.clone().try_acquire_owned().map_err(|_| {
+            CloudProviderError::Callback("both Cloud Files hydration workers are active".into())
         })
     }
 }
 
 #[cfg(any(test, target_os = "windows"))]
-impl Drop for HydrationWorkerPermit {
-    fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
+impl Default for HydrationWorkerGate {
+    fn default() -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(2)),
+        }
     }
 }
 
@@ -3621,18 +4213,6 @@ impl HydrationTemporaryFile {
         self.path
             .as_deref()
             .expect("hydration temporary path consumed before publication")
-    }
-
-    fn publish_to(mut self, cache_path: &Path) -> Result<()> {
-        let temporary_path = self
-            .path
-            .take()
-            .expect("hydration temporary path consumed before publication");
-        if let Err(err) = fs::rename(&temporary_path, cache_path) {
-            self.path = Some(temporary_path);
-            return Err(err.into());
-        }
-        Ok(())
     }
 }
 
@@ -3879,6 +4459,12 @@ impl WindowsProjectedBridge {
 
 #[async_trait]
 impl ProviderBridge for WindowsProjectedBridge {
+    fn compatibility_status(&self) -> Option<VaultCompatibilityStatus> {
+        self.inner.compatibility_status()
+    }
+    fn set_legacy_compatibility(&self, enabled: bool) -> ProviderResult<VaultCompatibilityStatus> {
+        self.inner.set_legacy_compatibility(enabled)
+    }
     fn is_path_excluded(&self, encrypted_root: &Path, relative_path: &Path) -> bool {
         self.inner.is_path_excluded(encrypted_root, relative_path)
     }
@@ -3893,6 +4479,15 @@ impl ProviderBridge for WindowsProjectedBridge {
 
     async fn hydrate_file(&self, entry: &ProviderEntry) -> ProviderResult<Vec<u8>> {
         self.inner.hydrate_file(entry).await
+    }
+
+    async fn hydrate_file_range(
+        &self,
+        entry: &ProviderEntry,
+        offset: u64,
+        length: usize,
+    ) -> ProviderResult<zeroize::Zeroizing<Vec<u8>>> {
+        self.inner.hydrate_file_range(entry, offset, length).await
     }
 
     async fn hydrate_file_to_path(
@@ -4443,8 +5038,84 @@ impl CloudProviderHost {
         self.ensure_root_stopped(registration.root_id, "register")?;
         let paths = self.runtime_paths(registration.root_id)?;
         let writer = self.root_writer_access(registration.root_id, &paths)?;
-        platform::register_root(registration)?;
-        self.save_registration_locked(registration, writer.as_ref())?;
+        let mut registration = registration.clone();
+        if registration.registration_kind == CloudRootRegistrationKind::ShellIntegrated {
+            let duplicate_name = self.load_registrations()?.into_iter().any(|existing| {
+                existing.root_id != registration.root_id
+                    && existing.registration_kind == CloudRootRegistrationKind::ShellIntegrated
+                    && existing.display_name == registration.display_name
+            });
+            if duplicate_name {
+                let short = registration.root_id.simple().to_string();
+                registration.display_name =
+                    format!("{} ({})", registration.display_name, &short[..8]);
+            }
+        }
+        if let Some(existing) = self.load_registration(registration.root_id)? {
+            if existing.sync_root_path != registration.sync_root_path
+                || existing.encrypted_root != registration.encrypted_root
+            {
+                return Err(CloudProviderError::Callback(format!(
+                    "root {} is already registered with different source or mount paths",
+                    registration.root_id
+                )));
+            }
+            if existing.registration_kind == CloudRootRegistrationKind::LegacyCfApi
+                && registration.registration_kind == CloudRootRegistrationKind::ShellIntegrated
+            {
+                self.migrate_legacy_registration_to_shell(&existing)?;
+            }
+        }
+        platform::register_root(&registration)?;
+        self.save_registration_locked(&registration, writer.as_ref())?;
+        Ok(())
+    }
+
+    fn migrate_legacy_registration_to_shell(
+        &self,
+        registration: &CloudRootRegistration,
+    ) -> Result<()> {
+        let status = self.read_durable_runtime_status(registration.root_id).map_err(|error| {
+            CloudProviderError::Callback(format!(
+                "Cloud Files Explorer migration is deferred because safety state could not be verified: {error}"
+            ))
+        })?;
+        if !status.safe_to_unmount {
+            let detail = if status.unsafe_reasons.is_empty() {
+                "pending writeback or conflict work exists".to_string()
+            } else {
+                status
+                    .unsafe_reasons
+                    .iter()
+                    .take(3)
+                    .map(|reason| format!("{reason:?}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            return Err(CloudProviderError::Callback(format!(
+                "Cloud Files Explorer migration is deferred until the vault is safe: {detail}"
+            )));
+        }
+        let cleanup_filter = self.cleanup_path_filter(registration);
+        if registration.sync_root_path.exists() {
+            validate_dehydrate_summary(&platform::dehydrate_root_filtered(
+                &registration.sync_root_path,
+                cleanup_filter.as_ref(),
+            )?)?;
+            platform::verify_root_dehydrated_filtered(
+                &registration.sync_root_path,
+                cleanup_filter.as_ref(),
+            )?;
+            platform::clear_dehydrated_root_filtered(
+                &registration.sync_root_path,
+                cleanup_filter.as_ref(),
+            )?;
+        }
+        platform::unregister_registration(registration)?;
+        tracing::info!(
+            root_id = %registration.root_id,
+            "Migrated legacy CFAPI-only registration boundary; Shell registration will reuse the same path"
+        );
         Ok(())
     }
 
@@ -4457,7 +5128,7 @@ impl CloudProviderHost {
             self.ensure_root_stopped(registration.root_id, "unregister")?;
             let paths = self.runtime_paths(registration.root_id)?;
             let _writer = self.root_writer_access(registration.root_id, &paths)?;
-            return platform::unregister_root(sync_root_path);
+            return platform::unregister_registration(&registration);
         }
         platform::unregister_root(sync_root_path)
     }
@@ -4466,7 +5137,7 @@ impl CloudProviderHost {
         self.ensure_root_stopped(registration.root_id, "unregister")?;
         let paths = self.runtime_paths(registration.root_id)?;
         let _writer = self.root_writer_access(registration.root_id, &paths)?;
-        platform::unregister_root(&registration.sync_root_path)
+        platform::unregister_registration(registration)
     }
 
     pub fn unregister_domain_state(&self, root_id: Uuid) -> Result<()> {
@@ -4571,8 +5242,6 @@ impl CloudProviderHost {
                 &runtime_paths,
                 writer_lease.as_ref(),
             )?;
-            self.replay_pending_mutations(registration, bridge.clone(), &runtime_paths)
-                .await?;
             prepare_plaintext_cache_for_startup(&runtime_paths)?;
             let entries = bridge
                 .inventory(registration.root_id, &registration.encrypted_root)
@@ -4695,6 +5364,45 @@ impl CloudProviderHost {
             .await
     }
 
+    fn root_controls(&self, root_id: Uuid) -> Result<platform::CloudRootShutdownBarrier> {
+        self.connections
+            .lock()
+            .map_err(|_| CloudProviderError::Callback("connection registry lock poisoned".into()))?
+            .get(&root_id)
+            .map(CloudRootConnection::shutdown_barrier)
+            .ok_or_else(|| {
+                CloudProviderError::Callback(
+                    "Mount this folder to change its compatibility or resolve pending operations"
+                        .into(),
+                )
+            })
+    }
+
+    pub fn compatibility_status(&self, root_id: Uuid) -> Result<Option<VaultCompatibilityStatus>> {
+        Ok(self.root_controls(root_id)?.compatibility_status())
+    }
+
+    pub async fn set_legacy_compatibility(
+        &self,
+        root_id: Uuid,
+        enabled: bool,
+    ) -> Result<VaultCompatibilityStatus> {
+        self.root_controls(root_id)?
+            .set_legacy_compatibility(enabled)
+            .await
+    }
+
+    pub async fn resolve_pending_operation(
+        &self,
+        root_id: Uuid,
+        operation_id: Uuid,
+        action: PendingOperationResolution,
+    ) -> Result<()> {
+        self.root_controls(root_id)?
+            .resolve_pending(operation_id, action)
+            .await
+    }
+
     pub async fn probe_root(&self, root_id: Uuid) -> Result<CloudRootProbeResult> {
         if !self.is_root_running(root_id) {
             return Err(CloudProviderError::Callback(format!(
@@ -4784,6 +5492,26 @@ impl CloudProviderHost {
         Ok(())
     }
 
+    /// Disconnect without deleting recovery data, and wait for callback-owned
+    /// writer leases before allowing a replacement connection to start.
+    pub async fn stop_root_for_restart(&self, root_id: Uuid) -> Result<()> {
+        let writer = self
+            .connections
+            .lock()
+            .map_err(|_| CloudProviderError::Callback("connection registry lock poisoned".into()))?
+            .get(&root_id)
+            .map(|connection| connection.writer_lease.clone());
+        self.stop_root(root_id).await?;
+        if let Some(writer) = writer {
+            if !wait_for_writer_quiescence(&writer, Duration::from_secs(30)).await {
+                return Err(CloudProviderError::Callback(
+                    "disconnected provider still has active work; restart deferred until its writer lease is released".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn stop_root_safely(
         &self,
         root_id: Uuid,
@@ -4796,7 +5524,7 @@ impl CloudProviderHost {
         })?;
         let paths = self.runtime_paths(root_id)?;
         let _writer = self.root_writer_access(root_id, &paths)?;
-        let status = self.read_runtime_status(root_id)?;
+        let status = self.read_durable_runtime_status(root_id)?;
         if !status.safe_to_unmount {
             return Err(CloudProviderError::Callback(format!(
                 "Cloud Files root {root_id} has unresolved mutation or conflict state"
@@ -4824,7 +5552,7 @@ impl CloudProviderHost {
             // deliver and ACK NOTIFY_DEHYDRATE.
             barrier.begin().await?;
 
-            let drained_status = match self.read_runtime_status(root_id) {
+            let drained_status = match self.read_durable_runtime_status(root_id) {
                 Ok(status) => status,
                 Err(err) => {
                     barrier.resume();
@@ -4888,7 +5616,7 @@ impl CloudProviderHost {
         // Disconnect drains callback delivery. Recheck durable safety in case a
         // callback committed work between the optimistic check and shutdown.
         // Preserve all recovery artifacts if that narrow race occurred.
-        let drained_status = match self.read_runtime_status(root_id) {
+        let drained_status = match self.read_durable_runtime_status(root_id) {
             Ok(status) => status,
             Err(err) => {
                 return Ok(SafeRootStopOutcome::RecoveryPreserved {
@@ -4964,7 +5692,7 @@ impl CloudProviderHost {
                 reason: format!("dehydrated placeholder cleanup failed: {err}"),
             });
         }
-        if let Err(err) = platform::unregister_root(&registration.sync_root_path) {
+        if let Err(err) = platform::unregister_registration(&registration) {
             return Ok(SafeRootStopOutcome::RecoveryPreserved {
                 reason: format!("Cloud Files sync-root unregistration failed: {err}"),
             });
@@ -5016,7 +5744,7 @@ impl CloudProviderHost {
         if let Some(registration) = self.load_registration(root_id)? {
             #[cfg(target_os = "windows")]
             match fs::metadata(&registration.sync_root_path) {
-                Ok(_) => platform::unregister_root(&registration.sync_root_path)?,
+                Ok(_) => platform::unregister_registration(&registration)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -5088,7 +5816,7 @@ impl CloudProviderHost {
         root_id: Uuid,
         paths: &CloudRuntimePaths,
     ) -> Result<()> {
-        let status = self.read_runtime_status(root_id)?;
+        let status = self.read_durable_runtime_status(root_id)?;
         if !status.safe_to_unmount {
             return Err(CloudProviderError::Callback(format!(
                 "refusing to remove Cloud Files plaintext cache for unsafe root {root_id}"
@@ -5273,12 +6001,13 @@ impl CloudProviderHost {
         let conflict_count = state
             .as_ref()
             .map(|inspection| inspection.value.conflicts.len());
-        let safe_to_unmount = match (&journal, &state) {
-            (Some(journal), Some(state)) => {
-                state.value.safe_to_unmount(journal.value.records.len())
-            }
-            _ => false,
-        };
+        let safe_to_unmount = lifecycle_healthy
+            && match (&journal, &state) {
+                (Some(journal), Some(state)) => {
+                    state.value.safe_to_unmount(journal.value.records.len())
+                }
+                _ => false,
+            };
 
         Ok(CloudRootHealthResponse {
             root_id,
@@ -5310,6 +6039,20 @@ impl CloudProviderHost {
     }
 
     pub fn read_runtime_status(&self, root_id: Uuid) -> Result<MountSyncRuntimeStatus> {
+        let mut status = self.read_durable_runtime_status(root_id)?;
+        let health = self.check_root_health(root_id)?;
+        if !health.lifecycle_healthy {
+            status.safe_to_unmount = false;
+            status.last_error = Some(
+                "Cloud Files provider is disconnected or its heartbeat is stale; local changes may not have been scanned. Resume synchronization before unmounting.".into(),
+            );
+        }
+        Ok(status)
+    }
+
+    // Shutdown must recheck the journal after disconnect, when a live heartbeat
+    // is no longer expected. This is not a claim about unscanned local files.
+    fn read_durable_runtime_status(&self, root_id: Uuid) -> Result<MountSyncRuntimeStatus> {
         let paths = self.read_only_runtime_paths(root_id)?;
         let journal =
             inspect_mutation_journal_sources(&paths.journal_path, root_id)?.ok_or_else(|| {
@@ -5505,13 +6248,14 @@ impl CloudProviderHost {
     ) -> Result<()> {
         self.validate_root_writer_lease(root_id, paths, writer)?;
         match inspect_mutation_journal_sources(&paths.journal_path, root_id) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                recover_mutation_journal_for_writer(&paths.journal_path, root_id)?;
+            }
             Ok(None) => {
                 write_mutation_journal(&paths.journal_path, &CloudMutationJournal::empty(root_id))?;
             }
             Err(_) => {
-                let recovered = recover_mutation_journal_for_writer(&paths.journal_path, root_id)?;
-                write_mutation_journal(&paths.journal_path, &recovered)?;
+                recover_mutation_journal_for_writer(&paths.journal_path, root_id)?;
             }
         }
         let store = CloudStateStore::new(paths.state_path.clone(), root_id);
@@ -5527,106 +6271,6 @@ impl CloudProviderHost {
         journal: &CloudMutationJournal,
     ) -> Result<()> {
         write_mutation_journal(journal_path, journal)
-    }
-
-    async fn replay_pending_mutations(
-        &self,
-        registration: &CloudRootRegistration,
-        bridge: Arc<dyn ProviderBridge>,
-        paths: &CloudRuntimePaths,
-    ) -> Result<()> {
-        let mut journal = self.read_journal_from_path(registration.root_id, &paths.journal_path)?;
-        if journal.records.is_empty() {
-            return Ok(());
-        }
-
-        let mut retained = Vec::new();
-        for mut record in journal.records.into_iter() {
-            let precondition = replay_expected_version(&record, registration.root_id).and_then(
-                |expected_version| {
-                    validate_replay_plaintext_paths(&record, &registration.sync_root_path)?;
-                    Ok(expected_version)
-                },
-            );
-            let result = match precondition {
-                Err(err) => Err(err),
-                Ok(expected_version) => match record.kind {
-                    CloudMutationKind::Writeback => match record.plaintext_path.as_ref() {
-                        None => Err(CloudProviderError::Callback(
-                            "pending writeback is missing plaintext_path".to_string(),
-                        )),
-                        Some(path) if !path.exists() => Err(CloudProviderError::Callback(format!(
-                            "pending writeback source {} no longer exists",
-                            path.display()
-                        ))),
-                        Some(path) => bridge
-                            .writeback_file_checked(
-                                registration.root_id,
-                                &registration.encrypted_root,
-                                &record.relative_path,
-                                path,
-                                record.identity.as_ref(),
-                                &expected_version,
-                            )
-                            .await
-                            .map(|_| ())
-                            .map_err(CloudProviderError::from),
-                    },
-                    CloudMutationKind::Delete => match record.identity.as_ref() {
-                        None => Err(CloudProviderError::Callback(
-                            "pending delete is missing identity".to_string(),
-                        )),
-                        Some(identity) => bridge
-                            .delete_entry_checked(
-                                registration.root_id,
-                                &registration.encrypted_root,
-                                identity,
-                                &expected_version,
-                            )
-                            .await
-                            .map_err(CloudProviderError::from),
-                    },
-                    CloudMutationKind::Rename => match record.identity.as_ref() {
-                        None => Err(CloudProviderError::Callback(
-                            "pending rename is missing identity".to_string(),
-                        )),
-                        Some(identity) => match record.target_relative_path.as_deref() {
-                            None => Err(CloudProviderError::Callback(
-                                "pending rename is missing target_relative_path".to_string(),
-                            )),
-                            Some(target_relative) => bridge
-                                .rename_entry_checked(
-                                    registration.root_id,
-                                    &registration.encrypted_root,
-                                    identity,
-                                    target_relative,
-                                    record
-                                        .plaintext_path
-                                        .as_deref()
-                                        .or(record.target_plaintext_path.as_deref()),
-                                    &expected_version,
-                                )
-                                .await
-                                .map(|_| ())
-                                .map_err(CloudProviderError::from),
-                        },
-                    },
-                },
-            };
-
-            if let Err(err) = result {
-                record.attempts = record.attempts.saturating_add(1);
-                record.last_error = Some(err.to_string());
-                record.updated_at = Utc::now();
-                retained.push(record);
-            }
-        }
-
-        journal.records = retained;
-        journal.updated_at = Utc::now();
-        self.write_journal_to_path(&paths.journal_path, &journal)?;
-        self.write_runtime_status(registration.root_id, paths, None)?;
-        Ok(())
     }
 
     fn write_runtime_status(
@@ -5680,11 +6324,47 @@ impl CloudProviderHost {
         last_error: Option<String>,
     ) -> MountSyncRuntimeStatus {
         let pending = journal.records.len();
+        let mut operation_counts = BTreeMap::new();
+        let operations = journal
+            .records
+            .iter()
+            .map(|record| {
+                let kind = format!("{:?}", record.kind).to_lowercase();
+                *operation_counts.entry(kind.clone()).or_insert(0) += 1;
+                hybridcipher_provider_core::PendingOperationSummary {
+                    id: record.id,
+                    kind,
+                    source: record.relative_path.clone(),
+                    destination: record.target_relative_path.clone(),
+                    state: serde_json::to_value(record.state)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                    attempts: record.attempts,
+                    merged_records: record.merged_records,
+                    last_error: record.last_error.clone(),
+                    error_code: record.error_code,
+                }
+            })
+            .collect();
+        let affected_file_count = journal
+            .records
+            .iter()
+            .map(|r| {
+                r.identity
+                    .as_ref()
+                    .and_then(|id| id.file_id.clone())
+                    .unwrap_or_else(|| r.relative_path.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
         let sample_paths = journal
             .records
             .iter()
-            .take(3)
             .map(|record| record.relative_path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(3)
             .collect::<Vec<_>>();
         let oldest_age_ms = journal
             .records
@@ -5717,6 +6397,10 @@ impl CloudProviderHost {
         MountSyncRuntimeStatus {
             safe_to_unmount: pending == 0,
             pending_writeback_count: pending,
+            pending_operation_count: pending,
+            pending_operation_counts: operation_counts,
+            affected_file_count,
+            pending_operations: operations,
             pending_writeback_oldest_age_ms: oldest_age_ms,
             pending_writeback_paths: sample_paths,
             unsafe_reasons,
@@ -6012,6 +6696,8 @@ mod tests {
             sync_root_path: mount.clone(),
             encrypted_root: encrypted,
             display_name: "test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
 
         validate_sync_root_cleanup_target(&user_config, &registration).unwrap();
@@ -6338,6 +7024,8 @@ mod tests {
             sync_root_path: directory.join("sync"),
             encrypted_root: directory.join("encrypted"),
             display_name: "Operational Health Fixture".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         })
         .unwrap();
         let paths = host.runtime_paths(root_id).unwrap();
@@ -6449,8 +7137,21 @@ mod tests {
         .unwrap()
     }
 
+    fn legacy_health_snapshot_v2_bytes(snapshot: &CloudRootOperationalHealth) -> Vec<u8> {
+        let legacy = LegacyPersistedRootOperationalHealthV2::from(snapshot);
+        let checksum_hex = legacy_health_snapshot_v2_checksum(&legacy).unwrap();
+        serde_json::to_vec_pretty(&LegacyPersistedHealthSnapshotEnvelopeV2 {
+            schema_version: LEGACY_CLOUD_HEALTH_SNAPSHOT_SCHEMA_VERSION_V2,
+            persisted_generation: snapshot.connection_generation,
+            persisted_revision: snapshot.snapshot_revision,
+            checksum_hex,
+            snapshot: legacy,
+        })
+        .unwrap()
+    }
+
     #[test]
-    fn health_snapshot_legacy_v1_envelope_defaults_reassesses_and_rewrites_as_v2() {
+    fn health_snapshot_legacy_v1_envelope_defaults_reassesses_and_rewrites_as_v3() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("health.json");
         let (telemetry, _) = running_health_telemetry();
@@ -6475,7 +7176,7 @@ mod tests {
         next.snapshot_revision += 1;
         write_health_snapshot(&path, &next).unwrap();
         let current: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(current["schema_version"], serde_json::json!(2));
+        assert_eq!(current["schema_version"], serde_json::json!(3));
         assert_eq!(
             parse_health_snapshot_validated(&fs::read(&path).unwrap(), snapshot.root_id)
                 .unwrap()
@@ -6485,7 +7186,36 @@ mod tests {
     }
 
     #[test]
-    fn health_snapshot_v2_rejects_unknown_snapshot_fields_without_weakening_checksum() {
+    fn health_snapshot_legacy_v2_migrates_transfer_health_fields() {
+        let (telemetry, generation) = running_health_telemetry();
+        telemetry
+            .begin_callback(
+                generation,
+                CloudCallbackKind::FetchData,
+                health_test_time(4),
+                health_test_time(14),
+            )
+            .finish_at(Err("decrypt failed".into()), None, health_test_time(5));
+        let snapshot = telemetry.snapshot(health_test_time(6), Duration::from_secs(30));
+        let migrated = parse_health_snapshot_validated(
+            &legacy_health_snapshot_v2_bytes(&snapshot),
+            snapshot.root_id,
+        )
+        .unwrap();
+
+        assert_eq!(
+            migrated.transfer_health_state,
+            CloudTransferHealthState::TransferDegraded
+        );
+        assert_eq!(
+            migrated.hydration_failure.as_deref(),
+            Some("decrypt failed")
+        );
+        assert!(migrated.last_hydration_transfer.is_none());
+    }
+
+    #[test]
+    fn health_snapshot_v3_rejects_unknown_snapshot_fields_without_weakening_checksum() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("health.json");
         let (telemetry, _) = running_health_telemetry();
@@ -6500,7 +7230,7 @@ mod tests {
     }
 
     #[test]
-    fn health_snapshot_v2_rejects_unknown_callback_health_fields_with_original_checksum() {
+    fn health_snapshot_v3_rejects_unknown_callback_health_fields_with_original_checksum() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("health.json");
         let (telemetry, _) = running_health_telemetry();
@@ -6516,7 +7246,7 @@ mod tests {
     }
 
     #[test]
-    fn health_snapshot_v2_rejects_duplicate_envelope_fields() {
+    fn health_snapshot_v3_rejects_duplicate_envelope_fields() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("health.json");
         let (telemetry, _) = running_health_telemetry();
@@ -7735,7 +8465,7 @@ mod tests {
     }
 
     #[test]
-    fn root_health_new_connection_generation_clears_prior_failures() {
+    fn root_health_new_connection_generation_clears_callback_but_retains_hydration_failure() {
         let (telemetry, first_generation) = running_health_telemetry();
         telemetry
             .begin_callback(
@@ -7760,7 +8490,11 @@ mod tests {
             .callback_health
             .iter()
             .all(|callback| callback.failure_count == 0));
-        assert!(health.hydration_failure.is_none());
+        assert_eq!(health.hydration_failure.as_deref(), Some("decrypt failed"));
+        assert_eq!(
+            health.transfer_health_state,
+            CloudTransferHealthState::TransferDegraded
+        );
     }
 
     #[test]
@@ -8533,6 +9267,114 @@ mod tests {
     }
 
     #[test]
+    fn hydration_failure_and_transfer_telemetry_survive_provider_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_id = Uuid::new_v4();
+        let (first, generation, first_lease, _) = new_persisted_health(
+            temp.path(),
+            root_id,
+            Uuid::new_v4(),
+            4_242,
+            health_test_time(0),
+            Duration::from_secs(30),
+        );
+        first
+            .record_running(generation, health_test_time(1))
+            .unwrap();
+        first
+            .begin_callback(
+                generation,
+                CloudCallbackKind::FetchData,
+                health_test_time(2),
+                health_test_time(12),
+            )
+            .finish_at(
+                Err("authenticated decryption failed".into()),
+                None,
+                health_test_time(3),
+            );
+        first
+            .record_hydration_transfer(
+                generation,
+                CloudHydrationTransferTelemetry {
+                    requested_offset: 4096,
+                    requested_length: 8192,
+                    transferred_bytes: 0,
+                    elapsed_millis: 27,
+                    cancellation_observed: false,
+                    completed_at: health_test_time(3),
+                    execute_results: vec![CloudHydrationExecuteResult {
+                        offset: 4096,
+                        length: 8192,
+                        completion_status: -1,
+                        cf_execute_succeeded: true,
+                    }],
+                },
+            )
+            .unwrap();
+        drop(first);
+        drop(first_lease);
+
+        let (second, _, _second_lease, _) = new_persisted_health(
+            temp.path(),
+            root_id,
+            Uuid::new_v4(),
+            8_484,
+            health_test_time(4),
+            Duration::from_secs(30),
+        );
+        let health = second.snapshot(health_test_time(5), Duration::from_secs(30));
+
+        assert_eq!(
+            health.hydration_failure.as_deref(),
+            Some("authenticated decryption failed")
+        );
+        assert_eq!(
+            health.transfer_health_state,
+            CloudTransferHealthState::TransferDegraded
+        );
+        assert_eq!(
+            health
+                .last_hydration_transfer
+                .as_ref()
+                .map(|transfer| (transfer.requested_offset, transfer.requested_length)),
+            Some((4096, 8192))
+        );
+        assert_eq!(
+            health
+                .callback(CloudCallbackKind::FetchData)
+                .expect("new-generation callback health")
+                .attempt_count,
+            0
+        );
+    }
+
+    #[test]
+    fn caller_cancellation_is_neutral_hydration_health() {
+        let (telemetry, generation) = running_health_telemetry();
+        telemetry
+            .begin_callback(
+                generation,
+                CloudCallbackKind::FetchData,
+                health_test_time(4),
+                health_test_time(14),
+            )
+            .expect("begin cancelled callback observation")
+            .finish_observed_at(health_test_time(5));
+
+        let health = telemetry.snapshot(health_test_time(6), Duration::from_secs(30));
+        let callback = health
+            .callback(CloudCallbackKind::FetchData)
+            .expect("fetch-data health");
+        assert_eq!(callback.attempt_count, 1);
+        assert_eq!(callback.success_count, 0);
+        assert_eq!(callback.failure_count, 0);
+        assert!(!health.hydration_success_observed);
+        assert!(health.hydration_failure.is_none());
+        assert!(health.healthy);
+    }
+
+    #[test]
     fn callback_health_older_success_cannot_clear_newer_failure() {
         let (telemetry, generation) = running_health_telemetry();
         let older = telemetry.begin_callback(
@@ -8745,6 +9587,56 @@ mod tests {
     }
 
     #[test]
+    fn identical_pending_renames_are_coalesced_without_touching_other_mutations() {
+        let root_id = Uuid::new_v4();
+        let mut first = CloudMutationRecord::new(
+            CloudMutationKind::Rename,
+            root_id,
+            "docs/old.txt",
+            Some(test_identity(root_id)),
+        );
+        first.target_relative_path = Some("docs/new.txt".to_string());
+        first.target_plaintext_path = Some(PathBuf::from(r"C:\mount\docs\new.txt"));
+        let retained_id = first.id;
+
+        let mut duplicate = first.clone();
+        duplicate.id = Uuid::new_v4();
+        duplicate.sequence = 2;
+        duplicate.attempts = 4;
+        duplicate.last_error = Some("previous retry failed".to_string());
+        let mut unrelated = CloudMutationRecord::new(
+            CloudMutationKind::Delete,
+            root_id,
+            "docs/other.txt",
+            Some(FileIdentityV1::new(
+                root_id,
+                ProviderEntryKind::File,
+                "docs/other.txt",
+                Some("different-object".into()),
+                Some(1),
+            )),
+        );
+        unrelated.sequence = 3;
+        let candidate = first.clone();
+        let mut records = vec![first, duplicate, unrelated];
+
+        let existing = coalesce_matching_pending_renames(&mut records, &candidate);
+
+        assert_eq!(existing, Some(retained_id));
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| same_pending_rename(record, &candidate))
+                .count(),
+            1
+        );
+        assert!(records
+            .iter()
+            .any(|record| record.kind == CloudMutationKind::Delete));
+    }
+
+    #[test]
     fn state_parser_recovers_first_json_value_when_file_has_trailing_json() {
         let root_id = Uuid::new_v4();
         let mut first = CloudMutationJournal::empty(root_id);
@@ -8838,7 +9730,7 @@ mod tests {
 
         fs::write(&path, b"truncated").unwrap();
         let recovered = recover_mutation_journal_for_writer(&path, root_id).unwrap();
-        assert_eq!(recovered.generation, 1);
+        assert_eq!(recovered.generation, 2);
         assert!(recovered.records.is_empty());
         assert_eq!(
             recover_mutation_journal_for_writer(&path, root_id)
@@ -9723,6 +10615,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Upgrade Restore Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let paths = host.runtime_paths(root_id).unwrap();
         let legacy_id = Uuid::new_v4();
@@ -9774,6 +10668,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Cross-kind Restore Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let paths = host.runtime_paths(root_id).unwrap();
         CloudStateStore::new(paths.state_path.clone(), root_id)
@@ -9873,6 +10769,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn recovery_waits_for_callback_lease_longer_than_old_retry_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_id = Uuid::new_v4();
+        let path = temp.path().join("writer.lock");
+        let lease = Arc::new(RootWriterLease::acquire(root_id, &path).unwrap());
+        let callback_lease = lease.clone();
+        let callback = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            drop(callback_lease);
+        });
+        // The former three attempts finished after just 250 + 500 milliseconds.
+        assert!(!wait_for_writer_quiescence(&lease, Duration::from_millis(750)).await);
+        assert!(RootWriterLease::acquire(root_id, &path).is_err());
+        assert!(wait_for_writer_quiescence(&lease, Duration::from_secs(3)).await);
+        callback.await.unwrap();
+        drop(lease);
+        RootWriterLease::acquire(root_id, &path).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn shutdown_barrier_drains_active_work_before_rejecting_new_callbacks() {
         let activity = Arc::new(StartupRecoveryActivity::default());
         activity.mark_running();
@@ -9940,24 +10856,44 @@ mod tests {
     }
 
     #[test]
-    fn hydration_request_policy_accepts_bounded_ranges_and_rejects_unsafe_ones() {
-        let accepted = validate_hydration_request(1024, 128, 256).unwrap();
-        assert_eq!(accepted.offset, 128);
-        assert_eq!(accepted.length, 256);
+    fn hydration_request_policy_accepts_large_ranges_and_rejects_invalid_ones() {
+        let accepted = validate_hydration_request(8192, 4096, 4096).unwrap();
+        assert_eq!(accepted.offset, 4096);
+        assert_eq!(accepted.length, 4096);
+        let eof = validate_hydration_request(4097, 4096, 1).unwrap();
+        assert_eq!(eof.offset, 4096);
+        assert_eq!(eof.length, 1);
+
+        let large_length = (16 * 1024 * 1024) + 4097;
+        let large = validate_hydration_request(large_length as u64, 0, large_length as i64)
+            .expect("requests larger than the former 16 MiB cap must be accepted");
+        let transfers = hydration_transfer_ranges(large).unwrap();
+        assert!(transfers.len() > 4);
+        assert_eq!(
+            transfers.iter().map(|range| range.length).sum::<usize>(),
+            large_length
+        );
+        assert!(transfers[..transfers.len() - 1]
+            .iter()
+            .all(|range| range.length % HYDRATION_TRANSFER_ALIGNMENT_BYTES == 0));
 
         for (file_size, offset, length) in [
             (1024, -1, 1),
             (1024, 0, 0),
             (1024, 1000, 25),
+            (8192, 128, 4096),
+            (8192, 0, 4097),
             (1024, i64::MAX, 2),
-            (1024, 0, (16 * 1024 * 1024) + 1),
-            ((1024 * 1024 * 1024) + 1, 0, 1),
         ] {
             assert!(
                 validate_hydration_request(file_size, offset, length).is_err(),
                 "unsafe hydration request unexpectedly passed: size={file_size}, offset={offset}, length={length}"
             );
         }
+
+        assert_eq!(hydration_completion_range(8192, 4096, 4096), (4096, 4096));
+        assert_eq!(hydration_completion_range(1024, 128, 256), (0, 4096));
+        assert_eq!(hydration_completion_range(0, -1, 0), (0, 4096));
     }
 
     #[test]
@@ -9968,10 +10904,13 @@ mod tests {
         let other_transfer = registry.register(12, 100, 100);
 
         assert_eq!(registry.cancel_intersecting(11, 110, 10), 1);
-        assert!(first.is_cancelled());
+        assert!(!first.is_cancelled());
+        assert_eq!(first.cancelled_ranges(100, 100), vec![(110, 120)]);
         assert!(!same_transfer_other_range.is_cancelled());
         assert!(!other_transfer.is_cancelled());
         assert_eq!(registry.cancel_intersecting(11, 250, 10), 0);
+        assert_eq!(registry.cancel_intersecting(11, 100, 100), 1);
+        assert!(first.is_cancelled());
         assert_eq!(registry.cancel_intersecting(12, 90, 120), 1);
         assert!(other_transfer.is_cancelled());
         assert_eq!(registry.active_count(), 3);
@@ -9983,17 +10922,19 @@ mod tests {
     }
 
     #[test]
-    fn hydration_worker_gate_rejects_parallel_cache_misses_until_cleanup_finishes() {
+    fn hydration_worker_gate_allows_two_workers_and_bounds_the_queue() {
         let gate = HydrationWorkerGate::default();
         let first = gate.try_begin().unwrap();
+        let second = gate.try_begin().unwrap();
 
         assert!(gate.try_begin().is_err());
         drop(first);
         assert!(gate.try_begin().is_ok());
+        drop(second);
     }
 
     #[test]
-    fn hydration_temporary_file_is_removed_on_drop_or_published_atomically() {
+    fn hydration_temporary_file_is_always_removed_on_drop() {
         let temp = tempfile::tempdir().unwrap();
         let root_id = Uuid::new_v4();
         let lease =
@@ -10008,14 +10949,9 @@ mod tests {
         assert!(!abandoned_path.exists());
 
         let completed_path = temp.path().join("completed.plain.tmp");
-        let cache_path = temp.path().join("cache.plain");
         fs::write(&completed_path, b"plaintext").unwrap();
-        HydrationTemporaryFile::new(completed_path.clone(), lease)
-            .publish_to(&cache_path)
-            .unwrap();
-
+        drop(HydrationTemporaryFile::new(completed_path.clone(), lease));
         assert!(!completed_path.exists());
-        assert_eq!(fs::read(cache_path).unwrap(), b"plaintext");
     }
 
     #[test]
@@ -10090,6 +11026,44 @@ mod tests {
         assert!(error.contains("not accepting provider work"), "{error}");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn hydration_waiter_survives_startup_and_wakes_when_running() {
+        let activity = Arc::new(StartupRecoveryActivity::default());
+        let waiting_activity = activity.clone();
+        let waiter = tokio::spawn(async move { waiting_activity.wait_until_running().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        activity.mark_running();
+
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("startup waiter should wake")
+            .expect("startup waiter task should complete")
+            .expect("running transition should be accepted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hydration_waiter_wakes_with_error_when_startup_aborts() {
+        let activity = Arc::new(StartupRecoveryActivity::default());
+        let waiting_activity = activity.clone();
+        let waiter = tokio::spawn(async move { waiting_activity.wait_until_running().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        activity.begin_shutdown();
+
+        let error = tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("startup waiter should wake")
+            .expect("startup waiter task should complete")
+            .expect_err("aborted startup must reject hydration");
+        assert!(matches!(
+            error,
+            CloudProviderError::StartupRecoveryUnavailable
+        ));
+    }
+
     #[test]
     fn ingestion_scan_descends_through_placeholder_directories() {
         let temp = tempfile::tempdir().unwrap();
@@ -10145,6 +11119,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Recovery Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         host.save_registration(&registration).unwrap();
 
@@ -10197,6 +11173,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "New Root Failure Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         host.save_registration(&registration).unwrap();
         let paths = host.runtime_paths(root_id).unwrap();
@@ -10272,6 +11250,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Unconfirmed Disconnect Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         host.save_registration(&registration).unwrap();
         let paths = host.runtime_paths(root_id).unwrap();
@@ -10445,7 +11425,7 @@ mod tests {
         assert!(!health.lifecycle_healthy);
         assert!(!health.heartbeat_fresh);
         assert!(health.durable_state_readable);
-        assert!(health.safe_to_unmount);
+        assert!(!health.safe_to_unmount);
         assert!(health
             .unhealthy_evidence
             .iter()
@@ -10482,7 +11462,7 @@ mod tests {
     }
 
     #[test]
-    fn root_health_confirmed_stop_boundary_is_disconnected_and_safe() {
+    fn root_health_disconnected_cannot_certify_unscanned_local_files() {
         let temp = tempfile::tempdir().unwrap();
         let root_id = Uuid::new_v4();
         let (host, paths) = registered_health_fixture(temp.path(), root_id);
@@ -10499,6 +11479,7 @@ mod tests {
         .unwrap();
         telemetry.record_running(generation, Utc::now()).unwrap();
         telemetry.record_heartbeat(generation, Utc::now());
+        assert!(host.read_runtime_status(root_id).unwrap().safe_to_unmount);
         assert!(telemetry.record_shutting_down(generation, Utc::now()));
         assert!(telemetry.record_stopped(generation, Utc::now()));
 
@@ -10509,7 +11490,16 @@ mod tests {
             CloudRootConnectionState::Disconnected
         );
         assert!(!health.lifecycle_healthy);
-        assert!(health.safe_to_unmount);
+        assert!(!health.safe_to_unmount);
+        let status = host.read_runtime_status(root_id).unwrap();
+        assert!(!status.safe_to_unmount);
+        assert!(status.last_error.unwrap().contains("local changes"));
+        // Cleanup's journal check remains available after a confirmed disconnect.
+        assert!(
+            host.read_durable_runtime_status(root_id)
+                .unwrap()
+                .safe_to_unmount
+        );
     }
 
     #[test]
@@ -10595,6 +11585,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Health Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         host.save_registration(&registration).unwrap();
         let paths = host.runtime_paths(root_id).unwrap();
@@ -10723,6 +11715,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Corrupt Durable Test".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         })
         .unwrap();
         let paths = host.runtime_paths(root_id).unwrap();
@@ -10759,6 +11753,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Registration Backup Test".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         host.save_registration(&registration).unwrap();
         host.save_registration(&registration).unwrap();
@@ -10812,10 +11808,22 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Legacy Registration".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let path = host.root_state_path(root_id).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, serde_json::to_vec(&registration).unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "root_id": registration.root_id,
+                "sync_root_path": registration.sync_root_path,
+                "encrypted_root": registration.encrypted_root,
+                "display_name": registration.display_name,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         let legacy = host.inspect_registration(root_id).unwrap().unwrap();
         assert_eq!(legacy.generation, 0);
@@ -10841,6 +11849,30 @@ mod tests {
     }
 
     #[test]
+    fn shell_registration_schema_round_trips_stable_sync_root_id() {
+        let root_id = Uuid::new_v4();
+        let registration = CloudRootRegistration {
+            root_id,
+            sync_root_path: PathBuf::from(r"C:\HybridCipher\mount"),
+            encrypted_root: PathBuf::from(r"C:\HybridCipher\encrypted"),
+            display_name: "HybridCipher — Vault".into(),
+            registration_kind: CloudRootRegistrationKind::ShellIntegrated,
+            shell_sync_root_id: Some(format!("HybridCipher!S-1-5-21-test!{root_id}")),
+        };
+
+        let bytes = encode_registration(&registration, 7).unwrap();
+        let (decoded, generation, legacy) = parse_registration(&bytes, root_id).unwrap();
+
+        assert_eq!(decoded, registration);
+        assert_eq!(generation, 7);
+        assert!(!legacy);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["schema_version"],
+            serde_json::json!(2)
+        );
+    }
+
+    #[test]
     fn root_health_registration_listing_discovers_backup_only_without_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let root_id = Uuid::new_v4();
@@ -10853,6 +11885,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Backup-only Registration".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let primary = host.root_state_path(root_id).unwrap();
         let directory = primary.parent().unwrap();
@@ -10891,6 +11925,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Primary Registration".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let primary = host.root_state_path(root_id).unwrap();
         let backup = primary.with_file_name(format!("{root_id}.json.bak"));
@@ -10917,6 +11953,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Lease-bound Registration".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let paths = host.runtime_paths(root_id).unwrap();
         let registration_path = host.root_state_path(root_id).unwrap();
@@ -11048,7 +12086,7 @@ mod tests {
             .count();
 
         let status = host.read_runtime_status(root_id).unwrap();
-        assert!(status.safe_to_unmount);
+        assert!(!status.safe_to_unmount);
         assert_eq!(host.unsafe_pending_mutation_count(root_id).unwrap(), 0);
         for (path, (bytes, modified)) in sources.iter().zip(before) {
             assert_eq!(fs::read(path).unwrap(), bytes);
@@ -11133,6 +12171,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Newer Backup".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         host.save_registration(&registration).unwrap();
         host.save_registration(&registration).unwrap();
@@ -11163,6 +12203,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Forged Registration".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         })
         .unwrap();
         let path = host.root_state_path(root_id).unwrap();
@@ -11190,6 +12232,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Wrong Root".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         fs::write(&path, encode_registration(&other, 1).unwrap()).unwrap();
         assert!(host.inspect_registration(root_id).is_err());
@@ -11199,6 +12243,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Unknown Field".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         })
         .unwrap();
         legacy["unexpected"] = serde_json::json!(true);
@@ -11336,6 +12382,8 @@ mod tests {
             sync_root_path: temp.path().join("sync"),
             encrypted_root: temp.path().join("encrypted"),
             display_name: "Concurrent Registration".into(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         host.save_registration(&registration).unwrap();
         let writer = {
@@ -11430,6 +12478,8 @@ mod tests {
             sync_root_path: PathBuf::from("sync"),
             encrypted_root: PathBuf::from("encrypted"),
             display_name: "Reconciliation Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let old_entry = ProviderEntry::cache_file_with_identity(
             root_id,
@@ -11528,6 +12578,8 @@ mod tests {
             sync_root_path: PathBuf::from("sync"),
             encrypted_root: PathBuf::from("encrypted"),
             display_name: "Directory Upgrade Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let legacy_id = Uuid::new_v4();
         let legacy_entry = ProviderEntry::cache_directory(
@@ -11605,6 +12657,8 @@ mod tests {
             sync_root_path: PathBuf::from("sync"),
             encrypted_root: PathBuf::from("encrypted"),
             display_name: "Directory Rename Test".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
         };
         let old_entry = ProviderEntry::cache_directory_with_identity(
             root_id,
@@ -11964,11 +13018,13 @@ mod ipc {
 mod platform {
     use super::{
         actionable_callback_handler_outcome, begin_provider_shutdown_barrier,
-        complete_callback_once, drain_provider_background_tasks, plan_remote_reconciliation,
+        complete_callback_once, drain_provider_background_tasks, hydration_completion_range,
+        hydration_transfer_ranges, paths_equal_for_platform, plan_remote_reconciliation,
         startup_error_after_disconnect, validate_hydration_request, CallbackHealthObservation,
-        CloudCallbackKind, CloudMutationJournal, CloudMutationKind, CloudMutationRecord,
-        CloudObjectIdentityV2, CloudPlaceholderEntry, CloudProviderError, CloudProviderHost,
-        CloudProviderStatus, CloudRootProbeKind, CloudRootRegistration, CloudRootStartError,
+        CloudCallbackKind, CloudHydrationExecuteResult, CloudHydrationTransferTelemetry,
+        CloudMutationJournal, CloudMutationKind, CloudMutationRecord, CloudObjectIdentityV2,
+        CloudPlaceholderEntry, CloudProviderError, CloudProviderHost, CloudProviderStatus,
+        CloudRootProbeKind, CloudRootRegistration, CloudRootRegistrationKind, CloudRootStartError,
         CloudRootStartResult, CloudRuntimePaths, CloudStateStore, DehydrateRootSummary,
         ExpectedProviderVersion, HydrationCancellationRegistry, HydrationCancellationToken,
         HydrationTemporaryFile, HydrationWorkerGate, LocalRefreshDisposition,
@@ -11990,25 +13046,44 @@ mod platform {
         mem::size_of,
         os::windows::ffi::OsStrExt,
         os::windows::fs::MetadataExt,
+        panic::{catch_unwind, AssertUnwindSafe},
         path::{Component, Path, PathBuf},
         ptr::null,
-        sync::{atomic::Ordering, Arc, Mutex},
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
     use tokio::sync::Mutex as AsyncMutex;
     use uuid::Uuid;
-    use windows::core::{GUID, HRESULT, PCWSTR};
+    use windows::core::{GUID, HRESULT, HSTRING, PCWSTR, PWSTR};
+    use windows::ApplicationModel::Package;
+    use windows::Security::Cryptography::CryptographicBuffer;
+    use windows::Storage::Provider::{
+        StorageProviderHardlinkPolicy, StorageProviderHydrationPolicy,
+        StorageProviderHydrationPolicyModifier, StorageProviderInSyncPolicy,
+        StorageProviderPopulationPolicy, StorageProviderSyncRootInfo,
+        StorageProviderSyncRootManager,
+    };
+    use windows::Storage::StorageFolder;
     use windows::Win32::Foundation::{
-        FreeLibrary, ERROR_ALREADY_EXISTS, ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, HANDLE, NTSTATUS,
+        CloseHandle, FreeLibrary, LocalFree, ERROR_ALREADY_EXISTS,
+        ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, HANDLE, HLOCAL, NTSTATUS, RPC_E_CHANGED_MODE,
         STATUS_CLOUD_FILE_INVALID_REQUEST, STATUS_CLOUD_FILE_REQUEST_ABORTED,
         STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS, WIN32_ERROR,
+    };
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{
+        GetTokenInformation, SetFileSecurityW, TokenUser, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::Storage::CloudFilters::{
         CfCloseHandle, CfConnectSyncRoot, CfCreatePlaceholders, CfDehydratePlaceholder,
         CfDisconnectSyncRoot, CfExecute, CfGetPlaceholderInfo, CfGetWin32HandleFromProtectedHandle,
         CfOpenFileWithOplock, CfReferenceProtectedHandle, CfRegisterSyncRoot,
-        CfReleaseProtectedHandle, CfSetInSyncState, CfUnregisterSyncRoot, CfUpdatePlaceholder,
-        CfUpdateSyncProviderStatus, CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS,
+        CfReleaseProtectedHandle, CfSetInSyncState, CfSetPinState, CfUnregisterSyncRoot,
+        CfUpdatePlaceholder, CfUpdateSyncProviderStatus, CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS,
         CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
         CF_CALLBACK_TYPE_CANCEL_FETCH_PLACEHOLDERS, CF_CALLBACK_TYPE_FETCH_DATA,
         CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS, CF_CALLBACK_TYPE_NONE,
@@ -12030,7 +13105,8 @@ mod platform {
         CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
         CF_OPERATION_TYPE_ACK_DATA, CF_OPERATION_TYPE_ACK_DEHYDRATE, CF_OPERATION_TYPE_ACK_DELETE,
         CF_OPERATION_TYPE_TRANSFER_DATA, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS,
-        CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
+        CF_PIN_STATE_UNPINNED, CF_PLACEHOLDER_BASIC_INFO,
+        CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
         CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_FLAG_SUPERSEDE,
         CF_PLACEHOLDER_CREATE_INFO, CF_PLACEHOLDER_INFO_BASIC, CF_PLACEHOLDER_INFO_STANDARD,
         CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT, CF_PLACEHOLDER_MAX_FILE_IDENTITY_LENGTH,
@@ -12039,42 +13115,113 @@ mod platform {
         CF_PROVIDER_STATUS_POPULATE_CONTENT, CF_PROVIDER_STATUS_TERMINATED,
         CF_REGISTER_FLAG_DISABLE_ON_DEMAND_POPULATION_ON_ROOT,
         CF_REGISTER_FLAG_MARK_IN_SYNC_ON_ROOT, CF_REGISTER_FLAG_UPDATE, CF_SET_IN_SYNC_FLAG_NONE,
-        CF_SYNC_POLICIES, CF_SYNC_REGISTRATION, CF_UPDATE_FLAG_DEHYDRATE,
+        CF_SET_PIN_FLAG_NONE, CF_SYNC_POLICIES, CF_SYNC_REGISTRATION, CF_UPDATE_FLAG_DEHYDRATE,
         CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION, CF_UPDATE_FLAG_MARK_IN_SYNC,
         CF_UPDATE_FLAG_VERIFY_IN_SYNC,
     };
     use windows::Win32::Storage::FileSystem::{
         FileDispositionInfo, FileStandardInfo, GetFileInformationByHandleEx,
         SetFileInformationByHandle, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_STANDARD_INFO,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+        FILE_DISPOSITION_INFO, FILE_STANDARD_INFO,
     };
     use windows::Win32::System::LibraryLoader::LoadLibraryW;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
+    use zeroize::Zeroizing;
 
     const HYBRIDCIPHER_PROVIDER_ID: GUID = GUID::from_u128(0x9c9eb75e_7e0b_47f4_8f33_546c1a3a38c4);
+    const HYBRIDCIPHER_PACKAGE_NAME: &str = "HybridCipher.Desktop";
     const WINDOWS_TICKS_PER_SECOND: i64 = 10_000_000;
     const SECONDS_FROM_1601_TO_UNIX_EPOCH: i64 = 11_644_473_600;
     const HYDRATION_CALLBACK_TIMEOUT: Duration = Duration::from_secs(50);
 
+    struct WindowsRuntimeApartment {
+        uninitialize: bool,
+    }
+
+    impl WindowsRuntimeApartment {
+        fn initialize() -> Result<Self> {
+            match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+                Ok(()) => Ok(Self { uninitialize: true }),
+                Err(error) if error.code() == RPC_E_CHANGED_MODE => {
+                    // Tauri's UI thread is already an STA. WinRT is initialized
+                    // there, so these agile storage-provider APIs remain valid.
+                    Ok(Self {
+                        uninitialize: false,
+                    })
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+
+    impl Drop for WindowsRuntimeApartment {
+        fn drop(&mut self) {
+            if self.uninitialize {
+                unsafe { RoUninitialize() };
+            }
+        }
+    }
+
     struct FetchDataCompletion {
         status: NTSTATUS,
-        bytes: Vec<u8>,
-        offset: i64,
-        cancellation: Option<HydrationCancellationToken>,
+        file_unavailable: bool,
+        handler_error: Option<String>,
+        execute_error: Option<String>,
+        cancellation_observed: bool,
+        transferred_bytes: u64,
+        requested_offset: i64,
+        requested_length: i64,
+        execute_results: Vec<CloudHydrationExecuteResult>,
     }
 
-    enum HydrationWorkerFailure {
-        Cancelled,
-        Failed(String),
+    struct HydrationOutstandingRanges {
+        ranges: Vec<(i64, i64)>,
     }
 
-    impl FetchDataCompletion {
-        fn failure(status: NTSTATUS, offset: i64) -> Self {
+    #[derive(Default)]
+    struct HydrationTransferStats {
+        transferred_bytes: u64,
+        cancellation_observed: bool,
+        execute_results: Vec<CloudHydrationExecuteResult>,
+    }
+
+    impl HydrationOutstandingRanges {
+        fn new(offset: i64, length: i64) -> Self {
             Self {
-                status,
-                bytes: Vec::new(),
-                offset,
-                cancellation: None,
+                ranges: offset
+                    .checked_add(length)
+                    .filter(|_| offset >= 0 && length > 0)
+                    .map_or_else(Vec::new, |end| vec![(offset, end)]),
             }
+        }
+
+        fn complete(&mut self, offset: i64, length: i64) {
+            let Some(end) = offset
+                .checked_add(length)
+                .filter(|_| offset >= 0 && length > 0)
+            else {
+                return;
+            };
+            let mut remaining = Vec::new();
+            for (start, range_end) in self.ranges.drain(..) {
+                if end <= start || offset >= range_end {
+                    remaining.push((start, range_end));
+                    continue;
+                }
+                if offset > start {
+                    remaining.push((start, offset));
+                }
+                if end < range_end {
+                    remaining.push((end, range_end));
+                }
+            }
+            self.ranges = remaining;
+        }
+
+        fn ranges(&self) -> Vec<(i64, i64)> {
+            self.ranges.clone()
         }
     }
 
@@ -12096,7 +13243,236 @@ mod platform {
         }
     }
 
+    pub fn current_user_shell_sync_root_id(root_id: Uuid) -> Result<String> {
+        Ok(format!("HybridCipher!{}!{}", current_user_sid()?, root_id))
+    }
+
+    fn current_user_sid() -> Result<String> {
+        struct OwnedToken(HANDLE);
+        impl Drop for OwnedToken {
+            fn drop(&mut self) {
+                if !self.0.is_invalid() {
+                    let _ = unsafe { CloseHandle(self.0) };
+                }
+            }
+        }
+
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)? };
+        let token = OwnedToken(token);
+        let mut required = 0u32;
+        let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut required) };
+        if required < size_of::<TOKEN_USER>() as u32 {
+            return Err(CloudProviderError::Callback(
+                "Windows did not return a current-user token SID".into(),
+            ));
+        }
+        let word_size = size_of::<usize>();
+        let mut buffer = vec![0usize; (required as usize + word_size - 1) / word_size];
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast()),
+                required,
+                &mut required,
+            )?
+        };
+        let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let mut sid = PWSTR::null();
+        unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid)? };
+        let sid_string = unsafe { sid.to_string() }.map_err(|error| {
+            CloudProviderError::Callback(format!("Windows returned an invalid user SID: {error}"))
+        })?;
+        let _ = unsafe { LocalFree(Some(HLOCAL(sid.0.cast()))) };
+        Ok(sid_string)
+    }
+
+    pub fn restrict_hydration_temp_directory(path: &Path) -> Result<()> {
+        ensure_existing_dir(path, "hydration temporary directory")?;
+        let descriptor_text = format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)", current_user_sid()?);
+        let descriptor_wide = to_wide(OsStr::new(&descriptor_text));
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(descriptor_wide.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )?;
+        }
+        struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
+        impl Drop for OwnedSecurityDescriptor {
+            fn drop(&mut self) {
+                if !self.0 .0.is_null() {
+                    let _ = unsafe { LocalFree(Some(HLOCAL(self.0 .0))) };
+                }
+            }
+        }
+        let descriptor = OwnedSecurityDescriptor(descriptor);
+        let path_wide = to_wide(path.as_os_str());
+        unsafe {
+            SetFileSecurityW(
+                PCWSTR(path_wide.as_ptr()),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.0,
+            )
+            .ok()?;
+        }
+        Ok(())
+    }
+
+    pub fn unregister_all_shell_roots() -> Result<usize> {
+        let _apartment = WindowsRuntimeApartment::initialize()?;
+        if !StorageProviderSyncRootManager::IsSupported()? {
+            return Ok(0);
+        }
+        let prefix = format!("HybridCipher!{}!", current_user_sid()?);
+        let roots = StorageProviderSyncRootManager::GetCurrentSyncRoots()?;
+        let mut registrations = Vec::new();
+        for index in 0..roots.Size()? {
+            let root = roots.GetAt(index)?;
+            let id = root.Id()?.to_string_lossy();
+            let shell_integrated = id.starts_with(&prefix);
+            let legacy_hybridcipher = root
+                .ProviderId()
+                .is_ok_and(|provider_id| provider_id == HYBRIDCIPHER_PROVIDER_ID);
+            if shell_integrated || legacy_hybridcipher {
+                let path = PathBuf::from(root.Path()?.Path()?.to_string_lossy());
+                registrations.push((id, path, shell_integrated));
+            }
+        }
+        for (id, path, shell_integrated) in &registrations {
+            if path.exists() {
+                let summary = dehydrate_root(path)?;
+                if summary.failed_count > 0 {
+                    return Err(CloudProviderError::Callback(format!(
+                        "refusing to unregister Explorer sync root {id}: {} placeholder(s) could not be safely dehydrated",
+                        summary.failed_count
+                    )));
+                }
+                verify_root_dehydrated(path)?;
+                clear_dehydrated_root(path)?;
+            }
+            if *shell_integrated {
+                StorageProviderSyncRootManager::Unregister(&HSTRING::from(id))?;
+            } else {
+                unregister_root(path)?;
+            }
+            if path.exists() {
+                fs::remove_dir(path)?;
+            }
+        }
+        Ok(registrations.len())
+    }
+
     pub fn register_root(registration: &CloudRootRegistration) -> Result<()> {
+        match registration.registration_kind {
+            CloudRootRegistrationKind::ShellIntegrated => register_shell_root(registration),
+            CloudRootRegistrationKind::LegacyCfApi => register_cfapi_root(registration),
+        }
+    }
+
+    fn production_package_identity() -> Result<Package> {
+        let package = Package::Current().map_err(|error| {
+            CloudProviderError::Callback(format!(
+                "HybridCipher's Windows package identity is missing ({error}). Repair or reinstall HybridCipher before mounting this vault"
+            ))
+        })?;
+        let package_name = package.Id()?.Name()?.to_string_lossy();
+        if package_name != HYBRIDCIPHER_PACKAGE_NAME {
+            return Err(CloudProviderError::Callback(format!(
+                "HybridCipher's Windows package identity is '{package_name}', expected '{HYBRIDCIPHER_PACKAGE_NAME}'. Repair or reinstall HybridCipher"
+            )));
+        }
+        Ok(package)
+    }
+
+    fn register_shell_root(registration: &CloudRootRegistration) -> Result<()> {
+        let _apartment = WindowsRuntimeApartment::initialize()?;
+        ensure_absolute_or_create_root(&registration.sync_root_path)?;
+        ensure_existing_dir(&registration.encrypted_root, "encrypted root")?;
+        let package = production_package_identity()?;
+        if !StorageProviderSyncRootManager::IsSupported()? {
+            return Err(CloudProviderError::Callback(
+                "Windows Shell cloud-file registration is unavailable; HybridCipher requires Windows 10 build 19041 or newer"
+                    .into(),
+            ));
+        }
+        let expected_id = current_user_shell_sync_root_id(registration.root_id)?;
+        let sync_root_id = registration.shell_sync_root_id.as_deref().ok_or_else(|| {
+            CloudProviderError::Callback(
+                "Shell-integrated registration is missing its stable sync-root ID".into(),
+            )
+        })?;
+        if sync_root_id != expected_id {
+            return Err(CloudProviderError::Callback(format!(
+                "Shell sync-root ID does not match the current user and root UUID (expected {expected_id})"
+            )));
+        }
+
+        let id = HSTRING::from(sync_root_id);
+        if let Ok(existing) = StorageProviderSyncRootManager::GetSyncRootInformationForId(&id) {
+            let existing_path = existing.Path()?.Path()?.to_string_lossy();
+            if paths_equal_for_platform(Path::new(&existing_path), &registration.sync_root_path) {
+                tracing::info!(
+                    root_id = %registration.root_id,
+                    shell_sync_root_id = sync_root_id,
+                    "Reusing existing Windows Shell sync-root registration"
+                );
+                return Ok(());
+            }
+            return Err(CloudProviderError::Callback(format!(
+                "Windows Shell sync-root ID {sync_root_id} is already registered at {existing_path}"
+            )));
+        }
+
+        let path = HSTRING::from(registration.sync_root_path.to_string_lossy().as_ref());
+        let folder = StorageFolder::GetFolderFromPathAsync(&path)?.get()?;
+        let info = StorageProviderSyncRootInfo::new()?;
+        info.SetId(&id)?;
+        info.SetPath(&folder)?;
+        info.SetDisplayNameResource(&HSTRING::from(&registration.display_name))?;
+        let executable = std::env::current_exe()?;
+        info.SetIconResource(&HSTRING::from(format!("{},0", executable.display())))?;
+        info.SetProviderId(HYBRIDCIPHER_PROVIDER_ID)?;
+        info.SetHydrationPolicy(StorageProviderHydrationPolicy::Progressive)?;
+        info.SetHydrationPolicyModifier(
+            StorageProviderHydrationPolicyModifier::StreamingAllowed
+                | StorageProviderHydrationPolicyModifier::AutoDehydrationAllowed,
+        )?;
+        info.SetPopulationPolicy(StorageProviderPopulationPolicy::AlwaysFull)?;
+        info.SetInSyncPolicy(
+            StorageProviderInSyncPolicy::FileCreationTime
+                | StorageProviderInSyncPolicy::FileReadOnlyAttribute
+                | StorageProviderInSyncPolicy::FileHiddenAttribute
+                | StorageProviderInSyncPolicy::FileSystemAttribute
+                | StorageProviderInSyncPolicy::DirectoryCreationTime
+                | StorageProviderInSyncPolicy::DirectoryReadOnlyAttribute
+                | StorageProviderInSyncPolicy::DirectoryHiddenAttribute
+                | StorageProviderInSyncPolicy::DirectorySystemAttribute
+                | StorageProviderInSyncPolicy::FileLastWriteTime
+                | StorageProviderInSyncPolicy::DirectoryLastWriteTime,
+        )?;
+        info.SetHardlinkPolicy(StorageProviderHardlinkPolicy::None)?;
+        info.SetAllowPinning(true)?;
+        info.SetShowSiblingsAsGroup(false)?;
+        let package_version = package.Id()?.Version()?;
+        info.SetVersion(&HSTRING::from(format!(
+            "{}.{}.{}.{}",
+            package_version.Major,
+            package_version.Minor,
+            package_version.Build,
+            package_version.Revision
+        )))?;
+        info.SetContext(&CryptographicBuffer::CreateFromByteArray(
+            registration.root_id.as_bytes(),
+        )?)?;
+        StorageProviderSyncRootManager::Register(&info)?;
+        Ok(())
+    }
+
+    fn register_cfapi_root(registration: &CloudRootRegistration) -> Result<()> {
         ensure_absolute_or_create_root(&registration.sync_root_path)?;
         ensure_existing_dir(&registration.encrypted_root, "encrypted root")?;
 
@@ -12153,6 +13529,63 @@ mod platform {
             } else {
                 return Err(err.into());
             }
+        }
+        Ok(())
+    }
+
+    pub fn unregister_registration(registration: &CloudRootRegistration) -> Result<()> {
+        match registration.registration_kind {
+            CloudRootRegistrationKind::ShellIntegrated => {
+                let _apartment = WindowsRuntimeApartment::initialize()?;
+                let id = registration.shell_sync_root_id.as_deref().ok_or_else(|| {
+                    CloudProviderError::Callback(
+                        "Shell-integrated registration is missing its stable sync-root ID".into(),
+                    )
+                })?;
+                match StorageProviderSyncRootManager::Unregister(&HSTRING::from(id)) {
+                    Ok(()) => Ok(()),
+                    Err(_error)
+                        if StorageProviderSyncRootManager::GetSyncRootInformationForId(
+                            &HSTRING::from(id),
+                        )
+                        .is_err() =>
+                    {
+                        tracing::info!(
+                            shell_sync_root_id = id,
+                            "Shell sync root is already unregistered"
+                        );
+                        Ok(())
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            CloudRootRegistrationKind::LegacyCfApi => unregister_root(&registration.sync_root_path),
+        }
+    }
+
+    fn verify_registration(registration: &CloudRootRegistration) -> Result<()> {
+        if registration.registration_kind == CloudRootRegistrationKind::LegacyCfApi {
+            return Ok(());
+        }
+        let _apartment = WindowsRuntimeApartment::initialize()?;
+        let _ = production_package_identity()?;
+        let id = registration.shell_sync_root_id.as_deref().ok_or_else(|| {
+            CloudProviderError::Callback(
+                "Shell-integrated registration is missing its stable sync-root ID".into(),
+            )
+        })?;
+        let info = StorageProviderSyncRootManager::GetSyncRootInformationForId(&HSTRING::from(id))
+            .map_err(|error| {
+                CloudProviderError::Callback(format!(
+                    "Windows Shell sync-root registration {id} is missing ({error}). Repair the HybridCipher installation and remount the vault"
+                ))
+            })?;
+        let registered_path = info.Path()?.Path()?.to_string_lossy();
+        if !paths_equal_for_platform(Path::new(&registered_path), &registration.sync_root_path) {
+            return Err(CloudProviderError::Callback(format!(
+                "Windows Shell sync-root registration {id} points to {registered_path}, expected {}",
+                registration.sync_root_path.display()
+            )));
         }
         Ok(())
     }
@@ -12590,6 +14023,7 @@ mod platform {
     ) -> CloudRootStartResult<ConnectedCloudRoot> {
         ensure_existing_dir(&registration.sync_root_path, "sync root")?;
         ensure_existing_dir(&registration.encrypted_root, "encrypted root")?;
+        verify_registration(registration)?;
 
         let sync_root_path_wide = to_wide(registration.sync_root_path.as_os_str());
         let context = Arc::new(CallbackContext::new(
@@ -12642,6 +14076,12 @@ mod platform {
         };
         connected._watchers = watchers;
         connected.background_tasks = background_tasks;
+        // Recovery can require plaintext. The native provider must be connected first.
+        if let Err(err) = context.replay_pending_locked(false).await {
+            context.startup_activity.begin_shutdown();
+            drop(startup_gate);
+            return Err(cleanup_connected_startup_failure(&mut connected, &context, err).await);
+        }
         if let Err(err) = context.reconcile_remote_inventory_locked().await {
             let recovery_error = context.mark_startup_recovery_failed(&err).err();
             context.startup_activity.begin_shutdown();
@@ -12712,6 +14152,9 @@ mod platform {
     fn dehydrate_file(path: &Path) -> Result<()> {
         let guard = CloudFileOplock::acquire_exclusive(path)?;
         unsafe {
+            // Explicit eviction/unmount overrides an item's prior pin intent because
+            // Windows rejects dehydration while a placeholder remains pinned.
+            CfSetPinState(guard.0, CF_PIN_STATE_UNPINNED, CF_SET_PIN_FLAG_NONE, None)?;
             CfDehydratePlaceholder(guard.0, 0, -1, CF_DEHYDRATE_FLAG_NONE, None)?;
         }
         Ok(())
@@ -12956,6 +14399,43 @@ mod platform {
     }
 
     impl CloudRootShutdownBarrier {
+        pub fn compatibility_status(&self) -> Option<super::VaultCompatibilityStatus> {
+            self.context.bridge.compatibility_status()
+        }
+
+        pub async fn set_legacy_compatibility(
+            &self,
+            enabled: bool,
+        ) -> Result<super::VaultCompatibilityStatus> {
+            let _operation = self.context.operation_lock.lock().await;
+            self.context.startup_activity.ensure_running()?;
+            let status = self.context.bridge.set_legacy_compatibility(enabled)?;
+            if enabled {
+                let mut journal = self.context.read_journal()?;
+                for record in &mut journal.records {
+                    if record.error_code == Some(hybridcipher_provider_core::ProviderFileErrorCode::LegacyConsentRequired) || record
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("legacy") || e.contains("older file"))
+                    {
+                        record.state = super::PendingOperationState::Ready;
+                    }
+                }
+                self.context.write_journal(&journal)?;
+            }
+            Ok(status)
+        }
+
+        pub async fn resolve_pending(
+            &self,
+            id: Uuid,
+            action: super::PendingOperationResolution,
+        ) -> Result<()> {
+            let _operation = self.context.operation_lock.lock().await;
+            self.context.startup_activity.ensure_running()?;
+            self.context.resolve_pending_locked(id, action).await
+        }
+
         pub async fn begin(&self) -> Result<()> {
             begin_provider_shutdown_barrier(
                 &self.context.startup_activity,
@@ -12995,11 +14475,21 @@ mod platform {
             let Some(connection_key) = self.connection_key else {
                 return Ok(());
             };
-            self.backing
-                .as_ref()
-                .context
-                .startup_activity
-                .begin_shutdown();
+            // Drain work that already passed ensure_running before disconnecting.
+            // Merely setting begin_shutdown leaves close/writeback callbacks alive
+            // after native disconnect, still holding the exclusive writer lease.
+            let context = &self.backing.as_ref().context;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                begin_provider_shutdown_barrier(&context.startup_activity, &context.operation_lock),
+            )
+            .await
+            .map_err(|_| {
+                CloudProviderError::Callback(
+                    "active provider work did not drain before disconnect; connection retained"
+                        .into(),
+                )
+            })?;
             self._watchers.clear();
             drain_provider_background_tasks(&mut self.background_tasks, Duration::from_secs(2))
                 .await?;
@@ -13067,6 +14557,7 @@ mod platform {
         }
     }
 
+    include!("pending_native.rs");
     struct CallbackContext {
         registration: CloudRootRegistration,
         bridge: Arc<dyn ProviderBridge>,
@@ -13231,24 +14722,6 @@ mod platform {
             Ok(())
         }
 
-        fn cache_path_for_entry(
-            &self,
-            identity: &CloudObjectIdentityV2,
-            entry: &ProviderEntry,
-        ) -> Result<PathBuf> {
-            let version = entry.content_version().ok_or_else(|| {
-                CloudProviderError::Callback(format!(
-                    "file {} has no content version",
-                    entry.relative_path
-                ))
-            })?;
-            Ok(super::versioned_cache_path(
-                &self.runtime_paths.cache_dir,
-                identity,
-                &version,
-            ))
-        }
-
         fn remove_cache_for_identity(&self, identity: &CloudObjectIdentityV2) {
             let prefix = format!(
                 "{}-",
@@ -13359,6 +14832,19 @@ mod platform {
 
         fn add_pending_mutation(&self, mut record: CloudMutationRecord) -> Result<Uuid> {
             let mut journal = self.read_journal()?;
+            if record.kind == CloudMutationKind::Rename {
+                let previous_len = journal.records.len();
+                if let Some(id) =
+                    super::coalesce_matching_pending_renames(&mut journal.records, &record)
+                {
+                    if journal.records.len() != previous_len {
+                        journal.updated_at = Utc::now();
+                        self.write_journal(&journal)?;
+                        self.write_runtime_status(None)?;
+                    }
+                    return Ok(id);
+                }
+            }
             record.updated_at = Utc::now();
             journal.next_sequence = journal.next_sequence.saturating_add(1);
             record.sequence = journal.next_sequence;
@@ -13449,7 +14935,6 @@ mod platform {
                         inventory.insert(object_id, entry);
                     }
                 }
-                self.prune_stale_cache_versions()?;
                 Ok(())
             }
             .await;
@@ -13523,6 +15008,7 @@ mod platform {
         }
 
         async fn ingest_local_tree_locked(&self) -> Result<()> {
+            self.replay_pending_locked(false).await?;
             let paths = self.collect_local_mutation_paths()?;
             let mut recovery_errors = Vec::new();
             for path in paths {
@@ -13544,12 +15030,19 @@ mod platform {
                     continue;
                 }
 
+                if self.read_journal()?.records.iter().any(|r| {
+                    r.kind == CloudMutationKind::Writeback && r.relative_path == relative_path
+                }) {
+                    continue;
+                }
                 if let Some(identity) = self.known_local_placeholder_identity(&path)? {
-                    if self
+                    match self
                         .ingest_local_placeholder_rename(&path, &relative_path, identity)
-                        .await?
+                        .await
                     {
-                        continue;
+                        Ok(true) => continue,
+                        Err(error) => return Err(error), // inability to retain durable work is a root failure
+                        Ok(false) => (),
                     }
                 }
 
@@ -13653,6 +15146,13 @@ mod platform {
                                 err
                             );
                             recovery_errors.push(format!("{relative_path}: {err}"));
+                            self.retain_failed_write(
+                                &path,
+                                &relative_path,
+                                Some(existing_entry.identity.clone()),
+                                &expected_version,
+                                err,
+                            )?;
                         }
                     }
                     drop(ingestion_guard);
@@ -13757,6 +15257,17 @@ mod platform {
                             err
                         );
                         recovery_errors.push(format!("{relative_path}: {err}"));
+                        if path.is_file() {
+                            self.retain_failed_write(
+                                &path,
+                                &relative_path,
+                                None,
+                                &ExpectedProviderVersion::Absent,
+                                err,
+                            )?;
+                        } else {
+                            return Err(err);
+                        }
                     }
                 }
                 drop(ingestion_guard);
@@ -13769,8 +15280,7 @@ mod platform {
                     recovery_errors.len(),
                     recovery_errors.join("; ")
                 );
-                self.write_runtime_status(Some(message.clone()))?;
-                Err(CloudProviderError::Callback(message))
+                self.write_runtime_status(Some(message))
             }
         }
 
@@ -13886,113 +15396,25 @@ mod platform {
             );
             record.target_relative_path = Some(target_relative_path.to_string());
             if identity.kind == ProviderEntryKind::File {
-                record.target_plaintext_path = Some(path.to_path_buf());
+                record.target_plaintext_path = Some(path.to_owned());
             }
-            record.expected_version = match &expected_version {
-                ExpectedProviderVersion::Exact(version) => Some(version.clone()),
-                ExpectedProviderVersion::Unchecked | ExpectedProviderVersion::Absent => None,
+            record.expected_version = match expected_version {
+                ExpectedProviderVersion::Exact(version) => Some(version),
+                _ => None,
             };
             let mutation_id = self.add_pending_mutation(record)?;
-
-            match self
-                .bridge
-                .rename_entry_checked(
-                    self.registration.root_id,
-                    &self.registration.encrypted_root,
-                    &existing_entry.identity,
-                    target_relative_path,
-                    (identity.kind == ProviderEntryKind::File).then_some(path),
-                    &expected_version,
-                )
-                .await
-            {
-                Ok(Some(entry)) => {
-                    self.remove_identity(&identity)?;
-                    let committed_entry = entry.clone();
-                    let committed_identity = self.upsert_committed_entry(entry)?;
-                    if let Err(err) = apply_local_placeholder_commit(
-                        &self.registration.sync_root_path,
-                        path,
-                        &committed_entry,
-                        &committed_identity,
-                        None,
-                    ) {
-                        tracing::debug!(
-                            "Could not refresh locally renamed placeholder identity for {}: {}",
-                            target_relative_path,
-                            err
-                        );
-                    }
-                    self.clear_pending_mutation(mutation_id)?;
-                    Ok(true)
-                }
-                Ok(None) => {
-                    if identity.kind == ProviderEntryKind::Directory {
-                        self.state_store.transaction(|state| {
-                            state.migrate_directory_path(
-                                &current_item.relative_path,
-                                target_relative_path,
-                            )
-                        })?;
-                        let mut inventory = self.inventory_by_object_id.lock().map_err(|_| {
-                            CloudProviderError::Callback("provider inventory lock poisoned".into())
-                        })?;
-                        if let Some(current) = inventory.get_mut(&identity.object_id) {
-                            current.relative_path = target_relative_path.to_string();
-                            current.encrypted_path = self
-                                .registration
-                                .encrypted_root
-                                .join(target_relative_path.replace('/', "\\"));
-                            current.identity = FileIdentityV1::new(
-                                self.registration.root_id,
-                                current.kind,
-                                target_relative_path,
-                                current.identity.file_id.clone(),
-                                current.identity.epoch_id,
-                            );
-                        }
-                        if let Err(err) = CloudFileOplock::acquire_exclusive(path)
-                            .and_then(|placeholder| placeholder.mark_in_sync())
-                        {
-                            tracing::debug!(
-                                "Could not mark locally renamed directory placeholder in-sync for {}: {}",
-                                target_relative_path,
-                                err
-                            );
-                        }
-                    }
-                    self.clear_pending_mutation(mutation_id)?;
-                    Ok(true)
-                }
-                Err(err @ ProviderCoreError::ContentConflict { .. }) => {
-                    if let ProviderCoreError::ContentConflict {
-                        expected, actual, ..
-                    } = &err
-                    {
-                        self.record_conflict(
-                            &identity,
-                            &current_item.relative_path,
-                            Some(path.to_path_buf()),
-                            expected.clone(),
-                            actual.clone(),
-                        )?;
-                    }
-                    self.mark_pending_mutation_error(mutation_id, &err.to_string())?;
-                    Err(err.into())
-                }
-                Err(err) => {
-                    self.mark_pending_mutation_error(mutation_id, &err.to_string())?;
-                    tracing::warn!(
-                        "Cloud Files local rename ingestion failed for {} -> {}: {}",
-                        current_item.relative_path,
-                        target_relative_path,
-                        err
-                    );
-                    Err(err.into())
-                }
+            let record = self
+                .read_journal()?
+                .records
+                .into_iter()
+                .find(|r| r.id == mutation_id)
+                .ok_or_else(|| CloudProviderError::Callback("Pending rename disappeared".into()))?;
+            if super::pending::ready(&record) {
+                let result = self.execute_pending_rename(&record, false).await;
+                self.finish_pending_attempt(mutation_id, result)?;
             }
+            Ok(true)
         }
-
         fn remove_local_path_for_remote_delete(
             &self,
             relative_path: &str,
@@ -14043,33 +15465,6 @@ mod platform {
                 .lock()
                 .map_err(|_| CloudProviderError::Callback("suppression lock poisoned".into()))?
                 .contains(&normalize_relative_path(relative_path)))
-        }
-
-        fn prune_stale_cache_versions(&self) -> Result<()> {
-            if !self.runtime_paths.cache_dir.exists() {
-                return Ok(());
-            }
-            let state = self.state_store.load()?;
-            let live = state
-                .items
-                .values()
-                .filter_map(|item| {
-                    item.content_version.as_ref().map(|version| {
-                        super::versioned_cache_path(
-                            &self.runtime_paths.cache_dir,
-                            &item.identity,
-                            version,
-                        )
-                    })
-                })
-                .collect::<std::collections::HashSet<_>>();
-            for entry in fs::read_dir(&self.runtime_paths.cache_dir)? {
-                let path = entry?.path();
-                if path.is_file() && !live.contains(&path) {
-                    fs::remove_file(path)?;
-                }
-            }
-            Ok(())
         }
     }
 
@@ -14503,82 +15898,105 @@ mod platform {
             return;
         }
         let info = unsafe { &*callback_info };
+        let started_at = Instant::now();
         let deadline = Instant::now() + HYDRATION_CALLBACK_TIMEOUT;
-        let offset = if callback_parameters.is_null() {
-            0
-        } else {
-            unsafe {
-                (*callback_parameters)
-                    .Anonymous
-                    .FetchData
-                    .RequiredFileOffset
-                    .max(0)
-            }
-        };
         let context = unsafe { callback_context(info) };
         let observation = context.as_ref().and_then(|context| {
             context
                 .begin_health_observation(CloudCallbackKind::FetchData, HYDRATION_CALLBACK_TIMEOUT)
                 .ok()
         });
-        let result = unsafe {
-            context
-                .as_ref()
-                .ok_or_else(|| {
-                    CloudProviderError::Callback("callback context is unavailable".into())
-                })
-                .and_then(|context| context.handle_fetch_data(info, callback_parameters, deadline))
+        let completion = if let Some(context) = context.as_ref() {
+            unsafe { context.handle_fetch_data(info, callback_parameters, deadline) }
+        } else {
+            let (requested_offset, requested_length) = if callback_parameters.is_null() {
+                (0, 0)
+            } else {
+                let params = unsafe { (*callback_parameters).Anonymous.FetchData };
+                (params.RequiredFileOffset, params.RequiredLength)
+            };
+            let (completion_offset, completion_length) =
+                hydration_completion_range(info.FileSize, requested_offset, requested_length);
+            let mut execute_results = Vec::new();
+            let execute_error = unsafe {
+                execute_transfer_data_recorded(
+                    info,
+                    STATUS_CLOUD_FILE_UNSUCCESSFUL,
+                    &[],
+                    completion_offset,
+                    completion_length,
+                    &mut execute_results,
+                )
+                .err()
+                .map(|error| error.to_string())
+            };
+            FetchDataCompletion {
+                status: STATUS_CLOUD_FILE_UNSUCCESSFUL,
+                file_unavailable: false,
+                handler_error: Some("callback context is unavailable".to_string()),
+                execute_error,
+                cancellation_observed: false,
+                transferred_bytes: 0,
+                requested_offset,
+                requested_length,
+                execute_results,
+            }
         };
-        let failure_status = result
-            .as_ref()
-            .err()
-            .map(hydration_error_status)
-            .unwrap_or(STATUS_CLOUD_FILE_UNSUCCESSFUL);
-        let mut execute_error = None;
-        let mut selected_status = failure_status.0;
-        let handler_error = complete_callback_once(
-            result,
-            FetchDataCompletion::failure(failure_status, offset),
-            |mut completion| {
-                if completion
-                    .cancellation
-                    .as_ref()
-                    .is_some_and(HydrationCancellationToken::is_cancelled)
-                {
-                    completion.status = STATUS_CLOUD_FILE_REQUEST_ABORTED;
-                    completion.bytes.clear();
-                }
-                selected_status = completion.status.0;
-                execute_error = unsafe {
-                    execute_transfer_data(
-                        info,
-                        completion.status,
-                        &completion.bytes,
-                        completion.offset,
-                    )
-                    .err()
-                };
-            },
-        );
-        if let Some(err) = &handler_error {
+        if let Some(err) = &completion.handler_error {
             tracing::warn!("Cloud Files hydration callback failed: {err}");
         }
-        if let Some(err) = &execute_error {
+        if let Some(err) = &completion.execute_error {
             tracing::warn!("Cloud Files hydration completion failed: {err}");
         }
-        if let Some(observation) = observation {
-            observation.finish_at(
-                actionable_callback_handler_outcome(
-                    handler_error.as_ref().map(ToString::to_string),
-                    selected_status,
-                ),
-                Some(
-                    execute_error
-                        .as_ref()
-                        .map_or(Ok(()), |error| Err(error.to_string())),
-                ),
-                Utc::now(),
+        if completion.cancellation_observed {
+            tracing::debug!(
+                transferred_bytes = completion.transferred_bytes,
+                "Cloud Files hydration cancellation was observed"
             );
+        }
+        let finished_at = Utc::now();
+        if let Some(context) = context.as_ref() {
+            let telemetry = CloudHydrationTransferTelemetry {
+                requested_offset: completion.requested_offset,
+                requested_length: completion.requested_length,
+                transferred_bytes: completion.transferred_bytes,
+                elapsed_millis: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                cancellation_observed: completion.cancellation_observed,
+                completed_at: finished_at,
+                execute_results: completion.execute_results.clone(),
+            };
+            if let Err(error) = context
+                .health
+                .record_hydration_transfer(context.health_generation, telemetry)
+            {
+                tracing::warn!("Could not persist Cloud Files hydration telemetry: {error}");
+            }
+        }
+        if let Some(observation) = observation {
+            if completion.file_unavailable && completion.execute_error.is_none() {
+                // Windows received a complete file-specific failure. Restarting the
+                // root cannot grant consent, repair ciphertext or restore a missing file.
+                observation.finish_observed_at(finished_at);
+            } else if completion.cancellation_observed
+                && completion.handler_error.is_none()
+                && completion.execute_error.is_none()
+            {
+                observation.finish_observed_at(finished_at);
+            } else {
+                observation.finish_at(
+                    actionable_callback_handler_outcome(
+                        completion.handler_error.clone(),
+                        completion.status.0,
+                    ),
+                    Some(
+                        completion
+                            .execute_error
+                            .as_ref()
+                            .map_or(Ok(()), |error| Err(error.clone())),
+                    ),
+                    finished_at,
+                );
+            }
         }
         let _ = unsafe { CfUpdateSyncProviderStatus(info.ConnectionKey, CF_PROVIDER_STATUS_IDLE) };
     }
@@ -14886,15 +16304,98 @@ mod platform {
             info: &CF_CALLBACK_INFO,
             callback_parameters: *const CF_CALLBACK_PARAMETERS,
             deadline: Instant,
-        ) -> Result<FetchDataCompletion> {
-            self.startup_activity.ensure_wait_allowed()?;
-            if callback_parameters.is_null() {
-                return Ok(FetchDataCompletion::failure(
-                    STATUS_CLOUD_FILE_INVALID_REQUEST,
-                    0,
-                ));
+        ) -> FetchDataCompletion {
+            let (requested_offset, requested_length) = if callback_parameters.is_null() {
+                (0, 0)
+            } else {
+                let params = (*callback_parameters).Anonymous.FetchData;
+                (params.RequiredFileOffset, params.RequiredLength)
+            };
+            let (completion_offset, completion_length) =
+                hydration_completion_range(info.FileSize, requested_offset, requested_length);
+            let mut outstanding =
+                HydrationOutstandingRanges::new(completion_offset, completion_length);
+            let mut stats = HydrationTransferStats::default();
+            let result = if callback_parameters.is_null() {
+                Err(CloudProviderError::Callback(
+                    "fetch-data callback parameters are unavailable".into(),
+                ))
+            } else {
+                self.hydrate_and_transfer(
+                    info,
+                    (*callback_parameters).Anonymous.FetchData,
+                    deadline,
+                    &mut outstanding,
+                    &mut stats,
+                )
+            };
+
+            match result {
+                Ok(()) => FetchDataCompletion {
+                    file_unavailable: false,
+                    status: if stats.cancellation_observed && stats.transferred_bytes == 0 {
+                        STATUS_CLOUD_FILE_REQUEST_ABORTED
+                    } else {
+                        STATUS_SUCCESS
+                    },
+                    handler_error: None,
+                    execute_error: None,
+                    cancellation_observed: stats.cancellation_observed,
+                    transferred_bytes: stats.transferred_bytes,
+                    requested_offset,
+                    requested_length,
+                    execute_results: stats.execute_results,
+                },
+                Err(error) => {
+                    let status = hydration_error_status(&error);
+                    let mut execute_error = None;
+                    for (range_start, range_end) in outstanding.ranges() {
+                        let range_length = range_end - range_start;
+                        if range_length <= 0 {
+                            continue;
+                        }
+                        if let Err(completion_error) = unsafe {
+                            execute_transfer_data_recorded(
+                                info,
+                                status,
+                                &[],
+                                range_start,
+                                range_length,
+                                &mut stats.execute_results,
+                            )
+                        } {
+                            execute_error.get_or_insert_with(|| completion_error.to_string());
+                        } else {
+                            outstanding.complete(range_start, range_length);
+                        }
+                    }
+                    let cancelled_error = matches!(error, CloudProviderError::HydrationCancelled);
+                    FetchDataCompletion {
+                        status,
+                        file_unavailable: matches!(&error, CloudProviderError::ProviderCore(error) if error.is_file_unavailable())
+                            || matches!(&error, CloudProviderError::Io(error) if error.kind() == std::io::ErrorKind::NotFound),
+                        handler_error: (!cancelled_error)
+                            .then(|| hydration_error_telemetry(&error)),
+                        execute_error,
+                        cancellation_observed: stats.cancellation_observed || cancelled_error,
+                        transferred_bytes: stats.transferred_bytes,
+                        requested_offset,
+                        requested_length,
+                        execute_results: stats.execute_results,
+                    }
+                }
             }
-            let params = (*callback_parameters).Anonymous.FetchData;
+        }
+
+        unsafe fn hydrate_and_transfer(
+            &self,
+            info: &CF_CALLBACK_INFO,
+            params: windows::Win32::Storage::CloudFilters::CF_CALLBACK_PARAMETERS_0_1,
+            deadline: Instant,
+            outstanding: &mut HydrationOutstandingRanges,
+            stats: &mut HydrationTransferStats,
+        ) -> Result<()> {
+            self.startup_activity.ensure_wait_allowed()?;
             let cancellation = self.hydration_cancellations.register(
                 info.TransferKey,
                 params.RequiredFileOffset,
@@ -14902,9 +16403,8 @@ mod platform {
             );
             let identity = self.resolve_callback_identity(info)?;
             if identity.kind != ProviderEntryKind::File {
-                return Ok(FetchDataCompletion::failure(
-                    STATUS_CLOUD_FILE_INVALID_REQUEST,
-                    params.RequiredFileOffset,
+                return Err(CloudProviderError::Callback(
+                    "Cloud Files hydration target is not a file".into(),
                 ));
             }
             let entry = self.entry_for_identity(&identity)?;
@@ -14914,115 +16414,157 @@ mod platform {
                 params.RequiredLength,
             )?;
             let tokio_deadline = tokio::time::Instant::from_std(deadline);
-            let _operation = self.runtime.block_on(async {
+            self.runtime.block_on(async {
                 tokio::select! {
                     _ = cancellation.cancelled() => Err(CloudProviderError::HydrationCancelled),
-                    lock = tokio::time::timeout_at(tokio_deadline, self.operation_lock.lock()) => {
-                        lock.map_err(|_| CloudProviderError::HydrationTimedOut)
+                    ready = tokio::time::timeout_at(
+                        tokio_deadline,
+                        self.startup_activity.wait_until_running(),
+                    ) => ready.map_err(|_| CloudProviderError::HydrationTimedOut)?,
+                }
+            })?;
+            let _worker_permit = self.runtime.block_on(async {
+                tokio::select! {
+                    _ = cancellation.cancelled() => Err(CloudProviderError::HydrationCancelled),
+                    permit = tokio::time::timeout_at(tokio_deadline, self.hydration_worker.begin()) => {
+                        permit.map_err(|_| CloudProviderError::HydrationTimedOut)?
                     }
                 }
             })?;
             self.startup_activity.ensure_running()?;
             ensure_hydration_active(&cancellation, deadline)?;
-
-            let cache_path = self.cache_path_for_entry(&identity, &entry)?;
-            let mut published_cache = false;
-            if !cache_path.exists() {
-                if let Some(parent) = cache_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let temporary_cache_path =
-                    cache_path.with_extension(format!("plain.tmp-{}", Uuid::new_v4()));
-                let worker_permit = self.hydration_worker.try_begin()?;
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                let bridge = self.bridge.clone();
-                let runtime = self.runtime.clone();
-                let writer_lease = self.writer_lease.clone();
-                let cancellation_signal = cancellation.cancellation_signal();
-                std::thread::Builder::new()
-                    .name(format!("hc-hydrate-{}", self.registration.root_id))
-                    .spawn(move || {
-                        let _worker_permit = worker_permit;
-                        let temporary =
-                            HydrationTemporaryFile::new(temporary_cache_path.clone(), writer_lease);
-                        let hydrate_result = runtime.block_on(async {
-                            bridge
-                                .hydrate_file_to_path(&entry, &temporary_cache_path)
-                                .await
-                        });
-                        if let Err(err) = hydrate_result {
-                            let _ =
-                                sender.send(Err(HydrationWorkerFailure::Failed(err.to_string())));
-                            return;
-                        }
-                        if cancellation_signal.load(Ordering::Acquire) {
-                            let _ = sender.send(Err(HydrationWorkerFailure::Cancelled));
-                            return;
-                        }
-                        let sync_result = OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(temporary.path())
-                            .and_then(|file| file.sync_all());
-                        if let Err(err) = sync_result {
-                            let _ =
-                                sender.send(Err(HydrationWorkerFailure::Failed(err.to_string())));
-                            return;
-                        }
-                        if cancellation_signal.load(Ordering::Acquire) {
-                            let _ = sender.send(Err(HydrationWorkerFailure::Cancelled));
-                            return;
-                        }
-                        let _ = sender.send(Ok(temporary));
-                    })?;
-                let temporary = self.runtime.block_on(async {
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => Err(CloudProviderError::HydrationCancelled),
-                        result = tokio::time::timeout_at(tokio_deadline, receiver) => {
-                            if cancellation.is_cancelled() {
-                                return Err(CloudProviderError::HydrationCancelled);
-                            }
-                            match result {
-                                Err(_) => Err(CloudProviderError::HydrationTimedOut),
-                                Ok(Err(_)) => Err(CloudProviderError::Callback(
-                                    "Cloud Files hydration worker stopped without a result".into(),
-                                )),
-                                Ok(Ok(Err(HydrationWorkerFailure::Cancelled))) => {
-                                    Err(CloudProviderError::HydrationCancelled)
-                                }
-                                Ok(Ok(Err(HydrationWorkerFailure::Failed(err)))) => {
-                                    Err(CloudProviderError::Callback(err))
-                                }
-                                Ok(Ok(Ok(temporary))) => Ok(temporary),
-                            }
-                        }
-                    }
-                })?;
-                ensure_hydration_active(&cancellation, deadline)?;
-                temporary.publish_to(&cache_path)?;
-                published_cache = true;
-            }
-
-            let mut file = File::open(&cache_path)?;
-            let mut buffer = vec![0u8; request.length];
-            file.seek(SeekFrom::Start(request.offset))?;
-            file.read_exact(&mut buffer)?;
-            if let Err(err) = ensure_hydration_active(&cancellation, deadline) {
-                if published_cache {
-                    let _ = fs::remove_file(&cache_path);
-                }
-                return Err(err);
-            }
             unsafe {
                 CfUpdateSyncProviderStatus(info.ConnectionKey, CF_PROVIDER_STATUS_POPULATE_CONTENT)?
             };
-            Ok(FetchDataCompletion {
-                status: STATUS_SUCCESS,
-                bytes: buffer,
-                offset: request.offset as i64,
-                cancellation: Some(cancellation),
-            })
+
+            let transfer_ranges = hydration_transfer_ranges(request)?;
+            for (index, transfer) in transfer_ranges.iter().enumerate() {
+                ensure_hydration_active(&cancellation, deadline)?;
+                let decrypt = self.runtime.block_on(async {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => Err(CloudProviderError::HydrationCancelled),
+                        result = tokio::time::timeout_at(
+                            tokio_deadline,
+                            self.bridge.hydrate_file_range(&entry, transfer.offset, transfer.length),
+                        ) => {
+                            result
+                                .map_err(|_| CloudProviderError::HydrationTimedOut)?
+                                .map_err(CloudProviderError::from)
+                        }
+                    }
+                });
+                match decrypt {
+                    Ok(bytes) => unsafe {
+                        transfer_decrypted_range(
+                            info,
+                            transfer.offset as i64,
+                            &bytes,
+                            &cancellation,
+                            outstanding,
+                            stats,
+                        )?;
+                    },
+                    Err(CloudProviderError::ProviderCore(error))
+                        if index == 0 && error.is_range_unsupported() =>
+                    {
+                        return unsafe {
+                            self.hydrate_full_file_fallback(
+                                info,
+                                &entry,
+                                &cancellation,
+                                deadline,
+                                outstanding,
+                                stats,
+                            )
+                        };
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+
+        unsafe fn hydrate_full_file_fallback(
+            &self,
+            info: &CF_CALLBACK_INFO,
+            entry: &ProviderEntry,
+            cancellation: &HydrationCancellationToken,
+            deadline: Instant,
+            outstanding: &mut HydrationOutstandingRanges,
+            stats: &mut HydrationTransferStats,
+        ) -> Result<()> {
+            fs::create_dir_all(&self.runtime_paths.cache_dir)?;
+            restrict_hydration_temp_directory(&self.runtime_paths.cache_dir)?;
+            let temporary_path = self
+                .runtime_paths
+                .cache_dir
+                .join(format!(".hydrate-{}.plain.tmp", Uuid::new_v4()));
+            let temporary =
+                HydrationTemporaryFile::new(temporary_path.clone(), self.writer_lease.clone());
+            let fallback = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+                let tokio_deadline = tokio::time::Instant::from_std(deadline);
+                self.runtime.block_on(async {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => Err(CloudProviderError::HydrationCancelled),
+                        result = tokio::time::timeout_at(
+                            tokio_deadline,
+                            self.bridge.hydrate_file_to_path(entry, &temporary_path),
+                        ) => {
+                            result
+                                .map_err(|_| CloudProviderError::HydrationTimedOut)?
+                                .map_err(CloudProviderError::from)
+                        }
+                    }
+                })?;
+                ensure_hydration_active(cancellation, deadline)?;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(temporary.path())?
+                    .sync_all()?;
+                let actual_length = fs::metadata(temporary.path())?.len();
+                if actual_length != entry.logical_size {
+                    return Err(CloudProviderError::Callback(format!(
+                        "temporary hydration length mismatch (expected {}, found {actual_length})",
+                        entry.logical_size
+                    )));
+                }
+
+                let full_length = usize::try_from(entry.logical_size).map_err(|_| {
+                    CloudProviderError::Callback(
+                        "legacy hydration file is too large for this process".into(),
+                    )
+                })?;
+                let mut file = File::open(temporary.path())?;
+                for transfer in hydration_transfer_ranges(super::HydrationRequest {
+                    offset: 0,
+                    length: full_length,
+                })? {
+                    ensure_hydration_active(cancellation, deadline)?;
+                    let mut bytes = Zeroizing::new(vec![0u8; transfer.length]);
+                    file.seek(SeekFrom::Start(transfer.offset))?;
+                    file.read_exact(&mut bytes)?;
+                    unsafe {
+                        transfer_decrypted_range(
+                            info,
+                            transfer.offset as i64,
+                            &bytes,
+                            cancellation,
+                            outstanding,
+                            stats,
+                        )?;
+                    }
+                }
+                Ok(())
+            }));
+            let result = match fallback {
+                Ok(result) => result,
+                Err(_) => Err(CloudProviderError::Callback(
+                    "legacy hydration fallback panicked; temporary plaintext was removed".into(),
+                )),
+            };
+            drop(temporary);
+            result
         }
 
         unsafe fn handle_close_completion(&self, info: &CF_CALLBACK_INFO) -> Result<()> {
@@ -15115,12 +16657,12 @@ mod platform {
                             actual.clone(),
                         )?;
                     }
-                    self.mark_pending_mutation_error(mutation_id, &err.to_string())?;
-                    return Err(err.into());
+                    self.finish_pending_attempt(mutation_id, Err(err.into()))?;
+                    return Ok(()); // durable file-specific work does not require a root restart
                 }
                 Err(err) => {
-                    self.mark_pending_mutation_error(mutation_id, &err.to_string())?;
-                    return Err(err.into());
+                    self.finish_pending_attempt(mutation_id, Err(err.into()))?;
+                    return Ok(()); // durable file-specific work does not require a root restart
                 }
             };
             self.remove_identity(&identity)?;
@@ -15283,12 +16825,118 @@ mod platform {
             })
     }
 
+    unsafe fn transfer_decrypted_range(
+        info: &CF_CALLBACK_INFO,
+        offset: i64,
+        bytes: &[u8],
+        cancellation: &HydrationCancellationToken,
+        outstanding: &mut HydrationOutstandingRanges,
+        stats: &mut HydrationTransferStats,
+    ) -> Result<()> {
+        let length = i64::try_from(bytes.len()).map_err(|_| {
+            CloudProviderError::Callback("hydration transfer buffer is too large".into())
+        })?;
+        if length <= 0 {
+            return Err(CloudProviderError::Callback(
+                "hydration transfer buffer is empty".into(),
+            ));
+        }
+        let end = offset.checked_add(length).ok_or_else(|| {
+            CloudProviderError::Callback("hydration transfer range overflows".into())
+        })?;
+        let cancelled = cancellation.cancelled_ranges(offset, length);
+        stats.cancellation_observed |= !cancelled.is_empty();
+
+        // CFAPI requires transfer offsets and non-EOF lengths to be 4-KiB aligned.
+        // A partial cancellation can bisect a page, so transfer that page when any
+        // byte is still required and abort only pages covered completely by the
+        // cancelled union.
+        let alignment = super::HYDRATION_TRANSFER_ALIGNMENT_BYTES as i64;
+        if offset % alignment != 0 {
+            return Err(CloudProviderError::Callback(
+                "hydration transfer offset is not 4-KiB aligned".into(),
+            ));
+        }
+        let mut segments: Vec<(i64, i64, bool)> = Vec::new();
+        let mut cursor = offset;
+        while cursor < end {
+            let page_end = cursor.saturating_add(alignment).min(end);
+            let page_cancelled = cancelled
+                .iter()
+                .any(|(start, range_end)| *start <= cursor && *range_end >= page_end);
+            if let Some((_, segment_end, segment_cancelled)) = segments.last_mut() {
+                if *segment_end == cursor && *segment_cancelled == page_cancelled {
+                    *segment_end = page_end;
+                } else {
+                    segments.push((cursor, page_end, page_cancelled));
+                }
+            } else {
+                segments.push((cursor, page_end, page_cancelled));
+            }
+            cursor = page_end;
+        }
+
+        for (segment_start, segment_end, segment_cancelled) in segments {
+            let segment_length = segment_end - segment_start;
+            if segment_cancelled {
+                unsafe {
+                    execute_transfer_data_recorded(
+                        info,
+                        STATUS_CLOUD_FILE_REQUEST_ABORTED,
+                        &[],
+                        segment_start,
+                        segment_length,
+                        &mut stats.execute_results,
+                    )?
+                };
+            } else {
+                let slice_start = usize::try_from(segment_start - offset).map_err(|_| {
+                    CloudProviderError::Callback("hydration slice offset is invalid".into())
+                })?;
+                let slice_end = usize::try_from(segment_end - offset).map_err(|_| {
+                    CloudProviderError::Callback("hydration slice end is invalid".into())
+                })?;
+                unsafe {
+                    execute_transfer_data_recorded(
+                        info,
+                        STATUS_SUCCESS,
+                        &bytes[slice_start..slice_end],
+                        segment_start,
+                        segment_length,
+                        &mut stats.execute_results,
+                    )?
+                };
+                stats.transferred_bytes = stats
+                    .transferred_bytes
+                    .saturating_add(segment_length as u64);
+            }
+            outstanding.complete(segment_start, segment_length);
+        }
+        Ok(())
+    }
+
     unsafe fn execute_transfer_data(
         info: &CF_CALLBACK_INFO,
         status: NTSTATUS,
         bytes: &[u8],
         offset: i64,
+        length: i64,
     ) -> Result<()> {
+        if length <= 0 {
+            return Err(CloudProviderError::Callback(
+                "Cloud Files transfer completion length must be nonzero".into(),
+            ));
+        }
+        if status == STATUS_SUCCESS && bytes.len() != length as usize {
+            return Err(CloudProviderError::Callback(
+                "successful Cloud Files transfer length does not match its buffer".into(),
+            ));
+        }
+        if status != STATUS_SUCCESS && !bytes.is_empty() {
+            return Err(CloudProviderError::Callback(
+                "failed Cloud Files transfer must not include plaintext bytes".into(),
+            ));
+        }
         let op_info = operation_info(info, CF_OPERATION_TYPE_TRANSFER_DATA);
         let mut params = CF_OPERATION_PARAMETERS {
             ParamSize: cf_operation_param_size::<CF_OPERATION_PARAMETERS_0_0>(),
@@ -15302,12 +16950,30 @@ mod platform {
                         bytes.as_ptr().cast()
                     },
                     Offset: offset,
-                    Length: bytes.len() as i64,
+                    Length: length,
                 },
             },
         };
         unsafe { CfExecute(&op_info, &mut params)? };
         Ok(())
+    }
+
+    unsafe fn execute_transfer_data_recorded(
+        info: &CF_CALLBACK_INFO,
+        status: NTSTATUS,
+        bytes: &[u8],
+        offset: i64,
+        length: i64,
+        results: &mut Vec<CloudHydrationExecuteResult>,
+    ) -> Result<()> {
+        let result = unsafe { execute_transfer_data(info, status, bytes, offset, length) };
+        results.push(CloudHydrationExecuteResult {
+            offset,
+            length,
+            completion_status: status.0,
+            cf_execute_succeeded: result.is_ok(),
+        });
+        result
     }
 
     unsafe fn execute_ack_data(
@@ -15428,6 +17094,67 @@ mod platform {
         match error {
             CloudProviderError::HydrationCancelled => STATUS_CLOUD_FILE_REQUEST_ABORTED,
             _ => STATUS_CLOUD_FILE_UNSUCCESSFUL,
+        }
+    }
+
+    fn hydration_error_telemetry(error: &CloudProviderError) -> String {
+        match error {
+            CloudProviderError::UnsupportedPlatform => {
+                "Cloud Files is unsupported on this platform".into()
+            }
+            CloudProviderError::NativeCallbacksNotImplemented => {
+                "Cloud Files callbacks are unavailable".into()
+            }
+            CloudProviderError::InvalidCommand(_) => "invalid provider command".into(),
+            CloudProviderError::InvalidPath(_) => "hydration path validation failed".into(),
+            CloudProviderError::IdentityTooLarge { length, max, .. } => {
+                format!("placeholder identity is too large ({length} bytes; maximum {max})")
+            }
+            CloudProviderError::Io(source) => format!(
+                "hydration I/O failed (kind={:?}, os_code={:?})",
+                source.kind(),
+                source.raw_os_error()
+            ),
+            CloudProviderError::ProviderCore(source) => match source {
+                ProviderCoreError::Io(source) => format!(
+                    "provider I/O failed (kind={:?}, os_code={:?})",
+                    source.kind(),
+                    source.raw_os_error()
+                ),
+                ProviderCoreError::IdentitySerialization(_) => {
+                    "provider identity serialization failed".into()
+                }
+                ProviderCoreError::InvalidIdentity(_) => "provider identity is invalid".into(),
+                ProviderCoreError::MetadataParse { .. } => {
+                    "encrypted metadata parsing failed".into()
+                }
+                ProviderCoreError::PathOutsideRoot { .. } => {
+                    "provider path escaped the encrypted root".into()
+                }
+                ProviderCoreError::Crypto(_) if source.is_legacy_consent_required() => "legacy_compatibility_required: Open folder details and enable access to older files after reviewing the integrity limitation".into(),
+                ProviderCoreError::Crypto(_) if source.is_integrity_failure() => "file_integrity_failed: The file failed authentication. Preserve its encrypted original and recover a verified copy".into(),
+                ProviderCoreError::Crypto(_) => "file_unavailable: Authenticated file decryption failed; inspect this file's recovery status".into(),
+                ProviderCoreError::MutationUnsupported(_) => {
+                    "provider operation is unsupported".into()
+                }
+                ProviderCoreError::ContentConflict { .. } => {
+                    "provider content version conflict".into()
+                }
+            },
+            CloudProviderError::Callback(_) => "Cloud Files callback invariant failed".into(),
+            CloudProviderError::StartupRecoveryUnavailable => {
+                "provider startup or shutdown interrupted hydration".into()
+            }
+            CloudProviderError::HydrationCancelled => {
+                "hydration was cancelled by the caller".into()
+            }
+            CloudProviderError::HydrationTimedOut => "hydration callback timed out".into(),
+            CloudProviderError::Serialization(_) => "provider state serialization failed".into(),
+            CloudProviderError::Uuid(_) => "provider root identity is invalid".into(),
+            CloudProviderError::Windows(source) => format!(
+                "Windows Cloud Files operation failed (HRESULT=0x{:08X})",
+                source.code().0 as u32
+            ),
         }
     }
 
@@ -15809,6 +17536,22 @@ mod platform {
     pub struct CloudRootShutdownBarrier;
 
     impl CloudRootShutdownBarrier {
+        pub fn compatibility_status(&self) -> Option<super::VaultCompatibilityStatus> {
+            None
+        }
+        pub async fn set_legacy_compatibility(
+            &self,
+            _enabled: bool,
+        ) -> Result<super::VaultCompatibilityStatus> {
+            Err(CloudProviderError::UnsupportedPlatform)
+        }
+        pub async fn resolve_pending(
+            &self,
+            _id: Uuid,
+            _action: super::PendingOperationResolution,
+        ) -> Result<()> {
+            Err(CloudProviderError::UnsupportedPlatform)
+        }
         pub async fn begin(&self) -> Result<()> {
             Err(CloudProviderError::UnsupportedPlatform)
         }
@@ -15843,6 +17586,22 @@ mod platform {
     }
 
     pub fn register_root(_registration: &CloudRootRegistration) -> Result<()> {
+        Err(CloudProviderError::UnsupportedPlatform)
+    }
+
+    pub fn current_user_shell_sync_root_id(_root_id: Uuid) -> Result<String> {
+        Err(CloudProviderError::UnsupportedPlatform)
+    }
+
+    pub fn restrict_hydration_temp_directory(_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn unregister_all_shell_roots() -> Result<usize> {
+        Err(CloudProviderError::UnsupportedPlatform)
+    }
+
+    pub fn unregister_registration(_registration: &CloudRootRegistration) -> Result<()> {
         Err(CloudProviderError::UnsupportedPlatform)
     }
 

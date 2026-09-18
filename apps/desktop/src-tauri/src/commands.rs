@@ -2142,7 +2142,7 @@ async fn load_personal_devices_overview_input_internal(
 pub async fn get_pending_devices(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<PendingDeviceSummary>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     let session = require_authenticated_session(&state).await?;
     let summaries = fetch_pending_device_records_internal(&state, &session)
         .await?
@@ -2161,7 +2161,7 @@ pub async fn get_pending_devices(
 pub async fn get_stale_devices(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<StaleDeviceSummary>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     let session = require_authenticated_session(&state).await?;
     let server_url = current_server_url(&state, &session);
     let api_base = api_base_url(&server_url);
@@ -2196,7 +2196,7 @@ pub async fn get_stale_devices(
 pub async fn get_unverified_devices(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<UnverifiedDeviceSummary>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     let session = require_authenticated_session(&state).await?;
     let server_url = current_server_url(&state, &session);
     let api_base = api_base_url(&server_url);
@@ -2628,7 +2628,7 @@ pub async fn get_session_health_config() -> Result<CommandResponse<SessionHealth
 pub async fn get_group_members(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<GroupMember>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
 
     let session = state
         .session
@@ -2703,7 +2703,7 @@ pub async fn remove_group_member(
     user_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<bool>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
 
     let session = state
         .session
@@ -2803,7 +2803,7 @@ pub async fn remove_group_member(
 pub async fn get_group_member_details(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<GroupMemberDetails>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
 
     let session = state
         .session
@@ -3943,14 +3943,15 @@ mod tests {
     fn build_individual_home_status_flags_missing_protection_layers() {
         let summary = build_individual_home_status(IndividualHomeStatusInput {
             security: IndividualSecuritySnapshot {
-                mfa_enabled: false,
-                recovery_backup_ok: false,
-                recovery_auto_backup_ok: false,
+                mfa_enabled: Some(false),
+                recovery_backup_ok: Some(false),
+                recovery_auto_backup_ok: Some(false),
             },
-            settings: IndividualSettingsSnapshot {
+            settings: Some(IndividualSettingsSnapshot {
                 coverage_last_scan: None,
                 registry_last_upload: None,
-            },
+            }),
+            unavailable_sections: Vec::new(),
             protected_count: 1,
             mounted_count: 1,
             current_device: Some(CurrentDeviceSnapshot {
@@ -3991,14 +3992,15 @@ mod tests {
     fn build_individual_home_status_marks_post_quantum_review_without_protected_folders() {
         let summary = build_individual_home_status(IndividualHomeStatusInput {
             security: IndividualSecuritySnapshot {
-                mfa_enabled: true,
-                recovery_backup_ok: true,
-                recovery_auto_backup_ok: true,
+                mfa_enabled: Some(true),
+                recovery_backup_ok: Some(true),
+                recovery_auto_backup_ok: Some(true),
             },
-            settings: IndividualSettingsSnapshot {
+            settings: Some(IndividualSettingsSnapshot {
                 coverage_last_scan: Some("2026-03-24T10:00:00Z".to_string()),
                 registry_last_upload: Some("2026-03-24T11:00:00Z".to_string()),
-            },
+            }),
+            unavailable_sections: Vec::new(),
             protected_count: 0,
             mounted_count: 0,
             current_device: Some(CurrentDeviceSnapshot {
@@ -4021,6 +4023,65 @@ mod tests {
             summary.post_quantum_secondary_text,
             "Add a protected folder to start securing files now with post-quantum encryption."
         );
+    }
+
+    #[test]
+    fn build_individual_home_status_reports_unloadable_sections_as_unknown() {
+        let summary = build_individual_home_status(IndividualHomeStatusInput {
+            security: IndividualSecuritySnapshot::default(),
+            settings: None,
+            unavailable_sections: vec!["sign-in protection".to_string(), "scan status".to_string()],
+            protected_count: 2,
+            mounted_count: 1,
+            current_device: None,
+            device_counts: DeviceCountSnapshot::default(),
+            folder_attention: FolderAttentionSnapshot::default(),
+            now: Utc.with_ymd_and_hms(2026, 3, 24, 12, 0, 0).unwrap(),
+        });
+
+        // Missing data must not be reported as a disabled protection.
+        assert_eq!(summary.mfa_enabled, None);
+        assert_eq!(summary.recovery_backup_ok, None);
+        assert_eq!(summary.recovery_auto_backup_ok, None);
+        assert!(!summary.scan_status_available);
+        assert_eq!(summary.last_scan_at, None);
+        // The only attention item is the load failure itself.
+        assert_eq!(summary.attention_count, 1);
+        assert_eq!(summary.unavailable_sections.len(), 2);
+    }
+
+    #[test]
+    fn build_individual_home_status_keeps_mfa_state_when_recovery_check_fails() {
+        let summary = build_individual_home_status(IndividualHomeStatusInput {
+            security: IndividualSecuritySnapshot {
+                mfa_enabled: Some(true),
+                recovery_backup_ok: None,
+                recovery_auto_backup_ok: None,
+            },
+            settings: Some(IndividualSettingsSnapshot {
+                coverage_last_scan: Some("2026-03-24T11:15:00Z".to_string()),
+                registry_last_upload: None,
+            }),
+            unavailable_sections: vec!["recovery backup".to_string()],
+            protected_count: 2,
+            mounted_count: 1,
+            current_device: Some(CurrentDeviceSnapshot {
+                device_id: "device-current".to_string(),
+                is_verified: true,
+            }),
+            device_counts: DeviceCountSnapshot::default(),
+            folder_attention: FolderAttentionSnapshot::default(),
+            now: Utc.with_ymd_and_hms(2026, 3, 24, 12, 0, 0).unwrap(),
+        });
+
+        // A failing recovery-artifact request used to take the MFA answer with it.
+        assert_eq!(summary.mfa_enabled, Some(true));
+        assert!(summary.scan_status_available);
+        assert_eq!(
+            summary.last_scan_at.as_deref(),
+            Some("2026-03-24T11:15:00Z")
+        );
+        assert_eq!(summary.attention_count, 1);
     }
 
     #[test]
@@ -4991,30 +5052,9 @@ pub async fn cancel_password_reset(session_id: String) -> Result<CommandResponse
 
 #[tauri::command]
 pub async fn get_cli_binary_path() -> Result<CommandResponse<String>, String> {
-    tracing::info!("Get CLI binary path command called");
-
-    // Try to locate built binary first
     match crate::cli_utils::locate_cli_binary() {
-        Ok((binary_path, _)) => {
-            tracing::info!("Found CLI binary at: {}", binary_path.display());
-            Ok(CommandResponse::ok(binary_path.display().to_string()))
-        }
-        #[cfg(not(feature = "individual-edition"))]
-        Err(_) => {
-            // Fallback: check if hybridcipher is in PATH
-            match which::which("hybridcipher") {
-                Ok(path) => {
-                    tracing::info!("Found hybridcipher in PATH: {}", path.display());
-                    Ok(CommandResponse::ok(path.display().to_string()))
-                }
-                Err(_) => Ok(CommandResponse::err(
-                    "Could not find hybridcipher CLI. Build it with 'cargo build --release --bin hybridcipher' or install it in PATH."
-                        .to_string(),
-                )),
-            }
-        }
-        #[cfg(feature = "individual-edition")]
-        Err(err) => Ok(CommandResponse::err(err)),
+        Ok((path, _)) => Ok(CommandResponse::ok(path.display().to_string())),
+        Err(error) => Ok(CommandResponse::err(error)),
     }
 }
 
@@ -5452,7 +5492,10 @@ pub async fn check_for_updates(
 }
 
 #[tauri::command]
-pub async fn install_update(app: tauri::AppHandle) -> Result<CommandResponse<String>, String> {
+pub async fn install_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<String>, String> {
     tracing::info!("Installing update");
     use tauri_plugin_updater::UpdaterExt;
 
@@ -5482,8 +5525,8 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<CommandResponse<Str
                     percent: Some(0.0),
                     message: Some(format!("Starting update to v{}…", version)),
                 });
-                if let Err(e) = update
-                    .download_and_install(
+                let package = update
+                    .download(
                         |downloaded, total| {
                             let downloaded_u64 = downloaded as u64;
                             let total_u64 = total.unwrap_or(0);
@@ -5500,31 +5543,26 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<CommandResponse<Str
                                 message: Some("Downloading update…".to_string()),
                             });
                         },
-                        || {
-                            emit_progress(UpdaterProgressEvent {
-                                phase: "installing".to_string(),
-                                downloaded: None,
-                                total: None,
-                                percent: Some(100.0),
-                                message: Some("Installing update…".to_string()),
-                            });
-                        },
+                        || {},
                     )
                     .await
-                {
-                    emit_progress(UpdaterProgressEvent {
-                        phase: "error".to_string(),
-                        downloaded: None,
-                        total: None,
-                        percent: None,
-                        message: Some(format!("Update failed: {}", e)),
-                    });
-                    tracing::error!("Failed to install update: {}", e);
-                    return Ok(CommandResponse::err(format!(
-                        "Failed to install update: {}",
-                        e
-                    )));
-                }
+                    .map_err(|e| {
+                        format!("Update download or signature verification failed: {e}")
+                    })?;
+                // The updater exits the process on Windows. Drain ongoing app
+                // operations and clean plaintext BEFORE calling install.
+                update_safety::install(&UPDATE_OPERATION_GATE,
+                    async { stop_all_desktop_cloud_roots(&state, false).await
+                        .map_err(|e| format!("Update cancelled: protected folders could not stop safely: {e}")) },
+                    async { state.mount_manager.unmount_all(false).await
+                        .map_err(|e| format!("Update cancelled: mounts could not stop safely: {e}")) },
+                    || {
+                emit_progress(UpdaterProgressEvent {
+                    phase: "installing".into(), downloaded: None, total: None,
+                    percent: Some(100.0), message: Some("Installing update…".into()),
+                });
+                update.install(package).map_err(|e| format!("Failed to install update: {e}"))
+                    }).await?;
                 emit_progress(UpdaterProgressEvent {
                     phase: "installed".to_string(),
                     downloaded: None,
@@ -5628,7 +5666,7 @@ pub async fn get_active_group_context(
 pub async fn refresh_local_client(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<bool>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
 
     let session = state
         .session
@@ -5693,7 +5731,7 @@ pub struct FolderCoverageWorkflowResult {
 pub async fn list_enrolled_folders(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<EnrolledFolder>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     tracing::info!("List enrolled folders command called");
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
@@ -5814,7 +5852,7 @@ pub async fn get_folder_coverage_review(
     folder_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<FolderCoverageReview>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
     }
@@ -5836,7 +5874,7 @@ pub async fn run_folder_coverage_action(
     folder_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<CoverageActionResult>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
     }
@@ -6144,7 +6182,7 @@ fn build_coverage_scan_result(
 pub async fn get_coverage_center_snapshot(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<CoverageCenterSnapshot>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
     }
@@ -6173,7 +6211,7 @@ pub async fn run_coverage_scan(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<CommandResponse<CoverageScanResult>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
     }
@@ -6240,7 +6278,7 @@ pub async fn enroll_folder(
     folder_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<EnrolledFolder>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     tracing::info!("Enroll folder command called: {}", folder_path);
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
@@ -6310,7 +6348,7 @@ pub async fn enroll_folder_and_hydrate(
     folder_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<FolderCoverageWorkflowResult>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     tracing::info!("Enroll and hydrate folder command called: {}", folder_path);
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
@@ -6390,7 +6428,7 @@ pub async fn unenroll_folder_and_decrypt(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<FolderCoverageWorkflowResult>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     tracing::info!("Unenroll and decrypt folder command called: {}", root_id);
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
@@ -6806,6 +6844,30 @@ async fn read_mount_sync_status(
     user_dir: &PathBuf,
     root_id: &str,
 ) -> Option<MountSyncRuntimeStatus> {
+    #[cfg(target_os = "windows")]
+    if let Ok(Some((_, mount))) = read_any_mount_state_by_root_id(user_dir, root_id).await {
+        if mount.backend().is_windows_cloud_files() {
+            let result = Uuid::parse_str(root_id)
+                .map_err(|error| error.to_string())
+                .and_then(|root_id| {
+                    let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+                        hybridcipher_windows_cloud_provider::ProviderHostConfig {
+                            user_config_dir: user_dir.clone(),
+                            pipe_name: None,
+                        },
+                    );
+                    host.read_runtime_status(root_id)
+                        .map_err(|error| error.to_string())
+                });
+            return Some(result.unwrap_or_else(|error| MountSyncRuntimeStatus {
+                safe_to_unmount: false,
+                last_error: Some(format!(
+                    "Cloud Files synchronization status is unavailable: {error}"
+                )),
+                ..MountSyncRuntimeStatus::default()
+            }));
+        }
+    }
     let status_path = mount_sync_status_path(user_dir, root_id);
     let content = fs::read_to_string(status_path).await.ok()?;
     serde_json::from_str(&content).ok()
@@ -6829,6 +6891,58 @@ async fn read_mount_state_by_root_id(
     }
 
     Ok(None)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod writeback_status_regression {
+    use super::*;
+
+    #[tokio::test]
+    async fn cloud_status_does_not_reuse_a_stale_safe_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_dir = temp.path().to_path_buf();
+        let root_id = Uuid::new_v4().to_string();
+        fs::create_dir_all(mount_states_dir(&user_dir))
+            .await
+            .unwrap();
+        let status = MountSyncRuntimeStatus {
+            safe_to_unmount: true,
+            ..MountSyncRuntimeStatus::default()
+        };
+        fs::write(
+            mount_sync_status_path(&user_dir, &root_id),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .await
+        .unwrap();
+        for (backend, expected_safe) in [
+            (MountBackend::Sync, true),
+            (MountBackend::WindowsCloudFiles, false),
+        ] {
+            let mount = MountRuntimeState {
+                root_id: root_id.clone(),
+                mountpoint: temp.path().join("mount"),
+                encrypted_dir: temp.path().join("encrypted"),
+                platform: "windows".into(),
+                backend: Some(backend),
+                host_pid: None,
+                fallback_reason: None,
+                ready: true,
+                requested_unmount: false,
+            };
+            fs::write(
+                mount_states_dir(&user_dir).join(format!("mount_state_{root_id}.json")),
+                serde_json::to_vec(&mount).unwrap(),
+            )
+            .await
+            .unwrap();
+            let result = read_mount_sync_status(&user_dir, &root_id).await.unwrap();
+            assert_eq!(result.safe_to_unmount, expected_safe);
+            if !expected_safe {
+                assert!(result.last_error.unwrap().contains("unavailable"));
+            }
+        }
+    }
 }
 
 async fn read_any_mount_state_by_root_id(
@@ -7187,7 +7301,7 @@ pub async fn check_mount_status_by_root_id(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountStatusPayload>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
 
     // Validate root_id format
     let _parsed_root_id =
@@ -7310,7 +7424,7 @@ pub async fn mount_enrolled_folder(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountStatusPayload>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     tracing::info!("Mount enrolled folder request with root_id: {}", root_id);
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
@@ -7723,7 +7837,7 @@ pub async fn mount_enrolled_folder(
 pub async fn list_active_mounts(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountInfo>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     tracing::info!("List active mounts command called");
 
     let session = require_authenticated_session(&state).await?;
@@ -7860,22 +7974,98 @@ fn build_device_count_snapshot(input: &PersonalDevicesOverviewInput) -> DeviceCo
 pub async fn get_individual_home_status(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<IndividualHomeStatus>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
 
     let session = require_authenticated_session(&state).await?;
-    let settings = load_settings_status_internal(&state).await?;
-    let security = load_security_status_internal(&state, &session).await?;
-    let client = state.local_client.client().await.map_err(|err| {
-        format!(
-            "Failed to load protected folders for workspace status: {}",
-            err
-        )
-    })?;
-    let folders = get_enrolled_folders_from_client(client.as_ref()).await?;
-    let mounts = load_active_mounts_internal(&state, &session).await?;
-    let devices_input = load_personal_devices_overview_input_internal(&state, &session).await?;
-    let devices_overview = build_personal_devices_overview(devices_input.clone());
-    let device_counts = build_device_count_snapshot(&devices_input);
+
+    // Every section below is loaded independently. A single failing sub-request
+    // must degrade its own card to "unknown" rather than blanking the whole home
+    // view, which previously rendered missing data as "MFA off / never scanned".
+    let mut unavailable_sections: Vec<String> = Vec::new();
+
+    let settings = match load_settings_status_internal(&state).await {
+        Ok(settings) => Some(IndividualSettingsSnapshot {
+            coverage_last_scan: settings.coverage_last_scan,
+            registry_last_upload: settings.registry_last_upload,
+        }),
+        Err(err) => {
+            tracing::warn!("Workspace home: coverage status unavailable: {}", err);
+            unavailable_sections.push("scan status".to_string());
+            None
+        }
+    };
+
+    // MFA and the recovery-backup check are separate requests: a failing recovery
+    // artifact lookup must not hide the real MFA state behind "Off".
+    let server_url = current_server_url(&state, &session);
+    let mut security = IndividualSecuritySnapshot::default();
+
+    match fetch_mfa_status(&server_url, &session.token).await {
+        Ok(status) => security.mfa_enabled = Some(status.enabled),
+        Err(err) => {
+            tracing::warn!("Workspace home: MFA status unavailable: {}", err);
+            unavailable_sections.push("sign-in protection".to_string());
+        }
+    }
+
+    // A local check, so it is always answerable.
+    security.recovery_auto_backup_ok =
+        Some(recovery_auto_backup_state(&session, &state) == "ready");
+
+    match recovery_backup_exists(&server_url, &session.token, &session.email, &state).await {
+        Ok(exists) => security.recovery_backup_ok = Some(exists),
+        Err(err) => {
+            tracing::warn!(
+                "Workspace home: recovery backup status unavailable: {}",
+                err
+            );
+            unavailable_sections.push("recovery backup".to_string());
+        }
+    }
+
+    let folders = match state.local_client.client_opt().await {
+        Some(client) => match get_enrolled_folders_from_client(client.as_ref()).await {
+            Ok(folders) => folders,
+            Err(err) => {
+                tracing::warn!("Workspace home: protected folders unavailable: {}", err);
+                unavailable_sections.push("protected folders".to_string());
+                Vec::new()
+            }
+        },
+        None => {
+            unavailable_sections.push("protected folders".to_string());
+            Vec::new()
+        }
+    };
+
+    let mounts = match load_active_mounts_internal(&state, &session).await {
+        Ok(mounts) => mounts,
+        Err(err) => {
+            tracing::warn!("Workspace home: active mounts unavailable: {}", err);
+            unavailable_sections.push("mounted folders".to_string());
+            Vec::new()
+        }
+    };
+
+    let (current_device, device_counts) =
+        match load_personal_devices_overview_input_internal(&state, &session).await {
+            Ok(devices_input) => {
+                let device_counts = build_device_count_snapshot(&devices_input);
+                let current_device = build_personal_devices_overview(devices_input)
+                    .current_device
+                    .map(|device| CurrentDeviceSnapshot {
+                        device_id: device.device_id,
+                        is_verified: device.is_verified,
+                    });
+                (current_device, device_counts)
+            }
+            Err(err) => {
+                tracing::warn!("Workspace home: device status unavailable: {}", err);
+                unavailable_sections.push("this device".to_string());
+                (None, DeviceCountSnapshot::default())
+            }
+        };
+
     let folder_attention =
         mounts
             .iter()
@@ -7888,25 +8078,14 @@ pub async fn get_individual_home_status(
             });
 
     let status = build_individual_home_status(IndividualHomeStatusInput {
-        security: IndividualSecuritySnapshot {
-            mfa_enabled: security.mfa_enabled,
-            recovery_backup_ok: security.recovery_backup_ok,
-            recovery_auto_backup_ok: security.recovery_auto_backup_ok,
-        },
-        settings: IndividualSettingsSnapshot {
-            coverage_last_scan: settings.coverage_last_scan,
-            registry_last_upload: settings.registry_last_upload,
-        },
+        security,
+        settings,
         protected_count: folders.len(),
         mounted_count: mounts.len(),
-        current_device: devices_overview
-            .current_device
-            .map(|device| CurrentDeviceSnapshot {
-                device_id: device.device_id,
-                is_verified: device.is_verified,
-            }),
+        current_device,
         device_counts,
         folder_attention,
+        unavailable_sections,
         now: chrono::Utc::now(),
     });
 
@@ -7917,7 +8096,7 @@ pub async fn get_individual_home_status(
 pub async fn get_personal_devices_overview(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<PersonalDevicesOverview>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     let session = require_authenticated_session(&state).await?;
     let input = load_personal_devices_overview_input_internal(&state, &session).await?;
     Ok(CommandResponse::ok(build_personal_devices_overview(input)))
@@ -7928,7 +8107,7 @@ pub async fn revoke_device(
     device_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<DeviceRevocationResult>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
 
     let session = require_authenticated_session(&state).await?;
     let target_device_id = device_id.trim();
@@ -7998,7 +8177,7 @@ pub async fn list_mount_conflicts(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountConflictRecord>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
     let (email, server_url) = {
@@ -8036,7 +8215,7 @@ pub async fn get_mount_conflict_preview(
     conflict_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountConflictPreview>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
     let conflict_id = Uuid::parse_str(&conflict_id)
         .map_err(|err| format!("Invalid conflict_id format: {}", err))?;
@@ -8121,7 +8300,7 @@ pub async fn resolve_mount_conflict(
     destination_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<ConflictResolutionResult>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
     let conflict_id = Uuid::parse_str(&conflict_id)
         .map_err(|err| format!("Invalid conflict_id format: {}", err))?;
@@ -8187,7 +8366,7 @@ pub async fn list_mount_recovery_copies(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountRecoveryCopyRecord>>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
     let (email, server_url) = {
@@ -8225,7 +8404,7 @@ pub async fn get_mount_recovery_copy_preview(
     recovery_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountRecoveryCopyPreview>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
     let (email, server_url) = {
@@ -8311,7 +8490,7 @@ pub async fn resolve_mount_recovery_copy(
     destination_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<RecoveryCopyResolutionResult>, String> {
-    ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_authenticated(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
     let (email, server_url) = {
@@ -8388,7 +8567,7 @@ mod cloud_provider_health_payload_tests {
     use hybridcipher_windows_cloud_provider::{
         CloudCallbackClass, CloudCallbackHealth, CloudCallbackKind, CloudRootConnectionState,
         CloudRootHealthResponse, CloudRootOperationalHealth, CloudRootProbeHealth,
-        DurableInspectionSource,
+        CloudTransferHealthState, DurableInspectionSource,
     };
 
     #[test]
@@ -8439,6 +8618,8 @@ mod cloud_provider_health_payload_tests {
                 last_hydration_success_at: Some(observed_at),
                 hydration_failure: Some("latest hydration failed".into()),
                 last_hydration_failure_at: Some(observed_at),
+                transfer_health_state: CloudTransferHealthState::TransferDegraded,
+                last_hydration_transfer: None,
                 persistence_error: None,
                 assessed_at: observed_at,
                 healthy: false,
@@ -8512,6 +8693,10 @@ mod cloud_provider_health_payload_tests {
             serde_json::json!("latest hydration failed")
         );
         assert_eq!(
+            encoded["operational_health"]["operational"]["transfer_health_state"],
+            serde_json::json!("transfer_degraded")
+        );
+        assert_eq!(
             encoded["operational_health"]["operational"]["callback_health"][0]
                 ["callback_success_observed"],
             serde_json::json!(true)
@@ -8561,6 +8746,112 @@ pub async fn get_mount_sync_status(
         Ok(CommandResponse::ok(true))
     } else {
         Ok(CommandResponse::ok(false))
+    }
+}
+
+#[tauri::command]
+pub async fn get_vault_compatibility(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<serde_json::Value>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(CommandResponse::ok(
+            serde_json::to_value(
+                state
+                    .cloud_provider
+                    .vault_compatibility(
+                        Uuid::parse_str(&root_id).map_err(|e| e.to_string())?,
+                        None,
+                    )
+                    .await?,
+            )
+            .map_err(|e| e.to_string())?,
+        ));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (root_id, state);
+        Ok(CommandResponse::ok(serde_json::Value::Null))
+    }
+}
+
+#[tauri::command]
+pub async fn set_vault_legacy_compatibility(
+    root_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<serde_json::Value>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(CommandResponse::ok(
+            serde_json::to_value(
+                state
+                    .cloud_provider
+                    .vault_compatibility(
+                        Uuid::parse_str(&root_id).map_err(|e| e.to_string())?,
+                        Some(enabled),
+                    )
+                    .await?,
+            )
+            .map_err(|e| e.to_string())?,
+        ));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (root_id, enabled, state);
+        Err("Legacy mount compatibility is available on Windows".into())
+    }
+}
+
+#[tauri::command]
+pub async fn list_pending_operations(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<serde_json::Value>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(CommandResponse::ok(
+            state
+                .cloud_provider
+                .list_pending_operations(Uuid::parse_str(&root_id).map_err(|e| e.to_string())?)
+                .await?,
+        ));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (root_id, state);
+        Ok(CommandResponse::ok(serde_json::json!([])))
+    }
+}
+
+#[tauri::command]
+pub async fn resolve_pending_operation(
+    root_id: String,
+    operation_id: String,
+    action: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<bool>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let action = serde_json::from_value::<
+            hybridcipher_windows_cloud_provider::PendingOperationResolution,
+        >(serde_json::Value::String(action))
+        .map_err(|e| e.to_string())?;
+        state
+            .cloud_provider
+            .resolve_pending_operation(
+                Uuid::parse_str(&root_id).map_err(|e| e.to_string())?,
+                Uuid::parse_str(&operation_id).map_err(|e| e.to_string())?,
+                action,
+            )
+            .await?;
+        return Ok(CommandResponse::ok(true));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (root_id, operation_id, action, state);
+        Err("Pending Cloud Files operations are available on Windows".into())
     }
 }
 
@@ -8740,7 +9031,7 @@ pub async fn open_path_in_shell(
     _state: State<'_, AppState>,
     _window: tauri::Window,
 ) -> Result<CommandResponse<bool>, String> {
-    ensure_authenticated(&_state).await?;
+    let _operation_guard = ensure_authenticated(&_state).await?;
     let target = PathBuf::from(&path);
 
     // Verify path exists
@@ -8798,9 +9089,15 @@ pub async fn prioritize_folder_decrypt(
 
 // Add more command implementations...
 
-async fn ensure_authenticated(state: &AppState) -> Result<(), String> {
+mod update_safety;
+static UPDATE_OPERATION_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+async fn ensure_authenticated(
+    state: &AppState,
+) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    let guard = UPDATE_OPERATION_GATE.read().await;
     if ensure_session_ready_internal(state).await?.is_some() {
-        Ok(())
+        Ok(guard)
     } else {
         Err("Please login through the desktop app to access this feature.".to_string())
     }
@@ -8838,6 +9135,16 @@ async fn fetch_group_member_emails(
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err("Authentication token rejected. Please login again.".to_string());
+        }
+
+        // Personal accounts may not be allowed to enumerate group members. Treat
+        // that the same way the device audit and unverified-device lookups do:
+        // an empty result, not a hard failure for every caller downstream.
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND
+        ) {
+            return Ok(emails);
         }
 
         if !response.status().is_success() {

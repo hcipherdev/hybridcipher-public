@@ -41,6 +41,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 #[cfg(unix)]
 use xattr;
+use zeroize::Zeroizing;
 
 #[cfg(target_os = "macos")]
 const FILE_ID_XATTR: &str = "com.hybridcipher.file_id";
@@ -218,6 +219,12 @@ pub enum MountSyncError {
     PathExcluded(String),
     #[error("Invalid path: {0}")]
     InvalidPath(PathBuf),
+    #[error("authenticated range decryption is unsupported for this file: {0}")]
+    RangeUnsupported(String),
+    #[error("Older file format requires legacy compatibility for this vault")]
+    LegacyCompatibilityRequired,
+    #[error("Encrypted file integrity verification failed: {0}")]
+    FileIntegrity(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,10 +403,39 @@ impl MountSafetyReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFileErrorCode {
+    LegacyConsentRequired,
+    IntegrityFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingOperationSummary {
+    pub id: Uuid,
+    pub kind: String,
+    pub source: String,
+    pub destination: Option<String>,
+    pub state: String,
+    pub attempts: u32,
+    pub merged_records: u32,
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<ProviderFileErrorCode>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountSyncRuntimeStatus {
     pub safe_to_unmount: bool,
     pub pending_writeback_count: usize,
+    #[serde(default)]
+    pub pending_operation_count: usize,
+    #[serde(default)]
+    pub pending_operation_counts: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub affected_file_count: usize,
+    #[serde(default)]
+    pub pending_operations: Vec<PendingOperationSummary>,
     #[serde(default)]
     pub pending_writeback_oldest_age_ms: Option<u64>,
     #[serde(default)]
@@ -434,6 +470,10 @@ impl Default for MountSyncRuntimeStatus {
         Self {
             safe_to_unmount: false,
             pending_writeback_count: 0,
+            pending_operation_count: 0,
+            pending_operation_counts: Default::default(),
+            affected_file_count: 0,
+            pending_operations: Vec::new(),
             pending_writeback_oldest_age_ms: None,
             pending_writeback_paths: Vec::new(),
             pending_refresh_count: 0,
@@ -681,6 +721,8 @@ impl From<ClientError> for MountSyncError {
     fn from(value: ClientError) -> Self {
         match value {
             ClientError::PathExcluded(path) => MountSyncError::PathExcluded(path),
+            ClientError::LegacyCompatibilityRequired => MountSyncError::LegacyCompatibilityRequired,
+            ClientError::FileIntegrity(reason) => MountSyncError::FileIntegrity(reason),
             other => MountSyncError::Crypto(other.to_string()),
         }
     }
@@ -704,6 +746,22 @@ pub trait MountCrypto: Send + Sync {
         output_path: &Path,
         metadata: &EncryptedFileMetadata,
     ) -> Result<(), MountSyncError>;
+
+    /// Decrypt exactly one logical plaintext range without materializing the
+    /// complete file. Implementations must authenticate every encrypted chunk
+    /// touched by the range. Legacy and sparse formats return
+    /// `RangeUnsupported` so callers can select an explicit full-file fallback.
+    async fn decrypt_file_range(
+        &self,
+        _encrypted_path: &Path,
+        _metadata: &EncryptedFileMetadata,
+        _offset: u64,
+        _length: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, MountSyncError> {
+        Err(MountSyncError::RangeUnsupported(
+            "the configured crypto backend does not implement range decryption".to_string(),
+        ))
+    }
 
     async fn encrypt_file(
         &self,
@@ -2481,7 +2539,11 @@ fn is_low_space_error(err: &MountSyncError) -> bool {
         MountSyncError::Format(message)
         | MountSyncError::Crypto(message)
         | MountSyncError::UnstableFile(message) => error_message_is_low_space(message),
-        MountSyncError::PathExcluded(_) | MountSyncError::InvalidPath(_) => false,
+        MountSyncError::PathExcluded(_)
+        | MountSyncError::RangeUnsupported(_)
+        | MountSyncError::LegacyCompatibilityRequired
+        | MountSyncError::FileIntegrity(_)
+        | MountSyncError::InvalidPath(_) => false,
     }
 }
 
@@ -4223,6 +4285,10 @@ impl SyncTracker {
             preflight_warnings,
             last_error,
             updated_at: now,
+            pending_operation_count: pending_writeback_count,
+            affected_file_count: pending_writeback_count,
+            pending_operation_counts: Default::default(),
+            pending_operations: Vec::new(),
         }
     }
 
@@ -9066,7 +9132,10 @@ impl SyncTracker {
         });
         let platform_metadata = capture_platform_metadata(decrypted_path);
         let logical_content_size = pre_meta.len();
-        let sparse_metadata = sparse_file_metadata(decrypted_path, &pre_meta)?;
+        // Until the streaming API accepts the complete sparse layout before
+        // key wrapping, encrypt logical bytes (including holes). Never add an
+        // unauthenticated layout after encryption.
+        let sparse_metadata: Option<SparseFileMetadata> = None;
 
         let ciphertext_budget = if let Some(sparse_metadata) = sparse_metadata.as_ref() {
             let chunk_size = self
@@ -10620,7 +10689,10 @@ pub fn decrypted_target_path(
         MountSyncError::Format("Encrypted file is outside the selected root".into())
     })?;
     let mut target = mount_root.join(relative);
-    target.set_file_name(decrypted_file_name(encrypted_path, parsed));
+    let name = decrypted_file_name(encrypted_path, parsed);
+    hybridcipher_client::file::safe_restore::validate_name(&name)
+        .map_err(|e| MountSyncError::Format(e.to_string()))?;
+    target.set_file_name(name);
     Ok(target)
 }
 
@@ -10797,7 +10869,7 @@ pub fn parse_encrypted_file_with_root(
         .filter(SparseFileMetadata::is_effectively_sparse);
 
     let mut ciphertext = Vec::new();
-    if header_version_value < CHUNKED_HEADER_VERSION && content_chunk_size.is_none() {
+    if content_chunk_size.is_none() {
         reader
             .read_to_end(&mut ciphertext)
             .map_err(MountSyncError::Io)?;

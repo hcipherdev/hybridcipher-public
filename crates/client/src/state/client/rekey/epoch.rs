@@ -1249,10 +1249,8 @@ impl<S: Storage, N: Network> Client<S, N> {
             header_version,
         );
         let new_wrap_aad_hash = hash_wrap_aad(&new_wrap_aad);
-        let file_key = AeadKey::from_bytes(&file_key_bytes)
-            .map_err(|e| ClientError::EncryptionError(format!("Invalid DEK: {e:?}")))?;
         let (new_wrapped_key, new_wrap_nonce_bytes) =
-            wrap_file_key(&file_key, &new_kek, &new_wrap_aad)
+            crate::file::content_manifest::rewrap(&file_key_bytes, &new_kek, &new_wrap_aad)
                 .map_err(|e| ClientError::EncryptionError(format!("Key wrap failed: {e:?}")))?;
 
         // Update metadata only; ciphertext stays intact
@@ -1499,15 +1497,14 @@ impl<S: Storage, N: Network> Client<S, N> {
             header_version,
         );
         let new_wrap_aad_hash = hash_wrap_aad(&new_wrap_aad);
-        let file_key = AeadKey::from_bytes(&file_key_bytes)
-            .map_err(|e| ClientError::EncryptionError(format!("Invalid DEK: {}", e)))?;
         let (new_wrapped_key, new_wrap_nonce_bytes) =
-            wrap_file_key(&file_key, &new_kek, &new_wrap_aad).map_err(|e| {
-                ClientError::EncryptionError(format!(
-                    "Failed to wrap DEK for epoch {}: {}",
-                    to_epoch, e
-                ))
-            })?;
+            crate::file::content_manifest::rewrap(&file_key_bytes, &new_kek, &new_wrap_aad)
+                .map_err(|e| {
+                    ClientError::EncryptionError(format!(
+                        "Failed to wrap DEK for epoch {}: {}",
+                        to_epoch, e
+                    ))
+                })?;
 
         let now_ts = Utc::now().to_rfc3339();
         header_json["epoch_id"] = serde_json::json!(to_epoch);

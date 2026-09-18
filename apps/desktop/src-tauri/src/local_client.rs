@@ -499,25 +499,8 @@ fn load_state_encryption_key(
 
 fn load_account_key_from_cache(user_dir: &Path) -> Result<[u8; 32], String> {
     let cache_path = user_dir.join(ACCOUNT_KEY_CACHE_FILE);
-    let encoded = fs::read_to_string(&cache_path).map_err(|e| {
-        format!(
-            "Failed to read account key cache {}: {}",
-            cache_path.display(),
-            e
-        )
-    })?;
-
-    let decoded = general_purpose::STANDARD
-        .decode(encoded.trim())
-        .map_err(|e| format!("Failed to decode account key cache: {}", e))?;
-
-    if decoded.len() != 32 {
-        return Err("Account key cache is invalid".to_string());
-    }
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded);
-    Ok(key)
+    hybridcipher_crypto::local_key_cache::load(&cache_path)
+        .map_err(|e| format!("Failed to unlock account key cache: {e}"))
 }
 
 fn load_or_create_device_keypair(

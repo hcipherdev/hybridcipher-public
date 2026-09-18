@@ -767,8 +767,28 @@ pub async fn handle_decrypt(
     output_path: Option<PathBuf>,
     in_place: bool,
     strict: bool,
+    allow_legacy_unverified: bool,
     session: &SessionManager,
 ) -> Result<(), CliError> {
+    if allow_legacy_unverified {
+        if in_place || !file_path.is_file() || output_path.is_none() {
+            return Err(CliError::invalid_input(
+                "Legacy recovery requires one file and --output; --in-place is forbidden",
+            ));
+        }
+        ui::warning("Legacy recovery cannot verify completeness or sparse layout. Keep the encrypted original and compare recovered data with a trusted copy before re-encrypting.");
+        let parsed = parse_encrypted_file(&file_path)?;
+        let client = session.create_local_client().await?;
+        let plaintext = client
+            .recover_legacy_file_unverified(&parsed.metadata)
+            .await
+            .map_err(|e| CliError::decryption(e.to_string()))?;
+        let output = output_path.as_ref().unwrap();
+        hybridcipher_client::file::safe_restore::write_new(output, &plaintext)
+            .map_err(|e| CliError::storage(e.to_string()))?;
+        ui::success("Recovered an unverified copy; the encrypted source was retained.");
+        return Ok(());
+    }
     if in_place && output_path.is_some() {
         return Err(CliError::file_operation(
             "--output cannot be combined with --in-place for decryption",

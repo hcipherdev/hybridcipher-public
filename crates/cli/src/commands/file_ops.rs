@@ -312,6 +312,10 @@ pub(crate) async fn decrypt_parsed_file_to_path(
     parsed: ParsedEncryptedFile,
     output_override: Option<PathBuf>,
 ) -> Result<DecryptFileOutcome, CliError> {
+    if let Some(name) = parsed.original_name.as_deref() {
+        hybridcipher_client::file::safe_restore::validate_name(name)
+            .map_err(|e| CliError::decryption(e.to_string()))?;
+    }
     let decrypted_data = client
         .decrypt_file(&parsed.metadata)
         .await
@@ -324,13 +328,15 @@ pub(crate) async fn decrypt_parsed_file_to_path(
         ensure_directory(parent)?;
     }
 
-    fs::write(&output_path, decrypted_data).map_err(|e| {
-        CliError::storage(format!(
-            "Failed to write decrypted file {}: {}",
-            output_path.display(),
-            e
-        ))
-    })?;
+    hybridcipher_client::file::safe_restore::write_new(&output_path, &decrypted_data).map_err(
+        |e| {
+            CliError::storage(format!(
+                "Failed to write decrypted file {}: {}",
+                output_path.display(),
+                e
+            ))
+        },
+    )?;
 
     preserve_file_mtime(source_path, &output_path)?;
 

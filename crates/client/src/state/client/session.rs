@@ -251,71 +251,9 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         user_dir: &Path,
     ) -> Result<[u8; 32], ClientError> {
-        let cache_path = user_dir.join(ACCOUNT_KEY_CACHE_FILE);
-        if !cache_path.exists() {
-            self.logger.log(
-                crate::logging::LogLevel::Warn,
-                &format!(
-                    "Account key cache not found at {:?}; session is locked",
-                    cache_path
-                ),
-                Some("Please run 'hybridcipher login' to unlock your session"),
-            );
-            return Err(ClientError::InvalidState(
-                "Account is locked. Please run 'hybridcipher login' to unlock it".to_string(),
-            ));
-        }
-
-        let encoded = std::fs::read_to_string(&cache_path).map_err(|e| {
-            self.logger.log(
-                crate::logging::LogLevel::Error,
-                &format!(
-                    "Failed to read account key cache at {:?}: {}",
-                    cache_path, e
-                ),
-                Some("Please run 'hybridcipher login' to refresh the session"),
-            );
-            ClientError::InvalidState(
-                "Unable to load account key cache. Please re-authenticate.".to_string(),
-            )
-        })?;
-
-        let decoded = general_purpose::STANDARD.decode(encoded.trim()).map_err(|e| {
-            self.logger.log(
-                crate::logging::LogLevel::Error,
-                &format!(
-                    "Account key cache at {:?} is corrupted: {}",
-                    cache_path, e
-                ),
-                Some("Please run 'hybridcipher login' to refresh the session"),
-            );
-            let _ = std::fs::remove_file(&cache_path);
-            ClientError::InvalidState(
-                "Account key cache was corrupted. Please run 'hybridcipher login' to unlock your account"
-                    .to_string(),
-            )
-        })?;
-
-        if decoded.len() != 32 {
-            self.logger.log(
-                crate::logging::LogLevel::Error,
-                &format!(
-                    "Account key cache at {:?} has invalid length {}",
-                    cache_path,
-                    decoded.len()
-                ),
-                Some("Please run 'hybridcipher login' to refresh the session"),
-            );
-            let _ = std::fs::remove_file(&cache_path);
-            return Err(ClientError::InvalidState(
-                "Account key cache was invalid. Please run 'hybridcipher login' to unlock your account"
-                    .to_string(),
-            ));
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        Ok(key)
+        hybridcipher_crypto::local_key_cache::load(&user_dir.join(ACCOUNT_KEY_CACHE_FILE)).map_err(
+            |e| ClientError::InvalidState(format!("Account is locked; please log in again: {e}")),
+        )
     }
 
     /// Load the state/device key used for session encryption.

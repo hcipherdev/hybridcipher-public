@@ -18,6 +18,9 @@ path = "src/lib.rs"
 name = "hybridcipher-cloud-provider"
 path = "src/bin/hybridcipher-cloud-provider.rs"
 
+[features]
+native-verification = ["hybridcipher-provider-core/native-verification"]
+
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -31,16 +34,30 @@ notify = "6.1"
 tokio = { version = "1.0", features = ["io-util", "net", "rt", "sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4", "serde"] }
+zeroize = { workspace = true }
+tempfile = "3.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [
+    "ApplicationModel",
+    "Foundation",
+    "Security_Cryptography",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
+    "Storage_Streams",
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_CloudFilters",
     "Win32_Storage_FileSystem",
     "Win32_System_CorrelationVector",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
 ] }
 
 [dev-dependencies]
+hybridcipher-mount-sync = { path = "../mount-sync" }
 tempfile = "3.0"

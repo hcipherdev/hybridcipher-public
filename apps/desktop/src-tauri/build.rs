@@ -7,7 +7,19 @@ use std::time::Duration;
 fn main() {
     build_macos_file_provider_bridge();
     stage_bundled_cli();
-    tauri_build::build()
+    let mut attributes = tauri_build::Attributes::new();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rerun-if-changed=windows/identity/app.manifest.in");
+        println!("cargo:rerun-if-env-changed=HYBRIDCIPHER_WINDOWS_IDENTITY_PUBLISHER");
+        let publisher = std::env::var("HYBRIDCIPHER_WINDOWS_IDENTITY_PUBLISHER")
+            .unwrap_or_else(|_| "CN=HybridCipher Team".to_string());
+        let manifest = include_str!("windows/identity/app.manifest.in")
+            .replace("@PUBLISHER@", &publisher)
+            .replace("@APPLICATION_ID@", "HybridCipher");
+        let windows = tauri_build::WindowsAttributes::new().app_manifest(manifest);
+        attributes = attributes.windows_attributes(windows);
+    }
+    tauri_build::try_build(attributes).expect("failed to run Tauri build script")
 }
 
 fn build_macos_file_provider_bridge() {

@@ -39,6 +39,9 @@ pub mod epoch_id;
 pub mod error;
 pub mod hybridkem;
 pub mod kdf;
+/// Shared account-key persistence, protected with user-scoped DPAPI on Windows.
+#[cfg(feature = "std")]
+pub mod local_key_cache;
 pub mod rekey;
 pub mod signatures;
 

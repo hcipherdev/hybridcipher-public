@@ -252,6 +252,9 @@ pub enum Commands {
         /// Fail fast on filesystem traversal errors (default: best-effort with warnings)
         #[arg(long)]
         strict: bool,
+        /// Recover one legacy file without completeness guarantees; requires --output and preserves ciphertext
+        #[arg(long, requires = "output", conflicts_with = "in_place")]
+        allow_legacy_unverified: bool,
     },
 
     /// Interactively mount an encrypted folder
@@ -1010,7 +1013,18 @@ pub async fn handle_command(
             output,
             in_place,
             strict,
-        } => files::handle_decrypt(path, output, in_place, strict, session_manager).await,
+            allow_legacy_unverified,
+        } => {
+            files::handle_decrypt(
+                path,
+                output,
+                in_place,
+                strict,
+                allow_legacy_unverified,
+                session_manager,
+            )
+            .await
+        }
         Commands::Mount(args) => {
             if let Some(command) = args.command {
                 if args.fuse || args.sync || args.cloud_files || args.file_provider {

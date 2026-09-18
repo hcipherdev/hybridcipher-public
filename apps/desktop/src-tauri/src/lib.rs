@@ -18,6 +18,8 @@ pub mod process_utils;
 pub mod recovery_artifact;
 pub mod release_notes;
 pub mod session;
+#[cfg(test)]
+mod security_regression;
 pub mod state;
 pub mod terminal_diagnostics;
 

@@ -94,6 +94,7 @@ tempfile = "3.8"
 hybridcipher-windows-cloud-provider = { path = "../../../crates/windows-cloud-provider" }
 
 [features]
+native-verification = ["hybridcipher-windows-cloud-provider/native-verification"]
 # Enable additional macOS-specific features
 custom-protocol = ["tauri/custom-protocol"]
 individual-edition = []

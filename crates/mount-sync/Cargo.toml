@@ -30,6 +30,7 @@ which = "6.0"
 dirs = "5.0"
 unicode-normalization = "0.1"
 sysinfo = "0.30"
+zeroize = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 xattr = "1.3"

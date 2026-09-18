@@ -210,7 +210,7 @@ Published Windows verification values for the current source snapshot:
 <!-- BEGIN GENERATED WINDOWS VERIFY HASHES -->
 | Source ref | Target | Artifact | SHA-256 |
 | --- | --- | --- | --- |
-| `103200fe59d0fd72c8b18ef1264e546a2cef2572` | `x86_64-pc-windows-msvc` | `HybridCipher_0.1.5_x64-setup.exe` | `fc5fc45e2f3b8524174a415165edd453475f2638897e4bc8e19691bd20e6dc90` |
+| `3d0792770ba57c7daac662f3c8a8520639c47825` | `x86_64-pc-windows-msvc` | `HybridCipher_0.1.6_x64-setup.exe` | `323cc54a613ed1b9554b7218cd697d9cbbd3822fd510d6d8e57880499d5628e3` |
 <!-- END GENERATED WINDOWS VERIFY HASHES -->
 
 Read [docs/desktop/OPEN_SOURCE_VERIFY.md](docs/desktop/OPEN_SOURCE_VERIFY.md)

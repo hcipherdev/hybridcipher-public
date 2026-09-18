@@ -1,4 +1,5 @@
 use super::*;
+use crate::file::content_manifest;
 
 impl<S: Storage, N: Network> Client<S, N> {
     pub(super) fn path_has_encrypted_suffix(path: &Path) -> bool {
@@ -657,7 +658,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         let file_id = self.generate_random_file_id();
 
         // Auth data for key wrap binds to file identity, epoch, group, and format version
-        let header_version = 1u32;
+        let header_version = content_manifest::VERSION;
         let wrap_aad = build_wrap_aad(
             &file_id,
             &normalized_file_path,
@@ -668,8 +669,6 @@ impl<S: Storage, N: Network> Client<S, N> {
         let wrap_aad_hash = hash_wrap_aad(&wrap_aad);
 
         // Wrap the DEK with the KEK
-        let (wrapped_file_key, key_wrap_nonce_bytes) = wrap_file_key(&file_key, &kek, &wrap_aad)
-            .map_err(|e| ClientError::EncryptionError(format!("Key wrap failed: {:?}", e)))?;
 
         // Encrypt file content
         let (ciphertext, content_nonce_bytes) = encrypt_content(content, &file_key, &file_id)
@@ -678,6 +677,16 @@ impl<S: Storage, N: Network> Client<S, N> {
         let mut encrypted_content = Vec::with_capacity(12 + ciphertext.len());
         encrypted_content.extend_from_slice(&content_nonce_bytes);
         encrypted_content.extend_from_slice(&ciphertext);
+        let manifest = content_manifest::digest(
+            content.len() as u64,
+            encrypted_content.len() as u64,
+            None,
+            &content_nonce_bytes,
+            None,
+        );
+        let (wrapped_file_key, key_wrap_nonce_bytes) =
+            content_manifest::wrap(&file_key, &kek, &wrap_aad, &manifest)
+                .map_err(|e| ClientError::EncryptionError(e.to_string()))?;
 
         let metadata = EncryptedFileMetadata {
             file_id: file_id.clone(),
@@ -864,7 +873,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         let normalized_file_path = Self::normalize_file_identifier(file_path);
         let file_id = file_id.to_string();
 
-        let header_version = 1u32;
+        let header_version = content_manifest::VERSION;
         let wrap_aad = build_wrap_aad(
             &file_id,
             &normalized_file_path,
@@ -874,15 +883,22 @@ impl<S: Storage, N: Network> Client<S, N> {
         );
         let wrap_aad_hash = hash_wrap_aad(&wrap_aad);
 
-        let (wrapped_file_key, key_wrap_nonce_bytes) = wrap_file_key(&file_key, &kek, &wrap_aad)
-            .map_err(|e| ClientError::EncryptionError(format!("Key wrap failed: {:?}", e)))?;
-
         let (ciphertext, content_nonce_bytes) = encrypt_content(content, &file_key, &file_id)
             .map_err(|e| ClientError::EncryptionError(format!("Encryption failed: {:?}", e)))?;
 
         let mut encrypted_content = Vec::with_capacity(12 + ciphertext.len());
         encrypted_content.extend_from_slice(&content_nonce_bytes);
         encrypted_content.extend_from_slice(&ciphertext);
+        let manifest = content_manifest::digest(
+            content.len() as u64,
+            encrypted_content.len() as u64,
+            None,
+            &content_nonce_bytes,
+            None,
+        );
+        let (wrapped_file_key, key_wrap_nonce_bytes) =
+            content_manifest::wrap(&file_key, &kek, &wrap_aad, &manifest)
+                .map_err(|e| ClientError::EncryptionError(e.to_string()))?;
 
         let metadata = EncryptedFileMetadata {
             file_id: file_id.clone(),
@@ -1101,7 +1117,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         let normalized_file_path = Self::normalize_file_identifier(file_path);
         let file_id = file_id.to_string();
 
-        let header_version = CHUNKED_HEADER_VERSION;
+        let header_version = content_manifest::VERSION;
         let wrap_aad = build_wrap_aad(
             &file_id,
             &normalized_file_path,
@@ -1110,9 +1126,6 @@ impl<S: Storage, N: Network> Client<S, N> {
             header_version,
         );
         let wrap_aad_hash = hash_wrap_aad(&wrap_aad);
-
-        let (wrapped_file_key, key_wrap_nonce_bytes) = wrap_file_key(&file_key, &kek, &wrap_aad)
-            .map_err(|e| ClientError::EncryptionError(format!("Key wrap failed: {:?}", e)))?;
 
         let mut content_nonce_bytes = [0u8; 12];
         rand::rngs::OsRng.fill_bytes(&mut content_nonce_bytes);
@@ -1135,6 +1148,17 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let encrypted_size = chunked_encrypted_size(content_size, chunk_size)
             .map_err(|e| ClientError::EncryptionError(e.to_string()))?;
+
+        let manifest = content_manifest::digest(
+            content_size,
+            encrypted_size,
+            Some(chunk_size as u64),
+            &content_nonce_bytes,
+            None,
+        );
+        let (wrapped_file_key, key_wrap_nonce_bytes) =
+            content_manifest::wrap(&file_key, &kek, &wrap_aad, &manifest)
+                .map_err(|e| ClientError::EncryptionError(e.to_string()))?;
 
         let header = SerializedEncryptedHeader {
             file_id: &file_id,
@@ -1374,6 +1398,25 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         encrypted_file: &EncryptedFileMetadata,
     ) -> Result<Vec<u8>, ClientError> {
+        self.decrypt_file_with_legacy_policy(encrypted_file, false)
+            .await
+    }
+
+    /// Explicit recovery only: legacy chunked/sparse contents may be incomplete
+    /// or rearranged. Verify against a trusted original before re-encrypting.
+    pub async fn recover_legacy_file_unverified(
+        &self,
+        encrypted_file: &EncryptedFileMetadata,
+    ) -> Result<Vec<u8>, ClientError> {
+        self.decrypt_file_with_legacy_policy(encrypted_file, true)
+            .await
+    }
+
+    async fn decrypt_file_with_legacy_policy(
+        &self,
+        encrypted_file: &EncryptedFileMetadata,
+        allow_legacy: bool,
+    ) -> Result<Vec<u8>, ClientError> {
         use hybridcipher_crypto::aead::AeadContext;
         use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
         use hybridcipher_crypto::{open, AeadKey, AeadNonce};
@@ -1519,13 +1562,12 @@ impl<S: Storage, N: Network> Client<S, N> {
             &wrap_aad,
             wrapped_key,
         )
-        .map_err(|e| ClientError::DecryptionError(format!("Key unwrap failed: {:?}", e)))?;
-        let file_key = AeadKey::from_bytes(&file_key_bytes)
-            .map_err(|e| ClientError::DecryptionError(format!("Invalid DEK bytes: {:?}", e)))?;
+        .map_err(|e| ClientError::FileIntegrity(format!("Key unwrap failed: {:?}", e)))?;
+        let file_key = content_manifest::verify(encrypted_file, &file_key_bytes, allow_legacy)?;
 
         let header_version = encrypted_file.header_version.unwrap_or(1);
         let packed_content_size = Self::effective_packed_content_size(encrypted_file);
-        let packed_plaintext = if header_version >= CHUNKED_HEADER_VERSION
+        let packed_plaintext = if header_version == CHUNKED_HEADER_VERSION
             || encrypted_file.content_chunk_size.is_some()
         {
             let chunk_size = encrypted_file.content_chunk_size.ok_or_else(|| {
@@ -1574,8 +1616,10 @@ impl<S: Storage, N: Network> Client<S, N> {
         if encrypted_file.content_size == 0
             || plaintext.len() == encrypted_file.content_size as usize
         {
-            self.maybe_schedule_rewrap(&encrypted_file.file_path, file_epoch_id)
-                .await;
+            if !content_manifest::requires_legacy_compatibility(encrypted_file) {
+                self.maybe_schedule_rewrap(&encrypted_file.file_path, file_epoch_id)
+                    .await;
+            }
             return Ok(plaintext);
         }
 
@@ -1591,15 +1635,38 @@ impl<S: Storage, N: Network> Client<S, N> {
         encrypted_file: &EncryptedFileMetadata,
         output_path: &Path,
     ) -> Result<(), ClientError> {
+        self.decrypt_file_streaming_to_path_with_policy(
+            encrypted_path,
+            encrypted_file,
+            output_path,
+            content_manifest::LegacyReadPolicy::Strict,
+        )
+        .await
+    }
+
+    pub async fn decrypt_file_streaming_to_path_with_policy(
+        &self,
+        encrypted_path: &Path,
+        encrypted_file: &EncryptedFileMetadata,
+        output_path: &Path,
+        policy: content_manifest::LegacyReadPolicy,
+    ) -> Result<(), ClientError> {
         use hybridcipher_crypto::aead::AeadContext;
         use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
         use hybridcipher_crypto::{open, AeadKey, AeadNonce};
         use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
+        policy.check(encrypted_file)?;
         let header_version = encrypted_file.header_version.unwrap_or(1);
         let chunk_size = encrypted_file.content_chunk_size;
         if header_version < CHUNKED_HEADER_VERSION || chunk_size.is_none() {
-            let plaintext = self.decrypt_file(encrypted_file).await?;
+            let plaintext = zeroize::Zeroizing::new(
+                self.decrypt_file_with_legacy_policy(
+                    encrypted_file,
+                    policy == content_manifest::LegacyReadPolicy::AllowLegacyUnverified,
+                )
+                .await?,
+            );
             return Self::write_plaintext_atomic(output_path, &plaintext);
         }
 
@@ -1733,9 +1800,12 @@ impl<S: Storage, N: Network> Client<S, N> {
             &wrap_aad,
             wrapped_key,
         )
-        .map_err(|e| ClientError::DecryptionError(format!("Key unwrap failed: {:?}", e)))?;
-        let file_key = AeadKey::from_bytes(&file_key_bytes)
-            .map_err(|e| ClientError::DecryptionError(format!("Invalid DEK bytes: {:?}", e)))?;
+        .map_err(|e| ClientError::FileIntegrity(format!("Key unwrap failed: {:?}", e)))?;
+        let file_key = content_manifest::verify(
+            encrypted_file,
+            &file_key_bytes,
+            policy == content_manifest::LegacyReadPolicy::AllowLegacyUnverified,
+        )?;
 
         let content_nonce = encrypted_file.content_nonce.as_ref().ok_or_else(|| {
             ClientError::DecryptionError("Missing content nonce in metadata".to_string())
@@ -1751,15 +1821,51 @@ impl<S: Storage, N: Network> Client<S, N> {
         let chunk_size = chunk_size.ok_or_else(|| {
             ClientError::DecryptionError("Missing chunk_size in metadata".to_string())
         })? as usize;
-        if chunk_size == 0 {
+        if chunk_size == 0 || chunk_size > 64 * 1024 * 1024 {
             return Err(ClientError::DecryptionError(
-                "chunk_size must be greater than 0".to_string(),
+                "chunk_size must be between 1 and 64 MiB".to_string(),
             ));
         }
 
-        let packed_content_size = Self::effective_packed_content_size(encrypted_file);
+        // Validate the layout with checked arithmetic before calculating sizes or allocating output.
+        let packed_content_size = match encrypted_file.sparse_metadata.as_ref() {
+            Some(layout) => {
+                let mut end = 0u64;
+                let mut packed = 0u64;
+                for extent in &layout.extents {
+                    if extent.offset < end {
+                        return Err(ClientError::FileIntegrity(
+                            "Overlapping sparse extents".into(),
+                        ));
+                    }
+                    end = extent.offset.checked_add(extent.length).ok_or_else(|| {
+                        ClientError::FileIntegrity("Sparse extent overflow".into())
+                    })?;
+                    if end > layout.logical_size {
+                        return Err(ClientError::FileIntegrity(
+                            "Sparse extent exceeds logical size".into(),
+                        ));
+                    }
+                    packed = packed
+                        .checked_add(extent.length)
+                        .ok_or_else(|| ClientError::FileIntegrity("Sparse size overflow".into()))?;
+                }
+                if layout.logical_size != encrypted_file.content_size {
+                    return Err(ClientError::FileIntegrity(
+                        "Sparse logical size mismatch".into(),
+                    ));
+                }
+                packed
+            }
+            None => encrypted_file.content_size,
+        };
         let expected_encrypted_size = chunked_encrypted_size(packed_content_size, chunk_size)
             .map_err(|e| ClientError::DecryptionError(e.to_string()))?;
+        if encrypted_file.encrypted_size != expected_encrypted_size {
+            return Err(ClientError::FileIntegrity(
+                "Declared ciphertext size mismatch".into(),
+            ));
+        }
 
         let ciphertext_offset = {
             let file = std::fs::File::open(encrypted_path).map_err(|e| {
@@ -1769,7 +1875,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                     e
                 ))
             })?;
-            let mut reader = BufReader::new(file);
+            let mut reader = BufReader::new(file).take(16 * 1024 * 1024);
             let mut line = Vec::new();
             loop {
                 line.clear();
@@ -1789,7 +1895,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                     break;
                 }
             }
-            reader.stream_position().map_err(|e| {
+            reader.get_mut().stream_position().map_err(|e| {
                 ClientError::DecryptionError(format!(
                     "Failed to locate ciphertext offset for {}: {}",
                     encrypted_path.display(),
@@ -1852,7 +1958,11 @@ impl<S: Storage, N: Network> Client<S, N> {
             })?;
 
         let mut reader = BufReader::new(input_file);
-        let mut packed_plaintext = Vec::with_capacity(packed_content_size as usize);
+        let mut output = crate::file::plaintext_output::PlaintextOutput::new(
+            output_path,
+            encrypted_file.content_size,
+            encrypted_file.sparse_metadata.as_ref(),
+        )?;
 
         let mut remaining = packed_content_size;
         let mut chunk_index = 0u64;
@@ -1875,26 +1985,343 @@ impl<S: Storage, N: Network> Client<S, N> {
             aad.extend_from_slice(encrypted_file.file_id.as_bytes());
             aad.extend_from_slice(&chunk_index.to_le_bytes());
 
-            let plaintext =
-                open(&file_key, &nonce, AeadContext::FileData, &aad, &buffer).map_err(|e| {
-                    ClientError::DecryptionError(format!("Chunk decrypt failed: {:?}", e))
-                })?;
-            packed_plaintext.extend_from_slice(&plaintext);
+            let plaintext = zeroize::Zeroizing::new(
+                open(&file_key, &nonce, AeadContext::FileData, &aad, &buffer).map_err(|_| {
+                    ClientError::FileIntegrity("Chunk authentication failed".into())
+                })?,
+            );
+            output.write_chunk(&plaintext)?;
 
             remaining -= plain_len as u64;
             chunk_index += 1;
         }
 
-        if let Some(sparse_metadata) = encrypted_file.sparse_metadata.as_ref() {
-            Self::write_sparse_plaintext_atomic(output_path, &packed_plaintext, sparse_metadata)?;
-        } else {
-            Self::write_plaintext_atomic(output_path, &packed_plaintext)?;
+        output.finish()?;
+
+        if !content_manifest::requires_legacy_compatibility(encrypted_file) {
+            self.maybe_schedule_rewrap(&encrypted_file.file_path, file_epoch_id)
+                .await;
         }
 
+        Ok(())
+    }
+
+    /// Authenticate and decrypt exactly one logical range from a current
+    /// chunked file. The returned allocation is zeroized when it is dropped.
+    /// Sparse and legacy formats are intentionally handled by the provider's
+    /// full-file temporary fallback instead of this method.
+    pub async fn decrypt_file_range(
+        &self,
+        encrypted_path: &Path,
+        encrypted_file: &EncryptedFileMetadata,
+        offset: u64,
+        length: usize,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ClientError> {
+        use hybridcipher_crypto::aead::AeadContext;
+        use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
+        use hybridcipher_crypto::{open, AeadKey, AeadNonce};
+        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+        use zeroize::Zeroizing;
+
+        let end = offset
+            .checked_add(u64::try_from(length).map_err(|_| {
+                ClientError::InvalidInput("Requested range length does not fit in u64".to_string())
+            })?)
+            .ok_or_else(|| ClientError::InvalidInput("Requested range overflows".to_string()))?;
+        if end > encrypted_file.content_size {
+            return Err(ClientError::InvalidInput(format!(
+                "Requested range {offset}..{end} exceeds logical file size {}",
+                encrypted_file.content_size
+            )));
+        }
+        if length == 0 {
+            return Ok(Zeroizing::new(Vec::new()));
+        }
+
+        let header_version = encrypted_file.header_version.unwrap_or(1);
+        if header_version != content_manifest::VERSION
+            || encrypted_file.content_chunk_size.is_none()
+        {
+            return Err(ClientError::InvalidInput(
+                "Range decryption requires the current chunked file format".to_string(),
+            ));
+        }
+        if encrypted_file.sparse_metadata.is_some() {
+            return Err(ClientError::InvalidInput(
+                "Range decryption does not reconstruct sparse extents".to_string(),
+            ));
+        }
+
+        self.ensure_state_loaded().await?;
+        if let Err(err) = self.auto_sync_welcome_messages("decrypt_file_range").await {
+            self.logger.log(
+                crate::logging::LogLevel::Warn,
+                &format!("Automatic Welcome sync before range decryption failed: {err}"),
+                Some("auto_sync"),
+            );
+        }
+
+        let active_group = {
+            let state = self.state.read().await;
+            state.active_group_id.ok_or_else(|| {
+                ClientError::InvalidState(
+                    "No active group selected. Run 'hybridcipher switch-group <group-id>' before decrypting."
+                        .to_string(),
+                )
+            })?
+        };
+        let file_group_id = encrypted_file.group_id.ok_or_else(|| {
+            ClientError::InvalidState(
+                "Encrypted file metadata is missing group information. Please re-encrypt the file with an updated client."
+                    .to_string(),
+            )
+        })?;
+        if file_group_id != active_group {
+            return Err(ClientError::InvalidState(format!(
+                "File belongs to group {}, but the active group is {}. Run 'hybridcipher switch-group {}' and retry.",
+                file_group_id, active_group, file_group_id
+            )));
+        }
+
+        match self.verify_file_coverage(&encrypted_file.file_path).await {
+            Ok(coverage_epoch) if coverage_epoch != encrypted_file.epoch_id => self.logger.log(
+                crate::logging::LogLevel::Warn,
+                &format!(
+                    "Coverage log reports epoch {} for file {}, but metadata references {}",
+                    coverage_epoch, encrypted_file.file_path, encrypted_file.epoch_id
+                ),
+                None,
+            ),
+            Ok(_) => {}
+            Err(err) => self.logger.log(
+                crate::logging::LogLevel::Warn,
+                &format!(
+                    "Unable to verify coverage for {}: {}",
+                    encrypted_file.file_path, err
+                ),
+                None,
+            ),
+        }
+
+        let file_epoch_id = encrypted_file.epoch_id;
+        {
+            let state = self.state.read().await;
+            if Self::get_epoch_state(&state, file_group_id, file_epoch_id).is_none() {
+                drop(state);
+                self.ensure_epoch_key_available(file_group_id, file_epoch_id)
+                    .await?;
+            }
+        }
+
+        let wrapped_key = encrypted_file.wrapped_file_key.as_ref().ok_or_else(|| {
+            ClientError::DecryptionError(
+                "Encrypted file missing wrapped_file_key (legacy format unsupported)".to_string(),
+            )
+        })?;
+        let wrap_nonce_bytes = encrypted_file.key_wrap_nonce.as_deref().ok_or_else(|| {
+            ClientError::DecryptionError("Missing key wrap nonce in encrypted metadata".to_string())
+        })?;
+        let wrap_nonce = AeadNonce::from_bytes(wrap_nonce_bytes).map_err(|err| {
+            ClientError::DecryptionError(format!("Invalid key wrap nonce: {err:?}"))
+        })?;
+        let wrap_aad = self.build_wrap_aad(
+            &encrypted_file.file_id,
+            &encrypted_file.file_path,
+            file_group_id,
+            file_epoch_id,
+            header_version,
+        );
+        if let Some(expected_hash) = encrypted_file.key_wrap_aad_hash.as_ref() {
+            if &hash_wrap_aad(&wrap_aad) != expected_hash {
+                return Err(ClientError::DecryptionError(
+                    "Key wrap AAD hash mismatch".to_string(),
+                ));
+            }
+        }
+        let epoch_key_bytes = {
+            let state = self.state.read().await;
+            Self::get_epoch_state(&state, file_group_id, file_epoch_id)
+                .map(|epoch| epoch.encryption_key)
+                .ok_or_else(|| {
+                    ClientError::InvalidState(format!(
+                        "Epoch {} not available for key unwrap",
+                        file_epoch_id
+                    ))
+                })?
+        };
+        let kek_bytes =
+            hkdf_expand(&epoch_key_bytes, HkdfContext::KeyWrapping, 32).map_err(|err| {
+                ClientError::DecryptionError(format!("HKDF(KeyWrapping) failed: {err:?}"))
+            })?;
+        let kek = AeadKey::from_bytes(&kek_bytes)
+            .map_err(|err| ClientError::DecryptionError(format!("Invalid KEK: {err:?}")))?;
+        let file_key_bytes = open(
+            &kek,
+            &wrap_nonce,
+            AeadContext::FileData,
+            &wrap_aad,
+            wrapped_key,
+        )
+        .map_err(|err| ClientError::FileIntegrity(format!("Key unwrap failed: {err:?}")))?;
+        let file_key = content_manifest::verify(encrypted_file, &file_key_bytes, false)?;
+
+        let content_nonce = encrypted_file.content_nonce.as_ref().ok_or_else(|| {
+            ClientError::DecryptionError("Missing content nonce in metadata".to_string())
+        })?;
+        if content_nonce.len() != 12 {
+            return Err(ClientError::DecryptionError(
+                "Invalid content nonce length".to_string(),
+            ));
+        }
+        let mut base_nonce = [0u8; 12];
+        base_nonce.copy_from_slice(content_nonce);
+        let chunk_size = usize::try_from(encrypted_file.content_chunk_size.unwrap_or_default())
+            .map_err(|_| ClientError::DecryptionError("chunk_size is too large".to_string()))?;
+        if chunk_size == 0 {
+            return Err(ClientError::DecryptionError(
+                "chunk_size must be greater than 0".to_string(),
+            ));
+        }
+
+        let packed_content_size = Self::effective_packed_content_size(encrypted_file);
+        if packed_content_size != encrypted_file.content_size {
+            return Err(ClientError::InvalidInput(
+                "Range decryption cannot address packed sparse content".to_string(),
+            ));
+        }
+        let expected_encrypted_size = chunked_encrypted_size(packed_content_size, chunk_size)
+            .map_err(|err| ClientError::DecryptionError(err.to_string()))?;
+        let ciphertext_offset = {
+            let file = std::fs::File::open(encrypted_path).map_err(|err| {
+                ClientError::DecryptionError(format!(
+                    "Failed to open encrypted file {}: {err}",
+                    encrypted_path.display()
+                ))
+            })?;
+            let mut reader = BufReader::new(file).take(16 * 1024 * 1024);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let bytes = reader.read_until(b'\n', &mut line).map_err(|err| {
+                    ClientError::DecryptionError(format!(
+                        "Failed to read encrypted header {}: {err}",
+                        encrypted_path.display()
+                    ))
+                })?;
+                if bytes == 0 {
+                    return Err(ClientError::DecryptionError(
+                        "Encrypted header separator not found".to_string(),
+                    ));
+                }
+                if line == b"---ENCRYPTED_DATA---\n" || line == b"---ENCRYPTED_DATA---" {
+                    break;
+                }
+            }
+            reader.get_mut().stream_position().map_err(|err| {
+                ClientError::DecryptionError(format!(
+                    "Failed to locate ciphertext offset for {}: {err}",
+                    encrypted_path.display()
+                ))
+            })?
+        };
+        let file_len = std::fs::metadata(encrypted_path)
+            .map_err(|err| {
+                ClientError::DecryptionError(format!(
+                    "Failed to stat encrypted file {}: {err}",
+                    encrypted_path.display()
+                ))
+            })?
+            .len();
+        let actual_cipher_len = file_len.checked_sub(ciphertext_offset).ok_or_else(|| {
+            ClientError::DecryptionError("Encrypted file is shorter than header offset".to_string())
+        })?;
+        if actual_cipher_len != expected_encrypted_size {
+            return Err(ClientError::DecryptionError(format!(
+                "Encrypted size mismatch (expected {expected_encrypted_size}, found {actual_cipher_len})"
+            )));
+        }
+
+        let chunk_size_u64 = u64::try_from(chunk_size)
+            .map_err(|_| ClientError::DecryptionError("chunk_size is too large".to_string()))?;
+        let chunk_stride = chunk_size_u64
+            .checked_add(AEAD_TAG_SIZE as u64)
+            .ok_or_else(|| ClientError::DecryptionError("chunk stride overflows".to_string()))?;
+        let first_chunk = offset / chunk_size_u64;
+        let final_chunk = (end - 1) / chunk_size_u64;
+        let seek_offset = ciphertext_offset
+            .checked_add(first_chunk.checked_mul(chunk_stride).ok_or_else(|| {
+                ClientError::DecryptionError("ciphertext range offset overflows".to_string())
+            })?)
+            .ok_or_else(|| {
+                ClientError::DecryptionError("ciphertext range offset overflows".to_string())
+            })?;
+        let mut input = std::fs::File::open(encrypted_path).map_err(|err| {
+            ClientError::DecryptionError(format!(
+                "Failed to open encrypted file {}: {err}",
+                encrypted_path.display()
+            ))
+        })?;
+        input.seek(SeekFrom::Start(seek_offset)).map_err(|err| {
+            ClientError::DecryptionError(format!(
+                "Failed to seek encrypted file {}: {err}",
+                encrypted_path.display()
+            ))
+        })?;
+        let mut reader = BufReader::new(input);
+        let mut ciphertext = vec![0u8; chunk_size + AEAD_TAG_SIZE];
+        let mut result = Zeroizing::new(Vec::with_capacity(length));
+
+        for chunk_index in first_chunk..=final_chunk {
+            let chunk_plain_offset = chunk_index.checked_mul(chunk_size_u64).ok_or_else(|| {
+                ClientError::DecryptionError("plaintext chunk offset overflows".to_string())
+            })?;
+            let remaining = packed_content_size
+                .checked_sub(chunk_plain_offset)
+                .ok_or_else(|| {
+                    ClientError::DecryptionError("plaintext chunk exceeds content size".to_string())
+                })?;
+            let plain_len = usize::try_from(remaining.min(chunk_size_u64)).map_err(|_| {
+                ClientError::DecryptionError("plaintext chunk length is too large".to_string())
+            })?;
+            let cipher_len = plain_len.checked_add(AEAD_TAG_SIZE).ok_or_else(|| {
+                ClientError::DecryptionError("ciphertext chunk length overflows".to_string())
+            })?;
+            ciphertext.resize(cipher_len, 0);
+            reader.read_exact(&mut ciphertext).map_err(|err| {
+                ClientError::DecryptionError(format!("Failed to read ciphertext chunk: {err}"))
+            })?;
+
+            let nonce_bytes = derive_chunk_nonce(&base_nonce, chunk_index);
+            let nonce = AeadNonce::from_bytes(&nonce_bytes).map_err(|err| {
+                ClientError::DecryptionError(format!("Invalid chunk nonce: {err:?}"))
+            })?;
+            let mut aad = Vec::with_capacity(encrypted_file.file_id.len() + 8);
+            aad.extend_from_slice(encrypted_file.file_id.as_bytes());
+            aad.extend_from_slice(&chunk_index.to_le_bytes());
+            let plaintext = Zeroizing::new(
+                open(&file_key, &nonce, AeadContext::FileData, &aad, &ciphertext).map_err(
+                    |err| {
+                        ClientError::FileIntegrity(format!("Chunk authentication failed: {err:?}"))
+                    },
+                )?,
+            );
+            let copy_start = offset.saturating_sub(chunk_plain_offset) as usize;
+            let chunk_plain_end = chunk_plain_offset + plain_len as u64;
+            let copy_end =
+                usize::try_from(end.min(chunk_plain_end) - chunk_plain_offset).map_err(|_| {
+                    ClientError::DecryptionError("range slice length is too large".to_string())
+                })?;
+            result.extend_from_slice(&plaintext[copy_start..copy_end]);
+        }
+        if result.len() != length {
+            return Err(ClientError::DecryptionError(format!(
+                "Range decrypt length mismatch (expected {length}, found {})",
+                result.len()
+            )));
+        }
         self.maybe_schedule_rewrap(&encrypted_file.file_path, file_epoch_id)
             .await;
-
-        Ok(())
+        Ok(result)
     }
 
     pub(super) fn decrypt_chunked_bytes(

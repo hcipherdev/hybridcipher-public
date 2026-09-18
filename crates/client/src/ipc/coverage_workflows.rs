@@ -1030,7 +1030,7 @@ where
     }
 
     let parsed = parse_encrypted_file(path)?;
-    let output_path = default_decrypted_path(path, parsed.original_name.as_deref());
+    let output_path = default_decrypted_path(path, parsed.original_name.as_deref())?;
     let parent_dir = output_path.parent().map(|dir| dir.to_path_buf());
     let parent_mtime = parent_dir
         .as_ref()
@@ -1252,20 +1252,10 @@ where
         .await
         .map_err(|e| ClientError::InvalidState(e.to_string()))?;
 
-    let output_path = output_override
-        .unwrap_or_else(|| default_decrypted_path(source_path, parsed.original_name.as_deref()));
+    let validated_default = default_decrypted_path(source_path, parsed.original_name.as_deref())?;
+    let output_path = output_override.unwrap_or(validated_default);
 
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            storage_error(
-                ErrorCode::StorageWrite,
-                format!("Failed to create directory {}: {}", parent.display(), err),
-                "coverage_decrypt_mkdir",
-            )
-        })?;
-    }
-
-    fs::write(&output_path, decrypted_data).map_err(|e| {
+    crate::file::safe_restore::write_new(&output_path, &decrypted_data).map_err(|e| {
         storage_error(
             ErrorCode::StorageWrite,
             format!(
@@ -1336,11 +1326,33 @@ fn ensure_encrypted_suffix(candidate: PathBuf, original: &Path) -> PathBuf {
     adjusted
 }
 
-fn default_decrypted_path(source: &Path, original_name: Option<&str>) -> PathBuf {
-    if let Some(name) = original_name {
-        source.parent().unwrap_or_else(|| Path::new(".")).join(name)
-    } else {
-        source.with_extension("decrypted")
+fn default_decrypted_path(
+    source: &Path,
+    original_name: Option<&str>,
+) -> Result<PathBuf, ClientError> {
+    crate::file::safe_restore::destination(source, original_name)
+        .map_err(|e| ClientError::InvalidInput(e.to_string()))
+}
+
+#[cfg(test)]
+mod security_regression {
+    use super::*;
+    #[test]
+    fn removal_workflow_rejects_redirected_names() {
+        let source = Path::new("protected/document.encrypted");
+        for name in [
+            "../escaped.txt",
+            "..\\escaped.txt",
+            "C:\\escaped.txt",
+            "file:stream",
+            "NUL",
+        ] {
+            assert!(default_decrypted_path(source, Some(name)).is_err());
+        }
+        assert_eq!(
+            default_decrypted_path(source, Some("document.txt")).unwrap(),
+            Path::new("protected/document.txt")
+        );
     }
 }
 

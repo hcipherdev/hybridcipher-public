@@ -3549,6 +3549,16 @@ body {
     background: rgba(90, 60, 12, 0.22);
 }
 
+.workspace-health-card.tone-unknown {
+    border-style: dashed;
+    border-color: rgba(255, 255, 255, 0.16);
+    background: rgba(10, 18, 40, 0.28);
+}
+
+.workspace-health-card.tone-unknown .workspace-health-card-value {
+    color: var(--text-secondary);
+}
+
 .workspace-health-card-label,
 .workspace-section-eyebrow {
     color: var(--text-secondary);

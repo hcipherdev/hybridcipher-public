@@ -27,7 +27,7 @@ fn cloud_provider_supervisor_requires_recovery(
 #[cfg(target_os = "windows")]
 struct RunningCloudRoot {
     host: hybridcipher_windows_cloud_provider::CloudProviderHost,
-    client: Arc<LocalClient>,
+    bridge: Arc<dyn hybridcipher_windows_cloud_provider::ProviderBridge>,
     operation_lock: Arc<Mutex<()>>,
     owner_token: Uuid,
     recovery_exhausted: Arc<AtomicBool>,
@@ -167,7 +167,7 @@ impl DesktopCloudProviderManager {
         root_id: Uuid,
         sync_root_path: PathBuf,
         encrypted_root: PathBuf,
-        display_name: String,
+        _display_name: String,
         client: Arc<LocalClient>,
     ) -> Result<(), String> {
         {
@@ -182,7 +182,17 @@ impl DesktopCloudProviderManager {
             }
         }
 
-        let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge(client.clone());
+        let compatibility = Arc::new(
+            hybridcipher_windows_cloud_provider::VaultCompatibility::load(
+                &user_config_dir,
+                root_id,
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge_with_compatibility(
+            client.clone(),
+            compatibility,
+        );
         let host = hybridcipher_windows_cloud_provider::CloudProviderHost::with_provider_bridge(
             hybridcipher_windows_cloud_provider::ProviderHostConfig {
                 user_config_dir,
@@ -197,18 +207,38 @@ impl DesktopCloudProviderManager {
             }));
         }
 
-        let registration = hybridcipher_windows_cloud_provider::CloudRootRegistration {
-            root_id,
-            sync_root_path,
-            encrypted_root,
-            display_name,
+        let vault_name = encrypted_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("Vault");
+        let base_display_name = format!("HybridCipher — {vault_name}");
+        let display_name = if host
+            .load_registrations()
+            .map_err(|err| err.to_string())?
+            .iter()
+            .any(|existing| {
+                existing.root_id != root_id && existing.display_name == base_display_name
+            }) {
+            let short = root_id.simple().to_string();
+            format!("{base_display_name} ({})", &short[..8])
+        } else {
+            base_display_name
         };
+        let registration =
+            hybridcipher_windows_cloud_provider::CloudRootRegistration::shell_integrated(
+                root_id,
+                sync_root_path,
+                encrypted_root,
+                display_name,
+            )
+            .map_err(|err| err.to_string())?;
         let registration_preexisted = host
             .registration_exists(root_id)
             .map_err(|err| err.to_string())?;
         host.register_root(&registration)
             .map_err(|err| err.to_string())?;
-        let start_result = host.start_root_with_bridge(root_id, bridge).await;
+        let start_result = host.start_root_with_bridge(root_id, bridge.clone()).await;
         if let Err(err) = start_result {
             return Err(host
                 .cleanup_failed_root_start_after_error(
@@ -270,7 +300,7 @@ impl DesktopCloudProviderManager {
             root_id,
             RunningCloudRoot {
                 host,
-                client,
+                bridge,
                 operation_lock: Arc::new(Mutex::new(())),
                 owner_token: Uuid::new_v4(),
                 recovery_exhausted: Arc::new(AtomicBool::new(false)),
@@ -312,7 +342,7 @@ impl DesktopCloudProviderManager {
                     (
                         *root_id,
                         root.host.clone(),
-                        root.client.clone(),
+                        root.bridge.clone(),
                         root.operation_lock.clone(),
                         root.owner_token,
                         root.recovery_exhausted.clone(),
@@ -320,7 +350,7 @@ impl DesktopCloudProviderManager {
                 })
                 .collect::<Vec<_>>()
         };
-        for (root_id, host, client, operation_lock, owner_token, recovery_exhausted) in targets {
+        for (root_id, host, bridge, operation_lock, owner_token, recovery_exhausted) in targets {
             if recovery_exhausted.load(Ordering::Acquire) {
                 continue;
             }
@@ -362,7 +392,7 @@ impl DesktopCloudProviderManager {
             let mut recovered = false;
             for attempt in 1..=3u32 {
                 if host.is_root_running(root_id) {
-                    if let Err(error) = host.stop_root(root_id).await {
+                    if let Err(error) = host.stop_root_for_restart(root_id).await {
                         failures.push(format!("attempt {attempt} stop failed: {error}"));
                         tokio::time::sleep(std::time::Duration::from_millis(
                             250 * u64::from(attempt),
@@ -371,9 +401,7 @@ impl DesktopCloudProviderManager {
                         continue;
                     }
                 }
-                let bridge =
-                    hybridcipher_windows_cloud_provider::local_provider_bridge(client.clone());
-                match host.start_root_with_bridge(root_id, bridge).await {
+                match host.start_root_with_bridge(root_id, bridge.clone()).await {
                     Ok(()) => match host.probe_root(root_id).await {
                         Ok(_) => {
                             recovered = true;
@@ -393,10 +421,9 @@ impl DesktopCloudProviderManager {
             if recovered {
                 tracing::info!(root_id = %root_id, "Cloud Files health supervisor recovered the root");
             } else {
-                recovery_exhausted.store(true, Ordering::Release);
                 tracing::error!(
                     root_id = %root_id,
-                    "Cloud Files health supervisor exhausted its 3-attempt recovery budget; stop and remount the root to retry: {}",
+                    "Cloud Files health supervisor exhausted this recovery cycle; retrying on the next health check: {}",
                     failures.join("; ")
                 );
             }
@@ -436,6 +463,68 @@ impl DesktopCloudProviderManager {
             }
         }
         Ok(health)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub async fn vault_compatibility(
+        &self,
+        root_id: Uuid,
+        enabled: Option<bool>,
+    ) -> Result<Option<hybridcipher_windows_cloud_provider::VaultCompatibilityStatus>, String> {
+        let (host, lock) = {
+            let running = self.running.lock().await;
+            let root = running
+                .get(&root_id)
+                .ok_or("Mount the folder to manage legacy compatibility")?;
+            (root.host.clone(), root.operation_lock.clone())
+        };
+        let _operation = lock.lock().await;
+        match enabled {
+            Some(enabled) => host
+                .set_legacy_compatibility(root_id, enabled)
+                .await
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            None => host
+                .compatibility_status(root_id)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub async fn list_pending_operations(
+        &self,
+        root_id: Uuid,
+    ) -> Result<serde_json::Value, String> {
+        let running = self.running.lock().await;
+        let root = running
+            .get(&root_id)
+            .ok_or("Mount the folder to view pending operations")?;
+        let status = root
+            .host
+            .read_runtime_status(root_id)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(status.pending_operations).map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub async fn resolve_pending_operation(
+        &self,
+        root_id: Uuid,
+        operation_id: Uuid,
+        action: hybridcipher_windows_cloud_provider::PendingOperationResolution,
+    ) -> Result<(), String> {
+        let (host, lock) = {
+            let running = self.running.lock().await;
+            let root = running
+                .get(&root_id)
+                .ok_or("Mount the folder to resolve pending work")?;
+            (root.host.clone(), root.operation_lock.clone())
+        };
+        let _operation = lock.lock().await;
+        host.resolve_pending_operation(root_id, operation_id, action)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     #[cfg(target_os = "macos")]

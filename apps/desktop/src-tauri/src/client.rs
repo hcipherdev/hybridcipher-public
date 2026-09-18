@@ -156,19 +156,9 @@ fn load_cached_account_key(user_dir: &Path) -> Result<Option<[u8; 32]>, String> 
         return Ok(None);
     }
 
-    let encoded = fs::read_to_string(&cache_path)
-        .map_err(|e| format!("Failed to read account key cache: {}", e))?;
-    let decoded = general_purpose::STANDARD
-        .decode(encoded.trim())
-        .map_err(|e| format!("Failed to decode account key cache: {}", e))?;
-
-    if decoded.len() != 32 {
-        return Err("Cached account key is invalid length".to_string());
-    }
-
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&decoded);
-    Ok(Some(key_bytes))
+    hybridcipher_crypto::local_key_cache::load(&cache_path)
+        .map(Some)
+        .map_err(|e| format!("Failed to unlock account key cache: {e}"))
 }
 
 fn read_protected_string(

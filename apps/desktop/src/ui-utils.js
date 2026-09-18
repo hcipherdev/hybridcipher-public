@@ -144,6 +144,19 @@
         };
     }
 
+    // `null`/`undefined` means "we could not determine this", which must never be
+    // rendered as a confirmed protection failure.
+    function optionalBoolean(value) {
+        return value === null || value === undefined ? null : Boolean(value);
+    }
+
+    function shouldRetryWorkspaceStatusAfterSessionRefresh(unavailableSections) {
+        if (!Array.isArray(unavailableSections)) return false;
+        return unavailableSections.some(section =>
+            section === 'sign-in protection' || section === 'this device'
+        );
+    }
+
     function buildWorkspaceHomeModel(snapshot = {}, { nowMs = Date.now() } = {}) {
         const protectedCount = toCount(snapshot.protected_count);
         const mountedCount = toCount(snapshot.mounted_count);
@@ -156,9 +169,24 @@
         const unverifiedDevices = toCount(deviceCounts.unverified);
         const currentDevice = snapshot.current_device || null;
         const scanAgeMs = lastScanMs === null ? null : Math.max(0, nowMs - lastScanMs);
+        const unavailableSections = Array.isArray(snapshot.unavailable_sections)
+            ? snapshot.unavailable_sections.filter(Boolean).map(String)
+            : [];
+
+        const mfaEnabled = optionalBoolean(snapshot.mfa_enabled);
+        const recoveryBackupOk = optionalBoolean(snapshot.recovery_backup_ok);
+        const recoveryAutoBackupOk = optionalBoolean(snapshot.recovery_auto_backup_ok);
+        // Only treat a missing timestamp as "never scanned" when we know the scan
+        // status was actually read. `scan_status_available === false` means unknown.
+        const scanStatusKnown = snapshot.scan_status_available !== false;
         const scanIsFresh = scanAgeMs !== null && scanAgeMs <= 36 * 60 * 60 * 1000;
-        const backupHealthy = Boolean(snapshot.recovery_backup_ok) && Boolean(snapshot.recovery_auto_backup_ok);
-        const deviceTrusted = Boolean(currentDevice && currentDevice.is_verified);
+
+        const backupHealthy = recoveryBackupOk === null || recoveryAutoBackupOk === null
+            ? null
+            : recoveryBackupOk && recoveryAutoBackupOk;
+        const deviceTrusted = currentDevice
+            ? optionalBoolean(currentDevice.is_verified)
+            : null;
         const folderIssues = toCount(folderAttention.conflicts) + toCount(folderAttention.recovery_copies);
         const postQuantum = buildPostQuantumStatusModel({
             protectedCount,
@@ -170,40 +198,83 @@
 
         const cards = [
             postQuantum.homeCard,
-            {
-                id: 'mfa',
-                title: 'Sign-in protection',
-                tone: snapshot.mfa_enabled ? 'safe' : 'danger',
-                value: snapshot.mfa_enabled ? 'On' : 'Off',
-                detail: snapshot.mfa_enabled
-                    ? 'Authenticator protection is enabled.'
-                    : 'Turn on MFA to protect new sign-ins and recovery.',
-                ctaAction: snapshot.mfa_enabled ? null : 'open-settings-mfa',
-            },
-            {
-                id: 'scan',
-                title: 'Scan freshness',
-                tone: scanIsFresh ? 'safe' : 'warning',
-                value: lastScanMs === null ? 'Not scanned yet' : (scanIsFresh ? 'Up to date' : 'Scan again'),
-                detail: lastScanMs === null
-                    ? 'Run a scan to verify your protected folders are covered.'
-                    : `Last scan ${new Date(lastScanMs).toISOString()}`,
-                ctaAction: 'run-coverage-scan',
-            },
-            {
-                id: 'device',
-                title: 'This device',
-                tone: deviceTrusted ? 'safe' : 'danger',
-                value: deviceTrusted ? 'Trusted' : 'Needs verification',
-                detail: currentDevice?.device_id
-                    ? `Device ID: ${currentDevice.device_id}`
-                    : 'Current device information is unavailable.',
-                ctaAction: 'open-devices',
-            },
+            mfaEnabled === null
+                ? {
+                    id: 'mfa',
+                    title: 'Sign-in protection',
+                    tone: 'unknown',
+                    value: 'Unknown',
+                    detail: 'HybridCipher could not check sign-in protection right now. Refresh to try again.',
+                    ctaAction: 'refresh-workspace-status',
+                    ctaLabel: 'Refresh',
+                }
+                : {
+                    id: 'mfa',
+                    title: 'Sign-in protection',
+                    tone: mfaEnabled ? 'safe' : 'danger',
+                    value: mfaEnabled ? 'On' : 'Off',
+                    detail: mfaEnabled
+                        ? 'Authenticator protection is enabled.'
+                        : 'Turn on MFA to protect new sign-ins and recovery.',
+                    ctaAction: mfaEnabled ? null : 'open-settings-mfa',
+                },
+            !scanStatusKnown
+                ? {
+                    id: 'scan',
+                    title: 'Scan freshness',
+                    tone: 'unknown',
+                    value: 'Unknown',
+                    detail: 'HybridCipher could not read the last scan time. Refresh to try again.',
+                    ctaAction: 'refresh-workspace-status',
+                    ctaLabel: 'Refresh',
+                }
+                : {
+                    id: 'scan',
+                    title: 'Scan freshness',
+                    tone: scanIsFresh ? 'safe' : 'warning',
+                    value: lastScanMs === null ? 'Not scanned yet' : (scanIsFresh ? 'Up to date' : 'Scan again'),
+                    detail: lastScanMs === null
+                        ? 'Run a scan to verify your protected folders are covered.'
+                        : `Last scan ${new Date(lastScanMs).toISOString()}`,
+                    ctaAction: 'run-coverage-scan',
+                },
+            deviceTrusted === null
+                ? {
+                    id: 'device',
+                    title: 'This device',
+                    tone: 'unknown',
+                    value: 'Unknown',
+                    detail: currentDevice?.device_id
+                        ? `Trust status unavailable for ${currentDevice.device_id}. Refresh to try again.`
+                        : 'HybridCipher could not check this device right now. Refresh to try again.',
+                    ctaAction: 'refresh-workspace-status',
+                    ctaLabel: 'Refresh',
+                }
+                : {
+                    id: 'device',
+                    title: 'This device',
+                    tone: deviceTrusted ? 'safe' : 'danger',
+                    value: deviceTrusted ? 'Trusted' : 'Needs verification',
+                    detail: currentDevice?.device_id
+                        ? `Device ID: ${currentDevice.device_id}`
+                        : 'Current device information is unavailable.',
+                    ctaAction: 'open-devices',
+                },
         ];
 
         const attentionItems = [];
-        if (!snapshot.mfa_enabled) {
+        if (unavailableSections.length > 0) {
+            attentionItems.push({
+                id: 'status-unavailable',
+                title: 'Some protection checks could not be loaded',
+                detail: `HybridCipher could not confirm ${unavailableSections.join(', ')}. The cards above show "Unknown" until this succeeds.`,
+                action: {
+                    id: 'refresh-workspace-status',
+                    label: 'Refresh',
+                },
+            });
+        }
+        if (mfaEnabled === false) {
             attentionItems.push({
                 id: 'mfa',
                 title: 'Multi-factor authentication is off',
@@ -214,7 +285,7 @@
                 },
             });
         }
-        if (!backupHealthy) {
+        if (backupHealthy === false) {
             attentionItems.push({
                 id: 'backup',
                 title: 'Recovery backup needs attention',
@@ -225,7 +296,7 @@
                 },
             });
         }
-        if (!scanIsFresh) {
+        if (scanStatusKnown && !scanIsFresh) {
             attentionItems.push({
                 id: 'scan',
                 title: protectedCount === 0
@@ -247,7 +318,7 @@
                     },
             });
         }
-        if (!deviceTrusted) {
+        if (deviceTrusted === false) {
             attentionItems.push({
                 id: 'device-trust',
                 title: 'This device is not fully trusted',
@@ -281,12 +352,26 @@
             });
         }
 
+        // A failed refresh is not the same as a confirmed problem, so it gets its
+        // own softer tone instead of the red "Needs attention" state.
+        const confirmedIssues = attentionItems.filter(item => item.id !== 'status-unavailable');
+        let summaryTone = 'safe';
+        let summaryLabel = 'Protected';
+        if (confirmedIssues.length > 0) {
+            summaryTone = 'danger';
+            summaryLabel = 'Needs attention';
+        } else if (unavailableSections.length > 0) {
+            summaryTone = 'warning';
+            summaryLabel = 'Status incomplete';
+        }
+
         return {
             protectedCount,
             mountedCount,
             postQuantum,
-            summaryTone: attentionItems.length > 0 ? 'danger' : 'safe',
-            summaryLabel: attentionItems.length > 0 ? 'Needs attention' : 'Protected',
+            summaryTone,
+            summaryLabel,
+            unavailableSections,
             cards,
             attentionItems,
         };
@@ -430,6 +515,22 @@
         };
     }
 
+    // The coverage IPC watcher is a Unix-socket-only channel, so on Windows the
+    // backend always reports "unsupported". Coverage is still re-scanned by the
+    // in-process watcher there, so don't surface a raw enum that reads like a
+    // failure — say nothing rather than something alarming and wrong.
+    function coverageWatcherLabel(ipcState) {
+        switch (ipcState) {
+            case 'active':
+                return 'On';
+            case 'inactive':
+                return 'Off';
+            case 'unsupported':
+            default:
+                return null;
+        }
+    }
+
     function buildCoverageCenterModel(snapshot = {}, runtime = {}) {
         const folders = Array.isArray(snapshot.folders)
             ? snapshot.folders.map(folder => {
@@ -501,6 +602,7 @@
             folderCount: toCount(snapshot.enrolled_folder_count),
             lastScanAt: snapshot.last_scan_at || null,
             ipcState: snapshot.ipc_state || 'inactive',
+            watcherLabel: coverageWatcherLabel(snapshot.ipc_state || 'inactive'),
             scanState: currentScanState,
         };
 
@@ -677,7 +779,15 @@
         };
     }
 
+    function pendingOperationLabel(status = {}) {
+        const count = Math.max(0, toCount(status.pending_operation_count));
+        const files = Math.max(0, toCount(status.affected_file_count));
+        const kind = count > 0 && toCount(status.pending_operation_counts?.rename) === count ? 'rename' : 'operation';
+        return `${count} unresolved ${pluralize(count, kind, `${kind}s`)} affecting ${files} ${pluralize(files, 'file', 'files')}`;
+    }
+
     const api = {
+        pendingOperationLabel,
         captureKeyedScrollPositions,
         restoreKeyedScrollPositions,
         filterProtectedFolders,
@@ -687,6 +797,7 @@
         getFolderRowStatusState,
         buildMountConflictReviewState,
         buildPostQuantumStatusModel,
+        shouldRetryWorkspaceStatusAfterSessionRefresh,
         buildWorkspaceHomeModel,
         buildFolderCoverageModel,
         buildFolderDetailModel,

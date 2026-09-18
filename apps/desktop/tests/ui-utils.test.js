@@ -2,9 +2,16 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+    pendingOperationLabel,
     getEmbeddedTerminalHeaderTitle,
     getFolderRowStatusState,
 } = require('../src/ui-utils.js');
+
+test('pending status counts logical operations independently of retry history', () => {
+    assert.equal(pendingOperationLabel({ pending_operation_count: 1, affected_file_count: 1, pending_operation_counts: { rename: 1 }, pending_operations: [{ attempts: 122, merged_records: 121 }] }), '1 unresolved rename affecting 1 file');
+    assert.equal(pendingOperationLabel({ pending_operation_count: 3, affected_file_count: 2, pending_operation_counts: { rename: 2, writeback: 1 } }), '3 unresolved operations affecting 2 files');
+    assert.equal(pendingOperationLabel({ pending_operation_count: 2, affected_file_count: 1, pending_operation_counts: { rename: 2 } }), '2 unresolved renames affecting 1 file');
+});
 
 test('embedded terminal header title is always static', () => {
     assert.equal(getEmbeddedTerminalHeaderTitle(), 'Embedded Terminal');

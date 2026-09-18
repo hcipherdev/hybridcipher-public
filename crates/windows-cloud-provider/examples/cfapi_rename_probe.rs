@@ -11,7 +11,8 @@ mod windows_probe {
         FileIdentityV1, ProviderBridge, ProviderEntry, Result as ProviderResult,
     };
     use hybridcipher_windows_cloud_provider::{
-        CloudProviderHost, CloudRootRegistration, ProviderHostConfig, SafeRootStopOutcome,
+        CloudCallbackKind, CloudProviderHost, CloudRootRegistration, ProviderHostConfig,
+        SafeRootStopOutcome,
     };
     use std::{
         collections::HashMap,
@@ -19,7 +20,10 @@ mod windows_probe {
         fs,
         path::{Path, PathBuf},
         process::Command,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
         time::{Duration, Instant},
     };
     use uuid::Uuid;
@@ -33,6 +37,8 @@ mod windows_probe {
     #[derive(Default)]
     struct ProbeBridge {
         entries: Mutex<HashMap<String, ProbeEntry>>,
+        delay_next_write: AtomicBool,
+        delayed_write_started: AtomicBool,
     }
 
     impl ProbeBridge {
@@ -65,6 +71,14 @@ mod windows_probe {
                 .expect("probe bridge lock")
                 .get(relative_path)
                 .and_then(|entry| entry.entry.identity.file_id.clone())
+        }
+
+        fn content_matches(&self, relative_path: &str, expected: &[u8]) -> bool {
+            self.entries
+                .lock()
+                .expect("probe bridge lock")
+                .get(relative_path)
+                .is_some_and(|entry| entry.bytes == expected)
         }
 
         fn write_plaintext(
@@ -142,6 +156,10 @@ mod windows_probe {
             plaintext_path: &Path,
             existing_identity: Option<&FileIdentityV1>,
         ) -> ProviderResult<ProviderEntry> {
+            if self.delay_next_write.swap(false, Ordering::SeqCst) {
+                self.delayed_write_started.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
             self.write_plaintext(
                 root_id,
                 encrypted_root,
@@ -215,7 +233,13 @@ mod windows_probe {
     fn run_child() -> Result<bool, Box<dyn Error>> {
         let mut args = std::env::args_os();
         let _program = args.next();
-        if args.next().as_deref() != Some(std::ffi::OsStr::new("--rename-child")) {
+        let mode = args.next();
+        if mode.as_deref() == Some(std::ffi::OsStr::new("--edit-child")) {
+            let path = PathBuf::from(args.next().ok_or("missing child edit path")?);
+            fs::write(path, b"edited during provider recovery\n")?;
+            return Ok(true);
+        }
+        if mode.as_deref() != Some(std::ffi::OsStr::new("--rename-child")) {
             return Ok(false);
         }
         let source = PathBuf::from(args.next().ok_or("missing child source path")?);
@@ -247,12 +271,12 @@ mod windows_probe {
             user_config_dir,
             pipe_name: None,
         });
-        let registration = CloudRootRegistration {
+        let registration = CloudRootRegistration::legacy_cfapi(
             root_id,
-            sync_root_path: sync_root_path.clone(),
-            encrypted_root: encrypted_root.clone(),
-            display_name: format!("HybridCipher CFAPI Rename Probe {root_id}"),
-        };
+            sync_root_path.clone(),
+            encrypted_root.clone(),
+            format!("HybridCipher CFAPI Rename Probe {root_id}"),
+        );
         let bridge = Arc::new(ProbeBridge::default());
         bridge.insert_directory(root_id, &encrypted_root, "nested");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -289,6 +313,44 @@ mod windows_probe {
                     source.display(),
                     target.display()
                 );
+
+                // Exercise a real Close callback while restarting. A provider-owned
+                // file open cannot test this because self-hydration is blocked.
+                bridge.delay_next_write.store(true, Ordering::SeqCst);
+                let edit_path = target.clone();
+                let executable = std::env::current_exe()?;
+                let editor = tokio::task::spawn_blocking(move || {
+                    Command::new(executable).arg("--edit-child").arg(edit_path).status()
+                });
+                wait_for("delayed edit writeback", Duration::from_secs(15), || {
+                    bridge.delayed_write_started.load(Ordering::SeqCst)
+                        && host.check_root_health(root_id).ok()
+                            .and_then(|health| health.operational)
+                            .is_some_and(|health| health.callback_health.iter().any(|callback| {
+                                callback.kind == CloudCallbackKind::Close && callback.in_flight_count > 0
+                            }))
+                }).await?;
+                host.stop_root_for_restart(root_id).await?;
+                if !editor.await??.success() {
+                    return Err("external editor failed".into());
+                }
+                if host.read_runtime_status(root_id)?.safe_to_unmount {
+                    return Err("disconnected root incorrectly reported safe".into());
+                }
+                let offline = sync_root_path.join("nested").join("offline-created.md");
+                fs::write(&offline, b"created while disconnected\n")?;
+                host.start_root_with_bridge(root_id, bridge.clone()).await?;
+                host.probe_root(root_id).await?;
+                wait_for("recovered edits and offline new file", Duration::from_secs(15), || {
+                    bridge.content_matches("nested/renamed.md", b"edited during provider recovery\n")
+                        && bridge.content_matches("nested/offline-created.md", b"created while disconnected\n")
+                }).await?;
+                let after_restart = sync_root_path.join("nested").join("after-restart.md");
+                fs::write(&after_restart, b"new file after restart\n")?;
+                wait_for("new-file writeback after restart", Duration::from_secs(15), || {
+                    bridge.content_matches("nested/after-restart.md", b"new file after restart\n")
+                }).await?;
+                println!("recovery probe passed: delayed edit, offline creation, and post-restart creation");
                 Ok(())
             })
         })();
@@ -297,6 +359,8 @@ mod windows_probe {
             for path in [
                 sync_root_path.join("nested").join("untitled.md"),
                 sync_root_path.join("nested").join("renamed.md"),
+                sync_root_path.join("nested").join("offline-created.md"),
+                sync_root_path.join("nested").join("after-restart.md"),
             ] {
                 if path.exists() {
                     let _ = fs::remove_file(path);
@@ -305,6 +369,8 @@ mod windows_probe {
             let _ = wait_for("probe delete writeback", Duration::from_secs(10), || {
                 !bridge.contains("nested/untitled.md")
                     && !bridge.contains("nested/renamed.md")
+                    && !bridge.contains("nested/offline-created.md")
+                    && !bridge.contains("nested/after-restart.md")
                     && host
                         .read_runtime_status(root_id)
                         .map(|status| status.safe_to_unmount)

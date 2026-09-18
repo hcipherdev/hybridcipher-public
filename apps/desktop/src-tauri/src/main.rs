@@ -49,6 +49,47 @@ async fn submit_feedback(
 }
 
 fn main() {
+    #[cfg(all(target_os = "windows", feature = "native-verification"))]
+    {
+        let arguments: Vec<String> = std::env::args().skip(1).collect();
+        let outcome = match arguments.first().map(String::as_str) {
+            Some("--verify-native-compatibility") => Some(
+                arguments
+                    .get(1)
+                    .ok_or_else(|| "missing disposable output directory".into())
+                    .and_then(|path| {
+                        hybridcipher_windows_cloud_provider::verification::run(
+                            std::path::Path::new(path),
+                        )
+                    }),
+            ),
+            Some("--native-verification-child") => Some(
+                hybridcipher_windows_cloud_provider::verification::child(&arguments[1..]),
+            ),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            if let Err(error) = outcome {
+                eprintln!("Native compatibility verification failed: {error}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if std::env::args_os().any(|argument| argument == "--unregister-shell-roots") {
+        match hybridcipher_windows_cloud_provider::unregister_all_hybridcipher_shell_roots() {
+            Ok(count) => {
+                eprintln!("Removed {count} HybridCipher Explorer sync-root registration(s)");
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("Failed to remove HybridCipher Explorer sync roots: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Initialize tracing for better debugging
     tracing_subscriber::registry()
         .with(
@@ -351,6 +392,10 @@ fn main() {
             get_mount_recovery_copy_preview,
             resolve_mount_recovery_copy,
             get_mount_sync_status,
+            get_vault_compatibility,
+            set_vault_legacy_compatibility,
+            list_pending_operations,
+            resolve_pending_operation,
             unmount_all_mounts,
             unmount_mount_by_root_id,
             exit_application,

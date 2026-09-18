@@ -1,17 +1,5 @@
 use std::path::{Path, PathBuf};
 
-#[cfg(not(feature = "individual-edition"))]
-fn is_truthy_env(var: &str) -> bool {
-    std::env::var(var)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 fn push_unique(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
     if !candidates.iter().any(|existing| existing == &candidate) {
         candidates.push(candidate);
@@ -33,55 +21,46 @@ fn app_bundle_cli_candidates(binary_name: &str) -> Vec<PathBuf> {
         &mut candidates,
         exe_dir.join("resources/bin").join(binary_name),
     );
+    // Windows tauri.conf.json packages exactly resources/bin. Do not treat a
+    // loose executable beside the app as a replacement for a missing bundle.
+    #[cfg(not(target_os = "windows"))]
     push_unique(&mut candidates, exe_dir.join("resources").join(binary_name));
 
-    // macOS app bundle layouts.
-    push_unique(
-        &mut candidates,
-        exe_dir.join("../Resources/bin").join(binary_name),
-    );
-    push_unique(
-        &mut candidates,
-        exe_dir.join("../Resources/resources/bin").join(binary_name),
-    );
-    push_unique(
-        &mut candidates,
-        exe_dir.join("../Resources").join(binary_name),
-    );
-    push_unique(
-        &mut candidates,
-        exe_dir.join("../Resources/resources").join(binary_name),
-    );
+    #[cfg(target_os = "macos")]
+    {
+        // macOS app bundle layouts.
+        push_unique(
+            &mut candidates,
+            exe_dir.join("../Resources/bin").join(binary_name),
+        );
+        push_unique(
+            &mut candidates,
+            exe_dir.join("../Resources/resources/bin").join(binary_name),
+        );
+        push_unique(
+            &mut candidates,
+            exe_dir.join("../Resources").join(binary_name),
+        );
+        push_unique(
+            &mut candidates,
+            exe_dir.join("../Resources/resources").join(binary_name),
+        );
+    }
 
-    // Same folder as desktop executable (fallback).
+    // Other supported package layouts.
+    #[cfg(not(target_os = "windows"))]
     push_unique(&mut candidates, exe_dir.join(binary_name));
 
     candidates
 }
 
-fn candidate_roots_for_dev_search(current_dir: &Path) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    for ancestor in current_dir.ancestors() {
-        push_unique(&mut roots, ancestor.to_path_buf());
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for ancestor in exe_dir.ancestors() {
-                push_unique(&mut roots, ancestor.to_path_buf());
-            }
-        }
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for ancestor in manifest_dir.ancestors() {
-        push_unique(&mut roots, ancestor.to_path_buf());
-    }
-
-    roots
+#[cfg(debug_assertions)]
+fn candidate_roots_for_dev_search(_current_dir: &Path) -> Vec<PathBuf> {
+    // Compile-time workspace only: never search the launch working directory.
+    vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")]
 }
 
+#[cfg(debug_assertions)]
 fn development_cli_candidates(binary_name: &str, current_dir: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -110,93 +89,31 @@ pub fn locate_bundled_cli_binary() -> Option<PathBuf> {
     let binary_name = format!("hybridcipher{}", std::env::consts::EXE_SUFFIX);
     app_bundle_cli_candidates(&binary_name)
         .into_iter()
-        .find(|candidate| candidate.exists())
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.canonicalize().ok())
 }
 
 /// Locate the locally built `hybridcipher` CLI binary and its project root.
 pub fn locate_cli_binary() -> Result<(PathBuf, PathBuf), String> {
-    let current_dir =
-        std::env::current_dir().map_err(|e| format!("Failed to read current directory: {}", e))?;
-
-    let exe_suffix = std::env::consts::EXE_SUFFIX;
-    let binary_name = format!("hybridcipher{}", exe_suffix);
-
-    #[cfg(feature = "individual-edition")]
-    {
-        for candidate in development_cli_candidates(&binary_name, &current_dir) {
-            if candidate.exists() {
-                let project_root = infer_project_root(&candidate, &current_dir);
-                return Ok((candidate, project_root));
-            }
-        }
-
-        if let Some(candidate) = locate_bundled_cli_binary() {
-            return Ok((candidate, current_dir.clone()));
-        }
-
-        return Err(
-            "This restricted desktop build requires the bundled `hybridcipher` CLI (or a workspace-built binary in local development). Rebuild the desktop bundle with the restricted CLI included.".to_string(),
-        );
+    let fallback = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .parent()
+        .ok_or("Application directory is unavailable")?
+        .to_path_buf();
+    if let Some(candidate) = locate_bundled_cli_binary() {
+        return Ok((candidate, fallback));
     }
-
-    #[cfg(not(feature = "individual-edition"))]
+    #[cfg(debug_assertions)]
     {
-        // 1) Explicit override for packaged or custom installs.
-        if let Some(path) = std::env::var_os("HYBRIDCIPHER_CLI_PATH") {
-            let candidate = PathBuf::from(path);
-            if candidate.exists() {
-                return Ok((candidate, current_dir.clone()));
+        let binary_name = format!("hybridcipher{}", std::env::consts::EXE_SUFFIX);
+        for candidate in development_cli_candidates(&binary_name, &fallback) {
+            if candidate.is_file() {
+                let candidate = candidate.canonicalize().map_err(|e| e.to_string())?;
+                return Ok((candidate.clone(), infer_project_root(&candidate, &fallback)));
             }
         }
-
-        // 2) Common packaged-app locations relative to the running executable.
-        if let Some(candidate) = locate_bundled_cli_binary() {
-            return Ok((candidate, current_dir.clone()));
-        }
-
-        // 3) Development workspace build outputs.
-        for candidate in development_cli_candidates(&binary_name, &current_dir) {
-            if candidate.exists() {
-                let project_root = infer_project_root(&candidate, &current_dir);
-                return Ok((candidate, project_root));
-            }
-        }
-
-        // In local debug runs, avoid silently falling back to a system-installed CLI because
-        // it may be stale and diverge from current workspace code.
-        if cfg!(debug_assertions)
-            && !is_truthy_env("HYBRIDCIPHER_ALLOW_SYSTEM_CLI_IN_DEV")
-            && std::env::var_os("HYBRIDCIPHER_CLI_PATH").is_none()
-        {
-            return Err(
-                "Desktop (debug) could not find a workspace-built `hybridcipher` binary under target/{release,debug}. Build it with `cargo build --release --bin hybridcipher` or set HYBRIDCIPHER_CLI_PATH explicitly. To allow system fallback in dev, set HYBRIDCIPHER_ALLOW_SYSTEM_CLI_IN_DEV=1.".to_string(),
-            );
-        }
-
-        // 4) Standard install locations for .pkg deployments.
-        let installed_candidates = [
-            PathBuf::from(format!("/usr/local/bin/{}", binary_name)),
-            PathBuf::from(format!("/opt/homebrew/bin/{}", binary_name)),
-            PathBuf::from(format!("/opt/local/bin/{}", binary_name)),
-        ];
-        for candidate in installed_candidates {
-            if candidate.exists() {
-                return Ok((candidate, current_dir.clone()));
-            }
-        }
-
-        // 5) PATH lookup for shell-launched apps/dev workflows.
-        if let Ok(path) = which::which("hybridcipher") {
-            return Ok((path, current_dir.clone()));
-        }
-
-        return Err(
-            "Could not find the `hybridcipher` CLI binary. Install it (for example with the macOS .pkg), set HYBRIDCIPHER_CLI_PATH, or build it with `cargo build --release --bin hybridcipher`.".to_string(),
-        );
     }
-
-    #[allow(unreachable_code)]
-    Err("Could not find the `hybridcipher` CLI binary.".to_string())
+    Err("The bundled HybridCipher CLI is missing. Repair or reinstall the application.".into())
 }
 
 fn infer_project_root(binary_path: &Path, fallback: &Path) -> PathBuf {
@@ -206,4 +123,22 @@ fn infer_project_root(binary_path: &Path, fallback: &Path) -> PathBuf {
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+#[cfg(all(test, debug_assertions))]
+mod security_regression {
+    use super::*;
+    #[test]
+    fn development_discovery_does_not_search_working_directory() {
+        let untrusted = std::env::temp_dir().join("attacker-controlled-cwd");
+        let candidates = development_cli_candidates("hybridcipher.exe", &untrusted);
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .iter()
+            .all(|candidate| !candidate.starts_with(&untrusted)));
+        assert_eq!(
+            candidate_roots_for_dev_search(&untrusted),
+            vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")]
+        );
+    }
 }

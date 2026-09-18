@@ -7,7 +7,7 @@ use crate::errors::{ErrorCode, ErrorContext};
 use crate::file::encrypt::{
     build_wrap_aad, chunked_encrypted_size, derive_chunk_nonce, encrypt_content,
     encrypt_content_chunked, generate_file_id, hash_wrap_aad, serialize_encrypted_header,
-    wrap_file_key, write_encrypted_file_atomic_for_coverage, PlatformFileMetadata,
+    write_encrypted_file_atomic_for_coverage, PlatformFileMetadata,
     SerializedEncryptedHeader, SparseFileMetadata, AEAD_TAG_SIZE, CHUNKED_HEADER_VERSION,
 };
 use crate::invitation::InvitationKeyPair;

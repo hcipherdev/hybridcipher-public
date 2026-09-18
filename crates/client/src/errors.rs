@@ -419,6 +419,12 @@ pub enum ClientError {
     #[error("Decryption error: {0}")]
     DecryptionError(String),
 
+    #[error("Older file format requires legacy compatibility for this vault. Its original completeness cannot be verified.")]
+    LegacyCompatibilityRequired,
+
+    #[error("Encrypted file integrity verification failed: {0}")]
+    FileIntegrity(String),
+
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 

@@ -9,6 +9,7 @@ const {
     shouldExpandAdvancedSettings,
     getFolderRowStatusState,
     buildMountConflictReviewState,
+    shouldRetryWorkspaceStatusAfterSessionRefresh,
     buildWorkspaceHomeModel,
     buildFolderDetailModel,
     buildFolderCoverageModel,
@@ -17,6 +18,23 @@ const {
     buildDeviceVerificationModel,
     buildDeviceVerificationCommand,
 } = require('./ui-utils');
+
+test('workspace status retries only for authenticated protection sections', () => {
+    assert.equal(shouldRetryWorkspaceStatusAfterSessionRefresh(null), false);
+    assert.equal(shouldRetryWorkspaceStatusAfterSessionRefresh([]), false);
+    assert.equal(
+        shouldRetryWorkspaceStatusAfterSessionRefresh(['scan status', 'recovery backup']),
+        false
+    );
+    assert.equal(
+        shouldRetryWorkspaceStatusAfterSessionRefresh(['sign-in protection']),
+        true
+    );
+    assert.equal(
+        shouldRetryWorkspaceStatusAfterSessionRefresh(['this device']),
+        true
+    );
+});
 
 test('filterProtectedFolders matches display names, basenames, and full paths', () => {
     const folders = [
@@ -327,6 +345,67 @@ test('buildWorkspaceHomeModel tells users to add a protected folder before scann
         scanAttention.detail,
         'Click Add Protected Folder on the left to start protecting folders before running a coverage scan.'
     );
+});
+
+test('buildWorkspaceHomeModel reports unknown instead of "off"/"never scanned" when the status could not load', () => {
+    // An empty snapshot is exactly what the home view gets when
+    // get_individual_home_status fails.
+    const model = buildWorkspaceHomeModel(
+        {
+            protected_count: 2,
+            mounted_count: 1,
+            scan_status_available: false,
+            unavailable_sections: ['sign-in protection', 'scan status'],
+            current_device: { device_id: 'device-current', is_verified: null },
+        },
+        { nowMs: Date.parse('2026-03-24T12:00:00.000Z') }
+    );
+
+    const card = id => model.cards.find(entry => entry.id === id);
+
+    assert.equal(card('mfa').value, 'Unknown');
+    assert.equal(card('mfa').tone, 'unknown');
+    assert.equal(card('mfa').ctaAction, 'refresh-workspace-status');
+    assert.equal(card('scan').value, 'Unknown');
+    assert.equal(card('scan').tone, 'unknown');
+    assert.equal(card('device').value, 'Unknown');
+    assert.equal(card('device').tone, 'unknown');
+
+    // Unknown data must not be reported as a confirmed protection failure.
+    assert.deepEqual(model.attentionItems.map(item => item.id), ['status-unavailable']);
+    assert.equal(model.summaryTone, 'warning');
+    assert.equal(model.summaryLabel, 'Status incomplete');
+    assert.deepEqual(model.unavailableSections, ['sign-in protection', 'scan status']);
+});
+
+test('buildWorkspaceHomeModel still reports a genuinely never-scanned workspace', () => {
+    const model = buildWorkspaceHomeModel(
+        {
+            protected_count: 2,
+            mounted_count: 1,
+            mfa_enabled: true,
+            recovery_backup_ok: true,
+            recovery_auto_backup_ok: true,
+            scan_status_available: true,
+            last_scan_at: null,
+            current_device: { device_id: 'device-current', is_verified: true },
+            unavailable_sections: [],
+        },
+        { nowMs: Date.parse('2026-03-24T12:00:00.000Z') }
+    );
+
+    const scanCard = model.cards.find(entry => entry.id === 'scan');
+    assert.equal(scanCard.value, 'Not scanned yet');
+    assert.equal(scanCard.tone, 'warning');
+    assert.equal(model.attentionItems.some(item => item.id === 'scan'), true);
+});
+
+test('buildCoverageCenterModel hides the watcher label where the IPC service is unsupported', () => {
+    const unsupported = buildCoverageCenterModel({ ipc_state: 'unsupported' }, {});
+    assert.equal(unsupported.summary.watcherLabel, null);
+
+    assert.equal(buildCoverageCenterModel({ ipc_state: 'active' }, {}).summary.watcherLabel, 'On');
+    assert.equal(buildCoverageCenterModel({ ipc_state: 'inactive' }, {}).summary.watcherLabel, 'Off');
 });
 
 test('buildFolderDetailModel promotes conflict resolution and mounted-folder actions', () => {

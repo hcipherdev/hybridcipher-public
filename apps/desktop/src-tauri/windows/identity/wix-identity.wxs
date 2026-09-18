@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="HybridCipherIdentityIntegration" Guid="5DD5C99C-0AF4-4C4F-A990-5C48D3B109A4">
+        <RegistryValue Root="HKCU"
+                       Key="Software\HybridCipher"
+                       Name="SparseIdentityIntegration"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <ComponentGroup Id="HybridCipherIdentityIntegrationGroup">
+      <ComponentRef Id="HybridCipherIdentityIntegration" />
+    </ComponentGroup>
+
+    <CustomAction Id="HybridCipherRegisterIdentity"
+                  Directory="INSTALLDIR"
+                  ExeCommand="powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]register-identity.ps1&quot; -Mode Install -InstallDirectory &quot;[INSTALLDIR]&quot;"
+                  Execute="immediate"
+                  Return="check" />
+    <CustomAction Id="HybridCipherVerifyWindowsBuild"
+                  Directory="TARGETDIR"
+                  ExeCommand="powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command &quot;if ([Environment]::OSVersion.Version.Build -lt 19041) { exit 1 }&quot;"
+                  Execute="immediate"
+                  Return="check" />
+    <CustomAction Id="HybridCipherUnregisterRoots"
+                  Directory="INSTALLDIR"
+                  ExeCommand="&quot;[INSTALLDIR]hybridcipher-desktop.exe&quot; --unregister-shell-roots"
+                  Execute="immediate"
+                  Return="check" />
+    <CustomAction Id="HybridCipherUnregisterIdentity"
+                  Directory="INSTALLDIR"
+                  ExeCommand="powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]register-identity.ps1&quot; -Mode Uninstall -InstallDirectory &quot;[INSTALLDIR]&quot;"
+                  Execute="immediate"
+                  Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="HybridCipherVerifyWindowsBuild" Before="InstallInitialize">NOT Installed</Custom>
+      <Custom Action="HybridCipherRegisterIdentity" After="InstallFiles">NOT REMOVE~=&quot;ALL&quot;</Custom>
+      <Custom Action="HybridCipherUnregisterRoots" Before="HybridCipherUnregisterIdentity">REMOVE~=&quot;ALL&quot;</Custom>
+      <Custom Action="HybridCipherUnregisterIdentity" Before="RemoveFiles">REMOVE~=&quot;ALL&quot;</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>
