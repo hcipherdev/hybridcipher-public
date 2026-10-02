@@ -37,7 +37,7 @@ test('classifyEnrollmentFailure falls back to generic retry guidance', () => {
     });
 
     assert.equal(model.kind, 'generic');
-    assert.match(model.detail, /review the terminal output/i);
+    assert.match(model.detail, /review the error details/i);
 });
 
 test('buildForceUnmountConfirmation requires a second explicit confirmation phrase', () => {
@@ -97,6 +97,6 @@ test('buildMountTimeoutMessage names the folder and gives recovery guidance', ()
     });
 
     assert.match(message, /Taxes/);
-    assert.match(message, /embedded terminal/i);
+    assert.match(message, /mount error details/i);
     assert.match(message, /already mounted|retry/i);
 });

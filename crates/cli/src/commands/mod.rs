@@ -17,6 +17,7 @@ pub mod pin;
 pub mod recovery;
 pub mod rekey;
 pub mod sos;
+pub mod team;
 pub mod trust;
 pub mod welcome;
 
@@ -139,6 +140,12 @@ pub enum Commands {
     /// Logout and clear session data securely
     Logout,
 
+    /// Activate or manage a Team organization
+    Team {
+        #[command(subcommand)]
+        command: team::TeamCommand,
+    },
+
     /// Create a new group owned by the authenticated user
     #[cfg_attr(feature = "individual-edition", command(hide = true))]
     CreateGroup {
@@ -255,6 +262,9 @@ pub enum Commands {
         /// Recover one legacy file without completeness guarantees; requires --output and preserves ciphertext
         #[arg(long, requires = "output", conflicts_with = "in_place")]
         allow_legacy_unverified: bool,
+        /// Explicit high-memory recovery of one older single-record file; requires a new output and retains ciphertext
+        #[arg(long, requires = "output", conflicts_with_all = ["in_place", "allow_legacy_unverified"])]
+        allow_large_single_record_recovery: bool,
     },
 
     /// Interactively mount an encrypted folder
@@ -939,6 +949,30 @@ pub fn enforce_individual_edition_command_policy(_command: &Commands) -> Result<
     Ok(())
 }
 
+fn team_write_command_name(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::CreateGroup { .. } => Some("create-group"),
+        Commands::RenameGroup { .. } => Some("rename-group"),
+        Commands::InitializeGroup { .. } => Some("initialize-group"),
+        Commands::DeleteGroup { .. } => Some("delete-group"),
+        Commands::AddMember { .. } => Some("add-member"),
+        Commands::RemoveMember { .. } => Some("remove-member"),
+        Commands::GenerateWelcome { .. } => Some("generate-welcome"),
+        Commands::Rekey(
+            RekeyCommands::Start { .. }
+            | RekeyCommands::Cutover { .. }
+            | RekeyCommands::Fallback { .. },
+        ) => Some("rekey"),
+        Commands::Team {
+            command:
+                team::TeamCommand::Invite { .. }
+                | team::TeamCommand::CancelInvitation { .. }
+                | team::TeamCommand::RemoveMember { .. },
+        } => Some("team administration"),
+        _ => None,
+    }
+}
+
 /// Main command handler dispatcher
 pub async fn handle_command(
     command: Commands,
@@ -949,9 +983,17 @@ pub async fn handle_command(
 
     enforce_individual_edition_command_policy(&command)?;
 
+    if team_write_command_name(&command).is_some() {
+        team::require_team_write_entitlement(session_manager).await?;
+    }
+
     match command {
         // Authentication commands
-        Commands::Login { username } => auth::handle_login(username, session_manager).await,
+        Commands::Login { username } => {
+            auth::handle_login(username, session_manager).await?;
+            team::refresh_entitlement_after_login(session_manager).await;
+            Ok(())
+        }
         Commands::Register {
             username,
             skip_confirmation,
@@ -971,6 +1013,7 @@ pub async fn handle_command(
             MfaCommand::Disable => mfa::handle_mfa_disable(session_manager).await,
         },
         Commands::Logout => auth::handle_logout(session_manager).await,
+        Commands::Team { command } => team::handle_team_command(command, session_manager).await,
 
         Commands::CreateGroup { name, description } => {
             groups::handle_create_group(name, description, session_manager).await
@@ -1014,6 +1057,7 @@ pub async fn handle_command(
             in_place,
             strict,
             allow_legacy_unverified,
+            allow_large_single_record_recovery,
         } => {
             files::handle_decrypt(
                 path,
@@ -1021,6 +1065,7 @@ pub async fn handle_command(
                 in_place,
                 strict,
                 allow_legacy_unverified,
+                allow_large_single_record_recovery,
                 session_manager,
             )
             .await

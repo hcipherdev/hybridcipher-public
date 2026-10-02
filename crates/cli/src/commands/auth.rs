@@ -1364,6 +1364,9 @@ pub async fn handle_keystore_status(session_manager: &SessionManager) -> Result<
 
 /// Enhanced password input with secure handling
 fn get_secure_password_input(prompt: &str) -> Result<SecretString, CliError> {
+    if ui::desktop::enabled() {
+        return ui::prompts::password(prompt).map(SecretString::new);
+    }
     print!("{}: ", prompt);
     io::stdout()
         .flush()
@@ -1850,6 +1853,9 @@ async fn handle_automatic_login(
         server_url: server_url.clone(),
         token: access_token,
         refresh_token,
+        team_entitlement: None,
+        team_revoked: false,
+        pending_team_requests: Vec::new(),
         opaque_export_key: Some(opaque_export_key_b64),
         device_binding: String::new(), // Will be set by SessionManager
         device_keypair: None,          // Will be generated on first use
@@ -2434,6 +2440,7 @@ mod tests {
     fn build_group(role: &str, epoch: Option<&str>) -> GroupInfo {
         GroupInfo {
             id: Uuid::new_v4().to_string(),
+            organization_id: None,
             name: "Test".to_string(),
             description: None,
             role: role.to_string(),

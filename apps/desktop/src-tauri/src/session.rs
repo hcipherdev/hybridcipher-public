@@ -14,8 +14,9 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 // Constants matching CLI's session management
 const USERS_DIR: &str = "users";
@@ -24,6 +25,8 @@ const ACTIVE_USER_FILE: &str = "active_user.json";
 const LAST_USER_FILE: &str = "last_user.json";
 const SESSION_FILE: &str = "session.toml";
 const SESSION_FILE_AAD: &[u8] = b"hybridcipher/session";
+const TEAM_REQUESTS_FILE: &str = "team_requests.protected.json";
+const TEAM_REQUESTS_FILE_AAD: &[u8] = b"hybridcipher/team_requests";
 const ACCOUNT_KEY_CACHE_FILE: &str = ".account_key_cache";
 const DEVICE_KEY_FILE: &str = "device_key.protected";
 const DEVICE_KEY_FILE_AAD: &[u8] = b"hybridcipher/device_key_material";
@@ -73,6 +76,12 @@ pub struct PersistedSession {
     #[serde(default)]
     pub refresh_token: String,
     #[serde(default)]
+    pub team_entitlement: Option<String>,
+    #[serde(default)]
+    pub team_revoked: bool,
+    #[serde(default)]
+    pub pending_team_requests: Vec<hybridcipher_client::team_requests::PendingTeamRequest>,
+    #[serde(default)]
     pub opaque_export_key: Option<String>,
     pub device_binding: String,
     pub device_keypair: Option<String>,
@@ -84,6 +93,19 @@ pub struct PersistedSession {
     // Desktop-specific fields (compatible addition)
     #[serde(default)]
     pub email: String,
+}
+
+impl Drop for PersistedSession {
+    fn drop(&mut self) {
+        self.token.zeroize();
+        self.refresh_token.zeroize();
+        if let Some(key) = &mut self.opaque_export_key {
+            key.zeroize();
+        }
+        if let Some(keypair) = &mut self.device_keypair {
+            keypair.zeroize();
+        }
+    }
 }
 
 /// Session security metadata - matches CLI's SessionSecurity
@@ -187,8 +209,18 @@ pub struct SessionStore {
 impl SessionStore {
     /// Create a new session store using CLI's directory structure
     pub fn new() -> Result<Self, String> {
+        Self::new_with_cache_migration(true)
+    }
+
+    /// Temporary login must not rewrite a pre-existing unlock cache before
+    /// authentication and the safe-stop transition have completed.
+    pub fn new_without_key_cache_migration() -> Result<Self, String> {
+        Self::new_with_cache_migration(false)
+    }
+
+    fn new_with_cache_migration(migrate_legacy_cache: bool) -> Result<Self, String> {
         let home = dirs::home_dir().ok_or_else(|| "Unable to locate home directory".to_string())?;
-        let base_dir = home.join(".hybridcipher");
+        let base_dir = home.join(hybridcipher_client::config_loader::account_data_location());
         let global_dir = base_dir.join(GLOBAL_DIR);
 
         // Create directories if they don't exist
@@ -200,8 +232,14 @@ impl SessionStore {
             .map_err(|e| format!("Failed to create users directory: {}", e))?;
 
         #[cfg(windows)]
-        hybridcipher_crypto::local_key_cache::migrate_users_directory(&base_dir.join(USERS_DIR))
+        if migrate_legacy_cache {
+            hybridcipher_crypto::local_key_cache::migrate_users_directory(
+                &base_dir.join(USERS_DIR),
+            )
             .map_err(|e| format!("Failed to protect legacy account-key caches: {e}"))?;
+        }
+        #[cfg(not(windows))]
+        let _ = migrate_legacy_cache;
 
         #[cfg(unix)]
         {
@@ -242,13 +280,27 @@ impl SessionStore {
         let user_dir = self.user_dir(email, server_url);
 
         // First load the account key from cache
-        let account_key = self.load_account_key(&user_dir)?;
+        let account_key = Zeroizing::new(self.load_account_key(&user_dir)?);
+
+        self.load_state_key_with_account_key(email, server_url, &account_key)
+            .map(|key| *key)
+    }
+
+    /// Open the existing state key using a password-derived key held by the
+    /// current process. Temporary desktop logins must not require a cache.
+    pub fn load_state_key_with_account_key(
+        &self,
+        email: &str,
+        server_url: &str,
+        account_key: &[u8; 32],
+    ) -> Result<Zeroizing<[u8; 32]>, String> {
+        let user_dir = self.user_dir(email, server_url);
 
         // Then try to load the device state key
         let device_key_path = user_dir.join(DEVICE_KEY_FILE);
         if !device_key_path.exists() {
             // Fallback to account key for legacy compatibility
-            return Ok(account_key);
+            return Ok(Zeroizing::new(*account_key));
         }
 
         // Try to decrypt device key, but fall back to account key if it fails
@@ -259,8 +311,10 @@ impl SessionStore {
             let protected: ProtectedData = serde_json::from_str(&raw)
                 .map_err(|e| format!("Invalid device key format: {}", e))?;
 
-            let decrypted = decrypt_with_ad(&protected, account_key, DEVICE_KEY_FILE_AAD)
-                .map_err(|e| format!("Failed to decrypt device key: {}", e))?;
+            let decrypted = Zeroizing::new(
+                decrypt_with_ad(&protected, *account_key, DEVICE_KEY_FILE_AAD)
+                    .map_err(|e| format!("Failed to decrypt device key: {}", e))?,
+            );
 
             if decrypted.len() != 32 {
                 return Err("Device key has invalid length".to_string());
@@ -270,14 +324,14 @@ impl SessionStore {
             key.copy_from_slice(&decrypted);
             Ok(key)
         })() {
-            Ok(device_key) => Ok(device_key),
+            Ok(device_key) => Ok(Zeroizing::new(device_key)),
             Err(e) => {
                 // Log the error but fall back to account key
                 tracing::warn!(
                     "Could not load device key ({}), using account key fallback",
                     e
                 );
-                Ok(account_key)
+                Ok(Zeroizing::new(*account_key))
             }
         }
     }
@@ -423,6 +477,28 @@ impl SessionStore {
         server_url: &str,
         password: &str,
     ) -> Result<Zeroizing<[u8; 32]>, String> {
+        self.initialize_account_protection_with_policy(email, server_url, password, true)
+    }
+
+    /// Derive the account key without creating an automatic-unlock cache.
+    /// Account metadata and the protected device key remain on disk so the
+    /// device identity and existing encrypted state survive later logins.
+    pub fn initialize_account_protection_uncached(
+        &self,
+        email: &str,
+        server_url: &str,
+        password: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, String> {
+        self.initialize_account_protection_with_policy(email, server_url, password, false)
+    }
+
+    fn initialize_account_protection_with_policy(
+        &self,
+        email: &str,
+        server_url: &str,
+        password: &str,
+        persist_unlock_cache: bool,
+    ) -> Result<Zeroizing<[u8; 32]>, String> {
         let user_dir = self.user_dir(email, server_url);
         fs::create_dir_all(&user_dir)
             .map_err(|e| format!("Failed to create user directory: {}", e))?;
@@ -462,7 +538,12 @@ impl SessionStore {
                             "Verifier mismatch for {}; re-wrapping desktop state with current password",
                             email
                         );
-                        self.rewrap_after_password_change(email, server_url, password)?;
+                        self.rewrap_after_password_change_with_policy(
+                            email,
+                            server_url,
+                            password,
+                            persist_unlock_cache,
+                        )?;
                         // Re-derive key against the freshly written metadata.
                         let fresh_metadata =
                             self.load_or_create_account_metadata(email, server_url)?;
@@ -474,8 +555,9 @@ impl SessionStore {
             }
         }
 
-        // Cache the account key
-        self.cache_account_key(email, server_url, &key)?;
+        if persist_unlock_cache {
+            self.cache_account_key(email, server_url, &key)?;
+        }
 
         // Ensure device/state key exists
         self.ensure_device_key_exists(email, server_url, &key)?;
@@ -559,6 +641,16 @@ impl SessionStore {
         server_url: &str,
         new_password: &str,
     ) -> Result<(), String> {
+        self.rewrap_after_password_change_with_policy(email, server_url, new_password, true)
+    }
+
+    fn rewrap_after_password_change_with_policy(
+        &self,
+        email: &str,
+        server_url: &str,
+        new_password: &str,
+        persist_unlock_cache: bool,
+    ) -> Result<(), String> {
         let storage_id = self.get_user_storage_id(email, server_url);
         let user_dir = self.user_dir(email, server_url);
         if !user_dir.exists() {
@@ -596,7 +688,9 @@ impl SessionStore {
 
         // Persist updated metadata and account key cache.
         self.save_account_metadata(email, server_url, &metadata)?;
-        self.cache_account_key(email, server_url, &new_account_key)?;
+        if persist_unlock_cache {
+            self.cache_account_key(email, server_url, &new_account_key)?;
+        }
 
         tracing::info!(
             "Re-wrapped desktop state after password change for: {}",
@@ -623,14 +717,16 @@ impl SessionStore {
         }
 
         // Load state key for encryption
-        let state_key = self.load_state_key(email, server_url)?;
+        let state_key = Zeroizing::new(self.load_state_key(email, server_url)?);
 
         // Serialize session to TOML (CLI format)
-        let content = toml::to_string_pretty(session)
-            .map_err(|e| format!("Failed to serialize session: {}", e))?;
+        let content = Zeroizing::new(
+            toml::to_string_pretty(session)
+                .map_err(|e| format!("Failed to serialize session: {}", e))?,
+        );
 
         // Encrypt the session data
-        let protected = encrypt_with_ad(content.as_bytes(), state_key, SESSION_FILE_AAD)
+        let protected = encrypt_with_ad(content.as_bytes(), *state_key, SESSION_FILE_AAD)
             .map_err(|e| format!("Failed to encrypt session: {}", e))?;
 
         let serialized = serde_json::to_string_pretty(&protected)
@@ -662,6 +758,72 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Keep pending administration requests independently of the access-token
+    /// session so logging out cannot discard an unsent request.
+    pub fn save_team_requests(
+        &self,
+        email: &str,
+        server_url: &str,
+        requests: &[hybridcipher_client::team_requests::PendingTeamRequest],
+    ) -> Result<(), String> {
+        let key = Zeroizing::new(self.load_state_key(email, server_url)?);
+        self.save_team_requests_with_key(email, server_url, requests, &key)
+    }
+
+    fn save_team_requests_with_key(
+        &self,
+        email: &str,
+        server_url: &str,
+        requests: &[hybridcipher_client::team_requests::PendingTeamRequest],
+        key: &[u8; 32],
+    ) -> Result<(), String> {
+        let user_dir = self.user_dir(email, server_url);
+        fs::create_dir_all(&user_dir).map_err(|err| err.to_string())?;
+        let content = Zeroizing::new(serde_json::to_vec(requests).map_err(|err| err.to_string())?);
+        let protected = encrypt_with_ad(&content, *key, TEAM_REQUESTS_FILE_AAD)
+            .map_err(|err| err.to_string())?;
+        let serialized = serde_json::to_vec(&protected).map_err(|err| err.to_string())?;
+        let path = user_dir.join(TEAM_REQUESTS_FILE);
+        let temp = path.with_extension("tmp");
+        fs::write(&temp, serialized).map_err(|err| err.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+                .map_err(|err| err.to_string())?;
+        }
+        fs::rename(temp, path).map_err(|err| err.to_string())
+    }
+
+    pub fn load_team_requests(
+        &self,
+        email: &str,
+        server_url: &str,
+    ) -> Result<Vec<hybridcipher_client::team_requests::PendingTeamRequest>, String> {
+        let key = Zeroizing::new(self.load_state_key(email, server_url)?);
+        self.load_team_requests_with_key(email, server_url, &key)
+    }
+
+    fn load_team_requests_with_key(
+        &self,
+        email: &str,
+        server_url: &str,
+        key: &[u8; 32],
+    ) -> Result<Vec<hybridcipher_client::team_requests::PendingTeamRequest>, String> {
+        let path = self.user_dir(email, server_url).join(TEAM_REQUESTS_FILE);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read(path).map_err(|err| err.to_string())?;
+        let protected: ProtectedData =
+            serde_json::from_slice(&raw).map_err(|err| err.to_string())?;
+        let plaintext = Zeroizing::new(
+            decrypt_with_ad(&protected, *key, TEAM_REQUESTS_FILE_AAD)
+                .map_err(|err| err.to_string())?,
+        );
+        serde_json::from_slice(&plaintext).map_err(|err| err.to_string())
+    }
+
     /// Save session with password-based encryption (for first-time login)
     /// This initializes account protection and then saves the session
     pub fn save_session_with_password(
@@ -685,6 +847,25 @@ impl SessionStore {
         email: &str,
         server_url: &str,
     ) -> Result<Option<PersistedSession>, String> {
+        self.load_session_internal(email, server_url, false)
+    }
+
+    /// Load protected account data even when the server access token expired.
+    /// The caller must verify the separate signed Team entitlement before use.
+    pub fn load_session_for_offline(
+        &self,
+        email: &str,
+        server_url: &str,
+    ) -> Result<Option<PersistedSession>, String> {
+        self.load_session_internal(email, server_url, true)
+    }
+
+    fn load_session_internal(
+        &self,
+        email: &str,
+        server_url: &str,
+        allow_expired: bool,
+    ) -> Result<Option<PersistedSession>, String> {
         let session_path = self.session_file_path(email, server_url);
 
         if !session_path.exists() {
@@ -692,16 +873,16 @@ impl SessionStore {
         }
 
         // Load state key for decryption
-        let state_key = self.load_state_key(email, server_url)?;
+        let state_key = Zeroizing::new(self.load_state_key(email, server_url)?);
 
         // Read and parse encrypted session
         let raw = fs::read_to_string(&session_path)
             .map_err(|e| format!("Failed to read session file: {}", e))?;
 
         // Try to parse as encrypted ProtectedData first
-        let content = match serde_json::from_str::<ProtectedData>(&raw) {
+        let content = Zeroizing::new(match serde_json::from_str::<ProtectedData>(&raw) {
             Ok(protected) if protected.magic == PROTECTED_DATA_MAGIC => {
-                let decrypted = decrypt_with_ad(&protected, state_key, SESSION_FILE_AAD)
+                let decrypted = decrypt_with_ad(&protected, *state_key, SESSION_FILE_AAD)
                     .map_err(|e| format!("Failed to decrypt session: {}", e))?;
                 String::from_utf8(decrypted)
                     .map_err(|e| format!("Session is not valid UTF-8: {}", e))?
@@ -710,7 +891,7 @@ impl SessionStore {
                 // Might be plaintext TOML (legacy)
                 raw
             }
-        };
+        });
 
         // Parse TOML content
         let mut session: PersistedSession =
@@ -721,8 +902,7 @@ impl SessionStore {
             session.email = session.username.clone();
         }
 
-        // Check if session is still valid
-        if !session.is_valid() {
+        if !allow_expired && !session.is_valid() {
             tracing::info!("Session expired for user: {}", email);
             return Ok(None);
         }
@@ -741,16 +921,34 @@ impl SessionStore {
 
         if session_path.exists() {
             // Securely overwrite file before deletion
-            if let Ok(metadata) = fs::metadata(&session_path) {
-                let file_size = metadata.len() as usize;
-                let zeros = Zeroizing::new(vec![0u8; file_size]);
-                let _ = fs::write(&session_path, zeros.as_slice());
+            if let (Ok(metadata), Ok(mut file)) = (
+                fs::metadata(&session_path),
+                fs::OpenOptions::new().write(true).open(&session_path),
+            ) {
+                let zeros = [0u8; 8192];
+                let mut remaining = metadata.len();
+                while remaining > 0 {
+                    let size = remaining.min(zeros.len() as u64) as usize;
+                    if file.write_all(&zeros[..size]).is_err() {
+                        break;
+                    }
+                    remaining -= size as u64;
+                }
             }
 
             fs::remove_file(&session_path)
                 .map_err(|e| format!("Failed to delete session file: {}", e))?;
 
             tracing::info!("Session deleted for user: {}", email);
+        }
+
+        // A failed atomic save can leave a complete encrypted session in the
+        // temporary file. Removing only session.toml would retain credentials.
+        let temp_path = session_path.with_extension("tmp");
+        match fs::remove_file(&temp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Failed to remove temporary session file: {e}")),
         }
 
         let cache_path = user_dir.join(ACCOUNT_KEY_CACHE_FILE);
@@ -761,7 +959,7 @@ impl SessionStore {
         }
 
         // Clear active user if it matches
-        self.clear_active_user_if_matches(email)?;
+        self.clear_active_user_if_matches(email, server_url)?;
 
         Ok(())
     }
@@ -804,15 +1002,19 @@ impl SessionStore {
     }
 
     /// Clear active user if it matches the given email
-    fn clear_active_user_if_matches(&self, email: &str) -> Result<(), String> {
+    fn clear_active_user_if_matches(&self, email: &str, server_url: &str) -> Result<(), String> {
         let active_file = self.global_dir.join(ACTIVE_USER_FILE);
         if active_file.exists() {
-            if let Ok(content) = fs::read_to_string(&active_file) {
-                if let Ok(record) = serde_json::from_str::<ActiveUserRecord>(&content) {
-                    if record.username.eq_ignore_ascii_case(email) {
-                        let _ = fs::remove_file(&active_file);
-                    }
-                }
+            let content = fs::read_to_string(&active_file)
+                .map_err(|e| format!("Failed to read active user file: {e}"))?;
+            let record: ActiveUserRecord = serde_json::from_str(&content)
+                .map_err(|e| format!("Invalid active user file: {e}"))?;
+            if record.username.eq_ignore_ascii_case(email)
+                && canonicalize_server_url(&record.server_url)
+                    == canonicalize_server_url(server_url)
+            {
+                fs::remove_file(&active_file)
+                    .map_err(|e| format!("Failed to remove active user file: {e}"))?;
             }
         }
         Ok(())
@@ -902,8 +1104,129 @@ fn canonicalize_server_url(server_url: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "../test/team_queue/test_team_queue.rs"]
+mod team_queue_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_account_unlock_never_creates_cache_and_keeps_device_key() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore {
+            base_dir: root.path().to_path_buf(),
+            global_dir: root.path().join(GLOBAL_DIR),
+        };
+        fs::create_dir(&store.global_dir).unwrap();
+        let email = "temporary@example.invalid";
+        let server = "https://fixture.example.invalid";
+        let user_dir = store.user_dir(email, server);
+
+        let account_key = store
+            .initialize_account_protection_uncached(email, server, "correct horse")
+            .unwrap();
+        let state_key = store
+            .load_state_key_with_account_key(email, server, &account_key)
+            .unwrap();
+        assert_ne!(*account_key, *state_key);
+        assert!(!user_dir.join(ACCOUNT_KEY_CACHE_FILE).exists());
+        assert!(user_dir.join(DEVICE_KEY_FILE).exists());
+
+        // A previous remembered login, including a failed atomic save, must
+        // be removed without rotating the device identity or local state key.
+        fs::write(
+            user_dir.join(ACCOUNT_KEY_CACHE_FILE),
+            b"old protected cache",
+        )
+        .unwrap();
+        fs::write(store.session_file_path(email, server), "encrypted session").unwrap();
+        fs::write(
+            store.session_file_path(email, server).with_extension("tmp"),
+            "temporary encrypted session",
+        )
+        .unwrap();
+        store.persist_active_user(email, server).unwrap();
+        store.delete_session(email, server).unwrap();
+        assert!(!store.session_file_path(email, server).exists());
+        assert!(!store
+            .session_file_path(email, server)
+            .with_extension("tmp")
+            .exists());
+        assert!(!user_dir.join(ACCOUNT_KEY_CACHE_FILE).exists());
+        assert!(!store.global_dir.join(ACTIVE_USER_FILE).exists());
+        assert!(user_dir.join(DEVICE_KEY_FILE).exists());
+        assert_eq!(
+            *store
+                .load_state_key_with_account_key(email, server, &account_key)
+                .unwrap(),
+            *state_key
+        );
+    }
+
+    #[test]
+    fn deleting_one_account_preserves_another_accounts_active_pointer() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore {
+            base_dir: root.path().to_path_buf(),
+            global_dir: root.path().join(GLOBAL_DIR),
+        };
+        fs::create_dir(&store.global_dir).unwrap();
+        let server = "https://fixture.example.invalid";
+        store
+            .persist_active_user("other@example.invalid", server)
+            .unwrap();
+        store
+            .delete_session("temporary@example.invalid", server)
+            .unwrap();
+        let active: ActiveUserRecord = serde_json::from_str(
+            &fs::read_to_string(store.global_dir.join(ACTIVE_USER_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active.username, "other@example.invalid");
+    }
+
+    #[test]
+    fn remembered_session_restores_from_protected_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore {
+            base_dir: root.path().to_path_buf(),
+            global_dir: root.path().join(GLOBAL_DIR),
+        };
+        fs::create_dir(&store.global_dir).unwrap();
+        let email = "remembered@example.invalid";
+        let server = "https://fixture.example.invalid";
+        store
+            .initialize_account_protection(email, server, "correct horse")
+            .unwrap();
+        let now = Utc::now();
+        let session = PersistedSession {
+            user_id: "user-a".into(),
+            username: email.into(),
+            device_id: "device-a".into(),
+            device_status: None,
+            server_url: server.into(),
+            token: "access-token".into(),
+            refresh_token: "refresh-token".into(),
+            team_entitlement: None,
+            team_revoked: false,
+            pending_team_requests: Vec::new(),
+            opaque_export_key: None,
+            device_binding: "binding".into(),
+            device_keypair: None,
+            created_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            last_activity: now,
+            migration_info: None,
+            security_metadata: SessionSecurity::default(),
+            email: email.into(),
+        };
+        store.save_session(&session).unwrap();
+        assert!(store.has_account_key_cached(email, server));
+        let restored = store.load_session(email, server).unwrap().unwrap();
+        assert_eq!(restored.refresh_token.as_str(), "refresh-token");
+        assert_eq!(store.list_sessions().unwrap().len(), 1);
+    }
 
     #[cfg(windows)]
     #[test]
@@ -937,6 +1260,9 @@ mod tests {
             server_url: CANONICAL_PRODUCTION_SERVER.to_string(),
             token: "token".to_string(),
             refresh_token: String::new(),
+            team_entitlement: None,
+            team_revoked: false,
+            pending_team_requests: Vec::new(),
             opaque_export_key: None,
             device_binding: String::new(),
             device_keypair: None,
@@ -962,6 +1288,9 @@ mod tests {
             server_url: CANONICAL_PRODUCTION_SERVER.to_string(),
             token: "token".to_string(),
             refresh_token: String::new(),
+            team_entitlement: None,
+            team_revoked: false,
+            pending_team_requests: Vec::new(),
             opaque_export_key: None,
             device_binding: String::new(),
             device_keypair: None,

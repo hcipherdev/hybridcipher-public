@@ -5,6 +5,12 @@
 /// and enabling seamless access during epoch transitions.
 const ENCRYPTED_FILE_SEPARATOR: &[u8] = b"\n---ENCRYPTED_DATA---\n";
 const COVERAGE_TMP_DIR_NAME: &str = ".hybridcipher-tmp";
+/// Maximum JSON header accepted from an encrypted file on disk.
+pub const MAX_ENCRYPTED_HEADER_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum authenticated content chunk accepted by all decoders.
+pub const MAX_CONTENT_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+/// Ordinary in-memory decrypts must use a streaming decoder above this size.
+pub const MAX_IN_MEMORY_PLAINTEXT_BYTES: u64 = 256 * 1024 * 1024;
 use crate::{
     epoch::EpochManager,
     file::cache::CacheManager,
@@ -522,6 +528,11 @@ pub fn encrypt_content(
     file_key: &AeadKey,
     file_id: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
+    if content.len() as u64 > MAX_IN_MEMORY_PLAINTEXT_BYTES {
+        return Err(EncryptionError::EncryptionFailure(
+            "Plaintext exceeds the 256 MiB in-memory limit; use chunked encryption".into(),
+        ));
+    }
     // Generate nonce for content encryption
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -620,6 +631,25 @@ pub struct SparseFileMetadata {
 }
 
 impl SparseFileMetadata {
+    pub fn validated_packed_size(&self, expected_logical_size: u64) -> Option<u64> {
+        if self.logical_size != expected_logical_size {
+            return None;
+        }
+        let mut end = 0u64;
+        let mut packed = 0u64;
+        for extent in &self.extents {
+            if extent.length == 0 || extent.offset < end {
+                return None;
+            }
+            end = extent.offset.checked_add(extent.length)?;
+            if end > self.logical_size {
+                return None;
+            }
+            packed = packed.checked_add(extent.length)?;
+        }
+        Some(packed)
+    }
+
     pub fn packed_size(&self) -> u64 {
         self.extents
             .iter()
@@ -634,6 +664,44 @@ impl SparseFileMetadata {
                 .first()
                 .map(|extent| extent.offset != 0 || extent.length != self.logical_size)
                 .unwrap_or(false)
+    }
+}
+
+/// Read a bounded JSON header, leaving the reader at the first ciphertext byte.
+/// The separator occupies its own line in the on-disk format.
+pub fn read_encrypted_header<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    use std::io::{BufRead, Error, ErrorKind};
+
+    let mut header = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let remaining = MAX_ENCRYPTED_HEADER_BYTES
+            .checked_sub(header.len())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Encrypted header exceeds 16 MiB"))?;
+        // Include one separator line in the limit, while bounding even a line
+        // without a newline before read_until can allocate it.
+        let limit = remaining.saturating_add(b"---ENCRYPTED_DATA---\n".len());
+        let bytes = reader.take(limit as u64).read_until(b'\n', &mut line)?;
+        if bytes == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Encrypted header separator not found",
+            ));
+        }
+        if line == b"---ENCRYPTED_DATA---\n" || line == b"---ENCRYPTED_DATA---" {
+            return Ok(header);
+        }
+        if bytes > remaining {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Encrypted header exceeds 16 MiB",
+            ));
+        }
+        header.try_reserve(bytes).map_err(|_| {
+            Error::new(ErrorKind::OutOfMemory, "Unable to reserve encrypted header")
+        })?;
+        header.extend_from_slice(&line);
     }
 }
 
@@ -659,9 +727,9 @@ pub fn chunked_encrypted_size(
     content_size: u64,
     chunk_size: usize,
 ) -> Result<u64, EncryptionError> {
-    if chunk_size == 0 {
+    if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE {
         return Err(EncryptionError::EncryptionFailure(
-            "chunk_size must be greater than 0".to_string(),
+            "chunk_size must be between 1 and 64 MiB".to_string(),
         ));
     }
     let chunk_size = chunk_size as u64;
@@ -686,9 +754,9 @@ pub fn encrypt_content_chunked<R: Read, W: Write>(
     base_nonce: &[u8; 12],
     chunk_size: usize,
 ) -> Result<(u64, [u8; 32]), EncryptionError> {
-    if chunk_size == 0 {
+    if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE {
         return Err(EncryptionError::EncryptionFailure(
-            "chunk_size must be greater than 0".to_string(),
+            "chunk_size must be between 1 and 64 MiB".to_string(),
         ));
     }
 

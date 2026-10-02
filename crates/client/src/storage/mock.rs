@@ -371,6 +371,19 @@ impl Storage for MockStorage {
         Ok(())
     }
 
+    async fn create_protected_config_if_absent(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<bool, StorageError> {
+        let mut data = self.data.write().await;
+        if data.config.contains_key(key) {
+            return Ok(false);
+        }
+        data.config.insert(key.to_string(), value.to_string());
+        Ok(true)
+    }
+
     async fn load_config(&self, key: &str) -> Result<Option<String>, StorageError> {
         let data = self.data.read().await;
         Ok(data.config.get(key).cloned())

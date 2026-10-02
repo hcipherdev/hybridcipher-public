@@ -335,6 +335,49 @@ async fn new_streamed_files_round_trip_and_failed_restore_keeps_output() {
 }
 
 #[tokio::test]
+#[ignore = "manual large-file streaming verification"]
+async fn large_chunked_file_streams_beyond_in_memory_limit() {
+    let (client, template) = fixture(3, false).await;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("large-source.bin");
+    let encrypted = root.path().join("large-source.encrypted");
+    let output = root.path().join("large-restored.bin");
+    let size = MAX_IN_MEMORY_PLAINTEXT_BYTES + 1;
+    std::fs::File::create(&source)
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+
+    let (metadata, _) = client
+        .encrypt_file_streaming_with_id_to_path(
+            "large-source.bin",
+            &source,
+            &encrypted,
+            Some("large-source.bin"),
+            None,
+            &template.file_id,
+            4 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata.content_size, size);
+    assert_eq!(metadata.content_chunk_size, Some(4 * 1024 * 1024));
+    client
+        .decrypt_file_streaming_to_path(&encrypted, &metadata, &output)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::metadata(&output).unwrap().len(), size);
+    use std::io::{Read, Seek, SeekFrom};
+    let mut restored = std::fs::File::open(&output).unwrap();
+    let mut boundary = [1u8; 1];
+    restored.read_exact(&mut boundary).unwrap();
+    assert_eq!(boundary, [0]);
+    restored.seek(SeekFrom::End(-1)).unwrap();
+    restored.read_exact(&mut boundary).unwrap();
+    assert_eq!(boundary, [0]);
+}
+
+#[tokio::test]
 async fn current_chunked_files_decrypt_exact_authenticated_ranges() {
     let (client, template) = fixture(content_manifest::VERSION, false).await;
     let root = tempfile::tempdir().unwrap();
@@ -383,4 +426,57 @@ async fn current_chunked_files_decrypt_exact_authenticated_ranges() {
         .decrypt_file_range(&encrypted, &metadata, (plaintext.len() - 17) as u64, 17,)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn forged_sizes_and_sparse_extents_are_rejected_before_large_allocations() {
+    let (client, metadata) = fixture(3, false).await;
+    let mut huge = metadata.clone();
+    huge.content_size = MAX_IN_MEMORY_PLAINTEXT_BYTES + 1;
+    assert!(client.decrypt_file(&huge).await.is_err());
+
+    let mut huge_chunk = metadata.clone();
+    huge_chunk.content_chunk_size = Some(MAX_CONTENT_CHUNK_SIZE as u64 + 1);
+    assert!(client.decrypt_file(&huge_chunk).await.is_err());
+
+    let mut short_ciphertext = metadata.clone();
+    short_ciphertext.encrypted_content.truncate(1);
+    assert!(client.decrypt_file(&short_ciphertext).await.is_err());
+
+    let (client, mut sparse) = fixture(3, true).await;
+    sparse.sparse_metadata.as_mut().unwrap().extents[0].offset = u64::MAX;
+    assert!(client.decrypt_file(&sparse).await.is_err());
+    let mut huge_sparse = sparse.clone();
+    huge_sparse.sparse_metadata.as_mut().unwrap().logical_size = MAX_IN_MEMORY_PLAINTEXT_BYTES + 1;
+    huge_sparse.content_size = MAX_IN_MEMORY_PLAINTEXT_BYTES + 1;
+    assert!(client.decrypt_file(&huge_sparse).await.is_err());
+}
+
+#[tokio::test]
+async fn streaming_rejects_oversized_chunk_and_header_without_output() {
+    let (client, metadata) = fixture(3, false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let encrypted = dir.path().join("fixture.encrypted");
+    let output = dir.path().join("plaintext");
+    let mut bytes = b"{}\n---ENCRYPTED_DATA---\n".to_vec();
+    bytes.extend_from_slice(&metadata.encrypted_content);
+    std::fs::write(&encrypted, &bytes).unwrap();
+    let mut huge_chunk = metadata.clone();
+    huge_chunk.content_chunk_size = Some(MAX_CONTENT_CHUNK_SIZE as u64 + 1);
+    assert!(client
+        .decrypt_file_streaming_to_path(&encrypted, &huge_chunk, &output)
+        .await
+        .is_err());
+    assert!(!output.exists());
+
+    let huge_header = vec![b' '; crate::file::encrypt::MAX_ENCRYPTED_HEADER_BYTES + 1];
+    let mut oversized = huge_header;
+    oversized.extend_from_slice(b"\n---ENCRYPTED_DATA---\n");
+    oversized.extend_from_slice(&metadata.encrypted_content);
+    std::fs::write(&encrypted, oversized).unwrap();
+    assert!(client
+        .decrypt_file_streaming_to_path(&encrypted, &metadata, &output)
+        .await
+        .is_err());
+    assert!(!output.exists());
 }

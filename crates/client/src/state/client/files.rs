@@ -252,7 +252,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         let digest = Sha256::digest(&plaintext);
         hash.copy_from_slice(&digest);
 
-        let active_group = { self.state.read().await.active_group_id };
+        let active_group = self.active_group_id_opt().await;
         let modified_at = preserved_times
             .as_ref()
             .map(|(_, _, recorded)| *recorded)
@@ -410,7 +410,7 @@ impl<S: Storage, N: Network> Client<S, N> {
     #[cfg(feature = "mount-fs")]
     pub(super) async fn active_group_id(&self) -> Result<Uuid, ClientError> {
         let state = self.state.read().await;
-        state.active_group_id.ok_or_else(|| {
+        self.local_group_id.or(state.active_group_id).ok_or_else(|| {
             ClientError::InvalidState(
                 "No active group selected. Run 'hybridcipher switch-group <group-id>' and retry the file operation."
                     .to_string(),
@@ -507,6 +507,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         file_path: &str,
         content: &[u8],
     ) -> Result<EncryptedFileMetadata, ClientError> {
+        self.require_local_write().await?;
         use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
         use hybridcipher_crypto::AeadKey;
         use rand::RngCore;
@@ -530,7 +531,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let active_group = {
             let state = self.state.read().await;
-            state.active_group_id
+            self.local_group_id.or(state.active_group_id)
         };
         let active_group = match active_group {
             Some(group_id) => group_id,
@@ -722,6 +723,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         content: &[u8],
         file_id: &str,
     ) -> Result<EncryptedFileMetadata, ClientError> {
+        self.require_local_write().await?;
         use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
         use hybridcipher_crypto::AeadKey;
         use rand::RngCore;
@@ -755,7 +757,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let active_group = {
             let state = self.state.read().await;
-            state.active_group_id
+            self.local_group_id.or(state.active_group_id)
         };
         let active_group = match active_group {
             Some(group_id) => group_id,
@@ -960,6 +962,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         file_id: &str,
         chunk_size: usize,
     ) -> Result<(EncryptedFileMetadata, [u8; 32]), ClientError> {
+        self.require_local_write().await?;
         use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
         use hybridcipher_crypto::AeadKey;
         use rand::RngCore;
@@ -1000,7 +1003,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let active_group = {
             let state = self.state.read().await;
-            state.active_group_id
+            self.local_group_id.or(state.active_group_id)
         };
         let active_group = match active_group {
             Some(group_id) => group_id,
@@ -1398,7 +1401,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         encrypted_file: &EncryptedFileMetadata,
     ) -> Result<Vec<u8>, ClientError> {
-        self.decrypt_file_with_legacy_policy(encrypted_file, false)
+        self.decrypt_file_with_legacy_policy(encrypted_file, false, false)
             .await
     }
 
@@ -1408,7 +1411,17 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         encrypted_file: &EncryptedFileMetadata,
     ) -> Result<Vec<u8>, ClientError> {
-        self.decrypt_file_with_legacy_policy(encrypted_file, true)
+        self.decrypt_file_with_legacy_policy(encrypted_file, true, false)
+            .await
+    }
+
+    /// Explicit, high-memory recovery of an older single-record ciphertext.
+    /// Callers must retain the encrypted source and publish only a new output.
+    pub async fn recover_large_single_record_unverified(
+        &self,
+        encrypted_file: &EncryptedFileMetadata,
+    ) -> Result<Vec<u8>, ClientError> {
+        self.decrypt_file_with_legacy_policy(encrypted_file, true, true)
             .await
     }
 
@@ -1416,10 +1429,70 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         encrypted_file: &EncryptedFileMetadata,
         allow_legacy: bool,
+        allow_large_single_record: bool,
     ) -> Result<Vec<u8>, ClientError> {
         use hybridcipher_crypto::aead::AeadContext;
         use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
         use hybridcipher_crypto::{open, AeadKey, AeadNonce};
+
+        let packed_content_size = match encrypted_file.sparse_metadata.as_ref() {
+            Some(layout) => layout
+                .validated_packed_size(encrypted_file.content_size)
+                .ok_or_else(|| ClientError::FileIntegrity("Invalid sparse extent layout".into()))?,
+            None => encrypted_file.content_size,
+        };
+        let chunked = encrypted_file.header_version == Some(CHUNKED_HEADER_VERSION)
+            || encrypted_file.content_chunk_size.is_some();
+        if allow_large_single_record && chunked {
+            return Err(ClientError::InvalidInput(
+                "Large-record recovery only supports older single-record files".into(),
+            ));
+        }
+        if !allow_large_single_record
+            && (encrypted_file.content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
+                || packed_content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES)
+        {
+            return Err(ClientError::InvalidInput(
+                "Plaintext exceeds the 256 MiB in-memory limit; use streaming decryption".into(),
+            ));
+        }
+        if chunked {
+            let chunk_size = usize::try_from(encrypted_file.content_chunk_size.unwrap_or_default())
+                .map_err(|_| ClientError::DecryptionError("chunk_size is too large".into()))?;
+            let expected = chunked_encrypted_size(packed_content_size, chunk_size)
+                .map_err(|err| ClientError::DecryptionError(err.to_string()))?;
+            if encrypted_file.encrypted_size != expected
+                || encrypted_file.encrypted_content.len() as u64 != expected
+            {
+                return Err(ClientError::FileIntegrity(
+                    "Ciphertext size mismatch".into(),
+                ));
+            }
+        } else {
+            let actual = encrypted_file.encrypted_content.len() as u64;
+            if actual != encrypted_file.encrypted_size || actual < 12 + AEAD_TAG_SIZE as u64 {
+                return Err(ClientError::FileIntegrity(
+                    "Ciphertext size mismatch".into(),
+                ));
+            }
+            if encrypted_file.header_version.unwrap_or(1) >= 3 {
+                let expected = packed_content_size
+                    .checked_add(12 + AEAD_TAG_SIZE as u64)
+                    .ok_or_else(|| ClientError::FileIntegrity("Ciphertext size overflow".into()))?;
+                if actual != expected {
+                    return Err(ClientError::FileIntegrity(
+                        "Ciphertext size mismatch".into(),
+                    ));
+                }
+            }
+            if !allow_large_single_record
+                && actual > MAX_IN_MEMORY_PLAINTEXT_BYTES + 12 + AEAD_TAG_SIZE as u64
+            {
+                return Err(ClientError::InvalidInput(
+                    "Single-record plaintext exceeds the 256 MiB in-memory limit".into(),
+                ));
+            }
+        }
 
         // Ensure client state is loaded
         self.ensure_state_loaded().await?;
@@ -1434,8 +1507,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let active_group = {
             let state = self.state.read().await;
-            state
-                .active_group_id
+            self.local_group_id.or(state.active_group_id)
                 .ok_or_else(|| {
                     ClientError::InvalidState(
                         "No active group selected. Run 'hybridcipher switch-group <group-id>' before decrypting."
@@ -1566,13 +1638,14 @@ impl<S: Storage, N: Network> Client<S, N> {
         let file_key = content_manifest::verify(encrypted_file, &file_key_bytes, allow_legacy)?;
 
         let header_version = encrypted_file.header_version.unwrap_or(1);
-        let packed_content_size = Self::effective_packed_content_size(encrypted_file);
         let packed_plaintext = if header_version == CHUNKED_HEADER_VERSION
             || encrypted_file.content_chunk_size.is_some()
         {
-            let chunk_size = encrypted_file.content_chunk_size.ok_or_else(|| {
-                ClientError::DecryptionError("Missing chunk_size in metadata".to_string())
-            })? as usize;
+            let chunk_size =
+                usize::try_from(encrypted_file.content_chunk_size.ok_or_else(|| {
+                    ClientError::DecryptionError("Missing chunk_size in metadata".to_string())
+                })?)
+                .map_err(|_| ClientError::DecryptionError("chunk_size is too large".into()))?;
             let content_nonce = encrypted_file.content_nonce.as_ref().ok_or_else(|| {
                 ClientError::DecryptionError("Missing content nonce in metadata".to_string())
             })?;
@@ -1654,7 +1727,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         use hybridcipher_crypto::aead::AeadContext;
         use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
         use hybridcipher_crypto::{open, AeadKey, AeadNonce};
-        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+        use std::io::{BufReader, Read, Seek, SeekFrom};
 
         policy.check(encrypted_file)?;
         let header_version = encrypted_file.header_version.unwrap_or(1);
@@ -1664,6 +1737,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                 self.decrypt_file_with_legacy_policy(
                     encrypted_file,
                     policy == content_manifest::LegacyReadPolicy::AllowLegacyUnverified,
+                    false,
                 )
                 .await?,
             );
@@ -1686,8 +1760,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let active_group = {
             let state = self.state.read().await;
-            state
-                .active_group_id
+            self.local_group_id.or(state.active_group_id)
                 .ok_or_else(|| {
                     ClientError::InvalidState(
                         "No active group selected. Run 'hybridcipher switch-group <group-id>' before decrypting."
@@ -1818,10 +1891,11 @@ impl<S: Storage, N: Network> Client<S, N> {
         let mut base_nonce = [0u8; 12];
         base_nonce.copy_from_slice(content_nonce);
 
-        let chunk_size = chunk_size.ok_or_else(|| {
+        let chunk_size = usize::try_from(chunk_size.ok_or_else(|| {
             ClientError::DecryptionError("Missing chunk_size in metadata".to_string())
-        })? as usize;
-        if chunk_size == 0 || chunk_size > 64 * 1024 * 1024 {
+        })?)
+        .map_err(|_| ClientError::DecryptionError("chunk_size is too large".into()))?;
+        if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE {
             return Err(ClientError::DecryptionError(
                 "chunk_size must be between 1 and 64 MiB".to_string(),
             ));
@@ -1833,7 +1907,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                 let mut end = 0u64;
                 let mut packed = 0u64;
                 for extent in &layout.extents {
-                    if extent.offset < end {
+                    if extent.length == 0 || extent.offset < end {
                         return Err(ClientError::FileIntegrity(
                             "Overlapping sparse extents".into(),
                         ));
@@ -1875,27 +1949,15 @@ impl<S: Storage, N: Network> Client<S, N> {
                     e
                 ))
             })?;
-            let mut reader = BufReader::new(file).take(16 * 1024 * 1024);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                let bytes = reader.read_until(b'\n', &mut line).map_err(|e| {
-                    ClientError::DecryptionError(format!(
-                        "Failed to read encrypted header {}: {}",
-                        encrypted_path.display(),
-                        e
-                    ))
-                })?;
-                if bytes == 0 {
-                    return Err(ClientError::DecryptionError(
-                        "Encrypted header separator not found".to_string(),
-                    ));
-                }
-                if line == b"---ENCRYPTED_DATA---\n" || line == b"---ENCRYPTED_DATA---" {
-                    break;
-                }
-            }
-            reader.get_mut().stream_position().map_err(|e| {
+            let mut reader = BufReader::new(file);
+            crate::file::encrypt::read_encrypted_header(&mut reader).map_err(|e| {
+                ClientError::DecryptionError(format!(
+                    "Failed to read encrypted header {}: {}",
+                    encrypted_path.display(),
+                    e
+                ))
+            })?;
+            reader.stream_position().map_err(|e| {
                 ClientError::DecryptionError(format!(
                     "Failed to locate ciphertext offset for {}: {}",
                     encrypted_path.display(),
@@ -1966,11 +2028,24 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let mut remaining = packed_content_size;
         let mut chunk_index = 0u64;
-        let mut buffer = vec![0u8; chunk_size + AEAD_TAG_SIZE];
+        let initial_cipher_len = usize::try_from(packed_content_size.min(chunk_size as u64))
+            .map_err(|_| ClientError::DecryptionError("Chunk size is too large".into()))?
+            .checked_add(AEAD_TAG_SIZE)
+            .ok_or_else(|| ClientError::DecryptionError("Chunk length overflows".into()))?;
+        let mut buffer = Vec::new();
+        if packed_content_size > 0 {
+            buffer.try_reserve_exact(initial_cipher_len).map_err(|_| {
+                ClientError::DecryptionError("Unable to reserve ciphertext chunk".into())
+            })?;
+        }
 
         while remaining > 0 {
-            let plain_len = usize::min(chunk_size, remaining as usize);
-            let cipher_len = plain_len + AEAD_TAG_SIZE;
+            let plain_len = usize::try_from(remaining.min(chunk_size as u64)).map_err(|_| {
+                ClientError::DecryptionError("Plaintext chunk length is too large".into())
+            })?;
+            let cipher_len = plain_len.checked_add(AEAD_TAG_SIZE).ok_or_else(|| {
+                ClientError::DecryptionError("Ciphertext chunk length overflows".into())
+            })?;
             buffer.resize(cipher_len, 0);
             reader.read_exact(&mut buffer).map_err(|e| {
                 ClientError::DecryptionError(format!("Failed to read ciphertext chunk: {}", e))
@@ -2020,8 +2095,14 @@ impl<S: Storage, N: Network> Client<S, N> {
         use hybridcipher_crypto::aead::AeadContext;
         use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
         use hybridcipher_crypto::{open, AeadKey, AeadNonce};
-        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+        use std::io::{BufReader, Read, Seek, SeekFrom};
         use zeroize::Zeroizing;
+
+        if length as u64 > MAX_IN_MEMORY_PLAINTEXT_BYTES {
+            return Err(ClientError::InvalidInput(
+                "Requested range exceeds the 256 MiB in-memory limit".into(),
+            ));
+        }
 
         let end = offset
             .checked_add(u64::try_from(length).map_err(|_| {
@@ -2063,7 +2144,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let active_group = {
             let state = self.state.read().await;
-            state.active_group_id.ok_or_else(|| {
+            self.local_group_id.or(state.active_group_id).ok_or_else(|| {
                 ClientError::InvalidState(
                     "No active group selected. Run 'hybridcipher switch-group <group-id>' before decrypting."
                         .to_string(),
@@ -2177,9 +2258,9 @@ impl<S: Storage, N: Network> Client<S, N> {
         base_nonce.copy_from_slice(content_nonce);
         let chunk_size = usize::try_from(encrypted_file.content_chunk_size.unwrap_or_default())
             .map_err(|_| ClientError::DecryptionError("chunk_size is too large".to_string()))?;
-        if chunk_size == 0 {
+        if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE {
             return Err(ClientError::DecryptionError(
-                "chunk_size must be greater than 0".to_string(),
+                "chunk_size must be between 1 and 64 MiB".to_string(),
             ));
         }
 
@@ -2198,26 +2279,14 @@ impl<S: Storage, N: Network> Client<S, N> {
                     encrypted_path.display()
                 ))
             })?;
-            let mut reader = BufReader::new(file).take(16 * 1024 * 1024);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                let bytes = reader.read_until(b'\n', &mut line).map_err(|err| {
-                    ClientError::DecryptionError(format!(
-                        "Failed to read encrypted header {}: {err}",
-                        encrypted_path.display()
-                    ))
-                })?;
-                if bytes == 0 {
-                    return Err(ClientError::DecryptionError(
-                        "Encrypted header separator not found".to_string(),
-                    ));
-                }
-                if line == b"---ENCRYPTED_DATA---\n" || line == b"---ENCRYPTED_DATA---" {
-                    break;
-                }
-            }
-            reader.get_mut().stream_position().map_err(|err| {
+            let mut reader = BufReader::new(file);
+            crate::file::encrypt::read_encrypted_header(&mut reader).map_err(|err| {
+                ClientError::DecryptionError(format!(
+                    "Failed to read encrypted header {}: {err}",
+                    encrypted_path.display()
+                ))
+            })?;
+            reader.stream_position().map_err(|err| {
                 ClientError::DecryptionError(format!(
                     "Failed to locate ciphertext offset for {}: {err}",
                     encrypted_path.display()
@@ -2268,8 +2337,18 @@ impl<S: Storage, N: Network> Client<S, N> {
             ))
         })?;
         let mut reader = BufReader::new(input);
-        let mut ciphertext = vec![0u8; chunk_size + AEAD_TAG_SIZE];
-        let mut result = Zeroizing::new(Vec::with_capacity(length));
+        let max_cipher_len = usize::try_from(packed_content_size.min(chunk_size_u64))
+            .map_err(|_| ClientError::DecryptionError("Chunk size is too large".into()))?
+            .checked_add(AEAD_TAG_SIZE)
+            .ok_or_else(|| ClientError::DecryptionError("Chunk length overflows".into()))?;
+        let mut ciphertext = Vec::new();
+        ciphertext.try_reserve_exact(max_cipher_len).map_err(|_| {
+            ClientError::DecryptionError("Unable to reserve ciphertext chunk".into())
+        })?;
+        let mut result = Zeroizing::new(Vec::new());
+        result.try_reserve_exact(length).map_err(|_| {
+            ClientError::DecryptionError("Unable to reserve plaintext range".into())
+        })?;
 
         for chunk_index in first_chunk..=final_chunk {
             let chunk_plain_offset = chunk_index.checked_mul(chunk_size_u64).ok_or_else(|| {
@@ -2334,9 +2413,21 @@ impl<S: Storage, N: Network> Client<S, N> {
     ) -> Result<Vec<u8>, ClientError> {
         use hybridcipher_crypto::{aead::AeadContext, open, AeadNonce};
 
-        if chunk_size == 0 {
+        if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE {
             return Err(ClientError::DecryptionError(
-                "chunk_size must be greater than 0".to_string(),
+                "chunk_size must be between 1 and 64 MiB".to_string(),
+            ));
+        }
+        if content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES {
+            return Err(ClientError::InvalidInput(
+                "Plaintext exceeds the 256 MiB in-memory limit".into(),
+            ));
+        }
+        let expected = chunked_encrypted_size(content_size, chunk_size)
+            .map_err(|err| ClientError::DecryptionError(err.to_string()))?;
+        if encrypted_content.len() as u64 != expected {
+            return Err(ClientError::FileIntegrity(
+                "Ciphertext size mismatch".into(),
             ));
         }
         if content_nonce.len() != 12 {
@@ -2348,20 +2439,29 @@ impl<S: Storage, N: Network> Client<S, N> {
         let mut base_nonce = [0u8; 12];
         base_nonce.copy_from_slice(content_nonce);
 
-        let mut output = Vec::with_capacity(content_size as usize);
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(content_size as usize)
+            .map_err(|_| ClientError::DecryptionError("Unable to reserve plaintext".into()))?;
         let mut offset = 0usize;
         let mut remaining = content_size;
         let mut chunk_index = 0u64;
 
         while remaining > 0 {
-            let plain_len = usize::min(chunk_size, remaining as usize);
-            let cipher_len = plain_len + AEAD_TAG_SIZE;
-            if offset + cipher_len > encrypted_content.len() {
+            let plain_len = usize::try_from(remaining.min(chunk_size as u64))
+                .map_err(|_| ClientError::DecryptionError("Chunk length is too large".into()))?;
+            let cipher_len = plain_len
+                .checked_add(AEAD_TAG_SIZE)
+                .ok_or_else(|| ClientError::DecryptionError("Chunk length overflows".into()))?;
+            let next = offset.checked_add(cipher_len).ok_or_else(|| {
+                ClientError::DecryptionError("Ciphertext offset overflows".into())
+            })?;
+            if next > encrypted_content.len() {
                 return Err(ClientError::DecryptionError(
                     "Chunked ciphertext truncated".to_string(),
                 ));
             }
-            let chunk_cipher = &encrypted_content[offset..offset + cipher_len];
+            let chunk_cipher = &encrypted_content[offset..next];
 
             let nonce_bytes = derive_chunk_nonce(&base_nonce, chunk_index);
             let nonce = AeadNonce::from_bytes(&nonce_bytes).map_err(|e| {
@@ -2378,7 +2478,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                 })?;
             output.extend_from_slice(&plaintext);
 
-            offset += cipher_len;
+            offset = next;
             remaining -= plain_len as u64;
             chunk_index += 1;
         }
@@ -2404,7 +2504,9 @@ impl<S: Storage, N: Network> Client<S, N> {
         packed: &[u8],
         sparse_metadata: &SparseFileMetadata,
     ) -> Result<Vec<u8>, ClientError> {
-        let packed_size = sparse_metadata.packed_size();
+        let packed_size = sparse_metadata
+            .validated_packed_size(sparse_metadata.logical_size)
+            .ok_or_else(|| ClientError::FileIntegrity("Invalid sparse extent layout".into()))?;
         if packed.len() as u64 != packed_size {
             return Err(ClientError::DecryptionError(format!(
                 "Sparse packed-size mismatch (expected {}, found {})",
@@ -2413,12 +2515,21 @@ impl<S: Storage, N: Network> Client<S, N> {
             )));
         }
 
+        if sparse_metadata.logical_size > MAX_IN_MEMORY_PLAINTEXT_BYTES {
+            return Err(ClientError::InvalidInput(
+                "Sparse plaintext exceeds the 256 MiB in-memory limit".into(),
+            ));
+        }
         let logical_len = usize::try_from(sparse_metadata.logical_size).map_err(|_| {
             ClientError::DecryptionError(
                 "Sparse logical size exceeds addressable memory".to_string(),
             )
         })?;
-        let mut output = vec![0u8; logical_len];
+        let mut output = Vec::new();
+        output.try_reserve_exact(logical_len).map_err(|_| {
+            ClientError::DecryptionError("Unable to reserve sparse plaintext".into())
+        })?;
+        output.resize(logical_len, 0);
         let mut packed_offset = 0usize;
         for extent in &sparse_metadata.extents {
             let start = usize::try_from(extent.offset).map_err(|_| {
@@ -2430,13 +2541,16 @@ impl<S: Storage, N: Network> Client<S, N> {
             let end = start.checked_add(len).ok_or_else(|| {
                 ClientError::DecryptionError("Sparse extent overflow".to_string())
             })?;
-            if end > output.len() || packed_offset + len > packed.len() {
+            let packed_end = packed_offset.checked_add(len).ok_or_else(|| {
+                ClientError::DecryptionError("Sparse packed offset overflow".into())
+            })?;
+            if end > output.len() || packed_end > packed.len() {
                 return Err(ClientError::DecryptionError(
                     "Sparse extent layout is inconsistent with plaintext size".to_string(),
                 ));
             }
-            output[start..end].copy_from_slice(&packed[packed_offset..packed_offset + len]);
-            packed_offset += len;
+            output[start..end].copy_from_slice(&packed[packed_offset..packed_end]);
+            packed_offset = packed_end;
         }
 
         Ok(output)

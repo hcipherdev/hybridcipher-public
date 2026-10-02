@@ -205,6 +205,17 @@ async fn run_cli_with_monitoring(cli: Cli) -> Result<(), CliError> {
     let session_manager = session::SessionManager::new(config.as_deref()).map_err(|e| {
         CliError::configuration(format!("Failed to initialize session manager: {}", e))
     })?;
+    if ui::desktop::enabled() {
+        let session = session_manager.require_auth()?;
+        let expected_user = std::env::var("HYBRIDCIPHER_DESKTOP_ACCOUNT")
+            .map_err(|_| CliError::authentication("Desktop account scope is missing"))?;
+        let expected_server = std::env::var("HYBRIDCIPHER_DESKTOP_SERVER")
+            .map_err(|_| CliError::authentication("Desktop server scope is missing"))?;
+        let normalize = |value: &str| value.trim_end_matches('/').trim_end_matches("/api/v1").to_ascii_lowercase();
+        if session.user_id != expected_user || normalize(&session.server_url) != normalize(&expected_server) {
+            return Err(CliError::authentication("The saved CLI account does not match the open desktop account"));
+        }
+    }
 
     if no_transparency && require_transparency {
         return Err(CliError::configuration(

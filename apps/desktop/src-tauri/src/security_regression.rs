@@ -17,16 +17,16 @@ fn version_three_single_record_payload_is_read_and_restore_names_are_confined() 
         content_nonce: &[4; 12],
         content_chunk_size: None,
         original_size: 4,
-        encrypted_size: 4,
+        encrypted_size: 32,
         encrypted_at: chrono::Utc::now(),
         original_name: Some("fixture.txt"),
         platform_metadata: None,
         sparse_metadata: None,
     };
     // Parser-only fixture: encryption/authentication is covered by client tests.
-    write_encrypted_file(&path, &header, b"test").unwrap();
+    write_encrypted_file(&path, &header, &[0; 32]).unwrap();
     let mut parsed = hybridcipher_mount_sync::parse_encrypted_file(&path).unwrap();
-    assert_eq!(parsed.metadata.encrypted_content, b"test");
+    assert_eq!(parsed.metadata.encrypted_content, [0; 32]);
     assert_eq!(parsed.metadata.header_version, Some(3));
     assert!(hybridcipher_mount_sync::decrypted_target_path(
         root.path(),

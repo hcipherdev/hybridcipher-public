@@ -19,8 +19,15 @@ async function invoke(command, args = {}) {
     return invokeFn(command, args);
 }
 
+const STORE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const STORE_CHECK_STORAGE_KEY = 'hybridcipher_store_update_check_v1';
+
 window.HybridCipherAppUpdateMethods = {
     async checkForUpdates() {
+        if (this.platformInfo?.update_channel === 'microsoft_store') {
+            await this.checkStoreForUpdates(false);
+            return;
+        }
         if (this.updatePreference === 'manual') return;
 
         try {
@@ -44,6 +51,10 @@ window.HybridCipherAppUpdateMethods = {
     },
 
     async checkForUpdatesManual() {
+        if (this.platformInfo?.update_channel === 'microsoft_store') {
+            await this.checkStoreForUpdates(true);
+            return;
+        }
         const statusEl = document.getElementById('settingsUpdateStatus');
         if (statusEl) statusEl.innerHTML = '<span class="update-status-checking">Checking for updates…</span>';
 
@@ -85,6 +96,25 @@ window.HybridCipherAppUpdateMethods = {
         const statusEl = document.getElementById('settingsUpdateStatus');
         if (!statusEl) return;
 
+        const storeManaged = this.platformInfo?.update_channel === 'microsoft_store';
+        const preferenceRow = document.getElementById('settingsUpdatePreferenceRow');
+        if (preferenceRow) preferenceRow.style.display = storeManaged ? 'none' : '';
+        if (storeManaged) {
+            const actions = document.getElementById('settingsUpdateActions');
+            if (actions) actions.style.display = '';
+            if (this.availableUpdate) {
+                statusEl.innerHTML = '<div class="update-status-available"><span>Update available from Microsoft Store</span><button class="btn btn-primary" id="settingsOpenStoreUpdateBtn" type="button">Open Microsoft Store</button></div>';
+                document.getElementById('settingsOpenStoreUpdateBtn')?.addEventListener('click', () => this.openStoreUpdatePage());
+            } else if (this.storeUpdateStatusKnown) {
+                statusEl.textContent = 'Updates are managed by Microsoft Store. No update is currently reported.';
+            } else {
+                statusEl.textContent = 'Updates are managed by Microsoft Store. Update status has not been checked yet.';
+            }
+            return;
+        }
+        const actions = document.getElementById('settingsUpdateActions');
+        if (actions) actions.style.display = '';
+
         if (this.availableUpdate) {
             statusEl.innerHTML = `
                 <div class="update-status-available">
@@ -100,6 +130,99 @@ window.HybridCipherAppUpdateMethods = {
         } else {
             statusEl.innerHTML = '<span class="update-status-current">✓ You\'re up to date</span>';
         }
+    },
+
+    async checkStoreForUpdates(manual = false) {
+        const statusEl = document.getElementById('settingsUpdateStatus');
+        if (this.storeUpdateCheckInFlight) {
+            if (manual && statusEl) statusEl.textContent = 'Checking Microsoft Store for updates…';
+            return;
+        }
+        this.storeUpdateCheckInFlight = true;
+        if (manual && statusEl) {
+            statusEl.textContent = 'Checking Microsoft Store for updates…';
+        }
+        try {
+            const versionResponse = await invoke('get_app_version');
+            const installedVersion = versionResponse?.success ? String(versionResponse.data || '') : '';
+            let cached = null;
+            try {
+                cached = JSON.parse(window.localStorage?.getItem(STORE_CHECK_STORAGE_KEY) || 'null');
+            } catch (_) { /* A missing or invalid cache simply triggers a new check. */ }
+            const now = Date.now();
+            const cacheValid = cached && cached.installedVersion === installedVersion
+                && Number.isFinite(cached.checkedAt)
+                && now >= cached.checkedAt
+                && now - cached.checkedAt < STORE_CHECK_INTERVAL_MS;
+            if (!manual && cacheValid) {
+                this.applyStoreUpdateAvailability(Boolean(cached.available));
+                return;
+            }
+
+            const result = await invoke('check_for_updates');
+            if (!result?.success) {
+                throw new Error(result?.error || 'Microsoft Store update check failed');
+            }
+            const available = Boolean(result.data?.available);
+            try {
+                window.localStorage?.setItem(STORE_CHECK_STORAGE_KEY, JSON.stringify({
+                    checkedAt: now,
+                    installedVersion,
+                    available,
+                }));
+            } catch (_) { /* Store checks still work when local storage is unavailable. */ }
+            this.applyStoreUpdateAvailability(available);
+        } catch (error) {
+            console.debug('Microsoft Store update check failed:', error);
+            if (manual && statusEl) {
+                statusEl.textContent = `Microsoft Store update check failed: ${error?.message || error}`;
+            }
+        } finally {
+            this.storeUpdateCheckInFlight = false;
+        }
+    },
+
+    applyStoreUpdateAvailability(available) {
+        this.storeUpdateStatusKnown = true;
+        this.availableUpdate = available ? { source: 'microsoft_store' } : null;
+        this.updateSettingsBadge();
+        if (available && !this.storeUpdateBannerShown && !this.storeUpdateBannerDismissed) {
+            this.showStoreUpdateBanner();
+            this.storeUpdateBannerShown = true;
+        }
+        if (!available) {
+            document.getElementById('updateBanner')?.remove();
+            this.storeUpdateBannerShown = false;
+            this.storeUpdateBannerDismissed = false;
+        }
+        this.renderSettingsUpdateStatus();
+    },
+
+    async openStoreUpdatePage() {
+        try {
+            const result = await invoke('open_store_update_page');
+            if (!result?.success) throw new Error(result?.error || 'Could not open Microsoft Store');
+        } catch (error) {
+            this.showNotification(error?.message || String(error), 'error');
+        }
+    },
+
+    showStoreUpdateBanner() {
+        document.getElementById('updateBanner')?.remove();
+        const banner = document.createElement('div');
+        banner.id = 'updateBanner';
+        banner.className = 'store-update-banner';
+        banner.setAttribute('role', 'status');
+        banner.innerHTML = '<strong>HybridCipher update available</strong><p>Open Microsoft Store to update the app.</p><div class="store-update-banner-actions"><button class="btn btn-primary" id="storeUpdateOpenBtn" type="button">Open Microsoft Store</button><button class="btn btn-secondary" id="storeUpdateLaterBtn" type="button">Later</button></div>';
+        document.body.appendChild(banner);
+        document.getElementById('storeUpdateOpenBtn')?.addEventListener('click', async () => {
+            await this.openStoreUpdatePage();
+            banner.remove();
+        });
+        document.getElementById('storeUpdateLaterBtn')?.addEventListener('click', () => {
+            this.storeUpdateBannerDismissed = true;
+            banner.remove();
+        });
     },
 
     showUpdateBanner(version, notes) {
@@ -277,6 +400,10 @@ window.HybridCipherAppUpdateMethods = {
     },
 
     async startUpdateInstallFlow() {
+        if (this.platformInfo?.update_channel === 'microsoft_store') {
+            this.renderSettingsUpdateStatus();
+            return;
+        }
         if (this.updateInstallInProgress) {
             return;
         }

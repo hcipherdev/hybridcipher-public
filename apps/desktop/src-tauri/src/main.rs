@@ -9,11 +9,26 @@ use hybridcipher_desktop::{
     state::AppState, DesktopCloudProviderManager,
 };
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use tauri::{async_runtime::Mutex, Emitter, Manager};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[test]
+fn platform_app_version_matches_tauri_context() {
+    #[cfg(target_os = "windows")]
+    let platform_config = include_str!("../tauri.windows.conf.json");
+    #[cfg(target_os = "macos")]
+    let platform_config = include_str!("../tauri.macos.conf.json");
+    let config: serde_json::Value = serde_json::from_str(platform_config).unwrap();
+    let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+    assert_eq!(
+        context.package_info().version.to_string(),
+        config["version"].as_str().unwrap()
+    );
+}
 
 fn show_main_window<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
     let Some(window) = app_handle.get_webview_window("main") else {
@@ -32,14 +47,100 @@ fn show_main_window<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
     }
 }
 
+fn request_native_safe_exit(app_handle: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app_handle.try_state::<AppState>() else {
+            tracing::error!("Quit was refused because application state is unavailable");
+            show_main_window(&app_handle);
+            return;
+        };
+        match exit_application(app_handle.clone(), state).await {
+            Ok(response) if response.success => {}
+            Ok(response) => {
+                let message = response
+                    .error
+                    .unwrap_or_else(|| "Safe stop failed".to_string());
+                tracing::error!("Quit was refused: {}", message);
+                show_main_window(&app_handle);
+                let _ = app_handle.emit("app_quit_failed", message);
+            }
+            Err(error) => {
+                tracing::error!("Quit was refused: {}", error);
+                show_main_window(&app_handle);
+                let _ = app_handle.emit("app_quit_failed", error);
+            }
+        }
+    });
+}
+
+#[derive(Default)]
+struct QuitRequestTracker {
+    next_id: AtomicU64,
+    pending_id: AtomicU64,
+}
+
+impl QuitRequestTracker {
+    fn begin(&self) -> Option<u64> {
+        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        self.pending_id
+            .compare_exchange(0, request_id, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| request_id)
+    }
+
+    fn claim(&self, request_id: u64) -> bool {
+        request_id != 0
+            && self
+                .pending_id
+                .compare_exchange(request_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+}
+
+#[tauri::command]
+fn ack_quit_request(
+    request_id: u64,
+    tracker: tauri::State<'_, QuitRequestTracker>,
+) -> CommandResponse<bool> {
+    CommandResponse::ok(tracker.claim(request_id))
+}
+
+#[cfg(test)]
+mod quit_request_tests {
+    use super::*;
+
+    #[test]
+    fn acknowledged_or_cancelled_quit_can_be_requested_again() {
+        let tracker = QuitRequestTracker::default();
+        let first = tracker.begin().unwrap();
+        assert!(tracker.claim(first));
+        assert!(!tracker.claim(first));
+        let second = tracker.begin().unwrap();
+        assert_ne!(first, second);
+        assert!(tracker.claim(second));
+        assert!(tracker.begin().is_some());
+    }
+
+    #[test]
+    fn missing_frontend_ack_can_be_claimed_once_by_native_fallback() {
+        let tracker = QuitRequestTracker::default();
+        let request = tracker.begin().unwrap();
+        assert!(tracker.claim(request));
+        assert!(!tracker.claim(request));
+        assert!(tracker.begin().is_some());
+    }
+}
+
 #[tauri::command]
 async fn submit_feedback(
+    app_handle: tauri::AppHandle,
     title: String,
     description: String,
     user_email: Option<String>,
     attachment_paths: Vec<String>,
 ) -> Result<FeedbackResponse, String> {
     hybridcipher_desktop::feedback::submit_feedback(
+        app_handle,
         title,
         description,
         user_email,
@@ -102,17 +203,18 @@ fn main() {
     tracing::info!("Starting HybridCipher Desktop Application");
 
     let shutting_down = Arc::new(AtomicBool::new(false));
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_fs::init());
+    #[cfg(not(feature = "store-msix"))]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    builder
         .setup({
-            let shutting_down = shutting_down.clone();
             move |app| {
                 // Initialize application state
                 let server_url = std::env::var("HYBRIDCIPHER_SERVER_URL")
-                    .unwrap_or_else(|_| "https://api.hybridcipher.com".to_string());
+                    .unwrap_or_else(|_| hybridcipher_client::config_loader::default_server_url());
 
                 let client = HybridCipherClient::new(server_url);
                 let cli_schema = CliSchemaManager::new();
@@ -126,30 +228,41 @@ fn main() {
                     client: Arc::new(client),
                     cli_schema: Arc::new(cli_schema),
                     session: Arc::new(Mutex::new(None)),
+                    team_queue: Arc::new(Mutex::new(())),
                     mount_manager,
                     local_client,
                     cloud_provider,
                 };
 
                 let app_handle = app.app_handle().clone();
-                let mount_manager = state.mount_manager.clone();
-                let signal_flag = shutting_down.clone();
+                let signal_in_progress = Arc::new(AtomicBool::new(false));
                 ctrlc::set_handler(move || {
-                    if signal_flag.swap(true, Ordering::SeqCst) {
+                    if signal_in_progress.swap(true, Ordering::SeqCst) {
                         return;
                     }
-                    tracing::info!("Received interrupt signal, cleaning up mounts");
-                    let mm = mount_manager.clone();
-                    tauri::async_runtime::block_on(async {
-                        if let Err(e) = mm.unmount_all(false).await {
-                            tracing::error!("Failed to cleanup mounts on signal: {}", e);
-                        }
+                    tracing::info!("Received interrupt signal, requesting safe exit");
+                    let outcome = tauri::async_runtime::block_on(async {
+                        let state = app_handle
+                            .try_state::<AppState>()
+                            .ok_or_else(|| "Application state unavailable".to_string())?;
+                        exit_application(app_handle.clone(), state).await
                     });
-                    app_handle.exit(0);
+                    match outcome {
+                        Ok(response) if response.success => {}
+                        Ok(response) => {
+                            tracing::error!("Interrupt exit was refused: {:?}", response.error);
+                            signal_in_progress.store(false, Ordering::SeqCst);
+                        }
+                        Err(error) => {
+                            tracing::error!("Interrupt exit was refused: {}", error);
+                            signal_in_progress.store(false, Ordering::SeqCst);
+                        }
+                    }
                 })
                 .map_err(|e| anyhow!(format!("Failed to install Ctrl+C handler: {}", e)))?;
 
                 app.manage(state);
+                app.manage(QuitRequestTracker::default());
 
                 // Set up custom protocol for serving local assets securely
                 #[cfg(target_os = "macos")]
@@ -265,17 +378,44 @@ fn main() {
             move |app_handle, event| {
                 // Handle menu events, particularly Quit
                 if event.id() == "quit" || event.id() == "tray_quit" {
-                    if shutting_down.swap(true, Ordering::SeqCst) {
+                    if shutting_down.load(Ordering::SeqCst) {
                         return;
                     }
                     tracing::info!("Quit menu selected, delegating quit flow to frontend");
                     if let Some(window) = app_handle.get_webview_window("main") {
-                        if let Err(err) = window.emit("app_quit_requested", ()) {
+                        let Some(tracker) = app_handle.try_state::<QuitRequestTracker>() else {
+                            request_native_safe_exit(app_handle.clone());
+                            return;
+                        };
+                        let Some(request_id) = tracker.begin() else {
+                            return;
+                        };
+                        if let Err(err) = window.emit(
+                            "app_quit_requested",
+                            serde_json::json!({ "request_id": request_id }),
+                        ) {
                             tracing::error!("Failed to emit quit request: {}", err);
-                            app_handle.exit(0);
+                            tracker.claim(request_id);
+                            request_native_safe_exit(app_handle.clone());
+                        } else {
+                            let app_handle = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                let Some(tracker) = app_handle.try_state::<QuitRequestTracker>()
+                                else {
+                                    request_native_safe_exit(app_handle);
+                                    return;
+                                };
+                                if tracker.claim(request_id) {
+                                    tracing::warn!(
+                                        "Frontend did not acknowledge Quit; using native safe stop"
+                                    );
+                                    request_native_safe_exit(app_handle.clone());
+                                }
+                            });
                         }
                     } else {
-                        app_handle.exit(0);
+                        request_native_safe_exit(app_handle.clone());
                     }
                 } else if event.id() == "tray_open" {
                     show_main_window(app_handle);
@@ -291,6 +431,12 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            start_desktop_operation,
+            get_desktop_operation,
+            answer_desktop_operation,
+            cancel_desktop_operation,
+            get_workspace_group_context,
+            list_coverage_verification_files,
             // Authentication commands
             register_user,
             login_user,
@@ -302,6 +448,15 @@ fn main() {
             check_email_confirmation,
             resend_confirmation_email,
             get_session_info,
+            get_team_license_status,
+            get_team_directory,
+            redeem_team_code,
+            accept_team_invitation,
+            invite_team_member,
+            queue_team_admin_request,
+            list_team_admin_requests,
+            sync_team_admin_requests,
+            dismiss_team_admin_request,
             logout_user,
             restore_session,
             get_user_status,
@@ -316,6 +471,7 @@ fn main() {
             // File operations commands
             encrypt_file,
             decrypt_file,
+            export_existing_team_file,
             encrypt_directory,
             list_encrypted_files,
             // Rekey operations commands
@@ -345,6 +501,7 @@ fn main() {
             offer_recovery_writer_handoff,
             accept_recovery_writer_handoffs,
             get_personal_devices_overview,
+            get_current_device_fingerprint,
             revoke_device,
             mfa_enroll_start,
             mfa_enroll_verify,
@@ -356,6 +513,8 @@ fn main() {
             get_command_help,
             execute_cli_command,
             run_shell_command,
+            run_bundled_cli,
+            ack_quit_request,
             start_terminal_session,
             write_terminal_stdin,
             close_terminal_session,
@@ -371,6 +530,7 @@ fn main() {
             get_global_cli_install_status,
             install_global_cli_symlink,
             check_for_updates,
+            open_store_update_page,
             install_update,
             restart_application,
             // Coverage and folder management commands
@@ -381,11 +541,14 @@ fn main() {
             run_folder_coverage_action,
             enroll_folder,
             enroll_folder_and_hydrate,
+            unenroll_folder_keep_encrypted,
             unenroll_folder_and_decrypt,
             mount_enrolled_folder,
             check_mount_status_by_root_id,
             list_active_mounts,
             list_mount_conflicts,
+            list_windows_cloud_conflicts,
+            recheck_windows_cloud_conflicts,
             get_mount_conflict_preview,
             resolve_mount_conflict,
             list_mount_recovery_copies,

@@ -3,12 +3,14 @@ use super::*;
 impl<S: Storage, N: Network> Client<S, N> {
     pub(in super::super) async fn active_group_required(&self) -> Result<Uuid, ClientError> {
         let state = self.state.read().await;
-        state.active_group_id.ok_or_else(|| {
-            ClientError::InvalidState(
+        self.local_group_id
+            .or(state.active_group_id)
+            .ok_or_else(|| {
+                ClientError::InvalidState(
                 "No active group selected. Run 'hybridcipher switch-group <group-id>' and retry."
                     .to_string(),
             )
-        })
+            })
     }
 
     pub(in super::super) async fn active_group_roots_map(
@@ -1327,6 +1329,11 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         metadata: FileMetadataData,
     ) -> Result<(), ClientError> {
+        if let Some(group_id) = metadata.group_id {
+            self.require_local_write_for_group(group_id).await?;
+        } else {
+            self.require_local_write().await?;
+        }
         self.storage
             .store_file_metadata(&metadata.file_path, &metadata)
             .await
@@ -1338,11 +1345,12 @@ impl<S: Storage, N: Network> Client<S, N> {
     where
         P: AsRef<Path> + Send,
     {
+        self.require_local_write().await?;
         self.ensure_state_loaded().await?;
 
         let group_id = {
             let state = self.state.read().await;
-            state.active_group_id.ok_or_else(|| {
+            self.local_group_id.or(state.active_group_id).ok_or_else(|| {
                 ClientError::InvalidState(
                     "Cannot enroll coverage root without an active group. Run 'hybridcipher switch-group <group-id>' first."
                         .to_string(),
@@ -1386,8 +1394,19 @@ impl<S: Storage, N: Network> Client<S, N> {
             .await?;
 
         let display_path = canonical.display().to_string();
-        let mut reactivated: Option<CoverageRoot> = None;
         let marker_hint = find_marker_for_path(&canonical, kind, group_id);
+
+        let has_foreign_history = {
+            let state = self.state.read().await;
+            state.coverage_roots.values().any(|root| {
+                root.group_id.is_some_and(|owner| owner != group_id)
+                    && paths_overlap(&root.path, &canonical)
+            })
+        };
+        if has_foreign_history {
+            self.assert_reenrollment_contents_for_group(canonical.clone(), group_id)
+                .await?;
+        }
 
         // Second layer: If marker exists for this group but not in state, it indicates
         // the registry was lost. Check against existing roots by marker's root_id.
@@ -1412,68 +1431,64 @@ impl<S: Storage, N: Network> Client<S, N> {
             }
         }
 
-        {
+        let root = {
             let mut state = self.state.write().await;
-            if let Some(existing) = state
-                .coverage_roots
-                .values_mut()
-                .find(|root| root.path == canonical)
-            {
-                if let Some(existing_group) = existing.group_id {
-                    if existing_group != group_id {
-                        return Err(ClientError::InvalidInput(format!(
-                            "Coverage root '{}' belongs to group {}. Run 'hybridcipher switch-group {}' to manage it.",
-                            display_path, existing_group, existing_group
-                        )));
-                    }
+            // Historical roots retain their identity and owner. Only active roots
+            // reserve a path; also check state when the registry has been lost.
+            for existing in state.coverage_roots.values() {
+                if existing.state != CoverageRootState::Active {
+                    continue;
                 }
-
-                if existing.state == CoverageRootState::Active {
+                if existing.group_id.is_some_and(|owner| owner != group_id)
+                    && paths_overlap(&existing.path, &canonical)
+                {
+                    return Err(ClientError::InvalidInput(format!(
+                        "Cannot protect '{}': it overlaps an active protected folder in group {}. Remove protection in that workspace first, or choose another folder.",
+                        display_path, existing.group_id.unwrap()
+                    )));
+                }
+                if existing.path == canonical {
                     return Err(ClientError::InvalidInput(format!(
                         "Coverage root '{}' is already enrolled",
                         display_path
                     )));
                 }
+            }
 
+            let reusable_id = state
+                .coverage_roots
+                .values()
+                .filter(|root| {
+                    root.path == canonical
+                        && root.state == CoverageRootState::Unenrolled
+                        && (root.group_id == Some(group_id) || root.group_id.is_none())
+                })
+                .min_by_key(|root| (root.group_id.is_none(), root.root_id))
+                .map(|root| root.root_id);
+            if let Some(root_id) = reusable_id {
+                let existing = state.coverage_roots.get_mut(&root_id).unwrap();
                 existing.group_id = Some(group_id);
                 existing.state = CoverageRootState::Active;
                 existing.updated_at = Utc::now();
-                reactivated = Some(existing.clone());
+                existing.clone()
+            } else {
+                let now = Utc::now();
+                let root = CoverageRoot {
+                    root_id: marker_hint
+                        .as_ref()
+                        .map(|m| m.root_id)
+                        .unwrap_or_else(Uuid::new_v4),
+                    path: canonical.clone(),
+                    group_id: Some(group_id),
+                    kind,
+                    state: CoverageRootState::Active,
+                    created_at: now,
+                    updated_at: now,
+                    last_scan: None,
+                };
+                state.coverage_roots.insert(root.root_id, root.clone());
+                root
             }
-        }
-
-        if let Some(root) = reactivated {
-            self.upsert_root_registry_entry(&root.path, group_id, root.root_id)
-                .await?;
-            self.save_client_state().await?;
-            if let Err(err) = write_marker_for_root(&root, group_id).await {
-                log::warn!(
-                    "Failed to write coverage marker for {}: {}",
-                    root.path.display(),
-                    err
-                );
-            }
-            return Ok(root);
-        }
-
-        let root = {
-            let mut state = self.state.write().await;
-            let now = Utc::now();
-            let root = CoverageRoot {
-                root_id: marker_hint
-                    .as_ref()
-                    .map(|m| m.root_id)
-                    .unwrap_or_else(Uuid::new_v4),
-                path: canonical.clone(),
-                group_id: Some(group_id),
-                kind,
-                state: CoverageRootState::Active,
-                created_at: now,
-                updated_at: now,
-                last_scan: None,
-            };
-            state.coverage_roots.insert(root.root_id, root.clone());
-            root
         };
 
         self.upsert_root_registry_entry(&canonical, group_id, root.root_id)
@@ -1489,11 +1504,117 @@ impl<S: Storage, N: Network> Client<S, N> {
         Ok(root)
     }
 
+    // Inspect headers only, before recording a new owner or touching files. A
+    // removed folder may still contain ciphertext belonging to its old group.
+    async fn assert_reenrollment_contents_for_group(
+        &self,
+        path: PathBuf,
+        group_id: Uuid,
+    ) -> Result<(), ClientError> {
+        let client = self.clone();
+        task::spawn_blocking(move || {
+            use std::io::{BufReader, Read, Seek};
+
+            for entry in WalkDir::new(&path)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| !client.is_path_excluded(entry.path()))
+            {
+                let entry = entry.map_err(|err| {
+                    ClientError::InvalidInput(format!(
+                        "Cannot inspect '{}' before changing workspace: {}",
+                        path.display(), err
+                    ))
+                })?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let file_path = entry.path();
+                let mut file = std::fs::File::open(file_path)
+                    .map_err(|err| ClientError::from(StorageError::Io(err)))?;
+                let mut prefix = Vec::new();
+                Read::by_ref(&mut file).take(8192).read_to_end(&mut prefix)
+                    .map_err(|err| ClientError::from(StorageError::Io(err)))?;
+                let encrypted_extension = file_path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("encrypted"));
+                let json_prefix = prefix.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{');
+                if !encrypted_extension && !json_prefix {
+                    continue;
+                }
+                file.rewind().map_err(|err| ClientError::from(StorageError::Io(err)))?;
+                let header = crate::file::encrypt::read_encrypted_header(&mut BufReader::new(file));
+                let owner = match header {
+                    Ok(header) => serde_json::from_slice::<Value>(&header).ok()
+                        .and_then(|json| json.get("group_id").and_then(Value::as_str)
+                            .and_then(|value| Uuid::parse_str(value).ok())),
+                    Err(err) if err.kind() != ErrorKind::InvalidData => {
+                        return Err(ClientError::from(StorageError::Io(err)));
+                    }
+                    Err(_) => {
+                        let looks_encrypted = encrypted_extension
+                            || (prefix.windows(b"\"file_id\"".len()).any(|part| part == b"\"file_id\"")
+                                && prefix.windows(b"\"epoch_id\"".len()).any(|part| part == b"\"epoch_id\""));
+                        if !looks_encrypted { continue; }
+                        None
+                    }
+                };
+                if owner != Some(group_id) {
+                    return Err(ClientError::InvalidInput(format!(
+                        "Cannot protect '{}': '{}' still contains encrypted data from another or unknown workspace. Return to its original workspace and remove protection with decryption first, or choose another folder.",
+                        path.display(), file_path.display()
+                    )));
+                }
+            }
+            Ok(())
+        }).await.map_err(|err| ClientError::InvalidState(format!(
+            "Folder inspection failed: {}", err
+        )))?
+    }
+
+    /// Resolve an active root in the selected group before removal or decryption.
+    /// Multiple inactive historical enrollments can legitimately share its path.
+    pub(crate) async fn coverage_active_root_for_path(
+        &self,
+        path: &Path,
+    ) -> Result<CoverageRoot, ClientError> {
+        self.ensure_state_loaded().await?;
+        let group_id = self.active_group_required().await?;
+        let display_path = path.display().to_string();
+        if let Some(entry) = self.load_root_registry().await?.entries.get(&display_path) {
+            if entry.group_id != group_id {
+                return Err(ClientError::InvalidState(format!(
+                    "Coverage root belongs to group {}, but the active group is {}. Select its workspace and retry.",
+                    entry.group_id, group_id
+                )));
+            }
+        }
+        self.state
+            .read()
+            .await
+            .coverage_roots
+            .values()
+            .filter(|root| {
+                root.path == path
+                    && root.state == CoverageRootState::Active
+                    && (root.group_id == Some(group_id) || root.group_id.is_none())
+            })
+            .min_by_key(|root| (root.group_id.is_none(), root.root_id))
+            .cloned()
+            .ok_or_else(|| {
+                ClientError::InvalidInput(format!(
+                    "No enrolled coverage root matches '{}' in the selected workspace",
+                    display_path
+                ))
+            })
+    }
+
     /// Adopt a specific file into coverage (creating a single-file root if needed).
     pub async fn coverage_adopt_path<P>(&self, path: P) -> Result<CoverageAdoptResult, ClientError>
     where
         P: AsRef<Path> + Send,
     {
+        self.require_local_write().await?;
         self.ensure_state_loaded().await?;
 
         let canonical = canonicalize_existing_path(path.as_ref().to_path_buf()).await?;
@@ -1682,11 +1803,12 @@ impl<S: Storage, N: Network> Client<S, N> {
     where
         P: AsRef<Path> + Send,
     {
+        self.require_local_write().await?;
         self.ensure_state_loaded().await?;
 
         let active_group = {
             let state = self.state.read().await;
-            state.active_group_id.ok_or_else(|| {
+            self.local_group_id.or(state.active_group_id).ok_or_else(|| {
                 ClientError::InvalidState(
                     "Cannot unenroll coverage root without an active group. Run 'hybridcipher switch-group <group-id>' first."
                         .to_string(),
@@ -1718,48 +1840,9 @@ impl<S: Storage, N: Network> Client<S, N> {
                 }
             }
         };
-        let display_path = canonical
-            .as_ref()
-            .unwrap_or(&absolute_candidate)
-            .display()
-            .to_string();
-
-        // Roots are bound to the group that enrolled them; block unenroll from the wrong group.
-        if let Some(registry_entry) = self.load_root_registry().await?.entries.get(&display_path) {
-            if registry_entry.group_id != active_group {
-                return Err(ClientError::InvalidState(format!(
-                    "Coverage root belongs to group {}, but the active group is {}. Run 'hybridcipher switch-group {}' and retry.",
-                    registry_entry.group_id, active_group, registry_entry.group_id
-                )));
-            }
-        }
-
-        let root = {
-            let state = self.state.read().await;
-            let maybe_root = state.coverage_roots.values().find(|root| {
-                if let Some(ref canonical) = canonical {
-                    root.path == *canonical
-                } else {
-                    root.path == absolute_candidate
-                }
-            });
-
-            let root = maybe_root.ok_or_else(|| {
-                ClientError::InvalidInput(format!(
-                    "No enrolled coverage root matches '{}'",
-                    display_path
-                ))
-            })?;
-
-            if root.state == CoverageRootState::Unenrolled {
-                return Err(ClientError::InvalidInput(format!(
-                    "Coverage root '{}' is already unenrolled",
-                    display_path
-                )));
-            }
-
-            root.clone()
-        };
+        let root = self
+            .coverage_active_root_for_path(canonical.as_deref().unwrap_or(&absolute_candidate))
+            .await?;
 
         let entries = self.list_file_index_entries_for_root(root.root_id).await?;
         let removals = self.collect_unenroll_removals(&root, &entries).await?;
@@ -1931,7 +2014,12 @@ impl<S: Storage, N: Network> Client<S, N> {
         for epoch_id in epoch_ids {
             let counts: CoverageCounts = state
                 .coverage_ledgers
-                .get(&state.active_group_id.unwrap_or_default())
+                .get(
+                    &self
+                        .local_group_id
+                        .or(state.active_group_id)
+                        .unwrap_or_default(),
+                )
                 .map(|l| l.log.counts_for_epoch(epoch_id))
                 .unwrap_or_default();
             if total_tracked_files == 0 {
@@ -1964,14 +2052,20 @@ impl<S: Storage, N: Network> Client<S, N> {
         if epochs.is_empty() {
             let counts = state
                 .coverage_ledgers
-                .get(&state.active_group_id.unwrap_or_default())
+                .get(
+                    &self
+                        .local_group_id
+                        .or(state.active_group_id)
+                        .unwrap_or_default(),
+                )
                 .map(|l| l.log.counts_for_epoch(state.current_epoch))
                 .unwrap_or_default();
             total_tracked_files = counts.total_items;
         }
 
-        let latest_snapshot = state
-            .active_group_id
+        let latest_snapshot = self
+            .local_group_id
+            .or(state.active_group_id)
             .and_then(|gid| state.coverage_ledgers.get(&gid))
             .and_then(|ledger| ledger.log.latest_snapshot())
             .map(|snapshot: CoverageRootSnapshot| CoverageSnapshotInfo {

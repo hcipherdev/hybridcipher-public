@@ -63,6 +63,7 @@ jobs:
 
     env:
       CARGO_TERM_COLOR: always
+      HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS: ${{ vars.HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS }}
 
     steps:
       - name: Checkout public source
@@ -163,30 +164,16 @@ jobs:
             exit 1
           fi
 
-          cargo_version="$(awk -F '"' '/^version = / { print $2; exit }' apps/desktop/src-tauri/Cargo.toml)"
-          if [ -z "$cargo_version" ]; then
-            echo "::error::Failed to detect desktop version from apps/desktop/src-tauri/Cargo.toml"
-            exit 1
-          fi
-
-          tauri_version="$(python3 - <<'PY'
-          import json
-          with open("apps/desktop/src-tauri/tauri.conf.json", "r", encoding="utf-8") as fh:
-              print(json.load(fh).get("version", ""))
-          PY
-          )"
-          if [ -z "$tauri_version" ]; then
-            echo "::error::Failed to detect desktop version from apps/desktop/src-tauri/tauri.conf.json"
-            exit 1
-          fi
+          source scripts/macos/app_version.sh
+          app_version="$(macos_app_version)"
 
           release_tag="$RELEASE_TAG_INPUT"
           if [ -z "$release_tag" ]; then
-            release_tag="desktop-v${cargo_version}"
+            release_tag="desktop-v${app_version}"
           fi
           tag_version="$(printf '%s' "$release_tag" | sed -E 's/^desktop-v//; s/^v//')"
-          if [ "$tag_version" != "$cargo_version" ]; then
-            echo "::error::Version mismatch: release tag $release_tag implies $tag_version but Cargo.toml is $cargo_version"
+          if [ "$tag_version" != "$app_version" ]; then
+            echo "::error::Version mismatch: release tag $release_tag implies $tag_version but macOS config is $app_version"
             exit 1
           fi
 
@@ -198,7 +185,7 @@ jobs:
             fi
           else
             release_notes_file="$RUNNER_TEMP/hybridcipher-release-notes.md"
-            python3 - "$cargo_version" "apps/desktop/release-notes/releases.json" "$release_notes_file" <<'PY'
+            python3 - "$app_version" "apps/desktop/release-notes/releases.macos.json" "$release_notes_file" <<'PY'
           import json
           import pathlib
           import sys
@@ -209,7 +196,7 @@ jobs:
           payload = json.loads(source.read_text(encoding="utf-8"))
           release = next((item for item in payload.get("releases", []) if item.get("version") == version), None)
           if release is None:
-              raise SystemExit(f"apps/desktop/release-notes/releases.json has no entry for version {version}")
+              raise SystemExit(f"apps/desktop/release-notes/releases.macos.json has no entry for version {version}")
 
           def section(title, values):
               if not values:
@@ -286,19 +273,18 @@ jobs:
             echo "HYBRIDCIPHER_RELEASE_SECRET_FILES=$cert_p12:$tauri_key_file:$apple_api_key_file:$release_env"
           } >> "$GITHUB_ENV"
 
-          echo "Prepared release $release_tag for desktop version $cargo_version"
+          echo "Prepared release $release_tag for desktop version $app_version"
           echo "Release notes: $release_notes_file"
 
       - name: Validate macOS File Provider source
         run: |
           set -euo pipefail
-          chmod +x scripts/macos/validate_file_provider_runtime.sh
-          scripts/macos/validate_file_provider_runtime.sh
+          bash scripts/macos/desktop_release_pkg.sh --validate-file-provider
 
       - name: Build, sign, notarize, and publish
         run: |
           set -euo pipefail
-          chmod +x scripts/macos/desktop_release_pkg.sh scripts/macos/build_file_provider_extension.sh
+          chmod +x scripts/macos/desktop_release_pkg.sh
           scripts/macos/desktop_release_pkg.sh
 
       - name: Upload workflow artifacts

@@ -1239,13 +1239,30 @@ pub async fn handle_list_groups(
     // Require authentication
     session_manager.require_auth()?;
 
-    ui::section("User Groups");
-
-    ui::info(&format!("Output format: {}", format));
-
     // Call the server API to get actual groups
     match session_manager.list_groups_http().await {
         Ok(groups) => {
+            if format.eq_ignore_ascii_case("json") {
+                let entries: Vec<_> = groups
+                    .iter()
+                    .map(|group| {
+                        serde_json::json!({
+                            "id": group.id,
+                            "organization_id": group.organization_id,
+                            "name": group.name,
+                            "description": group.description,
+                            "user_role": group.role,
+                            "current_epoch": group.current_epoch,
+                            "member_count": group.member_count,
+                            "created_at": group.created_at,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::Value::Array(entries));
+                return Ok(());
+            }
+            ui::section("User Groups");
+            ui::info(&format!("Output format: {}", format));
             if groups.is_empty() {
                 ui::info("You are not a member of any groups yet.");
                 ui::info(

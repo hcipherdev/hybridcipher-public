@@ -2682,7 +2682,7 @@ fn write_scan_log(
     })?;
 
     let log_dir = home
-        .join(".hybridcipher")
+        .join(hybridcipher_client::config_loader::account_data_location())
         .join("users")
         .join(&active_user.user_id)
         .join("logs")

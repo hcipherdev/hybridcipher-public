@@ -79,13 +79,27 @@ pub async fn handle_recovery_command(
     command: RecoveryCommands,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
+    // A desktop action is scoped to the workspace selected when it started.
+    // Keep ordinary CLI account-wide recovery behavior for invocations without this protocol.
+    let desktop_group = if ui::desktop::enabled() {
+        Some(std::env::var("HYBRIDCIPHER_DESKTOP_GROUP")
+            .map_err(|_| CliError::invalid_input("Select a group before opening recovery"))?)
+    } else { None };
+    let scoped_group = |provided: Option<String>| -> Result<Option<String>, CliError> {
+        if let (Some(expected), Some(provided)) = (&desktop_group, &provided) {
+            if expected != provided {
+                return Err(CliError::permission("Recovery group does not match the selected workspace"));
+            }
+        }
+        Ok(provided.or_else(|| desktop_group.clone()))
+    };
     match command {
-        RecoveryCommands::Upload { group_id } => handle_upload(group_id, session_manager).await,
+        RecoveryCommands::Upload { group_id } => handle_upload(scoped_group(group_id)?, session_manager).await,
         RecoveryCommands::Fetch {
             group_id,
             output,
             no_import,
-        } => handle_fetch(group_id, output, no_import, session_manager).await,
+        } => handle_fetch(scoped_group(group_id)?, output, no_import, session_manager).await,
     }
 }
 
@@ -546,7 +560,7 @@ async fn handle_fetch(
         ));
     }
 
-    let recovery_code_input = ui::prompts::password("Enter recovery code to decrypt backup")?;
+    let recovery_code_input = Zeroizing::new(ui::prompts::password("Enter recovery code to decrypt backup")?);
     let recovery_secret = parse_recovery_code(&recovery_code_input)?;
 
     let entries = artifact.decrypt_entries(&password, recovery_secret.as_ref())?;
@@ -856,7 +870,7 @@ fn prompt_for_recovery_materials(
             "Password cannot be empty for recovery".to_string(),
         ));
     }
-    let recovery_code_input = ui::prompts::password("Enter recovery code")?;
+    let recovery_code_input = Zeroizing::new(ui::prompts::password("Enter recovery code")?);
     let recovery_secret = parse_recovery_code(&recovery_code_input)?;
     Ok((password, recovery_secret))
 }

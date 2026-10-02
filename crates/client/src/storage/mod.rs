@@ -291,6 +291,18 @@ pub trait Storage: Send + Sync + 'static {
     /// * `value` - Configuration value
     async fn store_config(&self, key: &str, value: &str) -> Result<(), StorageError>;
 
+    /// Atomically create an account-protected record without replacing an existing record.
+    /// Implementations must fail closed when protected atomic persistence is unavailable.
+    async fn create_protected_config_if_absent(
+        &self,
+        _key: &str,
+        _value: &str,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::Encryption(
+            "Protected atomic configuration storage is unavailable".to_string(),
+        ))
+    }
+
     /// Load client configuration
     ///
     /// # Arguments
@@ -882,8 +894,22 @@ impl<S: Storage + Sync + Send> Storage for std::sync::Arc<S> {
         self.as_ref().store_config(key, value).await
     }
 
+    async fn create_protected_config_if_absent(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<bool, StorageError> {
+        self.as_ref()
+            .create_protected_config_if_absent(key, value)
+            .await
+    }
+
     async fn load_config(&self, key: &str) -> Result<Option<String>, StorageError> {
         self.as_ref().load_config(key).await
+    }
+
+    async fn delete_config(&self, key: &str) -> Result<(), StorageError> {
+        self.as_ref().delete_config(key).await
     }
 
     async fn load_config_fresh(&self, key: &str) -> Result<Option<String>, StorageError> {

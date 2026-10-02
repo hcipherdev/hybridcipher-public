@@ -5,9 +5,9 @@ use crate::{
         default_safe_decrypt_dir_root, default_safe_decrypt_file_path,
         detect_existing_encryption_metadata, encrypt_file_to_path,
         enforce_directory_ciphertext_policy, ensure_directory, ensure_hidden_subdir,
-        parse_encrypted_file, preserve_directory_mtime, preserve_file_mtime,
-        scan_directory_ciphertext_groups, DirectoryCiphertextGroup, DirectoryCiphertextPolicyError,
-        ExistingEncryptionMetadata, LocalClient, TraversalMode,
+        parse_encrypted_file, parse_encrypted_file_with_policy, preserve_directory_mtime,
+        preserve_file_mtime, scan_directory_ciphertext_groups, DirectoryCiphertextGroup,
+        DirectoryCiphertextPolicyError, ExistingEncryptionMetadata, LocalClient, TraversalMode,
     },
     error::CliError,
     session::SessionManager,
@@ -86,6 +86,9 @@ pub async fn handle_encrypt(
         ProcessingMode::Safe
     };
 
+    let active_group = session.ensure_current_group().await?;
+    super::team::require_local_file_write_for_group(session, active_group).await?;
+
     let client = session
         .create_local_client()
         .await
@@ -98,7 +101,6 @@ pub async fn handle_encrypt(
             TraversalMode::BestEffort
         };
         let mut warnings = TraversalWarnings::default();
-        let active_group = session.ensure_current_group().await?;
         let active_epoch = client.current_epoch_id().await.ok_or_else(|| {
             CliError::file_operation(
                 "Active epoch is unavailable. This device needs epoch keys.\n\
@@ -768,8 +770,40 @@ pub async fn handle_decrypt(
     in_place: bool,
     strict: bool,
     allow_legacy_unverified: bool,
+    allow_large_single_record_recovery: bool,
     session: &SessionManager,
 ) -> Result<(), CliError> {
+    if allow_large_single_record_recovery {
+        if in_place || !file_path.is_file() || output_path.is_none() {
+            return Err(CliError::invalid_input(
+                "Large single-record recovery requires one file and --output; --in-place is forbidden",
+            ));
+        }
+        let output = output_path.as_ref().unwrap();
+        if output.exists() {
+            return Err(CliError::invalid_input(
+                "Recovery output must be a new file",
+            ));
+        }
+        let parsed = parse_encrypted_file_with_policy(&file_path, true)?;
+        if parsed.metadata.content_chunk_size.is_some()
+            || parsed.metadata.header_version.unwrap_or(1) >= 2
+        {
+            return Err(CliError::invalid_input(
+                "High-memory recovery only supports older single-record files",
+            ));
+        }
+        ui::warning("High-memory recovery can consume more than 256 MiB. The encrypted original will be retained; verify the recovered file against a trusted copy.");
+        let client = session.create_local_client().await?;
+        let plaintext = client
+            .recover_large_single_record_unverified(&parsed.metadata)
+            .await
+            .map_err(|e| CliError::decryption(e.to_string()))?;
+        hybridcipher_client::file::safe_restore::write_new(output, &plaintext)
+            .map_err(|e| CliError::storage(e.to_string()))?;
+        ui::success("Recovered a copy; the encrypted source was retained.");
+        return Ok(());
+    }
     if allow_legacy_unverified {
         if in_place || !file_path.is_file() || output_path.is_none() {
             return Err(CliError::invalid_input(
@@ -883,7 +917,7 @@ async fn decrypt_single_file(
     ui::info(&format!("Epoch: {}", parsed.metadata.epoch_id));
     ui::info(&format!(
         "Encrypted size: {} bytes",
-        parsed.metadata.encrypted_content.len()
+        parsed.metadata.encrypted_size
     ));
 
     let output_path = match output_override {

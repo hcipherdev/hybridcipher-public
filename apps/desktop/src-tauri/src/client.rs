@@ -22,6 +22,7 @@ use std::{
 };
 use tracing::{info, warn};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 const ACCOUNT_KEY_CACHE_FILE: &str = ".account_key_cache";
 const DEVICE_KEYPAIR_FILE: &str = "device_keypair";
@@ -30,7 +31,7 @@ const INVITATION_KEYPAIR_FILE: &str = "invitation_keypair.json";
 const INVITATION_KEYPAIR_FILE_AAD: &[u8] = b"hybridcipher/localfs/invitation_keypair";
 const DEVICE_KEY_FILE: &str = "device_key.protected";
 const DEVICE_KEY_FILE_AAD: &[u8] = b"hybridcipher/device_key_material";
-const HYBRIDCIPHER_HOME: &str = ".hybridcipher";
+
 const USERS_DIR: &str = "users";
 const CANONICAL_PRODUCTION_SERVER: &str = "https://api.hybridcipher.com";
 const LEGACY_SERVER_ALIASES: &[&str] = &[
@@ -55,6 +56,13 @@ struct DeviceKeys {
     expires_at: chrono::DateTime<Utc>,
 }
 
+impl Drop for DeviceKeys {
+    fn drop(&mut self) {
+        self.identity_secret.zeroize();
+        self.invitation_secret.zeroize();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceCryptoMaterial {
     pub device_id: String,
@@ -62,6 +70,13 @@ pub(crate) struct DeviceCryptoMaterial {
     pub identity_secret: Vec<u8>,
     pub invitation_public: Vec<u8>,
     pub invitation_secret: Vec<u8>,
+}
+
+impl Drop for DeviceCryptoMaterial {
+    fn drop(&mut self) {
+        self.identity_secret.zeroize();
+        self.invitation_secret.zeroize();
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,6 +88,13 @@ struct StoredInvitationKeyPair {
     identity_secret_key: Vec<u8>,
     created_at: chrono::DateTime<Utc>,
     expires_at: chrono::DateTime<Utc>,
+}
+
+impl Drop for StoredInvitationKeyPair {
+    fn drop(&mut self) {
+        self.identity_secret_key.zeroize();
+        self.hybrid_secret_key.zeroize();
+    }
 }
 
 fn canonicalize_server_url(server_url: &str) -> String {
@@ -145,7 +167,7 @@ fn cli_user_dir(email: &str, server_url: &str) -> Result<PathBuf, String> {
     let canonical_server = canonicalize_server_url(server_url);
     let storage_id = user_storage_id(email, &canonical_server);
     Ok(home
-        .join(HYBRIDCIPHER_HOME)
+        .join(hybridcipher_client::config_loader::account_data_location())
         .join(USERS_DIR)
         .join(storage_id))
 }
@@ -214,7 +236,12 @@ fn read_protected_string(
     }
 }
 
-fn load_cli_device_keys(email: &str, server_url: &str) -> Result<Option<DeviceKeys>, String> {
+fn load_cli_device_keys(
+    email: &str,
+    server_url: &str,
+    current_account_key: Option<&[u8; 32]>,
+    current_state_key: Option<&[u8; 32]>,
+) -> Result<Option<DeviceKeys>, String> {
     let user_dir = cli_user_dir(email, server_url)?;
     if !user_dir.exists() {
         return Ok(None);
@@ -225,23 +252,29 @@ fn load_cli_device_keys(email: &str, server_url: &str) -> Result<Option<DeviceKe
         return Ok(None);
     }
 
-    let account_key = load_cached_account_key(&user_dir)?;
+    let account_key = match current_account_key {
+        Some(key) => Some(Zeroizing::new(*key)),
+        None => load_cached_account_key(&user_dir)?.map(Zeroizing::new),
+    };
 
     // Try to load state_key if account_key is available
-    let state_key = if let Some(ref acc_key) = account_key {
+    let state_key = if let Some(key) = current_state_key {
+        Some(Zeroizing::new(*key))
+    } else if let Some(ref acc_key) = account_key {
         load_device_key_from_fallback(&user_dir, acc_key)
             .ok()
             .flatten()
+            .map(Zeroizing::new)
     } else {
         None
     };
 
-    let serialized = if state_key.is_some() || account_key.is_some() {
+    let serialized = Zeroizing::new(if state_key.is_some() || account_key.is_some() {
         read_protected_string(
             &invitation_path,
             INVITATION_KEYPAIR_FILE_AAD,
-            state_key.as_ref(),
-            account_key.as_ref(),
+            state_key.as_deref(),
+            account_key.as_deref(),
         )?
         .ok_or_else(|| {
             format!(
@@ -252,7 +285,7 @@ fn load_cli_device_keys(email: &str, server_url: &str) -> Result<Option<DeviceKe
     } else {
         fs::read_to_string(&invitation_path)
             .map_err(|e| format!("Failed to read invitation keypair: {}", e))?
-    };
+    });
 
     let stored: StoredInvitationKeyPair = serde_json::from_str(&serialized).map_err(|e| {
         format!(
@@ -270,11 +303,11 @@ fn load_cli_device_keys(email: &str, server_url: &str) -> Result<Option<DeviceKe
     }
 
     Ok(Some(DeviceKeys {
-        device_id: stored.device_id,
-        identity_public: stored.identity_public_key,
-        identity_secret: stored.identity_secret_key,
-        invitation_public: stored.hybrid_public_key,
-        invitation_secret: stored.hybrid_secret_key,
+        device_id: stored.device_id.clone(),
+        identity_public: stored.identity_public_key.clone(),
+        identity_secret: stored.identity_secret_key.clone(),
+        invitation_public: stored.hybrid_public_key.clone(),
+        invitation_secret: stored.hybrid_secret_key.clone(),
         created_at: stored.created_at,
         expires_at: stored.expires_at,
     }))
@@ -383,8 +416,10 @@ fn persist_device_keys(
         expires_at: keys.expires_at,
     };
 
-    let serialized = serde_json::to_string_pretty(&stored)
-        .map_err(|e| format!("Failed to serialize invitation keypair: {}", e))?;
+    let serialized = Zeroizing::new(
+        serde_json::to_string_pretty(&stored)
+            .map_err(|e| format!("Failed to serialize invitation keypair: {}", e))?,
+    );
 
     let invitation_path = user_dir.join(INVITATION_KEYPAIR_FILE);
     let device_key_path = user_dir.join(DEVICE_KEYPAIR_FILE);
@@ -482,7 +517,8 @@ pub struct HybridCipherClient {
     // Store device keypairs
     device_keys: Arc<Mutex<Option<DeviceKeys>>>,
     // Store state key (device-specific encryption key)
-    state_key: Arc<Mutex<Option<[u8; 32]>>>,
+    state_key: Arc<Mutex<Option<Zeroizing<[u8; 32]>>>>,
+    account_key: Arc<Mutex<Option<Zeroizing<[u8; 32]>>>>,
     // Cache scope for in-memory auth material (email + server)
     auth_scope: Arc<Mutex<Option<String>>>,
 }
@@ -515,6 +551,7 @@ impl HybridCipherClient {
             opaque_auth: Arc::new(Mutex::new(None)),
             device_keys: Arc::new(Mutex::new(None)),
             state_key: Arc::new(Mutex::new(None)),
+            account_key: Arc::new(Mutex::new(None)),
             auth_scope: Arc::new(Mutex::new(None)),
         }
     }
@@ -539,6 +576,7 @@ impl HybridCipherClient {
         *self.opaque_auth.lock().unwrap() = None;
         *self.device_keys.lock().unwrap() = None;
         *self.state_key.lock().unwrap() = None;
+        *self.account_key.lock().unwrap() = None;
         *scope = Some(target_scope);
     }
 
@@ -546,6 +584,7 @@ impl HybridCipherClient {
         *self.opaque_auth.lock().unwrap() = None;
         *self.device_keys.lock().unwrap() = None;
         *self.state_key.lock().unwrap() = None;
+        *self.account_key.lock().unwrap() = None;
         *self.auth_scope.lock().unwrap() = None;
     }
 
@@ -555,7 +594,14 @@ impl HybridCipherClient {
             return Ok(keys);
         }
 
-        if let Some(keys) = match load_cli_device_keys(email, &self.server_url) {
+        let account_key = self.account_key.lock().unwrap().clone();
+        let state_key = self.state_key.lock().unwrap().clone();
+        if let Some(keys) = match load_cli_device_keys(
+            email,
+            &self.server_url,
+            account_key.as_deref(),
+            state_key.as_deref(),
+        ) {
             Ok(keys) => keys,
             Err(err) => {
                 warn!("Failed to load CLI device keys: {}", err);
@@ -568,8 +614,8 @@ impl HybridCipherClient {
         }
 
         let mut keys = generate_fresh_device_keys()?;
-        let state_key = self.state_key.lock().unwrap().as_ref().copied();
-        if let Err(err) = persist_device_keys(email, &self.server_url, &keys, state_key.as_ref()) {
+        if let Err(err) = persist_device_keys(email, &self.server_url, &keys, state_key.as_deref())
+        {
             warn!("Failed to persist device keys for {}: {}", email, err);
             // continue with in-memory keys to avoid blocking login
             // but regenerate created/expires to avoid drift if we retry
@@ -588,11 +634,11 @@ impl HybridCipherClient {
     ) -> Result<DeviceCryptoMaterial, String> {
         let keys = self.ensure_device_keys(email)?;
         Ok(DeviceCryptoMaterial {
-            device_id: keys.device_id,
-            identity_public: keys.identity_public,
-            identity_secret: keys.identity_secret,
-            invitation_public: keys.invitation_public,
-            invitation_secret: keys.invitation_secret,
+            device_id: keys.device_id.clone(),
+            identity_public: keys.identity_public.clone(),
+            identity_secret: keys.identity_secret.clone(),
+            invitation_public: keys.invitation_public.clone(),
+            invitation_secret: keys.invitation_secret.clone(),
         })
     }
 
@@ -797,59 +843,49 @@ impl HybridCipherClient {
     }
 
     /// Initialize or load state key (device-specific encryption key)
-    fn ensure_state_key(&self, email: &str, password: &str) -> Result<[u8; 32], String> {
+    fn ensure_state_key(&self, email: &str, password: &str) -> Result<Zeroizing<[u8; 32]>, String> {
         // Check if already initialized
         if let Some(existing) = self.state_key.lock().unwrap().as_ref() {
-            return Ok(*existing);
+            return Ok(existing.clone());
         }
 
         // Use the same account protection flow as the CLI (Argon2id + metadata)
-        let session_store =
-            SessionStore::new().map_err(|e| format!("Failed to create session store: {}", e))?;
+        let session_store = SessionStore::new_without_key_cache_migration()
+            .map_err(|e| format!("Failed to create session store: {}", e))?;
 
-        // This derives/validates the account key and ensures device key exists (CLI-compatible)
-        let account_key_zeroized = session_store
-            .initialize_account_protection(email, &self.server_url, password)
+        // Login must not create an automatic-unlock cache before the user's
+        // Remember me choice is applied after successful authentication.
+        let account_key = session_store
+            .initialize_account_protection_uncached(email, &self.server_url, password)
             .map_err(|e| format!("Failed to initialize account protection: {}", e))?;
+        let state_key =
+            session_store.load_state_key_with_account_key(email, &self.server_url, &account_key)?;
 
-        let mut account_key = [0u8; 32];
-        account_key.copy_from_slice(account_key_zeroized.as_ref());
-
-        let user_dir = cli_user_dir(email, &self.server_url)?;
-        ensure_user_dirs(&user_dir)?;
-
-        // Load device/state key (encrypted with account key)
-        let device_key_path = user_dir.join(DEVICE_KEY_FILE);
-        let state_key = if device_key_path.exists() {
-            let raw = fs::read_to_string(&device_key_path)
-                .map_err(|e| format!("Failed to read device key: {}", e))?;
-            let protected: ProtectedData = serde_json::from_str(&raw)
-                .map_err(|e| format!("Invalid device key format: {}", e))?;
-            let decrypted = decrypt_with_ad(&protected, account_key, DEVICE_KEY_FILE_AAD)
-                .map_err(|e| format!("Failed to decrypt device key: {}", e))?;
-
-            if decrypted.len() != 32 {
-                return Err("Device key has invalid length".to_string());
-            }
-
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&decrypted);
-            key
-        } else {
-            // Should not happen because initialize_account_protection creates it, but keep fallback
-            warn!("Device key missing, falling back to account key");
-            account_key
-        };
-
-        *self.state_key.lock().unwrap() = Some(state_key);
+        *self.account_key.lock().unwrap() = Some(account_key);
+        *self.state_key.lock().unwrap() = Some(state_key.clone());
         Ok(state_key)
+    }
+
+    pub(crate) fn session_keys(
+        &self,
+    ) -> Result<(Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>), String> {
+        let account_key = self.account_key.lock().unwrap().clone().ok_or_else(|| {
+            "Password-derived account key is unavailable for temporary login".to_string()
+        })?;
+        let state_key = self
+            .state_key
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "Device state key is unavailable for temporary login".to_string())?;
+        Ok((account_key, state_key))
     }
 
     /// Login with OPAQUE authentication
     pub async fn login(
         &self,
         email: String,
-        password: String,
+        password: &str,
         mfa_code: Option<String>,
         backup_code: Option<String>,
     ) -> Result<LoginResult, LoginErrorInfo> {
@@ -857,7 +893,7 @@ impl HybridCipherClient {
 
         // Initialize state key first (device-specific encryption key)
         let _state_key = self
-            .ensure_state_key(&email, &password)
+            .ensure_state_key(&email, password)
             .map_err(|message| LoginErrorInfo::new("LOGIN_FAILED", message))?;
 
         // Initialize or load device keys (prefer CLI device identity if present)
@@ -869,7 +905,7 @@ impl HybridCipherClient {
         let mut login_result = opaque
             .login_with_server(
                 &email,
-                &password,
+                password,
                 &self.server_url,
                 DeviceLoginMetadata {
                     identity_public_key_hex: hex::encode(&device_keys.identity_public),
@@ -899,7 +935,7 @@ impl HybridCipherClient {
                 login_result = opaque
                     .login_with_server(
                         &email,
-                        &password,
+                        password,
                         &self.server_url,
                         DeviceLoginMetadata {
                             identity_public_key_hex: hex::encode(&device_keys.identity_public),
@@ -1121,6 +1157,21 @@ pub struct LoginResult {
     pub opaque_export_key: Option<String>,
     #[serde(default)]
     pub recovery_code: Option<String>,
+}
+
+impl Drop for LoginResult {
+    fn drop(&mut self) {
+        self.token.zeroize();
+        if let Some(token) = &mut self.refresh_token {
+            token.zeroize();
+        }
+        if let Some(key) = &mut self.opaque_export_key {
+            key.zeroize();
+        }
+        if let Some(code) = &mut self.recovery_code {
+            code.zeroize();
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

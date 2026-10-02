@@ -148,6 +148,11 @@
                     <span class="app-name">HybridCipher</span>
                     <span class="beta-badge">BETA</span>
                 </div>
+                <select id="workspaceSelector" class="workspace-selector hidden" aria-label="Workspace">
+                    <option value="personal">Personal</option>
+                    <option value="team">Team</option>
+                </select>
+                <span id="workspaceLicenseBadge" class="workspace-license-badge hidden"></span>
             </div>
             <div class="header-center">
                 <div class="global-search">
@@ -177,13 +182,13 @@
                         </div>
                     </div>
                 </div>
-                <button class="labeled-btn hidden" id="adminPanelBtn" title="Admin panel" aria-hidden="true" tabindex="-1">
+                <button class="labeled-btn hidden" id="adminPanelBtn" title="Team administration" aria-hidden="true" tabindex="-1">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
                         <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
                             d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
                         <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 12h8M8 16h5" />
                     </svg>
-                    <span class="btn-label">Admin panel</span>
+                    <span class="btn-label">Team administration</span>
                 </button>
                 <button class="labeled-btn" id="feedbackBtn" title="Send Feedback">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
@@ -191,6 +196,9 @@
                             d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
                     </svg>
                     <span class="btn-label">Feedback</span>
+                </button>
+                <button class="labeled-btn hidden" id="desktopOperationsBtn" type="button" title="Review operation">
+                    <span class="btn-label">Activity</span>
                 </button>
             </div>
         </header>
@@ -257,16 +265,8 @@
                             </svg>
                             Home
                         </button>
-                        <button class="btn btn-secondary sidebar-terminal-btn individual-technical-nav" id="sidebarTerminalBtn" type="button"
-                            title="Open terminal" aria-pressed="false">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                    d="M4 5h16a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2z" />
-                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                    stroke-linejoin="round" d="M7 9l3 3-3 3m5 0h5" />
-                            </svg>
-                            Terminal
-                        </button>
+                        <button class="btn btn-secondary sidebar-terminal-btn" id="sidebarFilesBtn" type="button"
+                            title="Open workspace files" aria-pressed="false">Files</button>
                     </div>
                 </div>
             </aside>
@@ -277,7 +277,7 @@
                     <section class="admin-dashboard" id="adminDashboard">
                         <div class="dashboard-header">
                             <div class="dashboard-header-main">
-                                <h2 class="dashboard-title">Admin Cockpit</h2>
+                                <h2 class="dashboard-title" id="teamAdministrationTitle">Team administration</h2>
                                 <p class="dashboard-subtitle">Team-wide security operations and onboarding at a glance.
                                 </p>
                                 <div class="dashboard-meta">
@@ -579,6 +579,8 @@
                                                     </svg>
                                                     Switch group
                                                 </button>
+                                                <button class="btn btn-secondary" id="adminRenameGroupBtn" type="button">Rename selected group</button>
+                                                <button class="btn btn-secondary" id="adminDeleteGroupBtn" type="button">Delete selected group</button>
                                             </div>
                                         </div>
 
@@ -764,7 +766,13 @@
                         <div class="workspace-home-hero">
                             <div class="workspace-home-copy">
                                 <span class="workspace-home-eyebrow">Workspace Home</span>
-                                <h2 class="workspace-home-title">Personal Workspace</h2>
+                                <h2 class="workspace-home-title" id="workspaceHomeTitle">Personal Workspace</h2>
+                                <p class="workspace-context-label" id="workspaceContextLabel" aria-live="polite"></p>
+                                <div class="workspace-setup-notice hidden" id="teamSetupNotice" role="status">
+                                    <span id="teamSetupMessage"></span>
+                                    <button class="btn btn-secondary btn-small" id="teamSetupRetryBtn" type="button">Retry setup</button>
+                                    <button class="btn btn-secondary btn-small hidden" id="teamSetupDevicesBtn" type="button">Open Devices</button>
+                                </div>
                                 <p class="workspace-home-text" id="workspaceHomeLead">
                                     Add a protected folder to start securing files on this account.
                                 </p>
@@ -815,15 +823,6 @@
                                                 d="M12 5v14M5 12h14" />
                                         </svg>
                                         Add protected folder
-                                    </button>
-                                    <button class="btn btn-secondary individual-technical-nav" id="homeOpenTerminalBtn" type="button">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                d="M4 5h16a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2z" />
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                stroke-linejoin="round" d="M7 9l3 3-3 3m5 0h5" />
-                                        </svg>
-                                        Open terminal
                                     </button>
                                     <button class="btn btn-secondary" id="homeOpenDevicesBtn" type="button">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
@@ -1369,6 +1368,30 @@
         </div>
     </div>
 
+    <div class="modal hidden" id="addGroupMemberModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="addGroupMemberTitle">
+            <div class="modal-header">
+                <h2 id="addGroupMemberTitle">Add group member</h2>
+                <button class="modal-close" id="closeAddGroupMemberBtn" type="button" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Choose someone who has joined your organization. Adding them shares access to this encrypted group.</p>
+                <form id="addGroupMemberForm">
+                    <div class="form-group">
+                        <label for="groupMemberSelect">Organization member</label>
+                        <select id="groupMemberSelect" required></select>
+                    </div>
+                    <p class="form-hint" id="groupMemberDirectoryNote" role="status"></p>
+                    <div class="form-actions">
+                        <button class="btn btn-secondary" id="groupMemberInviteOrganizationBtn" type="button">Invite to organization</button>
+                        <button class="btn btn-primary" id="groupMemberAddBtn" type="submit">Add to group</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <!-- Create Group Modal -->
     <div class="modal hidden" id="createGroupModal">
         <div class="modal-backdrop"></div>
@@ -1387,6 +1410,8 @@
                         <label for="createGroupDescription">Group description (optional)</label>
                         <input type="text" id="createGroupDescription" placeholder="Team purpose or notes">
                     </div>
+                    <p id="createGroupProgress" class="form-hint" role="status" aria-live="polite"></p>
+                    <p id="createGroupError" class="form-error hidden" role="alert"></p>
                     <div class="form-actions">
                         <button type="button" class="btn btn-secondary" id="cancelCreateGroupBtn">Cancel</button>
                         <button type="submit" class="btn btn-primary" id="submitCreateGroupBtn">
@@ -1495,8 +1520,9 @@
                     <div class="form-group">
                         <label for="deviceVerifyFingerprintInput">Device fingerprint</label>
                         <input type="text" id="deviceVerifyFingerprintInput"
-                            placeholder="xxxx xxxx xxxx xxxx" autocomplete="off">
-                        <span class="form-hint">Compare this fingerprint with the requesting device before verifying.</span>
+                            placeholder="ABCD EF12 3456 7890" autocomplete="off" spellcheck="false"
+                            aria-describedby="deviceVerifyFingerprintHint deviceVerifyError">
+                        <span class="form-hint" id="deviceVerifyFingerprintHint">On the new device, open Devices → This device → Show fingerprint. Compare its 16 hex characters before verifying. Spaces are optional when pasting.</span>
                         <span class="form-error hidden" id="deviceVerifyError"></span>
                     </div>
                     <div class="form-actions">
@@ -1533,8 +1559,9 @@
                     <div class="form-group">
                         <label for="adminPinVerifyFingerprintInput">Fingerprint</label>
                         <input type="text" id="adminPinVerifyFingerprintInput"
-                            placeholder="xxxx xxxx xxxx xxxx" autocomplete="off">
-                        <span class="form-hint">Format: xxxx xxxx xxxx xxxx</span>
+                            placeholder="ABCD EF12 3456 7890" autocomplete="off" spellcheck="false"
+                            aria-describedby="adminPinVerifyFingerprintHint adminPinVerifyError">
+                        <span class="form-hint" id="adminPinVerifyFingerprintHint">Read this from the other device's Devices → This device → Show fingerprint. Enter 16 hex characters; spaces are optional.</span>
                         <span class="form-error hidden" id="adminPinVerifyError"></span>
                     </div>
                     <div class="form-actions">
@@ -1905,6 +1932,64 @@
                         </div>
                     </section>
 
+                    <section class="settings-section" id="settingsTeamSection">
+                        <div class="settings-section-header">
+                            <h3>Workspace license</h3>
+                            <p>Personal is always available. A Team code adds an organization to this account.</p>
+                        </div>
+                        <div class="settings-info" aria-live="polite">
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Workspace</span>
+                                <span class="settings-info-value" id="teamLicenseWorkspace">Personal</span>
+                            </div>
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">License</span>
+                                <span class="settings-info-value" id="teamLicenseState">Checking…</span>
+                            </div>
+                            <div class="settings-info-item hidden" id="teamLicenseSeatsRow">
+                                <span class="settings-info-label">Seats</span>
+                                <span class="settings-info-value" id="teamLicenseSeats">—</span>
+                            </div>
+                            <div class="settings-info-item hidden" id="teamLicenseExpiryRow">
+                                <span class="settings-info-label">Offline access until</span>
+                                <span class="settings-info-value" id="teamLicenseExpiry">—</span>
+                            </div>
+                        </div>
+                        <p class="team-license-note" id="teamLicenseNote"></p>
+                        <button class="btn btn-secondary hidden" id="teamExportExistingBtn" type="button">
+                            Export an existing encrypted file
+                        </button>
+                        <div id="teamActivationForm" class="team-license-form">
+                            <label for="teamOrganizationName">Organization name</label>
+                            <input id="teamOrganizationName" type="text" maxlength="100" autocomplete="organization" placeholder="Your organization">
+                            <label for="teamUnlockCode">Single-use Team code</label>
+                            <input id="teamUnlockCode" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="HC-TEAM-…">
+                            <button class="btn btn-primary" id="teamActivateBtn" type="button">Activate Team</button>
+                        </div>
+                        <div id="teamInvitationAcceptance" class="team-license-form">
+                            <label for="teamInvitationCode">Joining an existing Team?</label>
+                            <input id="teamInvitationCode" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="Invitation code">
+                            <button class="btn btn-secondary" id="teamAcceptInvitationBtn" type="button">Join Team</button>
+                        </div>
+                        <div id="teamInviteForm" class="team-license-form hidden">
+                            <label for="teamInviteEmail">Invite an organization member</label>
+                            <input id="teamInviteEmail" type="email" autocomplete="email" placeholder="person@example.com">
+                            <button class="btn btn-secondary" id="teamInviteBtn" type="button">Reserve seat and create invitation</button>
+                            <label for="teamGeneratedInvitation" class="hidden" id="teamGeneratedInvitationLabel">Invitation code (shown once)</label>
+                            <input id="teamGeneratedInvitation" class="hidden" type="text" readonly aria-label="Invitation code">
+                        </div>
+                        <div id="teamDirectoryPanel" class="team-license-form hidden">
+                            <strong>Organization members and invitations</strong>
+                            <p id="teamDirectoryNote"></p>
+                            <div id="teamDirectoryList" aria-live="polite"></div>
+                        </div>
+                        <div id="teamPendingRequestsPanel" class="team-license-form hidden">
+                            <strong>Team administration requests</strong>
+                            <p>Offline requests take effect only after the server accepts them.</p>
+                            <div id="teamPendingRequestsList" aria-live="polite"></div>
+                        </div>
+                    </section>
+
                     <section class="settings-section" id="settingsFoldersSection">
                         <div class="settings-section-header">
                             <h3>Folders</h3>
@@ -2003,7 +2088,7 @@
                                 <span class="settings-info-label">Current version</span>
                                 <span class="settings-info-value" id="settingsCurrentVersion">—</span>
                             </div>
-                            <div class="settings-info-item">
+                            <div class="settings-info-item" id="settingsUpdatePreferenceRow">
                                 <span class="settings-info-label">Update preference</span>
                                 <select id="settingsUpdatePreference" class="settings-select">
                                     <option value="automatic">Automatic</option>
@@ -2012,7 +2097,7 @@
                                 </select>
                             </div>
                         </div>
-                        <div class="settings-actions">
+                        <div class="settings-actions" id="settingsUpdateActions">
                             <button class="btn btn-secondary" id="settingsCheckUpdateBtn" type="button">
                                 Check for updates
                             </button>
@@ -2283,6 +2368,55 @@
         </div>
     </div>
 
+    <div class="modal hidden" id="workspaceSelectionModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="workspaceSelectionTitle">
+            <div class="modal-header"><h2 id="workspaceSelectionTitle">Choose an item</h2>
+                <button class="modal-close" id="workspaceSelectionCancelBtn" type="button" aria-label="Cancel">&times;</button></div>
+            <form id="workspaceSelectionForm" class="modal-body">
+                <p id="workspaceSelectionNote"></p>
+                <div class="form-group"><label for="workspaceSelectionSelect">Select</label>
+                    <select id="workspaceSelectionSelect" required></select></div>
+                <div class="form-actions"><button class="btn btn-primary" type="submit">Continue</button></div>
+            </form>
+        </div>
+    </div>
+
+    <div class="modal hidden" id="desktopOperationModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="desktopOperationTitle">
+            <div class="modal-header">
+                <h2 id="desktopOperationTitle">Operation</h2>
+                <button class="modal-close" id="closeDesktopOperationBtn" type="button" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="desktopOperationPhase" role="status" aria-live="polite">Preparing…</p>
+                <progress id="desktopOperationProgress" class="operation-progress" aria-label="Operation progress"></progress>
+                <p id="desktopOperationError" class="form-error hidden" role="alert"></p>
+                <form id="desktopOperationInputForm" class="hidden">
+                    <div class="form-group">
+                        <label for="desktopOperationInput" id="desktopOperationInputLabel">Details</label>
+                        <input id="desktopOperationInput" autocomplete="off" spellcheck="false">
+                        <button class="btn btn-secondary btn-small hidden" id="desktopOperationChooseFileBtn" type="button">Choose file</button>
+                    </div>
+                    <div class="form-actions">
+                        <button class="btn btn-primary" id="desktopOperationContinueBtn" type="submit">Continue</button>
+                        <button class="btn btn-secondary" id="desktopOperationDeclineBtn" type="button">Cancel</button>
+                    </div>
+                </form>
+                <details id="desktopOperationDetails" class="hidden">
+                    <summary>Results and details</summary>
+                    <div id="desktopOperationOutput" class="operation-output"></div>
+                </details>
+                <div class="form-actions">
+                    <button class="btn btn-secondary" id="desktopOperationCloseBtn" type="button">Close</button>
+                    <button class="btn btn-primary hidden" id="desktopOperationRetryBtn" type="button">Retry</button>
+                </div>
+                <p class="form-hint" id="desktopOperationBackgroundNote">Closing this window keeps the operation available in Activity.</p>
+            </div>
+        </div>
+    </div>
+
     <script src="cli-commands.js"></script>
     <script src="vendor/xterm/xterm.js"></script>
     <script src="vendor/xterm/xterm-addon-fit.js"></script>
@@ -2295,6 +2429,7 @@
     <script src="release-notes-utils.js"></script>
     <script src="app-tauri.js"></script>
     <script src="app-update-methods.js"></script>
+    <script src="app-team-methods.js"></script>
     <script src="app.js"></script>
 </body>
 

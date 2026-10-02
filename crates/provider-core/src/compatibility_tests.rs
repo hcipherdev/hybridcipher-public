@@ -292,6 +292,66 @@ fn partial_backup_disk_full_and_concurrent_change_never_publish_an_upgrade() {
     );
 }
 
+#[tokio::test]
+async fn provider_hydration_rejects_truncation_forged_sizes_and_sparse_relocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = dir.path().join("account");
+    let encrypted = dir.path().join("encrypted");
+    let root = Uuid::new_v4();
+    let group = Uuid::new_v4();
+    let client = client(&account, group).await;
+    let bridge = local_provider_bridge(client);
+    let path = fixture(&encrypted, "current.md", 256, 3, false, group);
+    let original = fs::read(&path).unwrap();
+    let entry = bridge.inventory(root, &encrypted).await.unwrap().remove(0);
+    let output = dir.path().join("hydrated.txt");
+    bridge.hydrate_file_to_path(&entry, &output).await.unwrap();
+    assert_eq!(fs::read(&output).unwrap(), vec![42; 256]);
+
+    let mut truncated = original.clone();
+    truncated.truncate(truncated.len() - 144);
+    fs::write(&path, &truncated).unwrap();
+    assert!(bridge.hydrate_file_to_path(&entry, &output).await.is_err());
+    assert_eq!(fs::read(&output).unwrap(), vec![42; 256]);
+    fs::write(&path, &original).unwrap();
+
+    let mut forged = entry.clone();
+    forged.metadata.as_mut().unwrap().content_size = 128;
+    forged.metadata.as_mut().unwrap().encrypted_size = 144;
+    assert!(bridge.hydrate_file_to_path(&forged, &output).await.is_err());
+    assert_eq!(fs::read(&output).unwrap(), vec![42; 256]);
+
+    let mut huge_chunk = entry.clone();
+    huge_chunk.metadata.as_mut().unwrap().content_chunk_size =
+        Some(hybridcipher_client::file::encrypt::MAX_CONTENT_CHUNK_SIZE as u64 + 1);
+    assert!(bridge
+        .hydrate_file_to_path(&huge_chunk, &output)
+        .await
+        .is_err());
+    assert_eq!(fs::read(&output).unwrap(), vec![42; 256]);
+
+    let sparse_path = fixture(&encrypted, "sparse.md", 128, 3, true, group);
+    let mut sparse = bridge
+        .inventory(root, &encrypted)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.encrypted_path == sparse_path)
+        .unwrap();
+    sparse
+        .metadata
+        .as_mut()
+        .unwrap()
+        .sparse_metadata
+        .as_mut()
+        .unwrap()
+        .extents[0]
+        .offset = 64;
+    assert!(bridge.hydrate_file_to_path(&sparse, &output).await.is_err());
+    assert_eq!(fs::read(&output).unwrap(), vec![42; 256]);
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn production_bridge_handles_long_protected_paths_and_backups() {

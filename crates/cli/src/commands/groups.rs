@@ -150,6 +150,8 @@ pub async fn handle_rename_group(
         None => session_manager.ensure_active_group().await?,
     };
 
+    ui::desktop::require_selected_group(target_group_id)?;
+
     session_manager
         .require_group_admin(target_group_id, "hybridcipher rename-group")
         .await?;
@@ -187,6 +189,8 @@ pub async fn handle_delete_group(
 
     let group_uuid = Uuid::parse_str(group_id)
         .map_err(|_| CliError::configuration(format!("Invalid group ID: {}", group_id)))?;
+
+    ui::desktop::require_selected_group(group_uuid)?;
 
     session_manager
         .require_group_admin(group_uuid, "hybridcipher delete-group")
@@ -293,7 +297,9 @@ async fn update_client_state_with_group(
     let _ = device_id;
     // Get current active user
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
-    let global_dir = home_dir.join(".hybridcipher").join("global");
+    let global_dir = home_dir
+        .join(hybridcipher_client::config_loader::account_data_location())
+        .join("global");
     let active_user_path = global_dir.join("active_user.json");
 
     let active_user_content = tokio::fs::read_to_string(&active_user_path)
@@ -305,7 +311,10 @@ async fn update_client_state_with_group(
         .ok_or("Invalid active user data")?;
 
     // Use per-user client state path
-    let user_dir = home_dir.join(".hybridcipher").join("users").join(user_id);
+    let user_dir = home_dir
+        .join(hybridcipher_client::config_loader::account_data_location())
+        .join("users")
+        .join(user_id);
     let client_state_path = user_dir.join("client_state.json");
 
     let now = chrono::Utc::now();
@@ -385,7 +394,9 @@ async fn rename_group_in_client_state(
     new_name: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
-    let global_dir = home_dir.join(".hybridcipher").join("global");
+    let global_dir = home_dir
+        .join(hybridcipher_client::config_loader::account_data_location())
+        .join("global");
     let active_user_path = global_dir.join("active_user.json");
 
     let active_user_content = tokio::fs::read_to_string(&active_user_path)
@@ -397,7 +408,7 @@ async fn rename_group_in_client_state(
         .ok_or("Invalid active user data")?;
 
     let client_state_path = home_dir
-        .join(".hybridcipher")
+        .join(hybridcipher_client::config_loader::account_data_location())
         .join("users")
         .join(user_id)
         .join("client_state.json");
@@ -437,7 +448,9 @@ async fn rename_group_in_client_state(
 
 async fn remove_group_from_client_state(group_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
-    let global_dir = home_dir.join(".hybridcipher").join("global");
+    let global_dir = home_dir
+        .join(hybridcipher_client::config_loader::account_data_location())
+        .join("global");
     let active_user_path = global_dir.join("active_user.json");
 
     let active_user_content = match tokio::fs::read_to_string(&active_user_path).await {
@@ -452,7 +465,10 @@ async fn remove_group_from_client_state(group_id: &str) -> Result<(), Box<dyn st
         None => return Ok(()),
     };
 
-    let user_dir = home_dir.join(".hybridcipher").join("users").join(user_id);
+    let user_dir = home_dir
+        .join(hybridcipher_client::config_loader::account_data_location())
+        .join("users")
+        .join(user_id);
     let client_state_path = user_dir.join("client_state.json");
 
     if !client_state_path.exists() {

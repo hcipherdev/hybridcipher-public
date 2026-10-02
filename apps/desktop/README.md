@@ -5,8 +5,8 @@ file encryption, protected-folder coverage, device trust, recovery workflows,
 and team file sharing.
 
 This repository includes the frontend in `src/`, the Rust/Tauri shell in
-`src-tauri/`, the packaged legal and release-note assets, the desktop icon set,
-and the optional feedback API helper.
+`src-tauri/`, the packaged legal and platform release-note assets, and the
+desktop icon set.
 
 ## Platform Scope
 
@@ -25,7 +25,6 @@ and the optional feedback API helper.
   `hybridcipher` CLI resource used in packaged desktop builds
 - `legal/`: bundled terms, privacy notice, and third-party notices
 - `release-notes/`: updater release metadata consumed by the app
-- `feedback-api/`: optional feedback submission service used by the desktop app
 
 ## First-Run Flow
 
@@ -62,8 +61,6 @@ root [`README.md`](../../README.md).
   [`architecture/README.md`](architecture/README.md)
 - Contribution guide:
   [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md)
-- Feedback API:
-  [`feedback-api/README.md`](feedback-api/README.md)
 - Icon assets:
   [`src-tauri/icons/README.md`](src-tauri/icons/README.md)
 - Tauri config:

@@ -4,6 +4,7 @@ pub mod error;
 pub mod formatting;
 pub mod progress;
 pub mod prompts;
+pub mod desktop;
 
 /// UI style constants for consistent formatting
 pub struct Styles {

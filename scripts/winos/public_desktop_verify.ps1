@@ -17,13 +17,17 @@ param(
     [string]$TargetTriple = "x86_64-pc-windows-msvc"
 )
 
+if ([string]::IsNullOrWhiteSpace($env:HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS)) {
+    throw "Set HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS to the published Team verification key list before building."
+}
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+. (Join-Path $PSScriptRoot "app-version.ps1")
+$ApplicationVersion = Get-WindowsAppVersion
 $DesktopDir = Join-Path $Repo "apps\desktop"
-$DesktopCargoToml = Join-Path $DesktopDir "src-tauri\Cargo.toml"
-$DesktopTauriConfig = Join-Path $DesktopDir "src-tauri\tauri.conf.json"
 $WindowsUnsignedConfig = Join-Path $DesktopDir "src-tauri\tauri.windows.test.conf.json"
 $CliPath = Join-Path $Repo "target\$TargetTriple\release\hybridcipher.exe"
 $DesktopExePath = Join-Path $Repo "target\$TargetTriple\release\hybridcipher-desktop.exe"
@@ -137,47 +141,6 @@ function Initialize-MsvcEnvironment {
     ) -join ";"
 }
 
-function Get-DesktopCargoVersion {
-    $text = Get-Content -Raw -LiteralPath $DesktopCargoToml
-    $packageMatch = [regex]::Match(
-        $text,
-        "(?ms)^\[package\]\s*(?<body>.*?)(?=^\[|\z)"
-    )
-    if (-not $packageMatch.Success) {
-        return $null
-    }
-
-    $versionMatch = [regex]::Match(
-        $packageMatch.Groups["body"].Value,
-        '(?m)^version\s*=\s*"(?<version>[^"]+)"'
-    )
-    if (-not $versionMatch.Success) {
-        return $null
-    }
-
-    return $versionMatch.Groups["version"].Value
-}
-
-function Get-DesktopTauriConfigVersion {
-    $config = Get-Content -Raw -LiteralPath $DesktopTauriConfig | ConvertFrom-Json
-    return $config.version
-}
-
-function Test-DesktopVersionConsistency {
-    $cargoVersion = Get-DesktopCargoVersion
-    $tauriVersion = Get-DesktopTauriConfigVersion
-
-    if (-not $cargoVersion) {
-        throw "Failed to detect desktop version from apps\desktop\src-tauri\Cargo.toml."
-    }
-    if (-not $tauriVersion) {
-        throw "Failed to detect desktop version from apps\desktop\src-tauri\tauri.conf.json."
-    }
-    if ($cargoVersion -ne $tauriVersion) {
-        throw "Desktop version mismatch: Cargo.toml=$cargoVersion tauri.conf.json=$tauriVersion."
-    }
-}
-
 function Find-NodeDirectory {
     $nodeCandidates = @()
     if ($env:ProgramFiles) {
@@ -218,7 +181,7 @@ function Find-WindowsInstaller {
         throw "The build completed without producing the NSIS bundle directory: $BundleDir"
     }
 
-    $installer = Get-ChildItem -LiteralPath $BundleDir -Filter "HybridCipher_*_x64-setup.exe" -File |
+    $installer = Get-ChildItem -LiteralPath $BundleDir -Filter "HybridCipher_${ApplicationVersion}_x64-setup.exe" -File |
         Sort-Object LastWriteTime, Name -Descending |
         Select-Object -First 1
     if ($null -eq $installer) {
@@ -281,7 +244,6 @@ Invoke-NativeCommand -FilePath $rustup -ArgumentList @(
     "target", "add", $TargetTriple
 )
 
-Test-DesktopVersionConsistency
 
 Write-Log "Installing desktop frontend dependencies"
 Push-Location $DesktopDir
@@ -299,8 +261,7 @@ try {
         "--release",
         "--target", $TargetTriple,
         "-p", "hybridcipher-cli",
-        "--bin", "hybridcipher",
-        "--features", "individual-edition"
+        "--bin", "hybridcipher"
     )
 } finally {
     Pop-Location
@@ -318,7 +279,6 @@ try {
         "tauri", "build",
         "--target", $TargetTriple,
         "--bundles", "nsis",
-        "--features", "individual-edition",
         "--config", "src-tauri\tauri.windows.test.conf.json",
         "--no-sign"
     )

@@ -14,7 +14,9 @@ param(
 
     [string]$TimestampUrl = "https://timestamp.digicert.com",
     [string]$Version = "",
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [ValidateSet("HybridCipher.Desktop", "HybridCipher.Desktop.local-signed-test")]
+    [string]$PackageName = "HybridCipher.Desktop"
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,10 +66,10 @@ function Write-SquarePng {
 
 $IdentityDir = $PSScriptRoot
 $TauriDir = (Resolve-Path (Join-Path $IdentityDir "..\..")).Path
+. (Join-Path $TauriDir "..\..\..\scripts\winos\app-version.ps1")
+$ApplicationVersion = Get-WindowsAppVersion
 if (-not $Version) {
-    $TauriConfig = Get-Content -LiteralPath (Join-Path $TauriDir "tauri.conf.json") -Raw |
-        ConvertFrom-Json
-    $Version = [string]$TauriConfig.version
+    $Version = $ApplicationVersion
 }
 $VersionParts = @($Version.Split('.'))
 if ($VersionParts.Count -gt 4 -or $VersionParts.Count -lt 1) {
@@ -82,6 +84,9 @@ foreach ($Part in $VersionParts) {
     }
 }
 $PackageVersion = $VersionParts -join "."
+if (($VersionParts[0..2] -join ".") -cne $ApplicationVersion) {
+    throw "Identity version must use the canonical Windows app version prefix ($ApplicationVersion): $Version"
+}
 
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $IdentityDir "dist"
@@ -124,7 +129,12 @@ New-Item -ItemType Directory -Path $Staging | Out-Null
 try {
     $Manifest = Get-Content -LiteralPath (Join-Path $IdentityDir "AppxManifest.xml.in") -Raw
     $Manifest = $Manifest.Replace("@PUBLISHER@", $Publisher).Replace("@VERSION@", $PackageVersion)
-    Set-Content -LiteralPath (Join-Path $Staging "AppxManifest.xml") -Value $Manifest -Encoding utf8
+    $Manifest = $Manifest.Replace('Name="HybridCipher.Desktop"', ('Name="' + $PackageName + '"'))
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Staging "AppxManifest.xml"),
+        $Manifest,
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
     $MsixPath = Join-Path $OutputDirectory "HybridCipher.identity.msix"
     & $MakeAppx pack /o /nv /d $Staging /p $MsixPath
@@ -164,8 +174,16 @@ try {
     Write-SquarePng -Source $SourceIcon -Destination (Join-Path $Assets "Square44x44Logo.png") -Size 44
     Copy-Item -LiteralPath (Join-Path $TauriDir "icons\icon.ico") `
         -Destination (Join-Path $OutputDirectory "HybridCipher.ico") -Force
-    Copy-Item -LiteralPath (Join-Path $IdentityDir "register-identity.ps1") `
-        -Destination (Join-Path $OutputDirectory "register-identity.ps1") -Force
+    $RegistrationScript = Get-Content -LiteralPath (Join-Path $IdentityDir "register-identity.ps1") -Raw
+    $RegistrationScript = $RegistrationScript.Replace(
+        '$PackageName = "HybridCipher.Desktop"',
+        ('$PackageName = "' + $PackageName + '"')
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $OutputDirectory "register-identity.ps1"),
+        $RegistrationScript,
+        [System.Text.UTF8Encoding]::new($false)
+    )
 
     Write-Host "Signed sparse identity package: $MsixPath"
     Write-Host "Publisher: $Publisher"

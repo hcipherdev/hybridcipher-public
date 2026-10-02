@@ -1,6 +1,7 @@
 pub mod mount_runner;
+pub mod readonly;
 
-use std::io::{BufRead, Read, Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
@@ -17,7 +18,7 @@ use hybridcipher_client::{
     file::encrypt::{
         chunked_encrypted_size, normalize_file_identifier, write_encrypted_file, MacOsFileMetadata,
         PlatformFileMetadata, PlatformXattr, SerializedEncryptedHeader, SparseExtent,
-        SparseFileMetadata, CHUNKED_HEADER_VERSION,
+        SparseFileMetadata, MAX_CONTENT_CHUNK_SIZE, MAX_IN_MEMORY_PLAINTEXT_BYTES,
     },
     storage::{AccessControlData, FileMetadataData},
     ClientError, EncryptedFileMetadata,
@@ -82,7 +83,8 @@ const CONFLICT_KIND_STREAM: &str = "hybridcipher.conflict_kind";
 
 const TEMP_FILE_GRACE_SECS: u64 = 30;
 const SPARSE_SKIP_SIZE_BYTES: u64 = 512 * 1024 * 1024;
-const STREAM_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+// New non-empty sync-mount writes use the authenticated chunked format by default.
+const STREAM_THRESHOLD_BYTES: u64 = 1;
 const STREAM_CHUNK_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const STREAM_STABILITY_AGE_SECS: u64 = 5;
 const STARTUP_LOCAL_DELETE_MAX_ACTIONS: usize = 20;
@@ -252,6 +254,7 @@ pub enum MountSafetyReason {
     PendingRefresh {
         count: usize,
     },
+    ProviderReconciliation,
     Conflict {
         count: usize,
         edited_count: usize,
@@ -287,6 +290,7 @@ impl MountSafetyReason {
                 !pending_writeback_error_is_terminal(last_error.as_deref())
             }
             MountSafetyReason::PendingRefresh { .. } => true,
+            MountSafetyReason::ProviderReconciliation => true,
             _ => false,
         }
     }
@@ -317,6 +321,9 @@ impl MountSafetyReason {
             MountSafetyReason::PendingRefresh { count } => format!(
                 "{count} pending plaintext refresh(es) are still rebuilding the local mount state."
             ),
+            MountSafetyReason::ProviderReconciliation => {
+                "Cloud Files is checking the mounted folder for changes.".to_string()
+            }
             MountSafetyReason::Conflict {
                 count,
                 edited_count,
@@ -730,6 +737,9 @@ impl From<ClientError> for MountSyncError {
 
 #[async_trait]
 pub trait MountCrypto: Send + Sync {
+    async fn check_write_access(&self) -> Result<(), MountSyncError> {
+        Ok(())
+    }
     fn is_path_excluded(&self, _path: &Path) -> bool {
         false
     }
@@ -1725,20 +1735,12 @@ fn rewrite_encrypted_file_atomic_from_ciphertext(
     let tmp_path = tmp_dir.join(tmp_name);
 
     let mut source = io::BufReader::new(fs::File::open(source_path)?);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let bytes = source.read_until(b'\n', &mut line)?;
-        if bytes == 0 {
-            return Err(MountSyncError::Format(format!(
-                "Encrypted header separator not found in {}",
-                source_path.display()
-            )));
-        }
-        if line == b"---ENCRYPTED_DATA---\n" || line == b"---ENCRYPTED_DATA---" {
-            break;
-        }
-    }
+    hybridcipher_client::file::encrypt::read_encrypted_header(&mut source).map_err(|err| {
+        MountSyncError::Format(format!(
+            "Invalid encrypted header in {}: {err}",
+            source_path.display()
+        ))
+    })?;
 
     let header_bytes = hybridcipher_client::file::encrypt::serialize_encrypted_header(header)
         .map_err(|err| MountSyncError::Format(err.to_string()))?;
@@ -2491,6 +2493,18 @@ fn pending_writeback_error_is_retryable(message: &str) -> bool {
     normalized.contains("unstable file")
         || normalized.contains("changed during read")
         || normalized.contains("mid-write")
+        || normalized.contains("offline")
+        || normalized.contains("network unavailable")
+        || normalized.contains("connection refused")
+        || normalized.contains("connection timed out")
+        || normalized.contains("temporary authentication")
+        || normalized.contains("entitlement expired")
+        || normalized.contains("license revoked")
+        || normalized.contains("403 forbidden")
+        || normalized.contains("401 unauthorized")
+        || normalized.contains("http 403")
+        || normalized.contains("http 401")
+        || normalized.contains("http 429")
 }
 
 fn pending_writeback_error_is_terminal(message: Option<&str>) -> bool {
@@ -3287,6 +3301,8 @@ fn apply_macos_acl_text(path: &Path, acl_text: &str) -> Result<(), MountSyncErro
 
 #[derive(Default)]
 pub struct SyncTracker {
+    access_readonly: Option<readonly::ReadOnlyMount>,
+    write_access_denied: Option<String>,
     encrypted_signatures: HashMap<PathBuf, FileSignature>,
     encrypted_directory_signatures: HashMap<PathBuf, FileSignature>,
     decrypted_signatures: HashMap<PathBuf, FileSignature>,
@@ -3611,6 +3627,9 @@ impl SyncTracker {
         _encrypted_root: &Path,
         mount_root: &Path,
     ) -> Result<usize, MountSyncError> {
+        if _crypto.check_write_access().await.is_err() {
+            return Ok(0);
+        }
         if self.pending_local_creates.is_empty() {
             return Ok(0);
         }
@@ -3707,6 +3726,9 @@ impl SyncTracker {
         _crypto: &C,
         encrypted_root: &Path,
     ) -> Result<usize, MountSyncError> {
+        if _crypto.check_write_access().await.is_err() {
+            return Ok(0);
+        }
         if self.pending_local_deletes.is_empty() {
             return Ok(0);
         }
@@ -3823,17 +3845,15 @@ impl SyncTracker {
     }
 
     fn should_stream_file(&self, size_bytes: u64) -> bool {
-        if self.stream_threshold_bytes == 0 {
-            return false;
-        }
-        size_bytes >= self.stream_threshold_bytes
+        // New sync-mount writes always use bounded chunk encryption. The legacy
+        // threshold remains readable in config but cannot re-enable one-record writes.
+        size_bytes > 0
     }
 
     fn stream_chunk_size(&self) -> Option<usize> {
-        if self.stream_chunk_size_bytes == 0 {
-            return None;
-        }
-        usize::try_from(self.stream_chunk_size_bytes).ok()
+        // Keep the legacy configuration field for reading existing configs while
+        // writing every new chunked sync record with the standard 4 MiB size.
+        Some(STREAM_CHUNK_SIZE_BYTES as usize)
     }
 
     /// Set the retention folder path
@@ -4016,6 +4036,9 @@ impl SyncTracker {
     }
 
     pub fn prepare_mountpoint_cleanup(&mut self) -> Result<(), MountSyncError> {
+        if let Some(permissions) = &mut self.access_readonly {
+            permissions.restore()?;
+        }
         if !self.mount_readonly_active {
             return Ok(());
         }
@@ -4256,6 +4279,9 @@ impl SyncTracker {
         preflight_warnings.extend(hard_link_warnings);
         preflight_warnings.extend(transactional_warnings);
         preflight_warnings.extend(recovery_copy_warnings);
+        if let Some(reason) = &self.write_access_denied {
+            preflight_warnings.push(format!("Team mount is read-only: {reason}"));
+        }
         if self.mount_readonly_active {
             preflight_warnings
                 .push("mount forced read-only due to low-space degraded mode".to_string());
@@ -5188,6 +5214,9 @@ impl SyncTracker {
         mount_root: &Path,
         request: &ConflictResolutionRequest,
     ) -> Result<ConflictResolutionResult, MountSyncError> {
+        if let Some(reason) = &self.write_access_denied {
+            return Err(MountSyncError::Crypto(reason.clone()));
+        }
         let (conflict_path, baseline) =
             self.conflict_by_id(request.conflict_id).ok_or_else(|| {
                 MountSyncError::Format(format!("Conflict {} was not found", request.conflict_id))
@@ -5317,6 +5346,9 @@ impl SyncTracker {
         mount_root: &Path,
         request: &RecoveryCopyResolutionRequest,
     ) -> Result<RecoveryCopyResolutionResult, MountSyncError> {
+        if let Some(reason) = &self.write_access_denied {
+            return Err(MountSyncError::Crypto(reason.clone()));
+        }
         let recovery_path = self
             .recovery_copy_by_relative_path(mount_root, &request.recovery_relative_path)
             .ok_or_else(|| {
@@ -6320,6 +6352,9 @@ impl SyncTracker {
         encrypted_root: &Path,
         mount_root: &Path,
     ) -> Result<(), MountSyncError> {
+        if crypto.check_write_access().await.is_err() {
+            return Ok(());
+        }
         if self.pending_writebacks.is_empty() {
             return Ok(());
         }
@@ -6482,7 +6517,29 @@ impl SyncTracker {
         encrypted_root: &Path,
         mount_root: &Path,
     ) -> Result<(), MountSyncError> {
+        let denied = crypto
+            .check_write_access()
+            .await
+            .err()
+            .map(|err| err.to_string());
+        let was_denied = self.write_access_denied.is_some();
+        self.write_access_denied = denied;
+        if self.write_access_denied.is_none() {
+            if let Some(permissions) = &mut self.access_readonly {
+                permissions.restore()?;
+            }
+        } else if was_denied && mount_root.exists() {
+            if let Some(permissions) = &mut self.access_readonly {
+                permissions.set_read_only(true)?;
+            }
+            return Ok(());
+        }
         if !mount_root.exists() {
+            if !self.pending_writebacks.is_empty() {
+                return Err(MountSyncError::Crypto(
+                    "Mounted view is missing; pending edits are retained".into(),
+                ));
+            }
             self.decrypted_signatures.clear();
             self.decrypted_directory_signatures.clear();
             self.decrypted_hashes.clear();
@@ -6528,11 +6585,13 @@ impl SyncTracker {
         self.refresh_space_warnings(encrypted_root, mount_root);
         self.enforce_low_space_mount_mode(mount_root)?;
         self.rebuild_mount_collision_index(mount_root);
-        self.retry_pending_metadata(crypto).await;
-        self.refresh_pending_open_unlinked(crypto, encrypted_root, mount_root)
-            .await?;
-        self.retry_pending_writebacks_before_scan(crypto, encrypted_root, mount_root)
-            .await?;
+        if self.write_access_denied.is_none() {
+            self.retry_pending_metadata(crypto).await;
+            self.refresh_pending_open_unlinked(crypto, encrypted_root, mount_root)
+                .await?;
+            self.retry_pending_writebacks_before_scan(crypto, encrypted_root, mount_root)
+                .await?;
+        }
 
         let mut expected: HashSet<PathBuf> = HashSet::new();
         let mut expected_directories: HashSet<PathBuf> = HashSet::new();
@@ -6606,25 +6665,30 @@ impl SyncTracker {
             self.pending_refreshes_dirty = true;
         }
 
-        self.track_missing_encrypted_directories(
-            encrypted_root,
-            mount_root,
-            &expected_directories,
-            &protected_missing_paths,
-        )?;
-        self.track_missing_encrypted_files(encrypted_root, mount_root, &expected)?;
-        self.sync_decrypted_changes(
-            crypto,
-            encrypted_root,
-            mount_root,
-            &mut expected,
-            &protected_missing_paths,
-        )
-        .await?;
-        self.cleanup_duplicate_encrypted_file_ids(encrypted_root, mount_root)?;
+        if self.write_access_denied.is_none() {
+            self.track_missing_encrypted_directories(
+                encrypted_root,
+                mount_root,
+                &expected_directories,
+                &protected_missing_paths,
+            )?;
+            self.track_missing_encrypted_files(encrypted_root, mount_root, &expected)?;
+            self.sync_decrypted_changes(
+                crypto,
+                encrypted_root,
+                mount_root,
+                &mut expected,
+                &protected_missing_paths,
+            )
+            .await?;
+            self.cleanup_duplicate_encrypted_file_ids(encrypted_root, mount_root)?;
+        }
 
         // Process pending deletions if mount is healthy
-        if self.mount_readonly_active {
+        if self.write_access_denied.is_some()
+            || crypto.check_write_access().await.is_err()
+            || self.mount_readonly_active
+        {
             debug!(
                 "Skipping deletion/orphan processing for {} while low-space read-only mode is active",
                 mount_root.display()
@@ -6655,6 +6719,18 @@ impl SyncTracker {
         self.flush_pending_metadata();
         self.flush_conflict_registry(mount_root);
         self.flush_recovery_registry(mount_root);
+
+        if self.write_access_denied.is_some() {
+            if self.access_readonly.is_none() {
+                let journal = self
+                    .pending_writeback_path
+                    .as_ref()
+                    .map(|path| path.with_extension("permissions.json"))
+                    .unwrap_or_else(|| encrypted_root.join(".hybridcipher-mount-permissions.json"));
+                self.access_readonly = Some(readonly::ReadOnlyMount::open(mount_root, journal)?);
+            }
+            self.access_readonly.as_mut().unwrap().set_read_only(true)?;
+        }
 
         Ok(())
     }
@@ -8388,13 +8464,20 @@ impl SyncTracker {
                     };
 
                     if !stable_ready {
-                        self.pending_stable.insert(
-                            path.clone(),
-                            StableEntry {
+                        self.pending_stable
+                            .entry(path.clone())
+                            .and_modify(|entry| {
+                                if entry.signature != signature {
+                                    *entry = StableEntry {
+                                        signature,
+                                        first_seen: Instant::now(),
+                                    };
+                                }
+                            })
+                            .or_insert(StableEntry {
                                 signature,
                                 first_seen: Instant::now(),
-                            },
-                        );
+                            });
                         debug!(
                             "Deferring encryption for {} until stable across scans",
                             path.display()
@@ -10717,30 +10800,62 @@ pub struct ParsedEncryptedFile {
     pub original_name: Option<String>,
 }
 
+fn parse_header_version(json: &serde_json::Value) -> Result<u32, MountSyncError> {
+    match json.get("header_version") {
+        None => Ok(1),
+        Some(value) => value
+            .as_u64()
+            .and_then(|number| u32::try_from(number).ok())
+            .ok_or_else(|| MountSyncError::Format("Invalid header_version".into())),
+    }
+}
+
+fn parse_content_size(json: &serde_json::Value, version: u32) -> Result<u64, MountSyncError> {
+    let size = json
+        .get("file_size")
+        .and_then(|value| value.as_u64())
+        .or_else(|| json.get("original_size").and_then(|value| value.as_u64()));
+    match size {
+        Some(size) => Ok(size),
+        None if version >= 3 => Err(MountSyncError::Format(
+            "Missing file size in current encrypted header".into(),
+        )),
+        None => Ok(0),
+    }
+}
+
+fn parse_content_chunk_size(json: &serde_json::Value) -> Result<Option<u64>, MountSyncError> {
+    match json.get("chunk_size") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| MountSyncError::Format("Invalid chunk_size".into())),
+    }
+}
+
+fn parse_sparse_metadata(
+    json: &serde_json::Value,
+) -> Result<Option<SparseFileMetadata>, MountSyncError> {
+    match json.get("sparse_metadata") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| MountSyncError::Format("Invalid sparse_metadata".into())),
+    }
+}
+
 /// Parse only the JSON header of an encrypted file — skips reading the ciphertext payload.
 /// Returns `(file_id, epoch_id, encrypted_size)` for use during inventory scans where
 /// reading the full payload (O(file size) per file) would be unacceptably slow.
 pub fn parse_encrypted_header_only(path: &Path) -> Result<(String, u64, u64), MountSyncError> {
-    use std::io::{BufRead, BufReader, Seek};
+    use std::io::{BufReader, Seek};
 
     let file_len = fs::metadata(path)?.len();
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
-    let mut header_bytes = Vec::new();
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line)?;
-        if bytes_read == 0 {
-            return Err(MountSyncError::Format(
-                "Invalid encrypted file format: separator not found".into(),
-            ));
-        }
-        if line == b"---ENCRYPTED_DATA---\n" || line == b"---ENCRYPTED_DATA---" {
-            break;
-        }
-        header_bytes.extend_from_slice(&line);
-    }
+    let header_bytes = hybridcipher_client::file::encrypt::read_encrypted_header(&mut reader)
+        .map_err(|err| MountSyncError::Format(format!("Invalid encrypted header: {err}")))?;
     let ciphertext_offset = reader
         .stream_position()
         .map_err(|e| MountSyncError::Format(format!("Failed to locate ciphertext: {}", e)))?;
@@ -10755,7 +10870,51 @@ pub fn parse_encrypted_header_only(path: &Path) -> Result<(String, u64, u64), Mo
     let epoch_id = json["epoch_id"]
         .as_u64()
         .ok_or_else(|| MountSyncError::Format("Missing epoch_id in metadata".into()))?;
-    let encrypted_size = file_len.saturating_sub(ciphertext_offset);
+    let encrypted_size = file_len.checked_sub(ciphertext_offset).ok_or_else(|| {
+        MountSyncError::Format("Encrypted file is shorter than its header".into())
+    })?;
+    let version = parse_header_version(&json)?;
+    let logical_size = parse_content_size(&json, version)?;
+    let sparse = parse_sparse_metadata(&json)?;
+    let packed_size = match sparse.as_ref() {
+        Some(layout) => layout.validated_packed_size(logical_size),
+        None => Some(logical_size),
+    }
+    .ok_or_else(|| MountSyncError::Format("Invalid sparse extent layout".into()))?;
+    if let Some(chunk_size) = parse_content_chunk_size(&json)? {
+        if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE as u64 {
+            return Err(MountSyncError::Format(
+                "chunk_size must be between 1 and 64 MiB".into(),
+            ));
+        }
+        let expected = chunked_encrypted_size(packed_size, chunk_size as usize)
+            .map_err(|err| MountSyncError::Format(err.to_string()))?;
+        if expected != encrypted_size {
+            return Err(MountSyncError::Format("Ciphertext size mismatch".into()));
+        }
+    } else {
+        if json
+            .get("file_size")
+            .and_then(|value| value.as_u64())
+            .is_some()
+            || json
+                .get("original_size")
+                .and_then(|value| value.as_u64())
+                .is_some()
+        {
+            let expected = packed_size
+                .checked_add(12 + 16)
+                .ok_or_else(|| MountSyncError::Format("Ciphertext size overflow".into()))?;
+            if encrypted_size != expected {
+                return Err(MountSyncError::Format("Ciphertext size mismatch".into()));
+            }
+        }
+        if encrypted_size > MAX_IN_MEMORY_PLAINTEXT_BYTES + 12 + 16 {
+            return Err(MountSyncError::Format(
+                "Single-record ciphertext exceeds the 256 MiB in-memory limit".into(),
+            ));
+        }
+    }
 
     Ok((file_id, epoch_id, encrypted_size))
 }
@@ -10770,26 +10929,13 @@ pub fn parse_encrypted_file_with_root(
     _encrypted_root: &Path,
     path: &Path,
 ) -> Result<ParsedEncryptedFile, MountSyncError> {
-    use std::io::{BufRead, BufReader, Read, Seek};
+    use std::io::{BufReader, Read, Seek};
 
     let file_len = fs::metadata(path)?.len();
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
-    let mut header_bytes = Vec::new();
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let bytes_read = reader.read_until(b'\n', &mut line)?;
-        if bytes_read == 0 {
-            return Err(MountSyncError::Format(
-                "Invalid encrypted file format: separator not found".into(),
-            ));
-        }
-        if line == b"---ENCRYPTED_DATA---\n" || line == b"---ENCRYPTED_DATA---" {
-            break;
-        }
-        header_bytes.extend_from_slice(&line);
-    }
+    let header_bytes = hybridcipher_client::file::encrypt::read_encrypted_header(&mut reader)
+        .map_err(|err| MountSyncError::Format(format!("Invalid encrypted header: {err}")))?;
 
     let ciphertext_offset = reader
         .stream_position()
@@ -10804,11 +10950,16 @@ pub fn parse_encrypted_file_with_root(
     let epoch_id = json["epoch_id"]
         .as_u64()
         .ok_or_else(|| MountSyncError::Format("Missing epoch_id in metadata".into()))?;
-    let content_size = json["file_size"]
-        .as_u64()
-        .or_else(|| json["original_size"].as_u64())
-        .unwrap_or(0);
-    let content_chunk_size = json.get("chunk_size").and_then(|v| v.as_u64());
+    let header_version_value = parse_header_version(&json)?;
+    let content_size = parse_content_size(&json, header_version_value)?;
+    let content_chunk_size = parse_content_chunk_size(&json)?;
+    if let Some(size) = content_chunk_size {
+        if size == 0 || size > MAX_CONTENT_CHUNK_SIZE as u64 {
+            return Err(MountSyncError::Format(
+                "chunk_size must be between 1 and 64 MiB".into(),
+            ));
+        }
+    }
     let original_name = json
         .get("original_name")
         .and_then(|v| v.as_str())
@@ -10818,11 +10969,6 @@ pub fn parse_encrypted_file_with_root(
         .get("group_id")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok());
-
-    let header_version = json
-        .get("header_version")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
 
     let key_wrap_aad_hash = json
         .get("key_wrap_aad_hash")
@@ -10836,8 +10982,6 @@ pub fn parse_encrypted_file_with_root(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| MountSyncError::Format("Missing file_path in metadata".into()))?;
     let aad_path = normalize_file_identifier(&stored_file_path);
-
-    let header_version_value = header_version.unwrap_or(1);
 
     let header_version = Some(header_version_value);
     let wrapped_file_key = json
@@ -10863,22 +11007,67 @@ pub fn parse_encrypted_file_with_root(
         .get("platform_metadata")
         .and_then(|value| serde_json::from_value::<PlatformFileMetadata>(value.clone()).ok())
         .filter(|metadata| !metadata.is_empty());
-    let sparse_metadata = json
-        .get("sparse_metadata")
-        .and_then(|value| serde_json::from_value::<SparseFileMetadata>(value.clone()).ok())
-        .filter(SparseFileMetadata::is_effectively_sparse);
+    let parsed_sparse_metadata = parse_sparse_metadata(&json)?;
+    let packed_size = match parsed_sparse_metadata.as_ref() {
+        Some(layout) => layout
+            .validated_packed_size(content_size)
+            .ok_or_else(|| MountSyncError::Format("Invalid sparse extent layout".into()))?,
+        None => content_size,
+    };
+    let sparse_metadata = parsed_sparse_metadata.filter(SparseFileMetadata::is_effectively_sparse);
+
+    let encrypted_size = file_len.checked_sub(ciphertext_offset).ok_or_else(|| {
+        MountSyncError::Format("Encrypted file is shorter than its header".into())
+    })?;
+    if let Some(chunk_size) = content_chunk_size {
+        let expected = chunked_encrypted_size(packed_size, chunk_size as usize)
+            .map_err(|err| MountSyncError::Format(err.to_string()))?;
+        if encrypted_size != expected {
+            return Err(MountSyncError::Format("Ciphertext size mismatch".into()));
+        }
+    } else {
+        if json
+            .get("file_size")
+            .and_then(|value| value.as_u64())
+            .is_some()
+            || json
+                .get("original_size")
+                .and_then(|value| value.as_u64())
+                .is_some()
+        {
+            let expected = packed_size
+                .checked_add(12 + 16)
+                .ok_or_else(|| MountSyncError::Format("Ciphertext size overflow".into()))?;
+            if encrypted_size != expected {
+                return Err(MountSyncError::Format("Ciphertext size mismatch".into()));
+            }
+        }
+        if encrypted_size > MAX_IN_MEMORY_PLAINTEXT_BYTES + 12 + 16 {
+            return Err(MountSyncError::Format(
+                "Single-record ciphertext exceeds the 256 MiB in-memory limit".into(),
+            ));
+        }
+    }
 
     let mut ciphertext = Vec::new();
     if content_chunk_size.is_none() {
+        let ciphertext_len = usize::try_from(encrypted_size).map_err(|_| {
+            MountSyncError::Format("Ciphertext is too large for this process".into())
+        })?;
+        ciphertext
+            .try_reserve_exact(ciphertext_len)
+            .map_err(|_| MountSyncError::Format("Unable to reserve ciphertext".into()))?;
+        ciphertext.resize(ciphertext_len, 0);
         reader
-            .read_to_end(&mut ciphertext)
+            .read_exact(&mut ciphertext)
             .map_err(MountSyncError::Io)?;
+        let mut extra = [0u8; 1];
+        if reader.read(&mut extra).map_err(MountSyncError::Io)? != 0 {
+            return Err(MountSyncError::Format(
+                "Ciphertext size changed while reading".into(),
+            ));
+        }
     }
-    let encrypted_size = if ciphertext.is_empty() {
-        file_len.saturating_sub(ciphertext_offset)
-    } else {
-        ciphertext.len() as u64
-    };
 
     let metadata = EncryptedFileMetadata {
         file_id: file_id.to_string(),
@@ -10919,12 +11108,122 @@ pub use mount_runner::{
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    include!("../tests/licensing/test_mount_expiry.rs");
+
+    #[test]
+    fn encrypted_parsers_reject_forged_versions_sizes_chunks_and_sparse_layouts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fixture.encrypted");
+        let base = serde_json::json!({
+            "file_id":"file-1", "epoch_id":1, "file_path":"fixture",
+            "header_version":3, "file_size":4, "chunk_size":4,
+        });
+        let write_fixture = |header: &serde_json::Value, bytes: usize| {
+            let mut data = serde_json::to_vec(header).unwrap();
+            data.extend_from_slice(b"\n---ENCRYPTED_DATA---\n");
+            data.resize(data.len() + bytes, 0);
+            fs::write(&path, data).unwrap();
+        };
+        write_fixture(&base, 20);
+        assert!(parse_encrypted_header_only(&path).is_ok());
+        assert!(parse_encrypted_file(&path).is_ok());
+
+        let mut bad = base.clone();
+        bad["header_version"] = serde_json::json!(u32::MAX as u64 + 3);
+        write_fixture(&bad, 20);
+        assert!(parse_encrypted_header_only(&path).is_err());
+        assert!(parse_encrypted_file(&path).is_err());
+
+        let mut bad = base.clone();
+        bad.as_object_mut().unwrap().remove("file_size");
+        write_fixture(&bad, 20);
+        assert!(parse_encrypted_header_only(&path).is_err());
+        assert!(parse_encrypted_file(&path).is_err());
+
+        let mut bad = base.clone();
+        bad["chunk_size"] = serde_json::json!(MAX_CONTENT_CHUNK_SIZE as u64 + 1);
+        write_fixture(&bad, 20);
+        assert!(parse_encrypted_header_only(&path).is_err());
+        assert!(parse_encrypted_file(&path).is_err());
+
+        let mut bad = base.clone();
+        bad["sparse_metadata"] = serde_json::json!({
+            "logical_size":4, "extents":[{"offset":u64::MAX,"length":4}]
+        });
+        write_fixture(&bad, 20);
+        assert!(parse_encrypted_header_only(&path).is_err());
+        assert!(parse_encrypted_file(&path).is_err());
+
+        write_fixture(&base, 19);
+        assert!(parse_encrypted_header_only(&path).is_err());
+        assert!(parse_encrypted_file(&path).is_err());
+    }
+
+    fn mock_tracker() -> SyncTracker {
+        let mut tracker = SyncTracker::new();
+        // Fixture scans have no real editor; their writes are already stable.
+        tracker.set_stream_stability_age_secs(0);
+        tracker
+    }
 
     struct MockCrypto;
     struct LowSpaceEncryptCrypto;
     struct MixedDecryptCrypto;
     struct RoundTripMetadataCrypto {
         plaintext: Vec<u8>,
+    }
+
+    fn mock_streaming_encryption(
+        relative_path: &str,
+        plaintext_path: &Path,
+        output_path: &Path,
+        original_name: Option<&str>,
+        platform_metadata: Option<&PlatformFileMetadata>,
+        file_id: Option<&str>,
+        chunk_size: usize,
+    ) -> Result<StreamingEncryptedFile, MountSyncError> {
+        let plaintext = fs::read(plaintext_path)?;
+        let mut metadata = mock_metadata(relative_path, &plaintext);
+        if let Some(id) = file_id {
+            metadata.file_id = id.to_string();
+        }
+        metadata.header_version = Some(2);
+        metadata.content_chunk_size = Some(chunk_size as u64);
+        metadata.platform_metadata = platform_metadata.cloned();
+        metadata.encrypted_size = chunked_encrypted_size(metadata.content_size, chunk_size)
+            .map_err(|error| MountSyncError::Format(error.to_string()))?;
+        let integrity_hash: [u8; 32] = Sha256::digest(&plaintext).into();
+        let ciphertext: Vec<u8> = integrity_hash
+            .iter()
+            .copied()
+            .cycle()
+            .take(metadata.encrypted_size as usize)
+            .collect();
+        let header = SerializedEncryptedHeader {
+            file_id: &metadata.file_id,
+            file_path: relative_path,
+            group_id: None,
+            epoch_id: 1,
+            header_version: 2,
+            wrapped_file_key: metadata.wrapped_file_key.as_ref().unwrap(),
+            key_wrap_nonce: metadata.key_wrap_nonce.as_ref().unwrap(),
+            key_wrap_aad_hash: metadata.key_wrap_aad_hash.as_ref().unwrap(),
+            content_nonce: metadata.content_nonce.as_ref().unwrap(),
+            content_chunk_size: metadata.content_chunk_size,
+            original_size: metadata.content_size,
+            encrypted_size: metadata.encrypted_size,
+            encrypted_at: metadata.created_at,
+            original_name,
+            platform_metadata,
+            sparse_metadata: None,
+        };
+        write_encrypted_file(output_path, &header, &ciphertext)
+            .map_err(|error| MountSyncError::Format(error.to_string()))?;
+        metadata.encrypted_content.clear();
+        Ok(StreamingEncryptedFile {
+            metadata,
+            integrity_hash,
+        })
     }
 
     fn mock_metadata(relative_path: &str, plaintext: &[u8]) -> EncryptedFileMetadata {
@@ -10942,11 +11241,16 @@ mod tests {
             content_nonce: Some(vec![4; 24]),
             content_chunk_size: None,
             content_size: plaintext.len() as u64,
-            encrypted_size: plaintext.len() as u64,
+            encrypted_size: plaintext.len() as u64 + 28,
             created_at: Utc::now(),
             platform_metadata: None,
             sparse_metadata: None,
-            encrypted_content: integrity_hash.to_vec(),
+            encrypted_content: integrity_hash
+                .iter()
+                .copied()
+                .cycle()
+                .take(plaintext.len() + 28)
+                .collect(),
         }
     }
 
@@ -10980,7 +11284,7 @@ mod tests {
 
     #[test]
     fn exclusion_matching_handles_absolute_obsidian_paths() {
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_excluded_patterns(vec![
             ".obsidian".to_string(),
             ".obsidian/**".to_string(),
@@ -10999,7 +11303,7 @@ mod tests {
 
     #[test]
     fn exclusion_matching_handles_absolute_target_paths() {
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_excluded_patterns(vec!["target/**".to_string(), "**/target/**".to_string()]);
 
         let absolute_file =
@@ -11022,7 +11326,7 @@ mod tests {
         async fn decrypt_file_streaming(
             &self,
             _encrypted_path: &Path,
-            _output_path: &Path,
+            output_path: &Path,
             _metadata: &EncryptedFileMetadata,
         ) -> Result<(), MountSyncError> {
             Err(MountSyncError::Crypto(
@@ -11051,31 +11355,43 @@ mod tests {
 
         async fn encrypt_file_streaming(
             &self,
-            _relative_path: &str,
-            _plaintext_path: &Path,
-            _output_path: &Path,
-            _original_name: Option<&str>,
-            _platform_metadata: Option<&PlatformFileMetadata>,
-            _chunk_size: usize,
+            relative_path: &str,
+            plaintext_path: &Path,
+            output_path: &Path,
+            original_name: Option<&str>,
+            platform_metadata: Option<&PlatformFileMetadata>,
+            chunk_size: usize,
         ) -> Result<StreamingEncryptedFile, MountSyncError> {
-            Err(MountSyncError::Crypto(
-                "streaming encrypt not used in test".to_string(),
-            ))
+            mock_streaming_encryption(
+                relative_path,
+                plaintext_path,
+                output_path,
+                original_name,
+                platform_metadata,
+                None,
+                chunk_size,
+            )
         }
 
         async fn encrypt_file_streaming_with_id(
             &self,
-            _relative_path: &str,
-            _plaintext_path: &Path,
-            _output_path: &Path,
-            _original_name: Option<&str>,
-            _platform_metadata: Option<&PlatformFileMetadata>,
-            _file_id: &str,
-            _chunk_size: usize,
+            relative_path: &str,
+            plaintext_path: &Path,
+            output_path: &Path,
+            original_name: Option<&str>,
+            platform_metadata: Option<&PlatformFileMetadata>,
+            file_id: &str,
+            chunk_size: usize,
         ) -> Result<StreamingEncryptedFile, MountSyncError> {
-            Err(MountSyncError::Crypto(
-                "streaming encrypt not used in test".to_string(),
-            ))
+            mock_streaming_encryption(
+                relative_path,
+                plaintext_path,
+                output_path,
+                original_name,
+                platform_metadata,
+                Some(file_id),
+                chunk_size,
+            )
         }
 
         async fn coverage_store_metadata(
@@ -11099,7 +11415,7 @@ mod tests {
         async fn decrypt_file_streaming(
             &self,
             _encrypted_path: &Path,
-            _output_path: &Path,
+            output_path: &Path,
             _metadata: &EncryptedFileMetadata,
         ) -> Result<(), MountSyncError> {
             Err(MountSyncError::Crypto(
@@ -11128,31 +11444,43 @@ mod tests {
 
         async fn encrypt_file_streaming(
             &self,
-            _relative_path: &str,
-            _plaintext_path: &Path,
-            _output_path: &Path,
-            _original_name: Option<&str>,
-            _platform_metadata: Option<&PlatformFileMetadata>,
-            _chunk_size: usize,
+            relative_path: &str,
+            plaintext_path: &Path,
+            output_path: &Path,
+            original_name: Option<&str>,
+            platform_metadata: Option<&PlatformFileMetadata>,
+            chunk_size: usize,
         ) -> Result<StreamingEncryptedFile, MountSyncError> {
-            Err(MountSyncError::Crypto(
-                "streaming encrypt not used in test".to_string(),
-            ))
+            mock_streaming_encryption(
+                relative_path,
+                plaintext_path,
+                output_path,
+                original_name,
+                platform_metadata,
+                None,
+                chunk_size,
+            )
         }
 
         async fn encrypt_file_streaming_with_id(
             &self,
-            _relative_path: &str,
-            _plaintext_path: &Path,
-            _output_path: &Path,
-            _original_name: Option<&str>,
-            _platform_metadata: Option<&PlatformFileMetadata>,
-            _file_id: &str,
-            _chunk_size: usize,
+            relative_path: &str,
+            plaintext_path: &Path,
+            output_path: &Path,
+            original_name: Option<&str>,
+            platform_metadata: Option<&PlatformFileMetadata>,
+            file_id: &str,
+            chunk_size: usize,
         ) -> Result<StreamingEncryptedFile, MountSyncError> {
-            Err(MountSyncError::Crypto(
-                "streaming encrypt not used in test".to_string(),
-            ))
+            mock_streaming_encryption(
+                relative_path,
+                plaintext_path,
+                output_path,
+                original_name,
+                platform_metadata,
+                Some(file_id),
+                chunk_size,
+            )
         }
 
         async fn coverage_store_metadata(
@@ -11201,13 +11529,13 @@ mod tests {
             content_nonce: &content_nonce,
             content_chunk_size: None,
             original_size: 4,
-            encrypted_size: 4,
+            encrypted_size: 32,
             encrypted_at: Utc::now(),
             original_name: None,
             platform_metadata: None,
             sparse_metadata: None,
         };
-        write_encrypted_file(path, &header, b"test")
+        write_encrypted_file(path, &header, &[0xAB; 32])
             .map_err(|err| MountSyncError::Format(err.to_string()))
     }
 
@@ -11233,7 +11561,7 @@ mod tests {
             content_nonce: &content_nonce,
             content_chunk_size: None,
             original_size: 0,
-            encrypted_size: 0,
+            encrypted_size: 28,
             encrypted_at: Utc::now(),
             original_name: Path::new(relative_path)
                 .file_name()
@@ -11241,7 +11569,7 @@ mod tests {
             platform_metadata: Some(platform_metadata),
             sparse_metadata: None,
         };
-        write_encrypted_file(path, &header, b"")
+        write_encrypted_file(path, &header, &[0xAB; 28])
             .map_err(|err| MountSyncError::Format(err.to_string()))
     }
 
@@ -11281,7 +11609,7 @@ mod tests {
         write_test_encrypted_file(&canonical_encrypted_path, file_id, "API_keys/Untitled2.md")
             .unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker
             .file_id_to_mount_path
@@ -11364,7 +11692,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker.decrypted_signatures.insert(
             canonical_mount_path.clone(),
@@ -11433,7 +11761,7 @@ mod tests {
         let mount_path = mount_root.join("document.txt");
         fs::write(&mount_path, b"original").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         let encrypted_path =
             seed_tracked_file(&mut tracker, &encrypted_root, &mount_root, &mount_path);
 
@@ -11480,7 +11808,7 @@ mod tests {
 
         let journal_path = temp.path().join("pending_orphans.json");
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_orphans.insert(
             mount_path.clone(),
             PendingOrphan {
@@ -11493,7 +11821,7 @@ mod tests {
         tracker.pending_orphans_dirty = true;
         tracker.flush_pending_orphans();
 
-        let mut reloaded = SyncTracker::new();
+        let mut reloaded = mock_tracker();
         reloaded.set_pending_orphan_path(journal_path);
 
         let pending = reloaded.pending_orphans.get(&mount_path).unwrap();
@@ -11509,7 +11837,7 @@ mod tests {
         let encrypted_path = temp.path().join("document.txt.encrypted");
         let journal_path = temp.path().join("pending_writebacks.json");
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_writebacks.insert(
             mount_path.clone(),
             PendingWriteback {
@@ -11524,7 +11852,7 @@ mod tests {
         tracker.pending_writebacks_dirty = true;
         tracker.flush_pending_writebacks();
 
-        let mut reloaded = SyncTracker::new();
+        let mut reloaded = mock_tracker();
         reloaded.set_pending_writeback_path(journal_path);
 
         let pending = reloaded.pending_writebacks.get(&mount_path).unwrap();
@@ -11544,7 +11872,7 @@ mod tests {
         let encrypted_path = temp.path().join("document.txt.encrypted");
         let journal_path = temp.path().join("pending_refreshes.json");
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_refreshes.insert(
             mount_path.clone(),
             PendingRefresh {
@@ -11556,7 +11884,7 @@ mod tests {
         tracker.pending_refreshes_dirty = true;
         tracker.flush_pending_refreshes();
 
-        let mut reloaded = SyncTracker::new();
+        let mut reloaded = mock_tracker();
         reloaded.set_pending_refresh_path(journal_path);
 
         let pending = reloaded.pending_refreshes.get(&mount_path).unwrap();
@@ -11573,7 +11901,7 @@ mod tests {
         let encrypted_path = temp.path().join("document.txt.encrypted");
         let journal_path = temp.path().join("pending_metadata.json");
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_metadata.insert(
             encrypted_path.clone(),
             mock_file_metadata_record("document.txt"),
@@ -11582,7 +11910,7 @@ mod tests {
         tracker.pending_metadata_dirty = true;
         tracker.flush_pending_metadata();
 
-        let mut reloaded = SyncTracker::new();
+        let mut reloaded = mock_tracker();
         reloaded.set_pending_metadata_path(journal_path);
 
         let pending = reloaded.pending_metadata.get(&encrypted_path).unwrap();
@@ -11622,14 +11950,14 @@ mod tests {
             content_nonce: &content_nonce,
             content_chunk_size: None,
             original_size: 4,
-            encrypted_size: 4,
+            encrypted_size: 32,
             encrypted_at: Utc::now(),
             original_name: Some("document.txt"),
             platform_metadata: Some(&platform_metadata),
             sparse_metadata: None,
         };
 
-        write_encrypted_file(&encrypted_path, &header, b"test").unwrap();
+        write_encrypted_file(&encrypted_path, &header, &[0xAB; 32]).unwrap();
 
         let parsed = parse_encrypted_file(&encrypted_path).unwrap();
         assert_eq!(parsed.metadata.platform_metadata, Some(platform_metadata));
@@ -11656,7 +11984,11 @@ mod tests {
                 },
             ],
         };
-        let ciphertext = vec![0xAB; sparse_metadata.packed_size() as usize];
+        let ciphertext = vec![
+            0xAB;
+            chunked_encrypted_size(sparse_metadata.packed_size(), 4096).unwrap()
+                as usize
+        ];
 
         let header = SerializedEncryptedHeader {
             file_id: "sparse-header-file-id",
@@ -11758,7 +12090,7 @@ mod tests {
         let crypto = RoundTripMetadataCrypto {
             plaintext: plaintext.clone(),
         };
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         let mut expected = HashSet::new();
 
         tracker
@@ -11834,7 +12166,7 @@ mod tests {
 
         fs::remove_file(&mount_path).unwrap();
 
-        let mut restore_tracker = SyncTracker::new();
+        let mut restore_tracker = mock_tracker();
         restore_tracker
             .sync(&crypto, &encrypted_root, &mount_root)
             .await
@@ -11850,7 +12182,7 @@ mod tests {
 
     #[test]
     fn runtime_status_reports_pending_commit_and_low_space_state() {
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_writebacks.insert(
             PathBuf::from("/mount/document.txt"),
             PendingWriteback {
@@ -11922,7 +12254,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_pending_writeback_path(journal_path);
 
         let pending = tracker
@@ -11945,7 +12277,7 @@ mod tests {
         let encrypted_path = encrypted_root.join("document.txt.encrypted");
         let signature = FileSignature::from_metadata(&fs::metadata(&mount_path).unwrap());
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.record_pending_writeback(&mount_path, &encrypted_path, None);
         tracker.pending_stable.insert(
             mount_path.clone(),
@@ -11979,7 +12311,7 @@ mod tests {
         write_test_encrypted_file(&encrypted_path, "file-1", "document.txt").unwrap();
 
         let signature = FileSignature::from_metadata(&fs::metadata(&mount_path).unwrap());
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.record_pending_writeback(&mount_path, &encrypted_path, None);
         tracker.pending_stable.insert(
             mount_path.clone(),
@@ -12016,7 +12348,7 @@ mod tests {
             .join(".obsidian")
             .join(DIRECTORY_METADATA_FILE_NAME);
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_excluded_patterns(vec![
             ".obsidian".to_string(),
             ".obsidian/**".to_string(),
@@ -12052,7 +12384,7 @@ mod tests {
         fs::create_dir_all(&ignored_dir).unwrap();
         fs::write(mount_root.join("note.md"), b"hello").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_excluded_patterns(vec![
             ".obsidian".to_string(),
             ".obsidian/**".to_string(),
@@ -12094,7 +12426,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         let created = tracker
             .materialize_recovered_pending_copies(
                 &quarantine_root,
@@ -12155,7 +12487,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_recovery_registry_path(registry_path.clone());
         tracker
             .materialize_recovered_pending_copies(
@@ -12192,7 +12524,7 @@ mod tests {
             .join("document.txt.recovered-pending-20260313_120000");
         fs::write(&recovery_path, b"recovered pending").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         let created = tracker
             .materialize_existing_recovered_pending_copies(&quarantine_root, &mount_root)
             .unwrap();
@@ -12222,7 +12554,7 @@ mod tests {
         fs::write(&live_path, b"old live").unwrap();
         fs::write(&recovery_path, b"recovered live").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker.note_recovered_pending_copy(
             &recovery_path,
@@ -12267,7 +12599,7 @@ mod tests {
         let conflict_path = mount_root.join("document.txt.conflict-20260313_120000");
         fs::write(&conflict_path, b"local conflict").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         let mut expected = HashSet::new();
         tracker
             .sync_decrypted_changes(
@@ -12311,7 +12643,7 @@ mod tests {
         let conflict_path = mount_root.join("document.txt.conflict-20260313_120001");
         fs::write(&conflict_path, b"original conflict").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         let mut expected = HashSet::new();
         tracker
             .sync_decrypted_changes(
@@ -12366,7 +12698,7 @@ mod tests {
         let conflict_path = mount_root.join("document.txt.conflict-20260313_120002");
         fs::write(&conflict_path, b"conflict payload").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_conflict_registry_path(registry_path.clone());
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
@@ -12396,7 +12728,7 @@ mod tests {
         let mount_path = mount_root.join("document.txt");
         write_test_encrypted_file(&encrypted_path, "recover-id", "document.txt").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_conflict_registry_path(registry_path.clone());
         let crypto = RoundTripMetadataCrypto {
             plaintext: b"recovered".to_vec(),
@@ -12432,7 +12764,7 @@ mod tests {
         fs::write(&live_path, b"live").unwrap();
         fs::write(&conflict_path, b"conflict").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker.update_conflict_file_tracking(
             &conflict_path,
@@ -12473,7 +12805,7 @@ mod tests {
         fs::write(&live_path, b"live").unwrap();
         fs::write(&conflict_path, b"conflict").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker.update_conflict_file_tracking(
             &conflict_path,
@@ -12518,7 +12850,7 @@ mod tests {
         fs::write(&live_path, b"live version").unwrap();
         fs::write(&conflict_path, b"conflict version").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker.update_conflict_file_tracking(
             &conflict_path,
@@ -12560,7 +12892,7 @@ mod tests {
         fs::write(&live_path, b"live").unwrap();
         fs::write(&conflict_path, b"conflict payload").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker.update_conflict_file_tracking(
             &conflict_path,
@@ -12611,7 +12943,7 @@ mod tests {
         let conflict_path = mount_root.join("document.txt.conflict-20260313_120014");
         fs::write(&conflict_path, b"conflict").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_conflict_registry_path(registry_path.clone());
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
@@ -12644,7 +12976,7 @@ mod tests {
         let mount_path = mount_root.join("document.txt");
         fs::write(&mount_path, b"local edits").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_pending_writeback_path(journal_root.join("pending_writebacks.json"));
 
         let mut expected = HashSet::new();
@@ -12672,11 +13004,9 @@ mod tests {
 
         let pending = tracker.pending_writebacks.get(&mount_path).unwrap();
         assert!(pending.low_space);
-        assert!(pending
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("No space left on device"));
+        assert!(pending.last_error.as_deref().unwrap_or_default().contains(
+            &io::Error::from_raw_os_error(if cfg!(windows) { 112 } else { 28 }).to_string()
+        ));
         assert!(mount_path.exists());
         assert!(!tracker.can_cleanup_mountpoint());
     }
@@ -12702,7 +13032,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MixedDecryptCrypto, &encrypted_root, &mount_root)
             .await
@@ -12727,7 +13057,7 @@ mod tests {
         fs::write(&mount_path, b"local edits").unwrap();
         let original_mode = fs::metadata(&mount_path).unwrap().permissions().mode();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_pending_writeback_path(journal_root.join("pending_writebacks.json"));
         tracker.pending_refreshes.insert(
             mount_root.join("stale.txt"),
@@ -12803,7 +13133,7 @@ mod tests {
 
         let expected_metadata = capture_platform_metadata(&folder_path).unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -12821,7 +13151,7 @@ mod tests {
 
         fs::remove_dir_all(&folder_path).unwrap();
 
-        let mut restored = SyncTracker::new();
+        let mut restored = mock_tracker();
         restored
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -12846,7 +13176,7 @@ mod tests {
         let folder_path = mount_root.join("untitled folder");
         fs::create_dir_all(&folder_path).unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -12899,7 +13229,7 @@ mod tests {
         let new_folder_path = mount_root.join("Project Alpha");
         fs::create_dir_all(&old_folder_path).unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -12956,7 +13286,7 @@ mod tests {
         let folder_path = mount_root.join("folder_a");
         fs::create_dir_all(&folder_path).unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -13009,7 +13339,7 @@ mod tests {
         let old_folder_path = mount_root.join("untitled folder");
         fs::create_dir_all(&old_folder_path).unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -13090,7 +13420,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -13127,7 +13457,7 @@ mod tests {
         let mount_path = mount_root.join("library.sqlite");
         fs::write(&mount_path, b"sqlite payload").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         let mut expected = HashSet::new();
         tracker
             .sync_decrypted_changes(
@@ -13168,7 +13498,7 @@ mod tests {
         let mount_path = package_root.join("Index.xml");
         fs::write(&mount_path, b"package payload").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         let mut expected = HashSet::new();
         tracker
             .sync_decrypted_changes(
@@ -13202,7 +13532,7 @@ mod tests {
         let alias_path = mount_root.join("document-copy.txt");
         fs::write(&mount_path, b"original").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -13293,7 +13623,7 @@ mod tests {
         fs::write(&mount_path, b"original").unwrap();
         let original_mode = fs::metadata(&mount_path).unwrap().permissions().mode() & 0o777;
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -13346,7 +13676,7 @@ mod tests {
         let alias_path = mount_root.join("document-copy.txt");
         fs::write(&mount_path, b"original").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker
             .sync(&MockCrypto, &encrypted_root, &mount_root)
             .await
@@ -13414,7 +13744,7 @@ mod tests {
         let journal_path = config_root.join("pending_deletions.json");
         write_test_encrypted_file(&encrypted_path, "pending-delete-id", "document.txt").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_deletion_config(DeletionConfig {
             min_consecutive_missing_scans: 10,
             rapid_scan_total_duration_ms: 1,
@@ -13434,7 +13764,7 @@ mod tests {
         tracker.pending_deletions_dirty = true;
         tracker.flush_pending_deletions();
 
-        let mut reloaded = SyncTracker::new();
+        let mut reloaded = mock_tracker();
         reloaded.set_deletion_config(DeletionConfig {
             min_consecutive_missing_scans: 10,
             rapid_scan_total_duration_ms: 1,
@@ -13467,7 +13797,7 @@ mod tests {
         let mount_path = mount_root.join("document.txt");
         write_test_encrypted_file(&encrypted_path, "rehydrate-id", "document.txt").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.seed_file(
             encrypted_path.clone(),
             mount_path.clone(),
@@ -13513,7 +13843,7 @@ mod tests {
         let first_seen_at = Utc::now();
         let last_seen_at = first_seen_at + chrono::TimeDelta::seconds(5);
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_open_unlinked.insert(
             mount_path.clone(),
             PendingOpenUnlinked {
@@ -13532,7 +13862,7 @@ mod tests {
         tracker.pending_open_unlinked_dirty = true;
         tracker.flush_pending_open_unlinked();
 
-        let mut reloaded = SyncTracker::new();
+        let mut reloaded = mock_tracker();
         reloaded.set_pending_open_unlinked_path(journal_path);
 
         let pending = reloaded.pending_open_unlinked.get(&mount_path).unwrap();
@@ -13557,7 +13887,7 @@ mod tests {
         let encrypted_path = encrypted_root.join("document.txt.encrypted");
         write_test_encrypted_file(&encrypted_path, "deleted-open-id", "document.txt").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_writebacks.insert(
             mount_path.clone(),
             PendingWriteback {
@@ -13621,7 +13951,7 @@ mod tests {
         let mount_path = mount_root.join("document.txt");
         write_test_encrypted_file(&encrypted_path, "recover-id", "document.txt").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_open_unlinked.insert(
             mount_path.clone(),
             PendingOpenUnlinked {
@@ -13673,7 +14003,7 @@ mod tests {
         fs::create_dir_all(&mount_root).unwrap();
 
         let mount_path = mount_root.join("draft.txt");
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.pending_open_unlinked.insert(
             mount_path.clone(),
             PendingOpenUnlinked {
@@ -13721,7 +14051,7 @@ mod tests {
         let mount_path = mount_root.join("document.txt");
         fs::write(&mount_path, b"stable content").unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker.set_deletion_config(DeletionConfig {
             min_consecutive_missing_scans: 2,
@@ -13764,7 +14094,7 @@ mod tests {
         let config_root = temp.path().join("config");
         fs::create_dir_all(&config_root).unwrap();
 
-        let mut tracker = SyncTracker::new();
+        let mut tracker = mock_tracker();
         tracker.set_retention_folder(&config_root);
         tracker.set_deletion_config(DeletionConfig {
             min_consecutive_missing_scans: 2,
@@ -13851,7 +14181,9 @@ mod tests {
             _relative_path: &str,
             _plaintext: &[u8],
         ) -> Result<EncryptedFileMetadata, MountSyncError> {
-            Err(MountSyncError::Io(io::Error::from_raw_os_error(28)))
+            Err(MountSyncError::Io(io::Error::from_raw_os_error(
+                if cfg!(windows) { 112 } else { 28 },
+            )))
         }
 
         async fn encrypt_file_with_id(
@@ -13860,7 +14192,9 @@ mod tests {
             _plaintext: &[u8],
             _file_id: &str,
         ) -> Result<EncryptedFileMetadata, MountSyncError> {
-            Err(MountSyncError::Io(io::Error::from_raw_os_error(28)))
+            Err(MountSyncError::Io(io::Error::from_raw_os_error(
+                if cfg!(windows) { 112 } else { 28 },
+            )))
         }
 
         async fn encrypt_file_streaming(
@@ -13872,7 +14206,9 @@ mod tests {
             _platform_metadata: Option<&PlatformFileMetadata>,
             _chunk_size: usize,
         ) -> Result<StreamingEncryptedFile, MountSyncError> {
-            Err(MountSyncError::Io(io::Error::from_raw_os_error(28)))
+            Err(MountSyncError::Io(io::Error::from_raw_os_error(
+                if cfg!(windows) { 112 } else { 28 },
+            )))
         }
 
         async fn encrypt_file_streaming_with_id(
@@ -13885,7 +14221,9 @@ mod tests {
             _file_id: &str,
             _chunk_size: usize,
         ) -> Result<StreamingEncryptedFile, MountSyncError> {
-            Err(MountSyncError::Io(io::Error::from_raw_os_error(28)))
+            Err(MountSyncError::Io(io::Error::from_raw_os_error(
+                if cfg!(windows) { 112 } else { 28 },
+            )))
         }
 
         async fn coverage_store_metadata(
@@ -13906,7 +14244,9 @@ mod tests {
             if encrypted_path.file_name().and_then(|name| name.to_str())
                 == Some("blocked.txt.encrypted")
             {
-                return Err(MountSyncError::Io(io::Error::from_raw_os_error(28)));
+                return Err(MountSyncError::Io(io::Error::from_raw_os_error(
+                    if cfg!(windows) { 112 } else { 28 },
+                )));
             }
             Ok(b"decrypted".to_vec())
         }

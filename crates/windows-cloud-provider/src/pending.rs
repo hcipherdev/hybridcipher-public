@@ -1,4 +1,11 @@
 use super::*;
+use hybridcipher_provider_core::normalize_relative_path;
+
+// Dropbox can temporarily deny replacement while its existing Cloud Files target
+// is out of sync. Keep retries bounded so a persistent permission error surfaces.
+const MAX_WRITEBACK_ACCESS_DENIED_ATTEMPTS: u32 = 8;
+const LEGACY_WRITEBACK_ACCESS_DENIED: &str =
+    "provider-core error: I/O error: Access is denied. (os error 5)";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -14,6 +21,30 @@ pub enum PendingOperationState {
 pub enum PendingOperationResolution {
     RetryRename,
     KeepOriginalName,
+    KeepRenamedFile,
+}
+
+/// A pending rename owns both namespace locations, including directory descendants.
+/// An editor replacement must not be imported as an unrelated new file at its target.
+pub(super) fn reserves_path(records: &[CloudMutationRecord], path: &str) -> bool {
+    records.iter().any(|record| {
+        record.kind == CloudMutationKind::Rename
+            && [
+                &record.relative_path,
+                record
+                    .target_relative_path
+                    .as_ref()
+                    .unwrap_or(&record.relative_path),
+            ]
+            .iter()
+            .any(|reserved| paths_overlap(reserved, path))
+    })
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let a = normalize_relative_path(a.to_owned()).to_lowercase();
+    let b = normalize_relative_path(b.to_owned()).to_lowercase();
+    a == b || a.starts_with(&(b.clone() + "/")) || b.starts_with(&(a + "/"))
 }
 
 pub(super) fn touches(a: &CloudMutationRecord, b: &CloudMutationRecord) -> bool {
@@ -55,7 +86,10 @@ pub(super) fn ready(record: &CloudMutationRecord) -> bool {
     {
         return true;
     }
-    record.state != PendingOperationState::NeedsAttention
+    (record.state != PendingOperationState::NeedsAttention
+        || (record.kind == CloudMutationKind::Writeback
+            && record.attempts < MAX_WRITEBACK_ACCESS_DENIED_ATTEMPTS
+            && record.last_error.as_deref() == Some(LEGACY_WRITEBACK_ACCESS_DENIED)))
         && record.retry_after.is_none_or(|time| time <= Utc::now())
 }
 
@@ -155,6 +189,9 @@ pub(super) fn failed(record: &mut CloudMutationRecord, error: &CloudProviderErro
         }
         CloudProviderError::ProviderCore(ProviderCoreError::Io(e)) => {
             matches!(e.raw_os_error(), Some(32 | 33 | 112))
+                || (record.kind == CloudMutationKind::Writeback
+                    && e.raw_os_error() == Some(5)
+                    && record.attempts < MAX_WRITEBACK_ACCESS_DENIED_ATTEMPTS)
         }
         _ => false,
     };
@@ -170,6 +207,32 @@ pub(super) fn failed(record: &mut CloudMutationRecord, error: &CloudProviderErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rename_reserves_both_paths_and_descendants_but_not_similar_names() {
+        let record = rename(Uuid::new_v4(), 1);
+        assert!(reserves_path(
+            &[record.clone()],
+            "API_keys/GITHUB BACKUP CODES.md"
+        ));
+        assert!(reserves_path(
+            &[record.clone()],
+            "API_keys\\github backup-codes.md"
+        ));
+        assert!(!reserves_path(
+            &[record.clone()],
+            "API_keys/github backup-codes.md.other"
+        ));
+        assert!(!reserves_path(&[record.clone()], "unrelated.md"));
+        let mut directory = record;
+        directory.relative_path = "old-dir".into();
+        directory.target_relative_path = Some("new-dir".into());
+        assert!(reserves_path(
+            &[directory.clone()],
+            "new-dir/editor-save.md"
+        ));
+        directory.kind = CloudMutationKind::Writeback;
+        assert!(!reserves_path(&[directory], "new-dir/editor-save.md"));
+    }
     #[test]
     fn deterministic_errors_wait_and_transient_attempts_back_off_on_the_same_id() {
         let mut record = rename(Uuid::new_v4(), 1);
@@ -209,6 +272,34 @@ mod tests {
         duplicate.target_plaintext_path = Some(PathBuf::from("C:/different-binding.md"));
         let mut distinct_bindings = vec![record, duplicate];
         assert!(!compact(&mut distinct_bindings));
+    }
+
+    #[test]
+    fn writeback_access_denied_retries_with_a_limit_and_recovers_existing_records() {
+        let mut record = rename(Uuid::new_v4(), 1);
+        record.kind = CloudMutationKind::Writeback;
+        record.state = PendingOperationState::NeedsAttention;
+        record.last_error = Some(LEGACY_WRITEBACK_ACCESS_DENIED.into());
+        assert!(ready(&record));
+
+        let error = CloudProviderError::ProviderCore(ProviderCoreError::Io(
+            std::io::Error::from_raw_os_error(5),
+        ));
+        assert_eq!(error.to_string(), LEGACY_WRITEBACK_ACCESS_DENIED);
+        while record.attempts < MAX_WRITEBACK_ACCESS_DENIED_ATTEMPTS - 1 {
+            failed(&mut record, &error);
+            assert_eq!(record.state, PendingOperationState::Retryable);
+            assert!(record.retry_after.is_some());
+        }
+        failed(&mut record, &error);
+        assert_eq!(record.state, PendingOperationState::NeedsAttention);
+        assert_eq!(record.retry_after, None);
+        assert!(!ready(&record));
+
+        let mut rename_record = rename(Uuid::new_v4(), 1);
+        failed(&mut rename_record, &error);
+        assert_eq!(rename_record.state, PendingOperationState::NeedsAttention);
+        assert!(!ready(&rename_record));
     }
     fn rename(root: Uuid, sequence: u64) -> CloudMutationRecord {
         let mut r = CloudMutationRecord::new(

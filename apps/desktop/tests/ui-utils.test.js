@@ -2,10 +2,17 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+    actionErrorMessage,
     pendingOperationLabel,
     getEmbeddedTerminalHeaderTitle,
     getFolderRowStatusState,
 } = require('../src/ui-utils.js');
+
+test('folder actions preserve Tauri string rejections and Error messages', () => {
+    assert.equal(actionErrorMessage('Original file is missing'), 'Original file is missing');
+    assert.equal(actionErrorMessage(new Error('Destination changed')), 'Destination changed');
+    assert.equal(actionErrorMessage(null), 'Folder action failed.');
+});
 
 test('pending status counts logical operations independently of retry history', () => {
     assert.equal(pendingOperationLabel({ pending_operation_count: 1, affected_file_count: 1, pending_operation_counts: { rename: 1 }, pending_operations: [{ attempts: 122, merged_records: 121 }] }), '1 unresolved rename affecting 1 file');
@@ -34,6 +41,7 @@ test('mounted healthy folder shows mounted badge and green dot', () => {
         }),
         {
             showMountedBadge: true,
+            showUnmountingBadge: false,
             showAlertButton: false,
             healthDotTone: 'green',
         }
@@ -52,6 +60,7 @@ test('mounted conflict folder shows alert button and red dot', () => {
         }),
         {
             showMountedBadge: true,
+            showUnmountingBadge: false,
             showAlertButton: true,
             healthDotTone: 'red',
         }
@@ -70,6 +79,7 @@ test('mounted recovery-copy folder shows alert button and red dot', () => {
         }),
         {
             showMountedBadge: true,
+            showUnmountingBadge: false,
             showAlertButton: true,
             healthDotTone: 'red',
         }
@@ -92,6 +102,7 @@ test('mounted pending-only folder stays non-red and does not surface extra pills
         }),
         {
             showMountedBadge: true,
+            showUnmountingBadge: false,
             showAlertButton: true,
             healthDotTone: 'green',
         }
@@ -110,6 +121,7 @@ test('unmounted folder shows no mounted badge or dot', () => {
         }),
         {
             showMountedBadge: false,
+            showUnmountingBadge: false,
             showAlertButton: false,
             healthDotTone: null,
         }

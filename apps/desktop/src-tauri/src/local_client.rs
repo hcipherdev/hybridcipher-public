@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tauri::async_runtime::Mutex;
 use tracing::warn;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -113,12 +114,50 @@ impl LocalClientProvider {
     pub async fn initialize_for_session(
         &self,
         session: &UserSession,
+        server_url: &str,
+    ) -> Result<(), String> {
+        self.initialize_for_session_impl(session, server_url, None)
+            .await
+    }
+
+    pub async fn initialize_for_session_with_keys(
+        &self,
+        session: &UserSession,
+        server_url: &str,
+        account_key: &[u8; 32],
+        state_key: &[u8; 32],
+    ) -> Result<(), String> {
+        self.initialize_for_session_impl(session, server_url, Some((account_key, state_key)))
+            .await
+    }
+
+    async fn initialize_for_session_impl(
+        &self,
+        session: &UserSession,
         _server_url: &str,
+        keys: Option<(&[u8; 32], &[u8; 32])>,
     ) -> Result<(), String> {
         let resolved = resolve_session_context(&self.config_dir, session)?;
-        let client = build_local_client(&self.config_dir, &resolved.storage_id).await?;
+        let client = build_local_client(&self.config_dir, &resolved.storage_id, keys).await?;
 
         let client = Arc::new(client);
+        client
+            .configure_local_write_access(
+                hybridcipher_client::local_write_access::LocalWriteAccess {
+                    issuer: session
+                        .server_url
+                        .as_deref()
+                        .unwrap_or(_server_url)
+                        .trim_end_matches('/')
+                        .trim_end_matches("/api/v1")
+                        .to_string(),
+                    user_id: session.user_id.clone(),
+                    entitlement: session.team_entitlement.clone(),
+                    revoked: session.team_revoked,
+                },
+            )
+            .await
+            .map_err(|err| err.to_string())?;
         let user_dir = self.config_dir.join(USERS_DIR).join(&resolved.storage_id);
         let socket_path = user_dir.join("coverage_ipc.sock");
 
@@ -127,13 +166,15 @@ impl LocalClientProvider {
             if let Some(server) = ipc_guard.take() {
                 server.shutdown().await;
             }
-            let handler = Arc::new(DesktopCoverageIpcHandler::new(client.clone()));
-            match CoverageIpcServer::start(socket_path, handler).await {
-                Ok(server) => {
-                    *ipc_guard = Some(server);
-                }
-                Err(err) => {
-                    warn!("Failed to start coverage IPC server: {}", err);
+            if session.persistent {
+                let handler = Arc::new(DesktopCoverageIpcHandler::new(client.clone()));
+                match CoverageIpcServer::start(socket_path, handler).await {
+                    Ok(server) => {
+                        *ipc_guard = Some(server);
+                    }
+                    Err(err) => {
+                        warn!("Failed to start coverage IPC server: {}", err);
+                    }
                 }
             }
         }
@@ -154,6 +195,29 @@ impl LocalClientProvider {
     }
 
     /// Return the current client or an error if no session is active.
+    pub async fn update_write_access(&self, session: &UserSession) -> Result<(), String> {
+        if let Some(client) = self.client_opt().await {
+            client
+                .record_online_write_access(
+                    hybridcipher_client::local_write_access::LocalWriteAccess {
+                        issuer: session
+                            .server_url
+                            .as_deref()
+                            .unwrap_or(CANONICAL_PRODUCTION_SERVER)
+                            .trim_end_matches('/')
+                            .trim_end_matches("/api/v1")
+                            .to_string(),
+                        user_id: session.user_id.clone(),
+                        entitlement: session.team_entitlement.clone(),
+                        revoked: session.team_revoked,
+                    },
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    }
+
     pub async fn client(&self) -> Result<Arc<LocalClient>, String> {
         let guard = self.client.lock().await;
         guard
@@ -169,7 +233,7 @@ impl LocalClientProvider {
 
 fn default_config_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "Unable to locate home directory".to_string())?;
-    Ok(home.join(".hybridcipher"))
+    Ok(home.join(hybridcipher_client::config_loader::account_data_location()))
 }
 
 fn ensure_config_structure(base_dir: &Path) -> Result<(), String> {
@@ -320,6 +384,15 @@ fn resolve_session_context(
         return Err("Desktop session is missing an email identity".to_string());
     }
 
+    if !session.persistent {
+        let server_url = session.server_url.as_deref().ok_or_else(|| {
+            "Temporary desktop session is missing its server identity".to_string()
+        })?;
+        return Ok(ResolvedSessionContext {
+            storage_id: get_user_storage_id(session_email, &canonicalize_server_url(server_url)),
+        });
+    }
+
     let active = load_active_user_record(config_dir)?.ok_or_else(|| {
         "No active_user.json context found. Please log out and log in again before using desktop IPC."
             .to_string()
@@ -378,7 +451,11 @@ fn store_device_key_in_keystore(storage_id: &str, key: &[u8; 32]) -> Result<(), 
     })
 }
 
-async fn build_local_client(base_dir: &Path, storage_id: &str) -> Result<LocalClient, String> {
+async fn build_local_client(
+    base_dir: &Path,
+    storage_id: &str,
+    keys: Option<(&[u8; 32], &[u8; 32])>,
+) -> Result<LocalClient, String> {
     let user_dir = base_dir.join(USERS_DIR).join(storage_id);
     fs::create_dir_all(&user_dir).map_err(|e| {
         format!(
@@ -401,9 +478,21 @@ async fn build_local_client(base_dir: &Path, storage_id: &str) -> Result<LocalCl
     }
 
     let storage = Arc::new(LocalFsStorage::new_for_user(base_dir, storage_id));
-    let account_key = load_account_key_from_cache(&user_dir)?;
-    let state_key = load_state_encryption_key(&user_dir, storage_id, &account_key)?;
-    storage.enable_account_encryption(state_key);
+    let (account_key, state_key) = match keys {
+        Some((account_key, state_key)) => {
+            (Zeroizing::new(*account_key), Zeroizing::new(*state_key))
+        }
+        None => {
+            let account_key = Zeroizing::new(load_account_key_from_cache(&user_dir)?);
+            let state_key = Zeroizing::new(load_state_encryption_key(
+                &user_dir,
+                storage_id,
+                &account_key,
+            )?);
+            (account_key, state_key)
+        }
+    };
+    storage.enable_account_encryption(*state_key);
 
     let device_keypair = load_or_create_device_keypair(&user_dir, &state_key, &account_key)?;
     let network = Arc::new(MockNetwork::new());
@@ -501,6 +590,91 @@ fn load_account_key_from_cache(user_dir: &Path) -> Result<[u8; 32], String> {
     let cache_path = user_dir.join(ACCOUNT_KEY_CACHE_FILE);
     hybridcipher_crypto::local_key_cache::load(&cache_path)
         .map_err(|e| format!("Failed to unlock account key cache: {e}"))
+}
+
+#[cfg(test)]
+mod session_context_tests {
+    use super::*;
+
+    #[test]
+    fn temporary_session_uses_its_own_identity_without_active_cli_user() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = UserSession {
+            email: "temporary@example.invalid".into(),
+            device_id: "device-a".into(),
+            token: "access".into(),
+            refresh_token: "refresh".into(),
+            team_entitlement: None,
+            team_revoked: false,
+            pending_team_requests: Vec::new(),
+            expires_at: 0,
+            user_id: "user-a".into(),
+            server_url: Some("https://fixture.example.invalid".into()),
+            opaque_export_key: None,
+            persistent: false,
+        };
+
+        let resolved = resolve_session_context(root.path(), &session).unwrap();
+        assert_eq!(
+            resolved.storage_id,
+            get_user_storage_id(&session.email, session.server_url.as_deref().unwrap())
+        );
+
+        // An existing CLI pointer for another account must not be adopted by
+        // a temporary desktop session.
+        fs::create_dir_all(root.path().join(GLOBAL_DIR)).unwrap();
+        fs::write(
+            root.path().join(GLOBAL_DIR).join(ACTIVE_USER_FILE),
+            r#"{"username":"other@example.invalid","server_url":"https://fixture.example.invalid","user_id":"ignored"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_session_context(root.path(), &session)
+                .unwrap()
+                .storage_id,
+            resolved.storage_id
+        );
+        session.persistent = true;
+        assert!(resolve_session_context(root.path(), &session).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_client_accepts_temporary_keys_without_unlock_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let server_url = "https://fixture.example.invalid";
+        let email = "temporary@example.invalid";
+        let storage_id = get_user_storage_id(email, server_url);
+        let account_key = [11u8; 32];
+        let state_key = [22u8; 32];
+        let provider = LocalClientProvider {
+            config_dir: root.path().to_path_buf(),
+            client: Mutex::new(None),
+            coverage_ipc: Mutex::new(None),
+        };
+        let session = UserSession {
+            email: email.into(),
+            device_id: "device-a".into(),
+            token: "access".into(),
+            refresh_token: "refresh".into(),
+            team_entitlement: None,
+            team_revoked: false,
+            pending_team_requests: Vec::new(),
+            expires_at: 0,
+            user_id: "user-a".into(),
+            server_url: Some(server_url.into()),
+            opaque_export_key: None,
+            persistent: false,
+        };
+        provider
+            .initialize_for_session_with_keys(&session, server_url, &account_key, &state_key)
+            .await
+            .unwrap();
+        assert!(provider.client().await.is_ok());
+        assert!(provider.coverage_ipc.lock().await.is_none());
+        let user_dir = root.path().join(USERS_DIR).join(storage_id);
+        assert!(!user_dir.join(ACCOUNT_KEY_CACHE_FILE).exists());
+        assert!(user_dir.join(DEVICE_KEYPAIR_FILE).exists());
+    }
 }
 
 fn load_or_create_device_keypair(

@@ -621,6 +621,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         pending: &PendingRewrap,
     ) -> Result<(), ClientError> {
+        self.require_local_write_for_group(pending.group_id).await?;
         // If a rewrap targets a newer epoch than the current group epoch and there is no active
         // rekey, treat the task as stale (fallback likely occurred) and drop it.
         let (current_epoch_for_group, has_active_rekey) = {
@@ -850,15 +851,20 @@ impl<S: Storage, N: Network> Client<S, N> {
         }
 
         // Update file_index entry and migration bookkeeping
+        let registry = self.load_root_registry().await?;
         let mut state = self.state.write().await;
-        let root_match = state.coverage_roots.iter().find_map(|(id, root)| {
-            disk_path.strip_prefix(&root.path).ok().map(|rel| {
-                (
-                    *id,
-                    rel.to_string_lossy().trim_start_matches('/').to_string(),
-                )
-            })
-        });
+        let root_match = state
+            .coverage_roots
+            .iter()
+            .filter(|(_, root)| Self::root_for_group(root, pending.group_id, &registry).is_some())
+            .find_map(|(id, root)| {
+                disk_path.strip_prefix(&root.path).ok().map(|rel| {
+                    (
+                        *id,
+                        rel.to_string_lossy().trim_start_matches('/').to_string(),
+                    )
+                })
+            });
 
         if let Some(migration) = state.migration.as_mut() {
             if migration.to_epoch == pending.to_epoch {
@@ -1279,19 +1285,24 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         // Refresh file_index entry to reflect the new epoch and size so future scans use
         // the updated epoch for coverage reconciliation.
+        let registry = self.load_root_registry().await?;
         let root_match = {
             let state = self.state.read().await;
-            state.coverage_roots.iter().find_map(|(id, root)| {
-                PathBuf::from(path)
-                    .strip_prefix(&root.path)
-                    .ok()
-                    .map(|rel| {
-                        (
-                            *id,
-                            rel.to_string_lossy().trim_start_matches('/').to_string(),
-                        )
-                    })
-            })
+            state
+                .coverage_roots
+                .iter()
+                .filter(|(_, root)| Self::root_for_group(root, group_id, &registry).is_some())
+                .find_map(|(id, root)| {
+                    PathBuf::from(path)
+                        .strip_prefix(&root.path)
+                        .ok()
+                        .map(|rel| {
+                            (
+                                *id,
+                                rel.to_string_lossy().trim_start_matches('/').to_string(),
+                            )
+                        })
+                })
         };
 
         if let Some((root_id, rel_path)) = root_match {
@@ -1338,20 +1349,75 @@ impl<S: Storage, N: Network> Client<S, N> {
             .as_ref()
             .and_then(|dir| Self::capture_directory_mtime(dir));
 
-        let encrypted_file_bytes =
-            tokio::fs::read(disk_path)
+        use tokio::io::AsyncReadExt;
+        let file_len = tokio::fs::metadata(disk_path)
+            .await
+            .map_err(|e| ClientError::FileError {
+                context: ErrorContext::new(
+                    ErrorCode::StorageRead,
+                    format!("Failed to inspect encrypted file: {e}"),
+                    "rewrap_orphaned_file".to_string(),
+                ),
+                file_path: disk_path.display().to_string(),
+                file_size: None,
+            })?
+            .len();
+        let max_len = MAX_IN_MEMORY_PLAINTEXT_BYTES
+            + MAX_IN_MEMORY_PLAINTEXT_BYTES / 16
+            + crate::file::encrypt::MAX_ENCRYPTED_HEADER_BYTES as u64
+            + 28;
+        if file_len > max_len {
+            return Err(ClientError::InvalidInput(
+                "Encrypted file exceeds the in-memory rewrap limit".into(),
+            ));
+        }
+        let mut encrypted_file_bytes = Vec::new();
+        let file_len_usize = usize::try_from(file_len).map_err(|_| {
+            ClientError::InvalidInput("Encrypted file is too large for this process".into())
+        })?;
+        encrypted_file_bytes
+            .try_reserve_exact(file_len_usize)
+            .map_err(|_| ClientError::InvalidInput("Unable to reserve ciphertext memory".into()))?;
+        encrypted_file_bytes.resize(file_len_usize, 0);
+        let mut file =
+            tokio::fs::File::open(disk_path)
                 .await
                 .map_err(|e| ClientError::FileError {
                     context: ErrorContext::new(
                         ErrorCode::StorageRead,
-                        format!("Failed to read encrypted file: {}", e),
+                        format!("Failed to open encrypted file: {e}"),
                         "rewrap_orphaned_file".to_string(),
                     ),
                     file_path: disk_path.display().to_string(),
                     file_size: None,
                 })?;
+        file.read_exact(&mut encrypted_file_bytes)
+            .await
+            .map_err(|e| ClientError::FileError {
+                context: ErrorContext::new(
+                    ErrorCode::StorageRead,
+                    format!("Failed to read encrypted file: {}", e),
+                    "rewrap_orphaned_file".to_string(),
+                ),
+                file_path: disk_path.display().to_string(),
+                file_size: None,
+            })?;
 
-        let sep_pos = encrypted_file_bytes
+        let mut extra = [0u8; 1];
+        if file
+            .read(&mut extra)
+            .await
+            .map_err(|e| ClientError::InvalidInput(e.to_string()))?
+            != 0
+        {
+            return Err(ClientError::InvalidState(
+                "Encrypted file changed while reading".into(),
+            ));
+        }
+        let header_scan_len = encrypted_file_bytes
+            .len()
+            .min(crate::file::encrypt::MAX_ENCRYPTED_HEADER_BYTES + ENCRYPTED_FILE_SEPARATOR.len());
+        let sep_pos = encrypted_file_bytes[..header_scan_len]
             .windows(ENCRYPTED_FILE_SEPARATOR.len())
             .position(|w| w == ENCRYPTED_FILE_SEPARATOR)
             .ok_or_else(|| {

@@ -3,7 +3,10 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, Utc};
 use filetime::{set_file_mtime, set_file_times, FileTime};
 use hybridcipher_client::{
-    file::encrypt::SparseFileMetadata,
+    file::encrypt::{
+        chunked_encrypted_size, read_encrypted_header, SparseFileMetadata, MAX_CONTENT_CHUNK_SIZE,
+        MAX_IN_MEMORY_PLAINTEXT_BYTES,
+    },
     file::{write_encrypted_file as write_encrypted_file_with_header, SerializedEncryptedHeader},
     network::MockNetwork,
     storage::LocalFsStorage,
@@ -14,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Read,
+    io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -194,18 +197,30 @@ pub(crate) enum DirectoryCiphertextPolicyError {
 }
 
 pub(crate) fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, CliError> {
-    let encrypted_content = fs::read(path)
-        .map_err(|e| CliError::storage(format!("Failed to read {}: {}", path.display(), e)))?;
-    let separator = ENCRYPTED_FILE_SEPARATOR.as_bytes();
-    let sep_pos = encrypted_content
-        .windows(separator.len())
-        .position(|window| window == separator)
-        .ok_or_else(|| CliError::format("Invalid encrypted file format: separator not found"))?;
+    parse_encrypted_file_with_policy(path, false)
+}
 
-    let metadata_bytes = &encrypted_content[..sep_pos];
-    let ciphertext = encrypted_content[sep_pos + separator.len()..].to_vec();
+pub(crate) fn parse_encrypted_file_with_policy(
+    path: &Path,
+    allow_large_single_record: bool,
+) -> Result<ParsedEncryptedFile, CliError> {
+    let file = fs::File::open(path)
+        .map_err(|e| CliError::storage(format!("Failed to open {}: {}", path.display(), e)))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| CliError::storage(e.to_string()))?
+        .len();
+    let mut reader = BufReader::new(file);
+    let metadata_bytes = read_encrypted_header(&mut reader)
+        .map_err(|e| CliError::format(format!("Invalid encrypted header: {e}")))?;
+    let ciphertext_offset = reader
+        .stream_position()
+        .map_err(|e| CliError::storage(e.to_string()))?;
+    let encrypted_size = file_len
+        .checked_sub(ciphertext_offset)
+        .ok_or_else(|| CliError::format("Encrypted file is shorter than its header"))?;
 
-    let json: Value = serde_json::from_slice(metadata_bytes)
+    let json: Value = serde_json::from_slice(&metadata_bytes)
         .map_err(|e| CliError::format(format!("Failed to parse metadata: {}", e)))?;
 
     let file_id = json["file_id"]
@@ -219,7 +234,14 @@ pub(crate) fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, C
         .as_u64()
         .or_else(|| json["original_size"].as_u64())
         .unwrap_or(0);
-    let content_chunk_size = json.get("chunk_size").and_then(|v| v.as_u64());
+    let content_chunk_size = match json.get("chunk_size") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| CliError::format("Invalid chunk_size"))?,
+        ),
+    };
     let original_name = json
         .get("original_name")
         .and_then(|v| v.as_str())
@@ -239,8 +261,27 @@ pub(crate) fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, C
 
     let header_version = json
         .get("header_version")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| u32::try_from(number).ok())
+                .ok_or_else(|| CliError::format("Invalid header_version"))
+        })
+        .transpose()?;
+    if header_version.unwrap_or(1) >= 3
+        && json
+            .get("file_size")
+            .and_then(|value| value.as_u64())
+            .is_none()
+        && json
+            .get("original_size")
+            .and_then(|value| value.as_u64())
+            .is_none()
+    {
+        return Err(CliError::format(
+            "Missing file size in current encrypted header",
+        ));
+    }
     let wrapped_file_key = decode_bytes(json.get("wrapped_file_key"));
     let key_wrap_nonce = decode_bytes(json.get("key_wrap_nonce"));
     let key_wrap_aad_hash = decode_bytes(json.get("key_wrap_aad_hash"));
@@ -256,10 +297,76 @@ pub(crate) fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, C
         .get("platform_metadata")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
         .filter(|metadata: &hybridcipher_client::PlatformFileMetadata| !metadata.is_empty());
-    let sparse_metadata = json
-        .get("sparse_metadata")
-        .and_then(|value| serde_json::from_value::<SparseFileMetadata>(value.clone()).ok())
-        .filter(SparseFileMetadata::is_effectively_sparse);
+    let sparse_metadata = match json.get("sparse_metadata") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<SparseFileMetadata>(value.clone())
+                .map_err(|_| CliError::format("Invalid sparse_metadata"))?,
+        ),
+    };
+
+    let packed_size = match sparse_metadata.as_ref() {
+        Some(layout) => layout
+            .validated_packed_size(content_size)
+            .ok_or_else(|| CliError::format("Invalid sparse extent layout"))?,
+        None => content_size,
+    };
+    let mut ciphertext = Vec::new();
+    if let Some(chunk_size) = content_chunk_size {
+        if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE as u64 {
+            return Err(CliError::format("chunk_size must be between 1 and 64 MiB"));
+        }
+        let expected = chunked_encrypted_size(packed_size, chunk_size as usize)
+            .map_err(|e| CliError::format(e.to_string()))?;
+        if encrypted_size != expected {
+            return Err(CliError::format("Ciphertext size mismatch"));
+        }
+    } else {
+        if encrypted_size < 12 + 16 {
+            return Err(CliError::format("Single-record ciphertext is too short"));
+        }
+        if json
+            .get("file_size")
+            .and_then(|value| value.as_u64())
+            .is_some()
+            || json
+                .get("original_size")
+                .and_then(|value| value.as_u64())
+                .is_some()
+        {
+            let expected = packed_size
+                .checked_add(12 + 16)
+                .ok_or_else(|| CliError::format("Single-record ciphertext size overflow"))?;
+            if encrypted_size != expected {
+                return Err(CliError::format("Ciphertext size mismatch"));
+            }
+        }
+        if !allow_large_single_record
+            && (content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
+                || encrypted_size > MAX_IN_MEMORY_PLAINTEXT_BYTES + 12 + 16)
+        {
+            return Err(CliError::format(
+                "Single-record plaintext exceeds the 256 MiB in-memory limit",
+            ));
+        }
+        let reserve = usize::try_from(encrypted_size)
+            .map_err(|_| CliError::format("Ciphertext is too large for this process"))?;
+        ciphertext
+            .try_reserve_exact(reserve)
+            .map_err(|_| CliError::storage("Unable to reserve ciphertext memory"))?;
+        ciphertext.resize(reserve, 0);
+        reader
+            .read_exact(&mut ciphertext)
+            .map_err(|e| CliError::storage(format!("Failed to read ciphertext: {e}")))?;
+        let mut extra = [0u8; 1];
+        if reader
+            .read(&mut extra)
+            .map_err(|e| CliError::storage(e.to_string()))?
+            != 0
+        {
+            return Err(CliError::format("Ciphertext length changed while reading"));
+        }
+    }
 
     let metadata = EncryptedFileMetadata {
         file_id,
@@ -273,7 +380,7 @@ pub(crate) fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, C
         content_nonce,
         content_chunk_size,
         content_size,
-        encrypted_size: ciphertext.len() as u64,
+        encrypted_size,
         created_at,
         platform_metadata,
         sparse_metadata,
@@ -316,11 +423,6 @@ pub(crate) async fn decrypt_parsed_file_to_path(
         hybridcipher_client::file::safe_restore::validate_name(name)
             .map_err(|e| CliError::decryption(e.to_string()))?;
     }
-    let decrypted_data = client
-        .decrypt_file(&parsed.metadata)
-        .await
-        .map_err(|e| CliError::decryption(map_missing_welcome_error(e.to_string())))?;
-
     let output_path =
         output_override.unwrap_or_else(|| default_decrypted_path(source_path, &parsed));
 
@@ -328,15 +430,41 @@ pub(crate) async fn decrypt_parsed_file_to_path(
         ensure_directory(parent)?;
     }
 
-    hybridcipher_client::file::safe_restore::write_new(&output_path, &decrypted_data).map_err(
-        |e| {
-            CliError::storage(format!(
-                "Failed to write decrypted file {}: {}",
-                output_path.display(),
-                e
-            ))
-        },
-    )?;
+    let streaming = parsed.metadata.header_version.unwrap_or(1) >= 2
+        && parsed.metadata.content_chunk_size.is_some();
+    if streaming {
+        // The decoder authenticates every chunk and publishes inside this private
+        // directory only after the complete manifest and layout have been checked.
+        let private_dir = tempfile::Builder::new()
+            .prefix("hybridcipher-restore-")
+            .tempdir()
+            .map_err(|e| CliError::storage(format!("Failed to create private restore: {e}")))?;
+        let private_output = private_dir.path().join("authenticated.plain");
+        client
+            .decrypt_file_streaming_to_path(source_path, &parsed.metadata, &private_output)
+            .await
+            .map_err(|e| CliError::decryption(map_missing_welcome_error(e.to_string())))?;
+        hybridcipher_client::file::safe_restore::publish_new(&output_path, &private_output)
+            .map_err(|e| {
+                CliError::storage(format!(
+                    "Failed to publish authenticated file {}: {e}",
+                    output_path.display()
+                ))
+            })?;
+    } else {
+        let decrypted_data = client
+            .decrypt_file(&parsed.metadata)
+            .await
+            .map_err(|e| CliError::decryption(map_missing_welcome_error(e.to_string())))?;
+        hybridcipher_client::file::safe_restore::write_new(&output_path, &decrypted_data).map_err(
+            |e| {
+                CliError::storage(format!(
+                    "Failed to write decrypted file {}: {e}",
+                    output_path.display()
+                ))
+            },
+        )?;
+    }
 
     preserve_file_mtime(source_path, &output_path)?;
 
@@ -401,7 +529,7 @@ pub(crate) fn ensure_hidden_subdir(parts: &[&str]) -> Result<PathBuf, CliError> 
     let home = dirs::home_dir().ok_or_else(|| {
         CliError::storage("Unable to determine home directory for HybridCipher backups".to_string())
     })?;
-    let mut path = home.join(".hybridcipher");
+    let mut path = home.join(hybridcipher_client::config_loader::account_data_location());
     ensure_directory(&path)?;
     for part in parts {
         path = path.join(part);
@@ -733,7 +861,7 @@ pub(crate) fn default_safe_decrypt_dir_root(dir_path: &Path) -> Result<PathBuf, 
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Write;
+    use std::io::{Seek, Write};
     use tempfile::NamedTempFile;
     use uuid::Uuid;
 
@@ -767,5 +895,53 @@ mod tests {
         writeln!(temp, "not metadata").expect("write");
         let result = detect_existing_encryption_metadata(temp.path()).expect("metadata");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn restore_parser_bounds_header_chunks_ciphertext_and_sparse_layout() {
+        let mut temp = NamedTempFile::new().unwrap();
+        let base = json!({"file_id":"test", "epoch_id":1, "file_path":"safe.txt", "file_size":4, "chunk_size":4});
+        let write_fixture = |temp: &mut NamedTempFile, header: Value, payload: &[u8]| {
+            temp.as_file_mut().set_len(0).unwrap();
+            temp.as_file_mut().rewind().unwrap();
+            temp.write_all(header.to_string().as_bytes()).unwrap();
+            temp.write_all(ENCRYPTED_FILE_SEPARATOR.as_bytes()).unwrap();
+            temp.write_all(payload).unwrap();
+            temp.flush().unwrap();
+        };
+
+        write_fixture(&mut temp, base.clone(), &[0; 20]);
+        let parsed = parse_encrypted_file(temp.path()).unwrap();
+        assert_eq!(parsed.metadata.encrypted_size, 20);
+        assert!(
+            parsed.metadata.encrypted_content.is_empty(),
+            "chunked restore must stream"
+        );
+
+        let mut bad = base.clone();
+        bad["chunk_size"] = json!(MAX_CONTENT_CHUNK_SIZE as u64 + 1);
+        write_fixture(&mut temp, bad, &[0; 20]);
+        assert!(parse_encrypted_file(temp.path()).is_err());
+
+        write_fixture(&mut temp, base.clone(), &[0; 19]);
+        assert!(parse_encrypted_file(temp.path()).is_err());
+
+        let mut bad = base;
+        bad["sparse_metadata"] =
+            json!({"logical_size":4,"extents":[{"offset":u64::MAX,"length":4}]});
+        write_fixture(&mut temp, bad, &[0; 20]);
+        assert!(parse_encrypted_file(temp.path()).is_err());
+
+        temp.as_file_mut().set_len(0).unwrap();
+        temp.as_file_mut().rewind().unwrap();
+        temp.write_all(&vec![
+            b' ';
+            hybridcipher_client::file::encrypt::MAX_ENCRYPTED_HEADER_BYTES
+                + 1
+        ])
+        .unwrap();
+        temp.write_all(ENCRYPTED_FILE_SEPARATOR.as_bytes()).unwrap();
+        temp.flush().unwrap();
+        assert!(parse_encrypted_file(temp.path()).is_err());
     }
 }

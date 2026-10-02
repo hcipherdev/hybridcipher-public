@@ -1,6 +1,31 @@
 {
   "releases": [
     {
+      "version": "0.1.7",
+      "published_at": "2026-10-03",
+      "highlights": [
+        "Fixed the \"Legal documents unavailable\" startup error affecting the macOS 0.1.6 release. The bundled Terms of Service and Privacy Notice now load from the correct location, so affected users can accept them and continue into the app.",
+        "Team workspaces are now available in the macOS desktop app with activation-code setup, workspace switching, member and invitation management, and clearer access status.",
+        "Removing a protected folder now lets you choose to keep its files encrypted or decrypt them, with a warning before plaintext could reach cloud storage."
+      ],
+      "important_changes": [
+        "Protected folders show an Unmounting indicator in the sidebar and folder details while the safety check and shutdown run, and prevent repeated unmount requests.",
+        "Devices → This device now offers Show fingerprint and Copy. Device verification explains where to find the fingerprint and accepts it with or without spaces.",
+        "Team write access is checked before macOS File Provider mutations. When Team access expires or is unavailable, protected edits are blocked and pending edits are preserved for recovery.",
+        "Team administration requests can be queued offline and retried after reconnecting, with clearer workspace, member, and invitation controls.",
+        "macOS releases now bundle the macOS release-note catalog separately from Windows, and release packaging uses an explicit destination for the legal documents."
+      ],
+      "fixes": [
+        "Resolved the legal-document packaging path mismatch that could block first launch in macOS 0.1.6 even though the documents were included in the installed app.",
+        "Home now waits for session recovery before making authenticated requests, refreshes after successful background renewal, and retries unknown device or MFA status after a silent session refresh.",
+        "Logout, quit, and update flows require a safe protected-folder shutdown before proceeding, helping preserve pending work.",
+        "Temporary login keeps session keys in memory without creating an automatic-unlock cache.",
+        "The Settings window closes after a successful logout or session-expiry transition.",
+        "Older-file notices disappear when no older files remain; remaining format limitations and encrypted-original locations are available under Details.",
+        "Folders removed from Personal protection can be enrolled again into a Team workspace while preserving their history, and ownership failures are displayed correctly."
+      ]
+    },
+    {
       "version": "0.1.6",
       "published_at": "2026-09-15",
       "highlights": [

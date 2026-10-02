@@ -1076,6 +1076,52 @@ impl Storage for LocalFsStorage {
         self.write_config_file(key, value).await
     }
 
+    async fn create_protected_config_if_absent(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<bool, StorageError> {
+        use tokio::io::AsyncWriteExt;
+
+        if Self::is_global_config_key(key) || key.contains('/') || key.contains('\\') {
+            return Err(StorageError::Encryption(
+                "Invalid protected configuration key".into(),
+            ));
+        }
+        let account_key = self.encryption_key().ok_or_else(|| {
+            StorageError::Encryption("Account must be unlocked before saving group setup".into())
+        })?;
+        let protected = encrypt_with_ad(value.as_bytes(), *account_key, &Self::aad_for_config(key))
+            .map_err(|err| StorageError::Encryption(err.to_string()))?;
+        let bytes = serde_json::to_vec(&protected)
+            .map_err(|err| StorageError::Serialization(err.to_string()))?;
+        let path = self.config_file(key);
+        fs::create_dir_all(&self.base_path).await?;
+        let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        // Publishing a complete file with a hard link is atomic and cannot replace
+        // another process's winning setup record, unlike a rename on Unix.
+        let published = fs::hard_link(&temporary, &path).await;
+        let _ = fs::remove_file(&temporary).await;
+        match published {
+            Ok(()) => {
+                #[cfg(unix)]
+                fs::File::open(&self.base_path).await?.sync_all().await?;
+                self.inner.store_config(key, value).await?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(false),
+            Err(err) => Err(StorageError::Io(err)),
+        }
+    }
+
     async fn delete_config(&self, key: &str) -> Result<(), StorageError> {
         self.inner.delete_config(key).await?;
         let file_path = self.config_file(key);

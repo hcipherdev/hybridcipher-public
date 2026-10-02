@@ -1,3 +1,4 @@
+// Tests trusted Windows executable quoting and removal of generated PTY workflows.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -20,24 +21,13 @@ test('generated Windows commands use the trusted absolute executable', () => {
     assert.equal(app.resolveCliCommand('hybridcipher status', '\\\\?\\UNC\\server\\share\\hybridcipher.exe'), '"\\\\server\\share\\hybridcipher.exe" status');
 });
 
-test('settings and dashboard commands are resolved before sending to the PTY', async () => {
-    const begin = source.indexOf('    async executeCommandDirectly(');
-    const finish = source.indexOf('    async getCliBinaryPath()', begin);
-    const sent = [];
-    const terminalApp = new (Function('invoke', `return class { ${source.slice(begin, finish)} ${source.slice(start, end)} }`)(async (name, args) => sent.push({ name, ...args })))();
-    Object.assign(terminalApp, {
-        platformInfo: { os_type: 'windows' }, activeWorkspaceView: 'terminal',
-        handleRestrictedIndividualCliCommand: async () => false,
-        getTerminalCwd: () => 'C:\\Untrusted', updateTerminalCwdDisplay() {},
-        shouldPreflightSessionForCommand: () => false, updateActiveTabTitle() {},
-        getActiveTab: () => ({ id: 'fixture', sessionId: 'fixture' }),
-        isWelcomeTab: () => false,
-        getCliBinaryPath: async () => 'C:\\Trusted\\hybridcipher.exe',
-    });
-    await terminalApp.executeCommandDirectly('hybridcipher status');
-    assert.deepEqual(sent, [{ name: 'write_terminal_stdin', sessionId: 'fixture', data: '"C:\\Trusted\\hybridcipher.exe" status\r' }]);
+test('normal workflows have no generated PTY execution helper', () => {
+    assert.ok(!source.includes('async executeCommandDirectly('));
+    const dialogs = fs.readFileSync(new URL('../src/app-team-methods.js', import.meta.url), 'utf8');
+    assert.ok(dialogs.includes("'start_desktop_operation'"));
+    assert.ok(!dialogs.includes('write_terminal_stdin'));
+    assert.ok(!dialogs.includes('run_shell_command'));
 });
-
 test('CMD ignores a planted current-directory CLI for app-generated commands', { skip: process.platform !== 'win32' }, () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-cli-resolution-'));
     const planted = path.join(cwd, 'hybridcipher.cmd');

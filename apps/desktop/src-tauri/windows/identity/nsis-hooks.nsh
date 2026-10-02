@@ -13,7 +13,7 @@
   Pop $0
   Pop $1
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP|MB_OK "Windows package identity registration failed. Repair the certificate/package configuration and run setup again.$\r$\n$1"
+    MessageBox MB_ICONSTOP|MB_OK "Windows package identity registration failed. Details:$\r$\n$1"
     Abort
   ${EndIf}
 !macroend

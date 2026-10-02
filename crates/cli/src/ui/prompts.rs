@@ -4,6 +4,9 @@ use dialoguer::{Confirm, Input, Password};
 
 /// Prompt for user confirmation with yes/no
 pub fn confirm(message: &str) -> Result<bool, CliError> {
+    if super::desktop::enabled() {
+        return super::desktop::confirmation(message, false);
+    }
     Confirm::new()
         .with_prompt(message)
         .default(false)
@@ -13,6 +16,9 @@ pub fn confirm(message: &str) -> Result<bool, CliError> {
 
 /// Prompt for user confirmation with custom default
 pub fn confirm_with_default(message: &str, default: bool) -> Result<bool, CliError> {
+    if super::desktop::enabled() {
+        return super::desktop::confirmation(message, default);
+    }
     Confirm::new()
         .with_prompt(message)
         .default(default)
@@ -22,6 +28,20 @@ pub fn confirm_with_default(message: &str, default: bool) -> Result<bool, CliErr
 
 /// Prompt for text input
 pub fn input(message: &str) -> Result<String, CliError> {
+    if super::desktop::enabled() {
+        let lower = message.to_ascii_lowercase();
+        return super::desktop::request(
+            if lower.contains("recovery code") {
+                "password"
+            } else if lower.contains("path") && lower.contains("file") {
+                "file"
+            } else {
+                "text"
+            },
+            message,
+            None,
+        );
+    }
     Input::new()
         .with_prompt(message)
         .interact_text()
@@ -30,6 +50,9 @@ pub fn input(message: &str) -> Result<String, CliError> {
 
 /// Prompt for text input with default value
 pub fn input_with_default(message: &str, default: &str) -> Result<String, CliError> {
+    if super::desktop::enabled() {
+        return super::desktop::request("text", message, Some(default));
+    }
     Input::new()
         .with_prompt(message)
         .default(default.to_string())
@@ -39,6 +62,9 @@ pub fn input_with_default(message: &str, default: &str) -> Result<String, CliErr
 
 /// Prompt for optional text input (allows empty to be submitted)
 pub fn input_allow_empty(message: &str) -> Result<String, CliError> {
+    if super::desktop::enabled() {
+        return super::desktop::request("text", message, Some(""));
+    }
     Input::new()
         .with_prompt(message)
         .allow_empty(true)
@@ -48,6 +74,9 @@ pub fn input_allow_empty(message: &str) -> Result<String, CliError> {
 
 /// Prompt for password input
 pub fn password(message: &str) -> Result<String, CliError> {
+    if super::desktop::enabled() {
+        return super::desktop::request("password", message, None);
+    }
     Password::new()
         .with_prompt(message)
         .interact()
@@ -56,6 +85,18 @@ pub fn password(message: &str) -> Result<String, CliError> {
 
 /// Prompt for password input with confirmation
 pub fn password_with_confirmation(message: &str) -> Result<String, CliError> {
+    if super::desktop::enabled() {
+        let password = zeroize::Zeroizing::new(super::desktop::request("password", message, None)?);
+        let confirmation = zeroize::Zeroizing::new(super::desktop::request(
+            "password",
+            "Confirm password",
+            None,
+        )?);
+        if *password != *confirmation {
+            return Err(CliError::invalid_input("Passwords do not match"));
+        }
+        return Ok(password.to_string());
+    }
     Password::new()
         .with_prompt(message)
         .with_confirmation("Confirm password", "Passwords do not match")
@@ -69,6 +110,15 @@ pub fn destructive_operation_warning(
     consequences: &[&str],
     confirmation_text: &str,
 ) -> Result<bool, CliError> {
+    if super::desktop::enabled() {
+        let message = format!(
+            "{}: {}. Type '{}' to confirm.",
+            operation,
+            consequences.join("; "),
+            confirmation_text
+        );
+        return Ok(super::desktop::request("text", &message, None)? == confirmation_text);
+    }
     println!();
     println!(
         "{}",

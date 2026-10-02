@@ -140,6 +140,7 @@ async fn read_attachment(path: &str) -> Result<FeedbackAttachment, String> {
 /// * `attachment_paths` - Paths to files to attach (will be read and base64 encoded)
 #[tauri::command]
 pub async fn submit_feedback(
+    app_handle: tauri::AppHandle,
     title: String,
     description: String,
     user_email: Option<String>,
@@ -176,7 +177,7 @@ pub async fn submit_feedback(
         description,
         user_email,
         attachments,
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        app_version: app_handle.package_info().version.to_string(),
         platform: std::env::consts::OS.to_string(),
     };
 

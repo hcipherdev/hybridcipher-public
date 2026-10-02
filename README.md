@@ -13,6 +13,20 @@ HybridCipher runs on macOS and Windows. On Windows the desktop app integrates
 with Windows Cloud Files so that encrypted vaults appear as native Explorer
 folders with on-demand hydration.
 
+## Platform app versions
+
+Edit the app version only in `apps/desktop/src-tauri/tauri.windows.conf.json`
+for Windows or `apps/desktop/src-tauri/tauri.macos.conf.json` for macOS.
+Their release versions advance independently. Build scripts, public verifiers,
+installer metadata, and the running app use the corresponding platform config.
+
+The shared desktop `Cargo.toml` and `Cargo.lock` contain crate metadata, not
+the Windows or macOS app release version. Builds do not synchronize these
+versions or rewrite the shared `tauri.conf.json`. Missing or invalid platform
+versions stop the build. `VERSION_OVERRIDE` may only forward the same macOS
+version; conflicting overrides are rejected. Store and sparse MSIX identity
+revisions remain separate from the Windows app version.
+
 ## Why HybridCipher Exists
 
 Most file-sharing systems make the cloud service part of the trust boundary.
@@ -105,10 +119,14 @@ client engine.
 Included here:
 
 - `apps/desktop/` for the Tauri desktop app, frontend assets, legal notices,
-  release metadata, icons, and the optional feedback API helper
+  release metadata and icons
 - the Rust crates needed to build the desktop app and bundled CLI from source,
   including the Windows Cloud Files provider
 - macOS public rebuild tooling: `scripts/macos/public_desktop_verify.sh`
+- shared macOS build and File Provider validation tooling:
+  `scripts/macos/desktop_release_pkg.sh`, also used by the macOS release workflow
+- platform version readers: `scripts/macos/app_version.sh` and
+  `scripts/winos/app-version.ps1`
 - Windows public rebuild tooling: `scripts/winos/public_desktop_verify.ps1`
 - [docs/desktop/OPEN_SOURCE_VERIFY.md](docs/desktop/OPEN_SOURCE_VERIFY.md) for
   the public verification model and hash-comparison rules
@@ -210,7 +228,7 @@ Published Windows verification values for the current source snapshot:
 <!-- BEGIN GENERATED WINDOWS VERIFY HASHES -->
 | Source ref | Target | Artifact | SHA-256 |
 | --- | --- | --- | --- |
-| `3d0792770ba57c7daac662f3c8a8520639c47825` | `x86_64-pc-windows-msvc` | `HybridCipher_0.1.6_x64-setup.exe` | `323cc54a613ed1b9554b7218cd697d9cbbd3822fd510d6d8e57880499d5628e3` |
+| `b2d1ca7ba9d1181e24bac1b6a5f86aaaeede8577` | `x86_64-pc-windows-msvc` | `HybridCipher_0.1.1_x64-setup.exe` | `2fe3ed240251b89cc95e4bc9dcf52cccc3692a78eb262e76ebccfcb815c91eac` |
 <!-- END GENERATED WINDOWS VERIFY HASHES -->
 
 Read [docs/desktop/OPEN_SOURCE_VERIFY.md](docs/desktop/OPEN_SOURCE_VERIFY.md)
@@ -232,8 +250,10 @@ npm install
 npx tauri build --target aarch64-apple-darwin
 ```
 
-That manual flow stages the CLI into the app resources before packaging, which
-matches the way `scripts/macos/public_desktop_verify.sh` prepares the bundle.
+That manual flow builds the Tauri app and stages its CLI resource. Use
+`scripts/macos/public_desktop_verify.sh` to also build and stage the native File
+Provider runtime, validate the assembled bundle, and produce canonical archives
+and hashes. The verifier shares those routines with `desktop_release_pkg.sh`.
 
 ### Manual Windows desktop build
 
@@ -313,3 +333,15 @@ The verification model, artifact names, and hash-comparison guidance live in
 If you want to help improve the public client surface, start with
 [CONTRIBUTING.md](CONTRIBUTING.md). That guide points to the desktop, CLI, and
 shared client layers that are present in this repository.
+
+## Public export safeguards
+
+The public desktop export excludes the feedback API and the shared source catalog
+`apps/desktop/release-notes/releases.json`. Windows and macOS keep their own
+release-note catalogs; signed bundles may still name the selected catalog
+`release-notes/releases.json` inside the installed application.
+
+Both exporters exclude credential files, environment files, logs, and generated
+directories at any depth. They validate a temporary export before replacing the
+destination. Recognizable credentials or symlinks stop the export; diagnostics
+show file paths, line numbers, and rule names without printing secret values.

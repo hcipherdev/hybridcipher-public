@@ -68,14 +68,19 @@ use tokio::{
     time::{sleep, Duration},
 };
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 mod file_ops;
 mod groups;
+mod license;
+mod operations;
 mod rekey;
 mod settings;
 
 pub use file_ops::*;
 pub use groups::*;
+pub use license::*;
+pub use operations::*;
 pub use rekey::*;
 pub use settings::*;
 
@@ -161,11 +166,19 @@ pub async fn check_email_confirmation(
     password: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<EmailConfirmationStatus>, String> {
-    match state
+    let password = Zeroizing::new(password);
+    let _login_guard = LOGIN_OPERATION_LOCK.lock().await;
+    if state.session.lock().await.is_some() {
+        return Ok(CommandResponse::err(
+            "Log out of the current desktop session before checking another login.",
+        ));
+    }
+    let login_result = state
         .client
-        .login(email.clone(), password, None, None)
-        .await
-    {
+        .login(email.clone(), &password, None, None)
+        .await;
+    state.client.clear_auth_cache();
+    match login_result {
         Ok(_) => Ok(CommandResponse::ok(EmailConfirmationStatus {
             confirmed: true,
             message: None,
@@ -475,12 +488,21 @@ pub async fn login_user(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<crate::client::LoginResult>, String> {
     tracing::info!("Login command called for email: {}", email);
+    let password = Zeroizing::new(password);
+    let _login_guard = LOGIN_OPERATION_LOCK.lock().await;
 
     let remember_me = persist_session.unwrap_or_else(default_remember_me);
+    // The shared client changes its auth scope and keys during login. Keep an
+    // existing desktop session untouched until it has been safely logged out.
+    if state.session.lock().await.is_some() {
+        return Ok(CommandResponse::err(
+            "Log out of the current desktop session before signing in again.",
+        ));
+    }
 
     match state
         .client
-        .login(email.clone(), password.clone(), mfa_code, backup_code)
+        .login(email.clone(), &password, mfa_code, backup_code)
         .await
     {
         Ok(result) => {
@@ -490,24 +512,27 @@ pub async fn login_user(
                 device_id: result.device_id.clone(),
                 token: result.token.clone(),
                 refresh_token: result.refresh_token.clone().unwrap_or_default(),
+                team_entitlement: None,
+                team_revoked: false,
+                pending_team_requests: Vec::new(),
                 expires_at: chrono::Utc::now().timestamp() + result.expires_in,
                 user_id: result.user_id.clone(),
                 server_url: Some(state.client.server_url().to_string()),
                 opaque_export_key: result.opaque_export_key.clone(),
+                persistent: remember_me,
             };
 
-            // Save session with password-based encryption (derives and caches account key)
-            // This allows desktop to login independently from CLI while sharing the same storage
             let save_result = if remember_me {
                 state.save_session_with_password(session, &password).await
             } else {
-                // Even for non-persistent sessions, we need the account key for encryption
-                // So still use password-based initialization but don't persist session
-                state.save_session_with_password(session, &password).await
+                state.save_temporary_session(session).await
             };
 
             if let Err(e) = save_result {
                 tracing::error!("Failed to save session: {}", e);
+                state.client.clear_auth_cache();
+                state.local_client.clear().await;
+                state.mount_manager.clear_manifest_scope().await;
                 return Ok(CommandResponse::err(format!(
                     "Login succeeded but session could not be initialized: {}",
                     e
@@ -534,7 +559,10 @@ pub async fn login_user(
 
             Ok(CommandResponse::ok(login_result))
         }
-        Err(e) => Ok(CommandResponse::err_with_code(e.code, e.message)),
+        Err(e) => {
+            state.client.clear_auth_cache();
+            Ok(CommandResponse::err_with_code(e.code, e.message))
+        }
     }
 }
 
@@ -662,10 +690,12 @@ fn select_primary_group_id(groups: &GroupListResponse) -> Option<Uuid> {
 }
 
 fn is_active_group_context_error(message: &str) -> bool {
-    message.contains("switch-group")
-        || message.contains("without an active group")
-        || message.contains("No active group selected")
+    message.contains("without an active group") || message.contains("No active group selected")
 }
+
+#[cfg(test)]
+#[path = "../tests/coverage/test_folder_errors.rs"]
+mod folder_error_tests;
 
 fn desktop_safe_client_error(error: impl ToString) -> String {
     let message = error.to_string();
@@ -1336,6 +1366,8 @@ pub struct SessionInfo {
     pub expires_at: Option<i64>,
     #[serde(default)]
     pub refreshed: bool,
+    #[serde(default)]
+    pub persistent: bool,
     pub error: Option<String>,
 }
 
@@ -1344,6 +1376,12 @@ struct RefreshTokenRequestBody {
     refresh_token: String,
     device_id: String,
     user_id: Uuid,
+}
+
+impl Drop for RefreshTokenRequestBody {
+    fn drop(&mut self) {
+        self.refresh_token.zeroize();
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1419,6 +1457,29 @@ async fn ensure_session_ready_internal(
     ensure_session_ready_impl(state, false).await
 }
 
+async fn clear_expired_session_safely(
+    state: &AppState,
+) -> Result<Option<crate::state::UserSession>, String> {
+    operations::cancel_all_desktop_operations(state).await;
+    let _exclusive = UPDATE_OPERATION_GATE.write().await;
+    // Another request may have refreshed the session while we waited for the
+    // exclusive gate. Do not discard its replacement token.
+    let current = state.session.lock().await.clone();
+    if current
+        .as_ref()
+        .is_some_and(|session| session.expires_at > chrono::Utc::now().timestamp())
+    {
+        return Ok(current);
+    }
+    stop_all_mounts_safely(state, false).await.map_err(|err| {
+        format!(
+            "Expired session remains available because mounted work could not stop safely: {err}"
+        )
+    })?;
+    state.clear_session().await?;
+    Ok(None)
+}
+
 async fn ensure_session_ready_impl(
     state: &AppState,
     force_refresh: bool,
@@ -1471,16 +1532,25 @@ async fn ensure_session_ready_impl(
                     "Session refresh failed but current token is still valid: {}",
                     last_err
                 );
+            } else if state.has_cached_team_data_access(&session) {
+                tracing::info!("Using locally cached Team data while authentication is offline");
+                return Ok(Some((session, false)));
             } else {
-                state.clear_session().await?;
-                return Err(last_err);
+                return clear_expired_session_safely(state)
+                    .await
+                    .map(|session| session.map(|session| (session, false)))
+                    .map_err(|err| format!("{last_err} {err}"));
             }
         }
     }
 
     if chrono::Utc::now().timestamp() >= session.expires_at {
-        state.clear_session().await?;
-        return Ok(None);
+        if state.has_cached_team_data_access(&session) {
+            return Ok(Some((session, false)));
+        }
+        return clear_expired_session_safely(state)
+            .await
+            .map(|session| session.map(|session| (session, false)));
     }
 
     Ok(Some((session, refreshed)))
@@ -1493,11 +1563,16 @@ pub async fn get_session_info(
 ) -> Result<SessionInfo, String> {
     match ensure_session_ready_impl(&state, force_refresh.unwrap_or(false)).await {
         Ok(Some((session, refreshed))) => Ok(SessionInfo {
-            status: "active".to_string(),
-            email: Some(session.email),
-            device_id: Some(session.device_id),
+            status: if session.expires_at <= chrono::Utc::now().timestamp() {
+                "offline".to_string()
+            } else {
+                "active".to_string()
+            },
+            email: Some(session.email.clone()),
+            device_id: Some(session.device_id.clone()),
             expires_at: Some(session.expires_at),
             refreshed,
+            persistent: session.persistent,
             error: None,
         }),
         Ok(None) => Ok(SessionInfo {
@@ -1506,6 +1581,7 @@ pub async fn get_session_info(
             device_id: None,
             expires_at: None,
             refreshed: false,
+            persistent: false,
             error: None,
         }),
         Err(err) => Ok(SessionInfo {
@@ -1514,6 +1590,7 @@ pub async fn get_session_info(
             device_id: None,
             expires_at: None,
             refreshed: false,
+            persistent: false,
             error: Some(err),
         }),
     }
@@ -1522,17 +1599,12 @@ pub async fn get_session_info(
 #[tauri::command]
 pub async fn logout_user(state: State<'_, AppState>) -> Result<CommandResponse<bool>, String> {
     tracing::info!("Logout command called");
-
-    if let Err(err) = stop_all_desktop_cloud_roots(&state, false).await {
+    operations::cancel_all_desktop_operations(&state).await;
+    let _exclusive = UPDATE_OPERATION_GATE.write().await;
+    if let Err(err) = stop_all_mounts_safely(&state, false).await {
         return Ok(CommandResponse::err(format!(
-            "Failed to dehydrate Cloud Files mounts during logout: {}",
-            err
+            "Logout was cancelled because protected folders could not stop safely: {err}"
         )));
-    }
-
-    // Unmount all folders before logout
-    if let Err(err) = state.mount_manager.unmount_all(false).await {
-        tracing::warn!("Failed to unmount folders during logout: {}", err);
     }
 
     // Clear session from memory, disk, and local caches
@@ -2143,7 +2215,7 @@ pub async fn get_pending_devices(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<PendingDeviceSummary>>, String> {
     let _operation_guard = ensure_authenticated(&state).await?;
-    let session = require_authenticated_session(&state).await?;
+    let session = current_authenticated_session(&state).await?;
     let summaries = fetch_pending_device_records_internal(&state, &session)
         .await?
         .into_iter()
@@ -2162,7 +2234,7 @@ pub async fn get_stale_devices(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<StaleDeviceSummary>>, String> {
     let _operation_guard = ensure_authenticated(&state).await?;
-    let session = require_authenticated_session(&state).await?;
+    let session = current_authenticated_session(&state).await?;
     let server_url = current_server_url(&state, &session);
     let api_base = api_base_url(&server_url);
     let Some(group_id) = active_group_id_for_session(&state).await else {
@@ -2197,7 +2269,7 @@ pub async fn get_unverified_devices(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<UnverifiedDeviceSummary>>, String> {
     let _operation_guard = ensure_authenticated(&state).await?;
-    let session = require_authenticated_session(&state).await?;
+    let session = current_authenticated_session(&state).await?;
     let server_url = current_server_url(&state, &session);
     let api_base = api_base_url(&server_url);
     let Some(group_id) = active_group_id_for_session(&state).await else {
@@ -2472,6 +2544,20 @@ async fn require_authenticated_session(
         .ok_or_else(|| "No active session found".to_string())
 }
 
+// Use after ensure_authenticated has acquired the operation read gate. A
+// second refresh here could need the exclusive gate to retire an expired
+// session and would deadlock behind our own read guard.
+async fn current_authenticated_session(
+    state: &AppState,
+) -> Result<crate::state::UserSession, String> {
+    let session = state.session.lock().await;
+    session
+        .as_ref()
+        .filter(|session| session.expires_at > chrono::Utc::now().timestamp())
+        .cloned()
+        .ok_or_else(|| "No active session found".to_string())
+}
+
 fn load_current_device_snapshot(
     session: &crate::state::UserSession,
     server_url: &str,
@@ -2504,7 +2590,12 @@ fn load_current_device_snapshot(
 
 async fn active_group_id_for_session(state: &AppState) -> Option<Uuid> {
     match state.local_client.client_opt().await {
-        Some(client) => client.active_group_id_opt().await,
+        Some(client) => {
+            if let Ok(Some(group)) = client.load_local_config("desktop_ui_group_id").await {
+                return Uuid::parse_str(&group).ok();
+            }
+            client.active_group_id_opt().await
+        },
         None => None,
     }
 }
@@ -3689,9 +3780,20 @@ mod tests {
     };
     use hybridcipher_client::state::client::{CoverageFileRecord, CoverageScanSummary};
 
+    #[test]
+    fn failed_cli_fallback_keeps_desktop_mount_reason() {
+        let message = mount_fallback_error(
+            Some("Store package identity was rejected"),
+            "root source path differs".to_string(),
+        );
+        assert!(message.contains("Store package identity was rejected"));
+        assert!(message.contains("root source path differs"));
+    }
+
     fn test_group(id: Uuid, current_epoch: Option<&str>, user_role: GroupRole) -> HttpGroupInfo {
         HttpGroupInfo {
             id,
+            organization_id: None,
             name: format!("Group {}", &id.to_string()[..8]),
             description: None,
             creator_id: Uuid::parse_str("99999999-9999-9999-9999-999999999999").unwrap(),
@@ -4593,6 +4695,95 @@ pub async fn run_shell_command(
     }
 }
 
+/// Run a desktop-owned CLI action without involving the user's shell. Each
+/// argument reaches the bundled executable as one argument, including Windows
+/// paths containing percent signs or trailing backslashes.
+#[tauri::command]
+pub async fn run_bundled_cli(
+    args: Vec<String>,
+    input: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<TerminalResult>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    let group = active_group_id_for_session(&state).await;
+    operations::validate_cli_args(&args, group)?;
+    if !operations::background_cli_args_allowed(&args) || input.is_some() {
+        return Ok(CommandResponse::err("Use the desktop operation dialog for actions that change data or need input"));
+    }
+    if args.is_empty() || args[0].is_empty() {
+        return Ok(CommandResponse::err("No CLI action provided"));
+    }
+
+    let persistent = state
+        .session
+        .lock()
+        .await
+        .as_ref()
+        .map(|session| session.persistent)
+        .unwrap_or(false);
+    if !persistent {
+        return Ok(CommandResponse::err_with_code(
+            "TEMPORARY_SESSION_CLI_UNAVAILABLE",
+            "This CLI-only action needs a saved login. Sign in again with Remember me, or use the desktop action for this task.",
+        ));
+    }
+
+    #[cfg(feature = "individual-edition")]
+    if let Some(command_name) = restricted_individual_args_name(&args) {
+        return Ok(CommandResponse::err_with_code(
+            "INDIVIDUAL_EDITION_RESTRICTED",
+            individual_command_restriction_message(command_name),
+        ));
+    }
+
+    let (cli_binary, _) = match crate::cli_utils::locate_cli_binary() {
+        Ok(found) => found,
+        Err(error) => return Ok(CommandResponse::err(error)),
+    };
+    let mut cmd = StdCommand::new(cli_binary);
+    cmd.args(&args);
+    cmd.env("HYBRIDCIPHER_DESKTOP_OPERATION", "1")
+        .env("HYBRIDCIPHER_DESKTOP_ACCOUNT", &session.user_id)
+        .env("HYBRIDCIPHER_DESKTOP_SERVER", current_server_url(&state, &session));
+    if let Some(group) = group { cmd.env("HYBRIDCIPHER_DESKTOP_GROUP", group.to_string()); }
+    configure_background_std_command(&mut cmd);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            if let Some(input_data) = input {
+                if let Some(mut stdin) = child.stdin.take() {
+                    if let Err(error) = stdin.write_all(input_data.as_bytes()) {
+                        return Ok(CommandResponse::err(format!(
+                            "Failed to write CLI input: {error}"
+                        )));
+                    }
+                }
+            } else {
+                drop(child.stdin.take());
+            }
+            match collect_child_output_limited(
+                child,
+                MAX_COMMAND_OUTPUT_BYTES,
+                COMMAND_OUTPUT_TAIL_BYTES,
+            ) {
+                Ok((status, stdout, stderr)) => Ok(CommandResponse::ok(TerminalResult {
+                    stdout,
+                    stderr,
+                    status: status.code().unwrap_or(-1),
+                })),
+                Err(error) => Ok(CommandResponse::err(format!("CLI action failed: {error}"))),
+            }
+        }
+        Err(error) => Ok(CommandResponse::err(format!(
+            "Failed to launch CLI: {error}"
+        ))),
+    }
+}
+
 fn default_shell_command() -> CommandBuilder {
     if cfg!(target_os = "windows") {
         let mut cmd = CommandBuilder::new("cmd.exe");
@@ -4635,6 +4826,11 @@ fn restricted_individual_command_name(command: &str) -> Option<&'static str> {
         .position(|token| is_hybridcipher_command_token(token))?;
     let args = &tokens[hybridcipher_index + 1..];
 
+    restricted_individual_args_name(args)
+}
+
+#[cfg(feature = "individual-edition")]
+fn restricted_individual_args_name(args: &[String]) -> Option<&'static str> {
     match args {
         [subcommand, ..] if subcommand == "create-group" => Some("create-group"),
         [subcommand, ..] if subcommand == "rename-group" => Some("rename-group"),
@@ -4736,7 +4932,9 @@ pub async fn start_terminal_session(
     }
     // Use provided cwd if it exists and is not a HybridCipher mount path; otherwise fall back to home.
     let home_dir = dirs::home_dir();
-    let hc_base = home_dir.as_ref().map(|h| h.join(".hybridcipher"));
+    let hc_base = home_dir
+        .as_ref()
+        .map(|h| h.join(hybridcipher_client::config_loader::account_data_location()));
     let resolved_cwd = cwd
         .as_deref()
         .map(PathBuf::from)
@@ -5076,6 +5274,8 @@ pub struct PlatformInfo {
     pub hostname: String,
     /// Home directory path
     pub home_dir: String,
+    /// Update channel: "microsoft_store" or "self"
+    pub update_channel: String,
 }
 
 #[tauri::command]
@@ -5116,6 +5316,12 @@ pub async fn get_platform_info() -> Result<CommandResponse<PlatformInfo>, String
         username,
         hostname,
         home_dir,
+        update_channel: if cfg!(feature = "store-msix") {
+            "microsoft_store"
+        } else {
+            "self"
+        }
+        .to_string(),
     }))
 }
 
@@ -5452,6 +5658,145 @@ pub async fn install_global_cli_symlink() -> Result<CommandResponse<GlobalCliIns
     }
 }
 
+#[cfg(feature = "store-msix")]
+#[tauri::command]
+pub async fn check_for_updates(
+    app: tauri::AppHandle,
+) -> Result<CommandResponse<serde_json::Value>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::Interface;
+        use windows::Services::Store::StoreContext;
+        use windows::Win32::UI::Shell::IInitializeWithWindow;
+
+        let window = app
+            .get_webview_window("main")
+            .ok_or_else(|| "Main app window is unavailable".to_string())?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let operation = (|| -> Result<_, String> {
+                let context = StoreContext::GetDefault().map_err(|error| error.to_string())?;
+                let initializer: IInitializeWithWindow =
+                    context.cast().map_err(|error| error.to_string())?;
+                let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+                unsafe { initializer.Initialize(hwnd) }.map_err(|error| error.to_string())?;
+                let updates = context
+                    .GetAppAndOptionalStorePackageUpdatesAsync()
+                    .map_err(|error| error.to_string())?;
+                Ok((context, updates))
+            })();
+            let _ = sender.send(operation);
+        })
+        .map_err(|error| error.to_string())?;
+
+        let (context, operation) = receiver
+            .await
+            .map_err(|_| "Microsoft Store update check was interrupted".to_string())??;
+        let available = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            // Keep StoreContext alive until the asynchronous Store query completes.
+            let _context = context;
+            let updates = operation.get().map_err(|error| error.to_string())?;
+            let current_name = windows::ApplicationModel::Package::Current()
+                .map_err(|error| error.to_string())?
+                .Id()
+                .map_err(|error| error.to_string())?
+                .Name()
+                .map_err(|error| error.to_string())?
+                .to_string();
+            for index in 0..updates.Size().map_err(|error| error.to_string())? {
+                let package_name = updates
+                    .GetAt(index)
+                    .map_err(|error| error.to_string())?
+                    .Package()
+                    .map_err(|error| error.to_string())?
+                    .Id()
+                    .map_err(|error| error.to_string())?
+                    .Name()
+                    .map_err(|error| error.to_string())?
+                    .to_string();
+                if package_name == current_name {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+
+        Ok(CommandResponse::ok(serde_json::json!({
+            "available": available,
+            "source": "microsoft_store",
+        })))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Ok(CommandResponse::err(
+            "Microsoft Store checks require Windows.".to_string(),
+        ))
+    }
+}
+
+const STORE_UPDATE_PAGE_URI: &str = "ms-windows-store://pdp/?ProductId=9NV89QMRRPSQ";
+const TEST_STORE_UPDATE_PAGE_URI: &str = "ms-windows-store://pdp/?ProductId=9NJNH789XCDG";
+
+fn store_update_page_uri_for_package(package_name: &str) -> Option<&'static str> {
+    match package_name {
+        "HybridCipher.HybridCipher" => Some(STORE_UPDATE_PAGE_URI),
+        "HybridCipher.HybridCipherTest" => Some(TEST_STORE_UPDATE_PAGE_URI),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod store_update_page_uri_tests {
+    use super::store_update_page_uri_for_package;
+
+    #[test]
+    fn routes_each_store_package_to_its_own_listing() {
+        assert_eq!(
+            store_update_page_uri_for_package("HybridCipher.HybridCipher"),
+            Some("ms-windows-store://pdp/?ProductId=9NV89QMRRPSQ")
+        );
+        assert_eq!(
+            store_update_page_uri_for_package("HybridCipher.HybridCipherTest"),
+            Some("ms-windows-store://pdp/?ProductId=9NJNH789XCDG")
+        );
+        assert_eq!(store_update_page_uri_for_package("Unrelated.App"), None);
+    }
+}
+
+#[tauri::command]
+pub fn open_store_update_page(app: tauri::AppHandle) -> Result<CommandResponse<bool>, String> {
+    if !cfg!(feature = "store-msix") {
+        return Ok(CommandResponse::err(
+            "This app is not installed through Microsoft Store.".to_string(),
+        ));
+    }
+    use tauri_plugin_shell::ShellExt;
+    #[cfg(target_os = "windows")]
+    let store_update_page_uri = {
+        let package_name = windows::ApplicationModel::Package::Current()
+            .map_err(|error| error.to_string())?
+            .Id()
+            .map_err(|error| error.to_string())?
+            .Name()
+            .map_err(|error| error.to_string())?
+            .to_string();
+        store_update_page_uri_for_package(&package_name).ok_or_else(|| {
+            format!("Unsupported Microsoft Store package identity: {package_name}")
+        })?
+    };
+    #[cfg(not(target_os = "windows"))]
+    let store_update_page_uri = STORE_UPDATE_PAGE_URI;
+    #[allow(deprecated)]
+    app.shell()
+        .open(store_update_page_uri, None)
+        .map_err(|error| format!("Could not open Microsoft Store: {error}"))?;
+    Ok(CommandResponse::ok(true))
+}
+
+#[cfg(not(feature = "store-msix"))]
 #[tauri::command]
 pub async fn check_for_updates(
     app: tauri::AppHandle,
@@ -5491,6 +5836,18 @@ pub async fn check_for_updates(
     }
 }
 
+#[cfg(feature = "store-msix")]
+#[tauri::command]
+pub async fn install_update(
+    _app: tauri::AppHandle,
+    _state: State<'_, AppState>,
+) -> Result<CommandResponse<String>, String> {
+    Ok(CommandResponse::err(
+        "Updates are managed by Microsoft Store.".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "store-msix"))]
 #[tauri::command]
 pub async fn install_update(
     app: tauri::AppHandle,
@@ -5591,6 +5948,8 @@ pub async fn restart_application(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     tracing::info!("restart_application: starting safe restart with unmount");
+    operations::cancel_all_desktop_operations(&state).await;
+    let _exclusive = UPDATE_OPERATION_GATE.write().await;
 
     stop_all_desktop_cloud_roots(&state, false)
         .await
@@ -5680,10 +6039,18 @@ pub async fn refresh_local_client(
         .clone()
         .unwrap_or_else(|| state.client.server_url().to_string());
 
-    state
-        .local_client
-        .initialize_for_session(&session, &server_url)
-        .await?;
+    if session.persistent {
+        state
+            .local_client
+            .initialize_for_session(&session, &server_url)
+            .await?;
+    } else {
+        let (account_key, state_key) = state.client.session_keys()?;
+        state
+            .local_client
+            .initialize_for_session_with_keys(&session, &server_url, &account_key, &state_key)
+            .await?;
+    }
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
     }
@@ -5731,7 +6098,7 @@ pub struct FolderCoverageWorkflowResult {
 pub async fn list_enrolled_folders(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<EnrolledFolder>>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
     tracing::info!("List enrolled folders command called");
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
@@ -5852,7 +6219,7 @@ pub async fn get_folder_coverage_review(
     folder_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<FolderCoverageReview>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
     }
@@ -6182,7 +6549,7 @@ fn build_coverage_scan_result(
 pub async fn get_coverage_center_snapshot(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<CoverageCenterSnapshot>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
     }
@@ -6424,6 +6791,55 @@ pub async fn enroll_folder_and_hydrate(
 }
 
 #[tauri::command]
+pub async fn unenroll_folder_keep_encrypted(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<FolderCoverageWorkflowResult>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    tracing::info!(
+        "Unenroll folder without decryption command called: {}",
+        root_id
+    );
+    if let Err(err) = ensure_local_active_group(&state).await {
+        return Ok(CommandResponse::err(err));
+    }
+
+    let client = match state.local_client.client().await {
+        Ok(client) => client,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    let summary = match find_coverage_root_summary_by_id(client.as_ref(), &root_id).await {
+        Ok(summary) => summary,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+
+    match client.coverage_unenroll_root(&summary.root.path).await {
+        Ok(root) => Ok(CommandResponse::ok(FolderCoverageWorkflowResult {
+            folder: EnrolledFolder {
+                path: root.path.display().to_string(),
+                root_id: root.root_id.to_string(),
+                kind: describe_root_kind(root.kind).to_string(),
+                state: describe_root_state(root.state).to_string(),
+                enrolled_at: root.created_at.to_rfc3339(),
+                last_scan: root.last_scan.map(|ts| ts.to_rfc3339()),
+                tracked_files: 0,
+                tracked_bytes: 0,
+                orphaned_files: 0,
+                unmanaged_files: 0,
+                coverage_ratio: 0.0,
+            },
+            encrypted_files: 0,
+            decrypted_files: 0,
+            skipped_files: 0,
+        })),
+        Err(err) => Ok(CommandResponse::err(format!(
+            "Failed to remove protected folder: {}",
+            desktop_safe_client_error(err)
+        ))),
+    }
+}
+
+#[tauri::command]
 pub async fn unenroll_folder_and_decrypt(
     root_id: String,
     state: State<'_, AppState>,
@@ -6570,7 +6986,7 @@ fn determine_desktop_mountpoint(encrypted_dir: &Path, root_id: Uuid) -> Result<P
         .unwrap_or("encrypted");
     let sanitized = sanitize_mount_name(encrypted_name);
     let home = dirs::home_dir().ok_or_else(|| "Unable to resolve home directory".to_string())?;
-    let base = home.join(".hybridcipher");
+    let base = home.join(hybridcipher_client::config_loader::account_data_location());
     std::fs::create_dir_all(&base).map_err(|e| {
         format!(
             "Failed to prepare mount directory {}: {}",
@@ -6724,10 +7140,16 @@ fn process_is_running(pid: u32) -> bool {
 pub struct MountStatusPayload {
     pub mountpoint: String,
     pub backend: String,
+    #[serde(default = "default_mount_availability")]
+    pub availability: String,
     #[serde(default)]
     pub fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operational_health: Option<serde_json::Value>,
+}
+
+fn default_mount_availability() -> String {
+    "usable".to_string()
 }
 
 /// Canonicalize server URL (matches CLI's logic)
@@ -6754,7 +7176,10 @@ fn get_user_storage_id(email: &str, server_url: &str) -> String {
 fn get_user_dir(email: &str, server_url: &str) -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "HOME not set".to_string())?;
     let user_id = get_user_storage_id(email, server_url);
-    Ok(home.join(".hybridcipher").join("users").join(&user_id))
+    Ok(home
+        .join(hybridcipher_client::config_loader::account_data_location())
+        .join("users")
+        .join(&user_id))
 }
 
 fn mount_sync_status_path(user_dir: &PathBuf, root_id: &str) -> PathBuf {
@@ -6813,6 +7238,72 @@ fn mount_operational_health(
         windows_cloud_provider_health(user_dir, root_id)
     } else {
         None
+    }
+}
+
+fn cloud_health_is_usable(health: Option<&serde_json::Value>) -> bool {
+    let Some(health) = health else { return false };
+    [
+        "registered",
+        "lifecycle_healthy",
+        "heartbeat_fresh",
+        "durable_state_readable",
+    ]
+    .iter()
+    .all(|field| health.get(field).and_then(|value| value.as_bool()) == Some(true))
+        && health
+            .get("operational")
+            .and_then(|value| value.get("healthy"))
+            .and_then(|value| value.as_bool())
+            == Some(true)
+}
+
+async fn mount_status_payload(
+    state: &AppState,
+    user_dir: &Path,
+    mount: &MountRuntimeState,
+) -> MountStatusPayload {
+    let operational_health = if mount.backend().is_windows_cloud_files() {
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(root_id) = Uuid::parse_str(&mount.root_id) {
+                if state.cloud_provider.is_root_active(root_id).await {
+                    Some(map_cloud_provider_health_payload(
+                        state
+                            .cloud_provider
+                            .check_root_health(root_id)
+                            .await
+                            .and_then(|health| {
+                                serde_json::to_value(health).map_err(|error| error.to_string())
+                            }),
+                    ))
+                } else {
+                    mount_operational_health(user_dir, &mount.root_id, mount.backend())
+                }
+            } else {
+                mount_operational_health(user_dir, &mount.root_id, mount.backend())
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            mount_operational_health(user_dir, &mount.root_id, mount.backend())
+        }
+    } else {
+        mount_operational_health(user_dir, &mount.root_id, mount.backend())
+    };
+    let availability = if mount.backend().is_windows_cloud_files()
+        && !cloud_health_is_usable(operational_health.as_ref())
+    {
+        "degraded"
+    } else {
+        "usable"
+    };
+    MountStatusPayload {
+        mountpoint: mount.mountpoint.display().to_string(),
+        backend: mount.backend().as_str().to_string(),
+        availability: availability.to_string(),
+        fallback_reason: mount.fallback_reason.clone(),
+        operational_health,
     }
 }
 
@@ -6951,23 +7442,38 @@ async fn read_any_mount_state_by_root_id(
 ) -> Result<Option<(PathBuf, MountRuntimeState)>, String> {
     let mount_state_path = mount_states_dir(user_dir).join(format!("mount_state_{}.json", root_id));
     if mount_state_path.exists() {
-        if let Ok(content) = fs::read_to_string(&mount_state_path).await {
-            if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content) {
-                if mount_state.root_id == root_id {
-                    return Ok(Some((mount_state_path, mount_state)));
-                }
-            }
+        let content = fs::read_to_string(&mount_state_path)
+            .await
+            .map_err(|err| format!("Failed to read {}: {err}", mount_state_path.display()))?;
+        let mount_state = serde_json::from_str::<MountRuntimeState>(&content)
+            .map_err(|err| format!("Invalid mount state {}: {err}", mount_state_path.display()))?;
+        if mount_state.root_id != root_id {
+            return Err(format!(
+                "Mount state root mismatch in {}",
+                mount_state_path.display()
+            ));
         }
+        return Ok(Some((mount_state_path, mount_state)));
     }
 
     let legacy_mount_state_path = user_dir.join("mount_state.json");
     if legacy_mount_state_path.exists() {
-        if let Ok(content) = fs::read_to_string(&legacy_mount_state_path).await {
-            if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content) {
-                if mount_state.root_id == root_id {
-                    return Ok(Some((legacy_mount_state_path, mount_state)));
-                }
-            }
+        let content = fs::read_to_string(&legacy_mount_state_path)
+            .await
+            .map_err(|err| {
+                format!(
+                    "Failed to read {}: {err}",
+                    legacy_mount_state_path.display()
+                )
+            })?;
+        let mount_state = serde_json::from_str::<MountRuntimeState>(&content).map_err(|err| {
+            format!(
+                "Invalid mount state {}: {err}",
+                legacy_mount_state_path.display()
+            )
+        })?;
+        if mount_state.root_id == root_id {
+            return Ok(Some((legacy_mount_state_path, mount_state)));
         }
     }
 
@@ -6976,28 +7482,33 @@ async fn read_any_mount_state_by_root_id(
 
 async fn load_cloud_mount_state_records_for_unmount(
     user_dir: &Path,
-) -> Vec<(PathBuf, MountRuntimeState)> {
+) -> Result<Vec<(PathBuf, MountRuntimeState)>, String> {
     let mut records = Vec::new();
     let mount_states_dir = mount_states_dir(user_dir);
     if mount_states_dir.exists() {
-        if let Ok(mut entries) = fs::read_dir(&mount_states_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if path.is_file()
-                    && path.extension().and_then(|s| s.to_str()) == Some("json")
-                    && file_name.starts_with("mount_state_")
+        let mut entries = fs::read_dir(&mount_states_dir)
+            .await
+            .map_err(|err| format!("Failed to inspect {}: {err}", mount_states_dir.display()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|err| format!("Failed to inspect mount states: {err}"))?
+        {
+            let path = entry.path();
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("json")
+                && file_name.starts_with("mount_state_")
+            {
+                let content = fs::read_to_string(&path)
+                    .await
+                    .map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
+                let mount_state = serde_json::from_str::<MountRuntimeState>(&content)
+                    .map_err(|err| format!("Invalid mount state {}: {err}", path.display()))?;
+                if mount_state.backend().is_windows_cloud_files()
+                    || mount_state.backend().is_macos_file_provider()
                 {
-                    if let Ok(content) = fs::read_to_string(&path).await {
-                        if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content)
-                        {
-                            if mount_state.backend().is_windows_cloud_files()
-                                || mount_state.backend().is_macos_file_provider()
-                            {
-                                records.push((path, mount_state));
-                            }
-                        }
-                    }
+                    records.push((path, mount_state));
                 }
             }
         }
@@ -7005,21 +7516,22 @@ async fn load_cloud_mount_state_records_for_unmount(
 
     let legacy_path = user_dir.join("mount_state.json");
     if legacy_path.exists() {
-        if let Ok(content) = fs::read_to_string(&legacy_path).await {
-            if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content) {
-                if (mount_state.backend().is_windows_cloud_files()
-                    || mount_state.backend().is_macos_file_provider())
-                    && !records
-                        .iter()
-                        .any(|(_, record)| record.root_id == mount_state.root_id)
-                {
-                    records.push((legacy_path, mount_state));
-                }
-            }
+        let content = fs::read_to_string(&legacy_path)
+            .await
+            .map_err(|err| format!("Failed to read {}: {err}", legacy_path.display()))?;
+        let mount_state = serde_json::from_str::<MountRuntimeState>(&content)
+            .map_err(|err| format!("Invalid mount state {}: {err}", legacy_path.display()))?;
+        if (mount_state.backend().is_windows_cloud_files()
+            || mount_state.backend().is_macos_file_provider())
+            && !records
+                .iter()
+                .any(|(_, record)| record.root_id == mount_state.root_id)
+        {
+            records.push((legacy_path, mount_state));
         }
     }
 
-    records
+    Ok(records)
 }
 
 fn ensure_sync_mount_backend(state: &MountRuntimeState, command_name: &str) -> Result<(), String> {
@@ -7196,103 +7708,50 @@ async fn submit_mount_recovery_request(
     }
 }
 
-/// Check if a folder is already mounted by reading CLI mount state
+/// Check only the requested root. A stale record for another root must not
+/// require its source path to be available.
+async fn matching_mount_state_for_root(
+    user_dir: &Path,
+    root_id: &str,
+    folder_path: &str,
+) -> Result<Option<MountRuntimeState>, String> {
+    let Some((_, mount)) = read_any_mount_state_by_root_id(user_dir, root_id).await? else {
+        return Ok(None);
+    };
+    let source = dunce::canonicalize(folder_path).map_err(|error| {
+        format!("Encrypted source for root {root_id} is unavailable at {folder_path}: {error}")
+    })?;
+    let saved_source = dunce::canonicalize(&mount.encrypted_dir).map_err(|error| {
+        format!(
+            "Saved encrypted source for root {root_id} is unavailable at {}: {error}",
+            mount.encrypted_dir.display()
+        )
+    })?;
+    if source != saved_source {
+        return Ok(None);
+    }
+    Ok(Some(mount))
+}
+
 async fn check_mount_status(
     folder_path: &str,
+    root_id: &str,
     email: &str,
     server_url: &str,
+    state: &AppState,
 ) -> Result<Option<MountStatusPayload>, String> {
     let user_dir = get_user_dir(email, server_url)?;
-
-    // Check for per-mount state files (new format)
-    let mount_states_dir = user_dir.join("mount_states");
-    if mount_states_dir.exists() {
-        if let Ok(mut entries) = fs::read_dir(&mount_states_dir).await {
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|e| format!("Failed to read mount states directory: {}", e))?
-            {
-                let path = entry.path();
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if path.is_file()
-                    && path.extension().and_then(|s| s.to_str()) == Some("json")
-                    && file_name.starts_with("mount_state_")
-                {
-                    if let Ok(content) = fs::read_to_string(&path).await {
-                        if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content)
-                        {
-                            // Check if this folder matches the encrypted_dir in mount state
-                            let canonical_folder =
-                                dunce::canonicalize(folder_path).map_err(|e| {
-                                    format!("Failed to canonicalize folder path: {}", e)
-                                })?;
-
-                            let canonical_encrypted =
-                                dunce::canonicalize(&mount_state.encrypted_dir).map_err(|e| {
-                                    format!("Failed to canonicalize encrypted dir: {}", e)
-                                })?;
-
-                            if canonical_folder == canonical_encrypted
-                                && !mount_state.requested_unmount
-                                && mount_state.is_ready()
-                                && mount_state_runtime_is_active(&user_dir, &mount_state)
-                            {
-                                // Check if mountpoint exists and is accessible
-                                if mount_state.mountpoint.exists() {
-                                    return Ok(Some(MountStatusPayload {
-                                        mountpoint: mount_state.mountpoint.display().to_string(),
-                                        backend: mount_state.backend().as_str().to_string(),
-                                        fallback_reason: mount_state.fallback_reason.clone(),
-                                        operational_health: mount_operational_health(
-                                            &user_dir,
-                                            &mount_state.root_id,
-                                            mount_state.backend(),
-                                        ),
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    let Some(mount) = matching_mount_state_for_root(&user_dir, root_id, folder_path).await? else {
+        return Ok(None);
+    };
+    if mount.requested_unmount
+        || !mount.is_ready()
+        || !mount.mountpoint.exists()
+        || !mount_state_runtime_is_active(&user_dir, &mount)
+    {
+        return Ok(None);
     }
-
-    // Fallback: check legacy single mount state file
-    let mount_state_path = user_dir.join("mount_state.json");
-    if mount_state_path.exists() {
-        if let Ok(mount_state_content) = fs::read_to_string(&mount_state_path).await {
-            if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&mount_state_content)
-            {
-                let canonical_folder = dunce::canonicalize(folder_path)
-                    .map_err(|e| format!("Failed to canonicalize folder path: {}", e))?;
-
-                let canonical_encrypted = dunce::canonicalize(&mount_state.encrypted_dir)
-                    .map_err(|e| format!("Failed to canonicalize encrypted dir: {}", e))?;
-
-                if canonical_folder == canonical_encrypted && !mount_state.requested_unmount {
-                    if mount_state.is_ready()
-                        && mount_state.mountpoint.exists()
-                        && mount_state_runtime_is_active(&user_dir, &mount_state)
-                    {
-                        return Ok(Some(MountStatusPayload {
-                            mountpoint: mount_state.mountpoint.display().to_string(),
-                            backend: mount_state.backend().as_str().to_string(),
-                            fallback_reason: mount_state.fallback_reason.clone(),
-                            operational_health: mount_operational_health(
-                                &user_dir,
-                                &mount_state.root_id,
-                                mount_state.backend(),
-                            ),
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(None)
+    Ok(Some(mount_status_payload(state, &user_dir, &mount).await))
 }
 
 /// Check mount status by root_id
@@ -7321,61 +7780,29 @@ pub async fn check_mount_status_by_root_id(
     };
 
     let user_dir = get_user_dir(&email, &server_url)?;
-    let mount_states_dir = user_dir.join("mount_states");
-    let mount_state_path = mount_states_dir.join(format!("mount_state_{}.json", root_id));
-
-    // Check mount state file (new format)
-    if mount_state_path.exists() {
-        if let Ok(content) = fs::read_to_string(&mount_state_path).await {
-            if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content) {
-                if mount_state.root_id == root_id
-                    && !mount_state.requested_unmount
-                    && mount_state.is_ready()
-                    && mount_state.mountpoint.exists()
-                    && mount_state_runtime_is_active(&user_dir, &mount_state)
-                {
-                    return Ok(CommandResponse::ok(MountStatusPayload {
-                        mountpoint: mount_state.mountpoint.display().to_string(),
-                        backend: mount_state.backend().as_str().to_string(),
-                        fallback_reason: mount_state.fallback_reason.clone(),
-                        operational_health: mount_operational_health(
-                            &user_dir,
-                            &mount_state.root_id,
-                            mount_state.backend(),
-                        ),
-                    }));
-                }
-            }
-        }
+    let Some((_, mount_state)) = read_any_mount_state_by_root_id(&user_dir, &root_id).await? else {
+        return Ok(CommandResponse::err("Mount not found"));
+    };
+    if !mount_state.encrypted_dir.is_dir() {
+        return Ok(CommandResponse::err_with_code(
+            "MOUNT_SOURCE_UNAVAILABLE",
+            format!(
+                "Encrypted source for root {} is unavailable at {}. Reconnect or restore that folder.",
+                root_id,
+                mount_state.encrypted_dir.display()
+            ),
+        ));
     }
-
-    // Fallback: check legacy mount state file
-    let legacy_mount_state_path = user_dir.join("mount_state.json");
-    if legacy_mount_state_path.exists() {
-        if let Ok(content) = fs::read_to_string(&legacy_mount_state_path).await {
-            if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content) {
-                if mount_state.root_id == root_id
-                    && !mount_state.requested_unmount
-                    && mount_state.is_ready()
-                    && mount_state.mountpoint.exists()
-                    && mount_state_runtime_is_active(&user_dir, &mount_state)
-                {
-                    return Ok(CommandResponse::ok(MountStatusPayload {
-                        mountpoint: mount_state.mountpoint.display().to_string(),
-                        backend: mount_state.backend().as_str().to_string(),
-                        fallback_reason: mount_state.fallback_reason.clone(),
-                        operational_health: mount_operational_health(
-                            &user_dir,
-                            &mount_state.root_id,
-                            mount_state.backend(),
-                        ),
-                    }));
-                }
-            }
-        }
+    if mount_state.requested_unmount
+        || !mount_state.is_ready()
+        || !mount_state.mountpoint.exists()
+        || !mount_state_runtime_is_active(&user_dir, &mount_state)
+    {
+        return Ok(CommandResponse::err("Mount not found"));
     }
-
-    Ok(CommandResponse::err("Mount not found".to_string()))
+    Ok(CommandResponse::ok(
+        mount_status_payload(&state, &user_dir, &mount_state).await,
+    ))
 }
 
 /// Wait for mount to become ready by polling mountpoint directory
@@ -7419,12 +7846,21 @@ async fn write_mount_runtime_state(path: &Path, state: &MountRuntimeState) -> Re
         .map_err(|e| format!("Failed to write mount state {}: {}", path.display(), e))
 }
 
+fn mount_fallback_error(desktop_error: Option<&str>, cli_error: String) -> String {
+    match desktop_error {
+        Some(primary) => {
+            format!("Desktop Cloud Files mount failed: {primary}; CLI fallback failed: {cli_error}")
+        }
+        None => cli_error,
+    }
+}
+
 #[tauri::command]
 pub async fn mount_enrolled_folder(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountStatusPayload>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_team_write(&state).await?;
     tracing::info!("Mount enrolled folder request with root_id: {}", root_id);
     if let Err(err) = ensure_local_active_group(&state).await {
         return Ok(CommandResponse::err(err));
@@ -7435,7 +7871,7 @@ pub async fn mount_enrolled_folder(
         Uuid::parse_str(&root_id).map_err(|e| format!("Invalid root_id format: {}", e))?;
 
     // Get current session info
-    let (email, server_url) = {
+    let (email, server_url, persistent) = {
         let session = state.session.lock().await;
         let user_session = session.as_ref().ok_or("No active session")?;
         let email = user_session.email.clone();
@@ -7444,7 +7880,7 @@ pub async fn mount_enrolled_folder(
             .as_deref()
             .unwrap_or_else(|| state.client.server_url())
             .to_string();
-        (email, server_url)
+        (email, server_url, user_session.persistent)
     };
 
     // Get folder path from root_id for mount status check
@@ -7474,10 +7910,44 @@ pub async fn mount_enrolled_folder(
         .ok_or_else(|| format!("No enrolled folder found with root_id: {}", root_id))?;
     let encrypted_root = PathBuf::from(&folder.path);
 
-    // Check if already mounted (same folder)
-    if let Some(mount_status) = check_mount_status(&folder.path, &email, &server_url).await? {
+    // Check the requested root before touching any other saved source path.
+    let existing =
+        match check_mount_status(&folder.path, &root_id, &email, &server_url, &state).await {
+            Ok(status) => status,
+            Err(error) => {
+                return Ok(CommandResponse::err_with_code(
+                    "MOUNT_SOURCE_UNAVAILABLE",
+                    error,
+                ))
+            }
+        };
+    if let Some(mount_status) = existing {
+        if mount_status.availability == "degraded" {
+            let diagnostics = mount_status
+                .operational_health
+                .as_ref()
+                .map(|health| health.to_string())
+                .unwrap_or_else(|| "Provider health is unavailable".to_string());
+            return Ok(CommandResponse::err_with_code(
+                "MOUNT_DEGRADED",
+                format!(
+                    "The existing Cloud Files mount for root {root_id} is degraded. Stop or repair it before mounting again. Health: {diagnostics}"
+                ),
+            ));
+        }
         tracing::info!("Folder already mounted at: {}", mount_status.mountpoint);
         return Ok(CommandResponse::ok(mount_status));
+    }
+
+    if !encrypted_root.is_dir() {
+        return Ok(CommandResponse::err_with_code(
+            "MOUNT_SOURCE_UNAVAILABLE",
+            format!(
+                "Encrypted source for root {} is unavailable at {}. Reconnect or restore that folder.",
+                root_id,
+                encrypted_root.display()
+            ),
+        ));
     }
 
     // With multiple mount support, we don't need to unmount other folders
@@ -7557,6 +8027,7 @@ pub async fn mount_enrolled_folder(
                                 return Ok(CommandResponse::ok(MountStatusPayload {
                                     mountpoint: provider_url.display().to_string(),
                                     backend: MountBackend::MacOsFileProvider.as_str().to_string(),
+                                    availability: default_mount_availability(),
                                     fallback_reason: None,
                                     operational_health: None,
                                 }));
@@ -7605,6 +8076,8 @@ pub async fn mount_enrolled_folder(
     #[cfg(not(target_os = "macos"))]
     let desktop_provider_fallback_reason: Option<String> = None;
 
+    let mut desktop_cloud_error: Option<String> = None;
+
     #[cfg(target_os = "windows")]
     if crate::cloud_provider::DesktopCloudProviderManager::cloud_files_available() {
         let user_dir = get_user_dir(&email, &server_url)?;
@@ -7643,22 +8116,20 @@ pub async fn mount_enrolled_folder(
                 let mut ready_state = runtime_state;
                 ready_state.ready = true;
                 write_mount_runtime_state(&mount_state_path, &ready_state).await?;
-                return Ok(CommandResponse::ok(MountStatusPayload {
-                    mountpoint: mountpoint.display().to_string(),
-                    backend: MountBackend::WindowsCloudFiles.as_str().to_string(),
-                    fallback_reason: None,
-                    operational_health: Some(map_cloud_provider_health_payload(
-                        state
-                            .cloud_provider
-                            .check_root_health(parsed_root_id)
-                            .await
-                            .and_then(|health| {
-                                serde_json::to_value(health).map_err(|error| error.to_string())
-                            }),
-                    )),
-                }));
+                let status = mount_status_payload(&state, &user_dir, &ready_state).await;
+                if status.availability == "degraded" {
+                    return Ok(CommandResponse::err_with_code(
+                        "MOUNT_DEGRADED",
+                        format!(
+                            "Cloud Files mounted root {root_id}, but its provider health is degraded. Stop or repair this mount before opening it. Health: {}",
+                            status.operational_health.as_ref().map(|value| value.to_string()).unwrap_or_default()
+                        ),
+                    ));
+                }
+                return Ok(CommandResponse::ok(status));
             }
             Err(err) => {
+                desktop_cloud_error = Some(err.to_string());
                 tracing::warn!(
                     "Desktop in-process Cloud Files mount failed for root {}: {}. Falling back to CLI mount.",
                     root_id,
@@ -7669,9 +8140,26 @@ pub async fn mount_enrolled_folder(
         }
     }
 
+    if !persistent {
+        let reason = desktop_cloud_error
+            .as_deref()
+            .or(desktop_provider_fallback_reason.as_deref())
+            .unwrap_or("A native desktop mount is unavailable");
+        return Ok(CommandResponse::err_with_code(
+            "PERSISTENT_LOGIN_REQUIRED",
+            format!(
+                "{reason}. CLI sync fallback requires a persistent login. Sign in with Remember me enabled to use it."
+            ),
+        ));
+    }
+
     // Locate CLI binary
-    let (cli_binary, _project_root) = crate::cli_utils::locate_cli_binary()
-        .map_err(|e| format!("Failed to locate CLI binary: {}", e))?;
+    let (cli_binary, _project_root) = crate::cli_utils::locate_cli_binary().map_err(|e| {
+        mount_fallback_error(
+            desktop_cloud_error.as_deref(),
+            format!("Failed to locate CLI binary: {}", e),
+        )
+    })?;
 
     // Execute CLI mount command in background with --root-id
     let server_url_clone = server_url.to_string();
@@ -7691,9 +8179,12 @@ pub async fn mount_enrolled_folder(
 
     configure_background_tokio_command(&mut cmd);
     tracing::info!("Spawning CLI mount command for root_id: {}", root_id);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn mount command: {}", e))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        mount_fallback_error(
+            desktop_cloud_error.as_deref(),
+            format!("Failed to spawn mount command: {}", e),
+        )
+    })?;
 
     // Wait a moment for mount to start
     sleep(Duration::from_millis(1000)).await;
@@ -7731,7 +8222,10 @@ pub async fn mount_enrolled_folder(
                     } else {
                         format!("Mount command failed with exit code: {:?}", status.code())
                     };
-                    return Ok(CommandResponse::err(error_msg));
+                    return Ok(CommandResponse::err(mount_fallback_error(
+                        desktop_cloud_error.as_deref(),
+                        error_msg,
+                    )));
                 }
             }
             Ok(None) => {
@@ -7792,28 +8286,45 @@ pub async fn mount_enrolled_folder(
 
         if start_time.elapsed() >= timeout_duration {
             let _ = child.kill().await;
-            return Ok(CommandResponse::err(
+            return Ok(CommandResponse::err(mount_fallback_error(
+                desktop_cloud_error.as_deref(),
                 "Mount did not complete within timeout period".to_string(),
-            ));
+            )));
         }
 
         sleep(Duration::from_millis(500)).await;
     }
 
-    let mountpoint_path = mountpoint.ok_or("Mountpoint not found")?;
+    let mountpoint_path = mountpoint.ok_or_else(|| {
+        mount_fallback_error(
+            desktop_cloud_error.as_deref(),
+            "Mountpoint not found".to_string(),
+        )
+    })?;
 
     // Wait for mount to be fully ready
     wait_for_mount_ready(&mountpoint_path, 60)
         .await
-        .map_err(|e| format!("Mount ready check failed: {}", e))?;
+        .map_err(|e| {
+            mount_fallback_error(
+                desktop_cloud_error.as_deref(),
+                format!("Mount ready check failed: {}", e),
+            )
+        })?;
 
     tracing::info!(
         "Mount completed successfully at: {}",
         mountpoint_path.display()
     );
     let mut mounted_state = read_mount_state_by_root_id(&user_dir, &root_id)
-        .await?
-        .ok_or_else(|| "Mount completed but runtime state is unavailable".to_string())?;
+        .await
+        .map_err(|e| mount_fallback_error(desktop_cloud_error.as_deref(), e))?
+        .ok_or_else(|| {
+            mount_fallback_error(
+                desktop_cloud_error.as_deref(),
+                "Mount completed but runtime state is unavailable".to_string(),
+            )
+        })?;
     if let Some(reason) = desktop_provider_fallback_reason.clone() {
         if mounted_state.backend().is_sync() && mounted_state.fallback_reason.is_none() {
             mounted_state.fallback_reason = Some(reason);
@@ -7821,26 +8332,19 @@ pub async fn mount_enrolled_folder(
         }
     }
 
-    Ok(CommandResponse::ok(MountStatusPayload {
-        mountpoint: mountpoint_path.display().to_string(),
-        backend: mounted_state.backend().as_str().to_string(),
-        fallback_reason: mounted_state.fallback_reason.clone(),
-        operational_health: mount_operational_health(
-            &user_dir,
-            &mounted_state.root_id,
-            mounted_state.backend(),
-        ),
-    }))
+    Ok(CommandResponse::ok(
+        mount_status_payload(&state, &user_dir, &mounted_state).await,
+    ))
 }
 
 #[tauri::command]
 pub async fn list_active_mounts(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountInfo>>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
     tracing::info!("List active mounts command called");
 
-    let session = require_authenticated_session(&state).await?;
+    let session = current_local_session(&state).await?;
     Ok(CommandResponse::ok(
         load_active_mounts_internal(&state, &session).await?,
     ))
@@ -7872,7 +8376,8 @@ async fn load_active_mounts_internal(
                                 && mount_state.mountpoint.exists()
                                 && mount_state_runtime_is_active(&user_dir, &mount_state)
                             {
-                                let backend = mount_state.backend().as_str().to_string();
+                                let status =
+                                    mount_status_payload(state, &user_dir, &mount_state).await;
                                 let sync_status = if mount_state.backend().has_runtime_status() {
                                     read_mount_sync_status(&user_dir, &mount_state.root_id).await
                                 } else {
@@ -7880,16 +8385,13 @@ async fn load_active_mounts_internal(
                                 };
                                 mounts.push(MountInfo {
                                     root_id: mount_state.root_id.clone(),
-                                    mountpoint: mount_state.mountpoint.display().to_string(),
+                                    mountpoint: status.mountpoint,
                                     encrypted_dir: mount_state.encrypted_dir.display().to_string(),
-                                    backend,
-                                    fallback_reason: mount_state.fallback_reason.clone(),
+                                    backend: status.backend,
+                                    availability: status.availability,
+                                    fallback_reason: status.fallback_reason,
                                     sync_status,
-                                    operational_health: mount_operational_health(
-                                        &user_dir,
-                                        &mount_state.root_id,
-                                        mount_state.backend(),
-                                    ),
+                                    operational_health: status.operational_health,
                                 });
                             }
                         }
@@ -7917,18 +8419,16 @@ async fn load_active_mounts_internal(
                         } else {
                             None
                         };
+                        let status = mount_status_payload(state, &user_dir, &mount_state).await;
                         mounts.push(MountInfo {
                             root_id: mount_state.root_id.clone(),
-                            mountpoint: mount_state.mountpoint.display().to_string(),
+                            mountpoint: status.mountpoint,
                             encrypted_dir: mount_state.encrypted_dir.display().to_string(),
-                            backend: mount_state.backend().as_str().to_string(),
-                            fallback_reason: mount_state.fallback_reason.clone(),
+                            backend: status.backend,
+                            availability: status.availability,
+                            fallback_reason: status.fallback_reason,
                             sync_status,
-                            operational_health: mount_operational_health(
-                                &user_dir,
-                                &mount_state.root_id,
-                                mount_state.backend(),
-                            ),
+                            operational_health: status.operational_health,
                         });
                     }
                 }
@@ -7974,9 +8474,9 @@ fn build_device_count_snapshot(input: &PersonalDevicesOverviewInput) -> DeviceCo
 pub async fn get_individual_home_status(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<IndividualHomeStatus>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
 
-    let session = require_authenticated_session(&state).await?;
+    let session = current_local_session(&state).await?;
 
     // Every section below is loaded independently. A single failing sub-request
     // must degrade its own card to "unknown" rather than blanking the whole home
@@ -8097,9 +8597,36 @@ pub async fn get_personal_devices_overview(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<PersonalDevicesOverview>, String> {
     let _operation_guard = ensure_authenticated(&state).await?;
-    let session = require_authenticated_session(&state).await?;
+    let session = current_authenticated_session(&state).await?;
     let input = load_personal_devices_overview_input_internal(&state, &session).await?;
     Ok(CommandResponse::ok(build_personal_devices_overview(input)))
+}
+
+#[derive(Debug, Serialize)]
+pub struct CurrentDeviceFingerprint {
+    pub device_id: String,
+    pub fingerprint: String,
+}
+
+#[tauri::command]
+pub async fn get_current_device_fingerprint(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<CurrentDeviceFingerprint>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    let material = state.client.device_crypto_material(&session.email)?;
+    if material.device_id != session.device_id {
+        return Err("Local device identity does not match the signed-in device.".to_string());
+    }
+    let identity_public: [u8; 32] = material
+        .identity_public
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Local device identity key is invalid.".to_string())?;
+    Ok(CommandResponse::ok(CurrentDeviceFingerprint {
+        device_id: session.device_id.clone(),
+        fingerprint: hybridcipher_client::pinning::generate_fingerprint(&identity_public),
+    }))
 }
 
 #[tauri::command]
@@ -8107,15 +8634,42 @@ pub async fn revoke_device(
     device_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<DeviceRevocationResult>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let mut operation_guard = Some(ensure_authenticated(&state).await?);
 
-    let session = require_authenticated_session(&state).await?;
+    let session = current_authenticated_session(&state).await?;
     let target_device_id = device_id.trim();
     if target_device_id.is_empty() {
         return Ok(CommandResponse::err(
             "Device identifier is required to revoke a device.",
         ));
     }
+
+    let revoking_current_device = target_device_id.eq_ignore_ascii_case(&session.device_id);
+    // Stop mounts while the current device can still authenticate CLI unmount.
+    // The server DELETE invalidates that credential, so cleanup afterward is
+    // too late. Upgrade the operation gate before stopping the mounts.
+    let _exclusive = if revoking_current_device {
+        drop(operation_guard.take());
+        operations::cancel_all_desktop_operations(&state).await;
+        let guard = UPDATE_OPERATION_GATE.write().await;
+        let current = current_authenticated_session(&state).await?;
+        if current.email != session.email
+            || current.device_id != session.device_id
+            || current.token != session.token
+        {
+            return Ok(CommandResponse::err(
+                "Session changed while preparing device revocation. Please retry.",
+            ));
+        }
+        if let Err(err) = stop_all_mounts_safely(&state, false).await {
+            return Ok(CommandResponse::err(format!(
+                "Device revocation was cancelled because protected folders could not stop safely: {err}"
+            )));
+        }
+        Some(guard)
+    } else {
+        None
+    };
 
     let server_url = current_server_url(&state, &session);
     let endpoint = api_endpoint(&server_url, &format!("auth/device/{}", target_device_id));
@@ -8146,14 +8700,15 @@ pub async fn revoke_device(
         .json()
         .await
         .map_err(|e| format!("Failed to parse device revocation response: {}", e))?;
-    let removed_current_device = payload.removed_device_id == session.device_id;
+    let removed_current_device = payload
+        .removed_device_id
+        .eq_ignore_ascii_case(&session.device_id);
 
     if removed_current_device {
-        if let Err(err) = state.mount_manager.unmount_all(false).await {
-            tracing::warn!(
-                "Failed to unmount folders before clearing revoked session: {}",
-                err
-            );
+        if !revoking_current_device {
+            return Ok(CommandResponse::err(
+                "Server revoked the current device unexpectedly; log out after safely stopping protected folders.",
+            ));
         }
         state.clear_session().await?;
     }
@@ -8177,7 +8732,7 @@ pub async fn list_mount_conflicts(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountConflictRecord>>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
     let (email, server_url) = {
@@ -8210,12 +8765,103 @@ pub async fn list_mount_conflicts(
 }
 
 #[tauri::command]
+pub async fn list_windows_cloud_conflicts(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<Vec<hybridcipher_windows_cloud_provider::CloudConflictRecord>>, String>
+{
+    let _operation_guard = ensure_local_data_access(&state).await?;
+    let parsed_root_id =
+        Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {err}"))?;
+    let (email, server_url) = {
+        let session = state.session.lock().await;
+        let user_session = session.as_ref().ok_or("No active session")?;
+        (
+            user_session.email.clone(),
+            user_session
+                .server_url
+                .as_deref()
+                .unwrap_or_else(|| state.client.server_url())
+                .to_string(),
+        )
+    };
+    let user_dir = get_user_dir(&email, &server_url)?;
+    let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
+        return Ok(CommandResponse::err("No active mount found".to_string()));
+    };
+    if !mount_state.backend().is_windows_cloud_files() {
+        return Ok(CommandResponse::err(
+            "This is not a Windows Cloud Files mount".to_string(),
+        ));
+    }
+    let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+        hybridcipher_windows_cloud_provider::ProviderHostConfig {
+            user_config_dir: user_dir,
+            pipe_name: None,
+        },
+    );
+    match host.read_conflicts(parsed_root_id) {
+        Ok(records) => Ok(CommandResponse::ok(records)),
+        Err(err) => Ok(CommandResponse::err(err.to_string())),
+    }
+}
+
+#[tauri::command]
+pub async fn recheck_windows_cloud_conflicts(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<()>, String> {
+    let _operation_guard = ensure_local_data_access(&state).await?;
+    let parsed_root_id =
+        Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {err}"))?;
+    let (email, server_url) = {
+        let session = state.session.lock().await;
+        let user_session = session.as_ref().ok_or("No active session")?;
+        (
+            user_session.email.clone(),
+            user_session
+                .server_url
+                .as_deref()
+                .unwrap_or_else(|| state.client.server_url())
+                .to_string(),
+        )
+    };
+    let user_dir = get_user_dir(&email, &server_url)?;
+    let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
+        return Ok(CommandResponse::err("No active mount found".to_string()));
+    };
+    if !mount_state.backend().is_windows_cloud_files() {
+        return Ok(CommandResponse::err(
+            "This is not a Windows Cloud Files mount".to_string(),
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match state
+            .cloud_provider
+            .recheck_cloud_files_conflicts(parsed_root_id)
+            .await
+        {
+            Ok(()) => Ok(CommandResponse::ok(())),
+            Err(err) => Ok(CommandResponse::err(err)),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = parsed_root_id;
+        Ok(CommandResponse::err(
+            "Windows Cloud Files is unavailable".to_string(),
+        ))
+    }
+}
+
+#[tauri::command]
 pub async fn get_mount_conflict_preview(
     root_id: String,
     conflict_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountConflictPreview>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
     let conflict_id = Uuid::parse_str(&conflict_id)
         .map_err(|err| format!("Invalid conflict_id format: {}", err))?;
@@ -8366,7 +9012,7 @@ pub async fn list_mount_recovery_copies(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountRecoveryCopyRecord>>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
     let (email, server_url) = {
@@ -8404,7 +9050,7 @@ pub async fn get_mount_recovery_copy_preview(
     recovery_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountRecoveryCopyPreview>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_local_data_access(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
     let (email, server_url) = {
@@ -8554,6 +9200,8 @@ pub struct MountInfo {
     pub mountpoint: String,
     pub encrypted_dir: String,
     pub backend: String,
+    #[serde(default = "default_mount_availability")]
+    pub availability: String,
     #[serde(default)]
     pub fallback_reason: Option<String>,
     pub sync_status: Option<MountSyncRuntimeStatus>,
@@ -8631,6 +9279,7 @@ mod cloud_provider_health_payload_tests {
             safe_to_unmount: false,
             pending_mutation_count: Some(2),
             pending_refresh_count: Some(1),
+            reconciliation_in_progress: Some(false),
             conflict_count: Some(0),
             durable_observed_at: chrono::Utc::now(),
             registration_source: Some(DurableInspectionSource::Primary),
@@ -8650,6 +9299,7 @@ mod cloud_provider_health_payload_tests {
         let payload = MountStatusPayload {
             mountpoint: "/mount".into(),
             backend: "windows-cloud-files".into(),
+            availability: "degraded".into(),
             fallback_reason: None,
             operational_health: Some(mapped),
         };
@@ -8660,6 +9310,7 @@ mod cloud_provider_health_payload_tests {
             encoded["operational_health"]["registration_generation"],
             serde_json::json!(7)
         );
+        assert_eq!(encoded["availability"], serde_json::json!("degraded"));
         assert_eq!(
             encoded["operational_health"]["safe_to_unmount"],
             serde_json::json!(false)
@@ -8731,6 +9382,95 @@ mod cloud_provider_health_payload_tests {
             mapped["error"],
             serde_json::json!("health snapshot corrupt")
         );
+    }
+
+    #[test]
+    fn unavailable_or_unhealthy_cloud_root_is_degraded() {
+        let healthy = serde_json::json!({
+            "registered": true,
+            "lifecycle_healthy": true,
+            "heartbeat_fresh": true,
+            "durable_state_readable": true,
+            "operational": { "healthy": true }
+        });
+        assert!(cloud_health_is_usable(Some(&healthy)));
+        let mut degraded = healthy.clone();
+        degraded["operational"]["healthy"] = serde_json::json!(false);
+        assert!(!cloud_health_is_usable(Some(&degraded)));
+        assert!(!cloud_health_is_usable(Some(&serde_json::json!({
+            "available": false,
+            "healthy": false,
+            "error": "provider not reachable"
+        }))));
+        assert!(!cloud_health_is_usable(None));
+    }
+
+    #[tokio::test]
+    async fn missing_source_for_a_does_not_block_lookup_of_b() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_dir = temp.path();
+        let states_dir = user_dir.join("mount_states");
+        fs::create_dir_all(&states_dir).await.unwrap();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+        let source_b = user_dir.join("source-b");
+        let mountpoint_b = user_dir.join("mount-b");
+        fs::create_dir_all(&source_b).await.unwrap();
+        fs::create_dir_all(&mountpoint_b).await.unwrap();
+        for (root_id, encrypted_dir, mountpoint) in [
+            (
+                &a,
+                user_dir.join("missing-source-a"),
+                user_dir.join("mount-a"),
+            ),
+            (&b, source_b.clone(), mountpoint_b),
+        ] {
+            let record = MountRuntimeState {
+                root_id: root_id.clone(),
+                mountpoint,
+                encrypted_dir,
+                platform: std::env::consts::OS.into(),
+                backend: Some(MountBackend::Sync),
+                host_pid: None,
+                fallback_reason: None,
+                ready: true,
+                requested_unmount: false,
+            };
+            fs::write(
+                states_dir.join(format!("mount_state_{root_id}.json")),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let record_b = matching_mount_state_for_root(user_dir, &b, source_b.to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record_b.root_id, b);
+        assert_eq!(
+            dunce::canonicalize(record_b.encrypted_dir).unwrap(),
+            source_b
+        );
+        let source_a = user_dir.join("missing-source-a");
+        assert!(
+            matching_mount_state_for_root(user_dir, &a, source_a.to_str().unwrap(),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_mount_state_prevents_safe_stop_from_claiming_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let states_dir = temp.path().join("mount_states");
+        fs::create_dir_all(&states_dir).await.unwrap();
+        fs::write(states_dir.join("mount_state_broken.json"), b"{")
+            .await
+            .unwrap();
+        assert!(load_cloud_mount_state_records_for_unmount(temp.path())
+            .await
+            .is_err());
     }
 }
 
@@ -8860,6 +9600,7 @@ pub async fn unmount_all_mounts(
     force: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<bool>, String> {
+    let _operation_guard = UPDATE_OPERATION_GATE.read().await;
     tracing::info!("Unmount all request received");
     let force = force.unwrap_or(false);
     if let Err(err) = stop_all_desktop_cloud_roots(&state, force).await {
@@ -8878,6 +9619,7 @@ pub async fn unmount_mount_by_root_id(
     force: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<bool>, String> {
+    let _operation_guard = UPDATE_OPERATION_GATE.read().await;
     tracing::info!("Unmount request received for root_id: {}", root_id);
 
     match unmount_desktop_cloud_root_if_active(&state, &root_id, force.unwrap_or(false)).await {
@@ -8901,7 +9643,7 @@ async fn unmount_desktop_cloud_root_if_active(
     root_id: &str,
     force: bool,
 ) -> Result<bool, String> {
-    let session = require_authenticated_session(state).await?;
+    let session = current_authenticated_session(state).await?;
     let server_url = current_server_url(state, &session);
     let user_dir = get_user_dir(&session.email, &server_url)?;
     let Some((state_path, mount_state)) =
@@ -8985,7 +9727,7 @@ async fn stop_all_desktop_cloud_roots(state: &AppState, force: bool) -> Result<(
     if let Some(session) = session {
         let server_url = current_server_url(state, &session);
         let user_dir = get_user_dir(&session.email, &server_url)?;
-        let records = load_cloud_mount_state_records_for_unmount(&user_dir).await;
+        let records = load_cloud_mount_state_records_for_unmount(&user_dir).await?;
         for (state_path, mount_state) in records {
             unmount_desktop_cloud_root_record(state, &user_dir, state_path, mount_state, force)
                 .await?;
@@ -8995,31 +9737,39 @@ async fn stop_all_desktop_cloud_roots(state: &AppState, force: bool) -> Result<(
     state.cloud_provider.stop_all(true, force).await
 }
 
+pub(crate) async fn stop_cli_mounts_for_session_transition(
+    state: &AppState,
+    email: &str,
+) -> Result<(), String> {
+    operations::cancel_all_desktop_operations(state).await;
+    let _exclusive = UPDATE_OPERATION_GATE.write().await;
+    let user_dir = get_user_dir(email, state.client.server_url())?;
+    state.mount_manager.unmount_account(&user_dir, false).await
+}
+
+pub(crate) async fn stop_all_mounts_safely(state: &AppState, force: bool) -> Result<(), String> {
+    stop_all_desktop_cloud_roots(state, force).await?;
+    state.mount_manager.unmount_all(force).await
+}
+
 #[tauri::command]
 pub async fn exit_application(
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<bool>, String> {
     tracing::info!("exit_application: starting safe quit with unmount");
+    operations::cancel_all_desktop_operations(&state).await;
+    let _exclusive = UPDATE_OPERATION_GATE.write().await;
 
-    if let Err(e) = stop_all_desktop_cloud_roots(&state, false).await {
-        tracing::error!("Failed to stop Cloud Files roots during exit: {}", e);
+    if let Err(e) = stop_all_mounts_safely(&state, false).await {
+        tracing::error!("Failed to stop protected folders during exit: {}", e);
         return Ok(CommandResponse::err(format!(
-            "Application remains open because protected folders are not safe to stop: {}",
+            "Application remains open because protected folders could not be stopped safely: {}",
             e
         )));
     }
 
-    // Unmount all folders before exiting
-    if let Err(e) = state.mount_manager.unmount_all(false).await {
-        tracing::error!("Failed to unmount during exit: {}", e);
-        return Ok(CommandResponse::err(format!(
-            "Application remains open because mounts could not be stopped safely: {}",
-            e
-        )));
-    } else {
-        tracing::info!("exit_application: unmount completed successfully");
-    }
+    tracing::info!("exit_application: safe stop completed successfully");
 
     app_handle.exit(0);
     Ok(CommandResponse::ok(true))
@@ -9091,16 +9841,84 @@ pub async fn prioritize_folder_decrypt(
 
 mod update_safety;
 static UPDATE_OPERATION_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+static LOGIN_OPERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn ensure_authenticated(
     state: &AppState,
 ) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    // Refresh or retire an expired session before taking the read gate: safe
+    // retirement needs the exclusive gate to stop all mount backends.
+    let ready = ensure_session_ready_internal(state).await?.is_some();
+    if !ready {
+        return Err("Please login through the desktop app to access this feature.".to_string());
+    }
     let guard = UPDATE_OPERATION_GATE.read().await;
-    if ensure_session_ready_internal(state).await?.is_some() {
+    if state.is_authenticated().await {
         Ok(guard)
     } else {
         Err("Please login through the desktop app to access this feature.".to_string())
     }
+}
+
+async fn ensure_local_data_access(
+    state: &AppState,
+) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    let ready = ensure_session_ready_internal(state).await?.is_some();
+    if !ready {
+        return Err("No protected account data is available".into());
+    }
+    let guard = UPDATE_OPERATION_GATE.read().await;
+    let session = state.session.lock().await;
+    if session.as_ref().is_some_and(|session| {
+        session.expires_at > chrono::Utc::now().timestamp()
+            || state.has_cached_team_data_access(session)
+    }) {
+        Ok(guard)
+    } else {
+        Err("Sign in to access this data".into())
+    }
+}
+
+async fn ensure_local_team_write(
+    state: &AppState,
+) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    let guard = ensure_local_data_access(state).await?;
+    let session = state.session.lock().await;
+    let session = session.as_ref().ok_or("No account is open")?;
+    if session.expires_at > chrono::Utc::now().timestamp() {
+        return Ok(guard);
+    }
+    if session.team_revoked {
+        return Err("Team license has been revoked".into());
+    }
+    let token = session
+        .team_entitlement
+        .as_deref()
+        .ok_or("No Team entitlement is cached")?;
+    let keys = hybridcipher_client::entitlement::trusted_keys_from_build()?;
+    hybridcipher_client::entitlement::verify(
+        token,
+        &keys,
+        session
+            .server_url
+            .as_deref()
+            .unwrap_or(state.client.server_url()),
+        &session.user_id,
+        chrono::Utc::now().timestamp(),
+    )?;
+    Ok(guard)
+}
+
+async fn current_local_session(state: &AppState) -> Result<crate::state::UserSession, String> {
+    let session = state.session.lock().await;
+    session
+        .as_ref()
+        .filter(|session| {
+            session.expires_at > chrono::Utc::now().timestamp()
+                || state.has_cached_team_data_access(session)
+        })
+        .cloned()
+        .ok_or("No protected account data is available".into())
 }
 
 fn api_base_url(server_url: &str) -> String {

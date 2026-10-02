@@ -29,6 +29,7 @@ pub mod compatibility_fixtures;
 mod compatibility_tests;
 pub use compatibility::{VaultCompatibility, VaultCompatibilityStatus};
 pub use hybridcipher_client::file::content_manifest::LegacyReadPolicy;
+pub use hybridcipher_mount_sync::readonly::ReadOnlyMount;
 
 pub use hybridcipher_mount_sync::{
     LowSpaceMode, MountConflictRecord, MountRecoveryCopyRecord, MountSafetyReason,
@@ -619,6 +620,9 @@ impl EncryptedInventory {
 
 #[async_trait]
 pub trait ProviderBridge: Send + Sync {
+    async fn check_write_access(&self) -> Result<()> {
+        Ok(())
+    }
     fn compatibility_status(&self) -> Option<VaultCompatibilityStatus> {
         None
     }
@@ -920,6 +924,7 @@ impl LocalProviderBridge {
 pub struct ClientMountCrypto {
     client: Arc<LocalProviderClient>,
     compatibility: Option<Arc<VaultCompatibility>>,
+    group_id: Option<Uuid>,
 }
 
 impl ClientMountCrypto {
@@ -927,12 +932,40 @@ impl ClientMountCrypto {
         Self {
             client,
             compatibility: None,
+            group_id: None,
         }
+    }
+
+    pub async fn for_root(
+        client: Arc<LocalProviderClient>,
+        root_id: Uuid,
+    ) -> std::result::Result<Self, MountSyncError> {
+        let group_id = client
+            .coverage_roots()
+            .await?
+            .into_iter()
+            .find(|root| root.root_id == root_id)
+            .and_then(|root| root.group_id)
+            .or(client.active_group_id_opt().await)
+            .ok_or_else(|| MountSyncError::Crypto("Mount has no group identity".into()))?;
+        let client = Arc::new(client.for_local_group(group_id));
+        Ok(Self {
+            client,
+            compatibility: None,
+            group_id: Some(group_id),
+        })
     }
 }
 
 #[async_trait]
 impl MountCrypto for ClientMountCrypto {
+    async fn check_write_access(&self) -> std::result::Result<(), MountSyncError> {
+        match self.group_id {
+            Some(group_id) => self.client.require_local_write_for_group(group_id).await,
+            None => self.client.require_local_write().await,
+        }
+        .map_err(MountSyncError::from)
+    }
     fn is_path_excluded(&self, path: &Path) -> bool {
         self.client.is_path_excluded(path)
     }
@@ -1009,6 +1042,7 @@ impl MountCrypto for ClientMountCrypto {
         relative_path: &str,
         plaintext: &[u8],
     ) -> std::result::Result<EncryptedFileMetadata, MountSyncError> {
+        self.check_write_access().await?;
         self.client
             .encrypt_file(relative_path, plaintext)
             .await
@@ -1021,6 +1055,7 @@ impl MountCrypto for ClientMountCrypto {
         plaintext: &[u8],
         file_id: &str,
     ) -> std::result::Result<EncryptedFileMetadata, MountSyncError> {
+        self.check_write_access().await?;
         self.client
             .encrypt_file_with_id(relative_path, plaintext, file_id)
             .await
@@ -1036,6 +1071,7 @@ impl MountCrypto for ClientMountCrypto {
         platform_metadata: Option<&PlatformFileMetadata>,
         chunk_size: usize,
     ) -> std::result::Result<StreamingEncryptedFile, MountSyncError> {
+        self.check_write_access().await?;
         let (metadata, integrity_hash) = self
             .client
             .encrypt_file_streaming_to_path(
@@ -1064,6 +1100,7 @@ impl MountCrypto for ClientMountCrypto {
         file_id: &str,
         chunk_size: usize,
     ) -> std::result::Result<StreamingEncryptedFile, MountSyncError> {
+        self.check_write_access().await?;
         let (metadata, integrity_hash) = self
             .client
             .encrypt_file_streaming_with_id_to_path(
@@ -1087,6 +1124,7 @@ impl MountCrypto for ClientMountCrypto {
         &self,
         metadata: FileMetadataData,
     ) -> std::result::Result<(), MountSyncError> {
+        self.check_write_access().await?;
         self.client
             .coverage_store_file_metadata(metadata)
             .await
@@ -1106,6 +1144,7 @@ pub fn local_provider_bridge_with_compatibility(
     let crypto = Arc::new(ClientMountCrypto {
         client,
         compatibility: Some(compatibility.clone()),
+        group_id: None,
     });
     Arc::new(LocalProviderBridge {
         crypto,
@@ -1113,8 +1152,27 @@ pub fn local_provider_bridge_with_compatibility(
     })
 }
 
+pub async fn local_provider_bridge_for_root_with_compatibility(
+    client: Arc<LocalProviderClient>,
+    root_id: Uuid,
+    compatibility: Arc<VaultCompatibility>,
+) -> Result<Arc<dyn ProviderBridge>> {
+    let mut crypto = ClientMountCrypto::for_root(client, root_id).await?;
+    crypto.compatibility = Some(compatibility.clone());
+    Ok(Arc::new(LocalProviderBridge {
+        crypto: Arc::new(crypto),
+        compatibility: Some(compatibility),
+    }))
+}
+
 #[async_trait]
 impl ProviderBridge for LocalProviderBridge {
+    async fn check_write_access(&self) -> Result<()> {
+        self.crypto
+            .check_write_access()
+            .await
+            .map_err(ProviderCoreError::from)
+    }
     fn compatibility_status(&self) -> Option<VaultCompatibilityStatus> {
         self.compatibility.as_ref().map(|p| p.status())
     }
@@ -1264,6 +1322,7 @@ impl ProviderBridge for LocalProviderBridge {
         plaintext_path: &Path,
         existing_identity: Option<&FileIdentityV1>,
     ) -> Result<ProviderEntry> {
+        self.check_write_access().await?;
         writeback_plaintext_file(
             self.crypto.as_ref(),
             self.compatibility.as_deref(),
@@ -1285,6 +1344,7 @@ impl ProviderBridge for LocalProviderBridge {
         existing_identity: Option<&FileIdentityV1>,
         expected_version: &ExpectedProviderVersion,
     ) -> Result<ProviderEntry> {
+        self.check_write_access().await?;
         let inventory = self.inventory(root_id, encrypted_root).await?;
         let resolved_identity = match existing_identity {
             Some(identity) => Some(
@@ -1308,6 +1368,7 @@ impl ProviderBridge for LocalProviderBridge {
     }
 
     async fn delete_entry(&self, encrypted_root: &Path, identity: &FileIdentityV1) -> Result<()> {
+        self.check_write_access().await?;
         let encrypted_path = encrypted_path_for_identity(encrypted_root, identity)?;
         if let Some(policy) = &self.compatibility {
             if encrypted_path.is_dir() {
@@ -1345,6 +1406,7 @@ impl ProviderBridge for LocalProviderBridge {
         encrypted_root: &Path,
         relative_path: &str,
     ) -> Result<ProviderEntry> {
+        self.check_write_access().await?;
         let normalized_relative_path = normalize_relative_path(relative_path);
         let mut directory_path = encrypted_root.to_path_buf();
         let mut component_path = String::new();
@@ -1382,6 +1444,7 @@ impl ProviderBridge for LocalProviderBridge {
         target_relative_path: &str,
         target_plaintext_path: Option<&Path>,
     ) -> Result<Option<ProviderEntry>> {
+        self.check_write_access().await?;
         if source_identity.kind == ProviderEntryKind::File {
             if let Some(target_plaintext_path) = target_plaintext_path {
                 let old_path = encrypted_path_for_identity(encrypted_root, source_identity)?;
@@ -1438,6 +1501,7 @@ impl ProviderBridge for LocalProviderBridge {
         target_plaintext_path: Option<&Path>,
         expected_version: &ExpectedProviderVersion,
     ) -> Result<Option<ProviderEntry>> {
+        self.check_write_access().await?;
         let inventory = self.inventory(root_id, encrypted_root).await?;
         let normalized_target = normalize_relative_path(target_relative_path);
         let target = inventory
@@ -1785,48 +1849,42 @@ async fn writeback_plaintext_file_checked(
         .flatten();
     fs::create_dir_all(&staging_dir)?;
     let staging_path = staging_dir.join(format!("checked-{}.encrypted", Uuid::new_v4()));
-    let streaming = match encrypt_plaintext_to_path(
-        crypto,
-        &normalized_relative_path,
-        plaintext_path,
-        &staging_path,
-        existing_identity,
-    )
-    .await
-    {
-        Ok(streaming) => streaming,
-        Err(err) => {
-            let _ = fs::remove_file(&staging_path);
-            return Err(err);
-        }
-    };
+    let result = async {
+        let streaming = encrypt_plaintext_to_path(
+            crypto,
+            &normalized_relative_path,
+            plaintext_path,
+            &staging_path,
+            existing_identity,
+        )
+        .await?;
 
-    let current = content_version_at_path(encrypted_root, &encrypted_path)?;
-    if let Err(err) = validate_expected_content_version(
-        &normalized_relative_path,
-        expected_version,
-        current.as_ref(),
-    ) {
-        let _ = fs::remove_file(&staging_path);
-        return Err(err);
-    }
-    if let Some(parent) = encrypted_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(backup) = backup {
-        if let Err(error) = backup.verify_current() {
-            let _ = fs::remove_file(&staging_path);
-            return Err(error);
+        let current = content_version_at_path(encrypted_root, &encrypted_path)?;
+        validate_expected_content_version(
+            &normalized_relative_path,
+            expected_version,
+            current.as_ref(),
+        )?;
+        if let Some(parent) = encrypted_path.parent() {
+            fs::create_dir_all(parent)?;
         }
+        if let Some(backup) = backup {
+            backup.verify_current()?;
+        }
+        replace_encrypted_file(&staging_path, &encrypted_path)?;
+        store_streaming_coverage(crypto, &streaming).await?;
+        Ok(ProviderEntry::file(
+            root_id,
+            normalized_relative_path,
+            encrypted_path,
+            streaming.metadata,
+        ))
     }
-    replace_encrypted_file(&staging_path, &encrypted_path)?;
-    store_streaming_coverage(crypto, &streaming).await?;
-    Ok(ProviderEntry::file(
-        root_id,
-        normalized_relative_path,
-        encrypted_path,
-        streaming.metadata,
-    ))
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&staging_path);
+    }
+    result
 }
 
 async fn encrypt_plaintext_to_path(

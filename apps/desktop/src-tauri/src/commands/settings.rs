@@ -12,8 +12,8 @@ pub async fn update_server_url(
 }
 
 #[tauri::command]
-pub async fn get_app_version() -> Result<CommandResponse<String>, String> {
-    let version = env!("CARGO_PKG_VERSION").to_string();
+pub async fn get_app_version(app_handle: AppHandle) -> Result<CommandResponse<String>, String> {
+    let version = app_handle.package_info().version.to_string();
     Ok(CommandResponse::ok(version))
 }
 
@@ -31,6 +31,9 @@ pub async fn get_release_notes_payload(
     app_handle: AppHandle,
 ) -> Result<CommandResponse<release_notes::ReleaseNotesPayload>, String> {
     let resource_dir = app_handle.path().resource_dir().ok();
-    let payload = release_notes::load_release_notes(resource_dir.as_deref())?;
+    let payload = release_notes::load_release_notes(
+        resource_dir.as_deref(),
+        &app_handle.package_info().version.to_string(),
+    )?;
     Ok(CommandResponse::ok(payload))
 }

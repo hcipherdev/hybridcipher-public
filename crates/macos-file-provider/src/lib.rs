@@ -504,6 +504,12 @@ impl MacFileProviderCacheBridge {
 
 #[async_trait]
 impl ProviderBridge for MacFileProviderCacheBridge {
+    async fn check_write_access(&self) -> hybridcipher_provider_core::Result<()> {
+        self.crypto
+            .check_write_access()
+            .await
+            .map_err(ProviderCoreError::from)
+    }
     async fn inventory(
         &self,
         root_id: Uuid,
@@ -591,6 +597,7 @@ impl ProviderBridge for MacFileProviderCacheBridge {
         plaintext_path: &Path,
         existing_identity: Option<&FileIdentityV1>,
     ) -> hybridcipher_provider_core::Result<ProviderEntry> {
+        self.check_write_access().await?;
         self.ensure_root(root_id, encrypted_root)?;
         let _operation = self.operation_lock.lock().await;
         let cache_path = cache_path_for_relative(&self.runtime_paths.cache_dir, relative_path)?;
@@ -617,6 +624,7 @@ impl ProviderBridge for MacFileProviderCacheBridge {
         encrypted_root: &Path,
         relative_path: &str,
     ) -> hybridcipher_provider_core::Result<ProviderEntry> {
+        self.check_write_access().await?;
         self.ensure_root(root_id, encrypted_root)?;
         let _operation = self.operation_lock.lock().await;
         let cache_path = cache_path_for_relative(&self.runtime_paths.cache_dir, relative_path)?;
@@ -635,6 +643,7 @@ impl ProviderBridge for MacFileProviderCacheBridge {
         encrypted_root: &Path,
         identity: &FileIdentityV1,
     ) -> hybridcipher_provider_core::Result<()> {
+        self.check_write_access().await?;
         self.ensure_root(identity.root_id, encrypted_root)?;
         let _operation = self.operation_lock.lock().await;
         let cache_path =
@@ -663,6 +672,7 @@ impl ProviderBridge for MacFileProviderCacheBridge {
         target_relative_path: &str,
         target_plaintext_path: Option<&Path>,
     ) -> hybridcipher_provider_core::Result<Option<ProviderEntry>> {
+        self.check_write_access().await?;
         self.ensure_root(root_id, encrypted_root)?;
         let _operation = self.operation_lock.lock().await;
         let source_path = cache_path_for_relative(

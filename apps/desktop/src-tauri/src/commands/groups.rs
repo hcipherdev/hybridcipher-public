@@ -11,12 +11,40 @@ pub async fn create_group(
     request: CreateGroupRequest,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<crate::client::CreateGroupResult>, String> {
+    super::license::require_team_write(&state).await?;
     tracing::info!("Create group command called: {}", request.group_name);
-
-    match state.client.create_group(request.group_name).await {
-        Ok(result) => Ok(CommandResponse::ok(result)),
-        Err(e) => Ok(CommandResponse::err(e)),
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    let response = reqwest::Client::new()
+        .post(api_endpoint(
+            &current_server_url(&state, &session),
+            "groups",
+        ))
+        .bearer_auth(&session.token)
+        .json(&json!({"name": request.group_name, "description": request.description}))
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Ok(CommandResponse::err(format!(
+            "Group creation failed: {}",
+            response.status()
+        )));
     }
+    let value: Value = response.json().await.map_err(|err| err.to_string())?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("Group ID missing from server response")?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(CommandResponse::ok(crate::client::CreateGroupResult {
+        group_id: id.to_string(),
+        name: name.to_string(),
+        created: true,
+    }))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,27 +56,32 @@ pub struct InitializeGroupRequest {
 #[tauri::command]
 pub async fn initialize_group(
     request: InitializeGroupRequest,
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<CommandResponse<bool>, String> {
-    tracing::info!("Initialize group command called: {}", request.group_id);
+    super::license::require_team_write(&state).await?;
+    let _guard = ensure_authenticated(&state).await?;
+    let group_id = Uuid::parse_str(&request.group_id).map_err(|_| "Invalid group ID")?;
+    let client = state.local_client.client().await?;
+    client
+        .ensure_group_initialized(group_id)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(CommandResponse::ok(true))
 }
 
 #[tauri::command]
 pub async fn list_groups(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<crate::client::GroupInfo>>, String> {
-    tracing::info!("List groups command called");
-
-    match state.client.list_groups().await {
-        Ok(groups) => Ok(CommandResponse::ok(groups)),
-        Err(e) => Ok(CommandResponse::err(e)),
-    }
+    Ok(CommandResponse::err(
+        "Use get_group_summaries for the current server groups",
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminGroupSummary {
     pub id: String,
+    pub organization_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub created_at: String,
@@ -123,6 +156,7 @@ pub async fn get_group_summaries(
 
         summaries.push(AdminGroupSummary {
             id: group.id.to_string(),
+            organization_id: group.organization_id.map(|id| id.to_string()),
             name: group.name,
             description: group.description,
             created_at: group.created_at.to_rfc3339(),
@@ -138,15 +172,10 @@ pub async fn get_group_summaries(
 #[tauri::command]
 pub async fn get_group_info(
     group_id: String,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<CommandResponse<Option<crate::client::GroupInfo>>, String> {
     tracing::info!("Get group info command called: {}", group_id);
-
-    match state.client.list_groups().await {
-        Ok(groups) => {
-            let info = groups.into_iter().find(|g| g.id == group_id);
-            Ok(CommandResponse::ok(info))
-        }
-        Err(e) => Ok(CommandResponse::err(e)),
-    }
+    Ok(CommandResponse::err(
+        "Use get_group_summaries for the current server groups",
+    ))
 }

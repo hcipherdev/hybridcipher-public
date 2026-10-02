@@ -1,5 +1,30 @@
 use super::*;
 
+#[tauri::command]
+pub async fn export_existing_team_file(
+    encrypted_path: String,
+    output_path: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<bool>, String> {
+    let _guard = ensure_local_data_access(&state).await?;
+    let client = state.local_client.client().await?;
+    let source = PathBuf::from(encrypted_path);
+    let destination = PathBuf::from(output_path);
+    if destination.exists() {
+        return Ok(CommandResponse::err("Export destination already exists"));
+    }
+    match hybridcipher_client::ipc::coverage_workflows::export_encrypted_file(
+        client.as_ref(),
+        &source,
+        &destination,
+    )
+    .await
+    {
+        Ok(()) => Ok(CommandResponse::ok(true)),
+        Err(err) => Ok(CommandResponse::err(err)),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EncryptFileRequest {
     pub file_path: String,
@@ -17,19 +42,13 @@ pub struct EncryptProgress {
 #[tauri::command]
 pub async fn encrypt_file(
     request: EncryptFileRequest,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     _window: tauri::Window,
 ) -> Result<CommandResponse<crate::client::EncryptFileResult>, String> {
     tracing::info!("Encrypt file command called: {}", request.file_path);
-
-    match state
-        .client
-        .encrypt_file(request.file_path, request.group_id)
-        .await
-    {
-        Ok(result) => Ok(CommandResponse::ok(result)),
-        Err(e) => Ok(CommandResponse::err(e)),
-    }
+    Ok(CommandResponse::err(
+        "This legacy file command is unavailable; use an enrolled folder or the bundled CLI",
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,18 +60,12 @@ pub struct DecryptFileRequest {
 #[tauri::command]
 pub async fn decrypt_file(
     request: DecryptFileRequest,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<CommandResponse<crate::client::DecryptFileResult>, String> {
     tracing::info!("Decrypt file command called: {}", request.file_path);
-
-    match state
-        .client
-        .decrypt_file(request.file_path, request.output_path)
-        .await
-    {
-        Ok(result) => Ok(CommandResponse::ok(result)),
-        Err(e) => Ok(CommandResponse::err(e)),
-    }
+    Ok(CommandResponse::err(
+        "This legacy file command is unavailable; use Export existing encrypted file or the bundled CLI",
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

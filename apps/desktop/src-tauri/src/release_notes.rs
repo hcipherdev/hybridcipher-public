@@ -33,9 +33,32 @@ pub fn release_notes_fallback_dir() -> PathBuf {
         .join("release-notes")
 }
 
+fn release_notes_fallback_file_name_for_os(os: &str) -> &'static str {
+    match os {
+        "macos" => "releases.macos.json",
+        "windows" => "releases.windows.json",
+        _ => "releases.json",
+    }
+}
+
+fn release_notes_fallback_path() -> PathBuf {
+    release_notes_fallback_dir().join(release_notes_fallback_file_name_for_os(
+        std::env::consts::OS,
+    ))
+}
+
 pub fn load_release_notes_from_dir(base_dir: &Path) -> Result<Vec<ReleaseNoteEntry>, String> {
-    let path = base_dir.join("releases.json");
-    let content = fs::read_to_string(&path)
+    let bundled_alias = base_dir.join("releases.json");
+    if bundled_alias.exists() {
+        return load_release_notes_from_path(&bundled_alias);
+    }
+    load_release_notes_from_path(&base_dir.join(release_notes_fallback_file_name_for_os(
+        std::env::consts::OS,
+    )))
+}
+
+fn load_release_notes_from_path(path: &Path) -> Result<Vec<ReleaseNoteEntry>, String> {
+    let content = fs::read_to_string(path)
         .map_err(|error| format!("Failed to read release notes {}: {}", path.display(), error))?;
     let parsed: ReleaseNotesDocument = serde_json::from_str(&content).map_err(|error| {
         format!(
@@ -51,30 +74,43 @@ pub fn load_release_notes_from_dir(base_dir: &Path) -> Result<Vec<ReleaseNoteEnt
         .filter(|entry| !entry.version.trim().is_empty())
         .collect::<Vec<_>>();
 
-    if releases.is_empty() {
-        return Err(format!(
-            "No versioned release notes were found in {}",
-            path.display()
-        ));
-    }
-
     Ok(releases)
 }
 
-pub fn load_release_notes(resource_dir: Option<&Path>) -> Result<ReleaseNotesPayload, String> {
+pub fn load_release_notes(
+    resource_dir: Option<&Path>,
+    current_version: &str,
+) -> Result<ReleaseNotesPayload, String> {
+    let fallback_path = release_notes_fallback_path();
+
+    // Development runs should reflect the editable catalog for the build host,
+    // even when Tauri has copied the general catalog into a local resource dir.
+    if cfg!(debug_assertions) && fallback_path.exists() {
+        return Ok(ReleaseNotesPayload {
+            current_version: current_version.to_string(),
+            releases: load_release_notes_from_path(&fallback_path)?,
+        });
+    }
+
     if let Some(resource_dir) = resource_dir {
-        let bundled_dir = resource_dir.join("release-notes");
-        if bundled_dir.exists() {
-            return Ok(ReleaseNotesPayload {
-                current_version: env!("CARGO_PKG_VERSION").to_string(),
-                releases: load_release_notes_from_dir(&bundled_dir)?,
-            });
+        // Resource maps use the first layout; Tauri's default ../release-notes
+        // directory resource uses _up_/release-notes in unsigned bundles.
+        for bundled_dir in [
+            resource_dir.join("release-notes"),
+            resource_dir.join("_up_").join("release-notes"),
+        ] {
+            if bundled_dir.exists() {
+                return Ok(ReleaseNotesPayload {
+                    current_version: current_version.to_string(),
+                    releases: load_release_notes_from_dir(&bundled_dir)?,
+                });
+            }
         }
     }
 
     Ok(ReleaseNotesPayload {
-        current_version: env!("CARGO_PKG_VERSION").to_string(),
-        releases: load_release_notes_from_dir(&release_notes_fallback_dir())?,
+        current_version: current_version.to_string(),
+        releases: load_release_notes_from_path(&fallback_path)?,
     })
 }
 
@@ -111,14 +147,62 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_repo_release_notes_in_dev() {
-        let payload = load_release_notes(None).expect("load fallback release notes");
+    fn accepts_an_empty_platform_catalog() {
+        let temp_dir = tempdir().expect("temp dir");
+        fs::write(temp_dir.path().join("releases.json"), r#"{"releases":[]}"#)
+            .expect("write empty catalog");
 
-        assert_eq!(payload.current_version, env!("CARGO_PKG_VERSION"));
-        assert!(!payload.releases.is_empty());
-        assert!(payload
-            .releases
-            .iter()
-            .any(|entry| entry.version == env!("CARGO_PKG_VERSION")));
+        let releases = load_release_notes_from_dir(temp_dir.path()).expect("load empty catalog");
+
+        assert!(releases.is_empty());
+    }
+
+    #[test]
+    fn selects_platform_catalog_for_development_fallback() {
+        assert_eq!(
+            release_notes_fallback_file_name_for_os("macos"),
+            "releases.macos.json"
+        );
+        assert_eq!(
+            release_notes_fallback_file_name_for_os("windows"),
+            "releases.windows.json"
+        );
+        assert_eq!(
+            release_notes_fallback_file_name_for_os("linux"),
+            "releases.json"
+        );
+
+        let payload = load_release_notes(None, "7.8.9").expect("load platform fallback catalog");
+        assert_eq!(payload.current_version, "7.8.9");
+        assert!(release_notes_fallback_path().exists());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn development_prefers_platform_catalog_over_bundled_general_catalog() {
+        let temp_dir = tempdir().expect("temp dir");
+        let bundled_dir = temp_dir.path().join("release-notes");
+        fs::create_dir_all(&bundled_dir).expect("create bundled release-notes dir");
+        fs::write(
+            bundled_dir.join("releases.json"),
+            r#"{"releases":[{"version":"99.0.0","published_at":"2026-01-01"}]}"#,
+        )
+        .expect("write bundled general catalog");
+
+        let payload =
+            load_release_notes(Some(temp_dir.path()), "7.8.9").expect("load development catalog");
+        let expected = load_release_notes_from_path(&release_notes_fallback_path())
+            .expect("load platform fallback catalog");
+
+        assert_eq!(payload.releases, expected);
+    }
+
+    #[test]
+    fn falls_back_to_repo_release_notes_in_dev() {
+        let payload = load_release_notes(None, "7.8.9").expect("load fallback release notes");
+
+        assert_eq!(payload.current_version, "7.8.9");
+        // The Windows catalog intentionally starts empty; other platform
+        // catalogs can have a newer version than the app package.
     }
 }

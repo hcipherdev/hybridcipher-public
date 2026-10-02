@@ -36,6 +36,7 @@ pub mod compression;
 pub mod config;
 pub mod config_loader;
 pub mod coverage;
+pub mod entitlement;
 pub mod epoch;
 pub mod epoch_key_source;
 pub mod errors;
@@ -43,6 +44,7 @@ pub mod file;
 pub mod group;
 pub mod invitation;
 pub mod ipc;
+pub mod local_write_access;
 pub mod logging;
 pub mod metrics;
 pub mod network;
@@ -55,6 +57,7 @@ pub mod scalable_groups;
 pub mod security;
 pub mod state;
 pub mod storage;
+pub mod team_requests;
 pub mod transparency;
 pub mod welcome_manager;
 
@@ -97,8 +100,8 @@ pub use hybridcipher_coverage::{CoverageManager, CoverageManagerError, CoverageR
 pub use recovery::{get_recovery_manager, CircuitBreaker, ErrorRecoveryManager, RetryPolicy};
 pub use state::client::{
     ActiveRekeyOperation, Client, CoveragePendingFile, CutoverSummary, DeviceRemovalSummary,
-    EncryptedFileMetadata, LocalRewrapSnapshot, RecoveryCapsulePlain, RecoveryEpochSecret,
-    RekeyErrorEntry, RekeyInitiationOptions, RekeyProgress,
+    EncryptedFileMetadata, GroupInitializationReadiness, LocalRewrapSnapshot, RecoveryCapsulePlain,
+    RecoveryEpochSecret, RekeyErrorEntry, RekeyInitiationOptions, RekeyProgress,
 };
 #[cfg(feature = "mount-fs")]
 pub use state::client::{

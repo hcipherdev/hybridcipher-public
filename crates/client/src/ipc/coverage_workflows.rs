@@ -1,7 +1,10 @@
 use crate::coverage::{CoverageRoot, CoverageRootKind};
 use crate::errors::{ClientError, ErrorCode};
 use crate::file::{
-    encrypt::SparseFileMetadata,
+    encrypt::{
+        chunked_encrypted_size, read_encrypted_header, SparseFileMetadata, MAX_CONTENT_CHUNK_SIZE,
+        MAX_IN_MEMORY_PLAINTEXT_BYTES,
+    },
     write_encrypted_file_atomic_for_coverage_with_sync as write_encrypted_file_with_header,
     SerializedEncryptedHeader,
 };
@@ -21,7 +24,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::{BufReader, ErrorKind, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -190,26 +193,53 @@ where
     S: Storage,
     N: Network,
 {
-    let root = client.coverage_unenroll_root(&path).await?;
-    let decrypted_files = if root.path.exists() {
-        match root.kind {
-            CoverageRootKind::SingleFile => {
-                decrypt_file_in_place_with_progress(client, &root.path, Some(on_progress)).await?
-                    as usize
-            }
-            CoverageRootKind::Folder => {
-                decrypt_directory_in_place_with_progress(client, &root.path, Some(on_progress))
-                    .await?
-            }
-        }
+    let absolute = if path.is_absolute() {
+        path.clone()
     } else {
-        0
+        std::env::current_dir()
+            .map_err(|e| {
+                storage_error(
+                    ErrorCode::StorageRead,
+                    e.to_string(),
+                    "coverage_decrypt_root",
+                )
+            })?
+            .join(&path)
     };
+    let requested = fs::canonicalize(&absolute).unwrap_or(absolute);
+    let root = client.coverage_active_root_for_path(&requested).await?;
 
-    Ok(CoverageUnenrollOutcome {
-        root,
-        decrypted_files,
-    })
+    // Keep the root enrolled if authentication or restoration fails. The
+    // watcher is paused while plaintext is being published under the root.
+    client
+        .mark_coverage_enrollment_in_progress(root.root_id)
+        .await;
+    let result = async {
+        let decrypted_files = if root.path.exists() {
+            match root.kind {
+                CoverageRootKind::SingleFile => {
+                    decrypt_file_in_place_with_progress(client, &root.path, Some(on_progress))
+                        .await? as usize
+                }
+                CoverageRootKind::Folder => {
+                    decrypt_directory_in_place_with_progress(client, &root.path, Some(on_progress))
+                        .await?
+                }
+            }
+        } else {
+            0
+        };
+        let root = client.coverage_unenroll_root(&root.path).await?;
+        Ok(CoverageUnenrollOutcome {
+            root,
+            decrypted_files,
+        })
+    }
+    .await;
+    client
+        .clear_coverage_enrollment_in_progress(root.root_id)
+        .await;
+    result
 }
 
 fn log_hydration_warning_summary(root: &CoverageRoot, summary: &CoverageHydrationSummary) {
@@ -872,30 +902,48 @@ fn detect_existing_encryption_metadata(
 }
 
 fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, ClientError> {
-    let encrypted_content = fs::read(path).map_err(|e| {
+    let file = fs::File::open(path).map_err(|e| {
         storage_error(
             ErrorCode::StorageRead,
-            format!("Failed to read {}: {}", path.display(), e),
+            format!("Failed to open {}: {}", path.display(), e),
             "coverage_decrypt_read",
         )
     })?;
-    let separator = ENCRYPTED_FILE_SEPARATOR.as_bytes();
-    let sep_pos = encrypted_content
-        .windows(separator.len())
-        .position(|window| window == separator)
-        .ok_or_else(|| {
-            file_error(
-                ErrorCode::FileInvalidFormat,
-                "Invalid encrypted file format: separator not found".to_string(),
-                "coverage_decrypt_parse",
-                path,
+    let file_len = file
+        .metadata()
+        .map_err(|e| {
+            storage_error(
+                ErrorCode::StorageRead,
+                e.to_string(),
+                "coverage_decrypt_read",
             )
-        })?;
-
-    let metadata_bytes = &encrypted_content[..sep_pos];
-    let ciphertext = encrypted_content[sep_pos + separator.len()..].to_vec();
-
-    let json: Value = serde_json::from_slice(metadata_bytes).map_err(|e| {
+        })?
+        .len();
+    let mut reader = BufReader::new(file);
+    let metadata_bytes = read_encrypted_header(&mut reader).map_err(|e| {
+        file_error(
+            ErrorCode::FileInvalidFormat,
+            format!("Invalid encrypted header: {e}"),
+            "coverage_decrypt_parse",
+            path,
+        )
+    })?;
+    let ciphertext_offset = reader.stream_position().map_err(|e| {
+        storage_error(
+            ErrorCode::StorageRead,
+            e.to_string(),
+            "coverage_decrypt_read",
+        )
+    })?;
+    let ciphertext_len = file_len.checked_sub(ciphertext_offset).ok_or_else(|| {
+        file_error(
+            ErrorCode::FileInvalidFormat,
+            "Encrypted file is shorter than its header".into(),
+            "coverage_decrypt_parse",
+            path,
+        )
+    })?;
+    let json: Value = serde_json::from_slice(&metadata_bytes).map_err(|e| {
         file_error(
             ErrorCode::FileInvalidFormat,
             format!("Failed to parse metadata: {}", e),
@@ -958,13 +1006,52 @@ fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, ClientError>
 
     let header_version = json
         .get("header_version")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| u32::try_from(number).ok())
+                .ok_or_else(|| {
+                    file_error(
+                        ErrorCode::FileInvalidFormat,
+                        "Invalid header_version".into(),
+                        "coverage_decrypt_parse",
+                        path,
+                    )
+                })
+        })
+        .transpose()?;
+    if header_version.unwrap_or(1) >= 3
+        && json
+            .get("file_size")
+            .and_then(|value| value.as_u64())
+            .is_none()
+        && json
+            .get("original_size")
+            .and_then(|value| value.as_u64())
+            .is_none()
+    {
+        return Err(file_error(
+            ErrorCode::FileInvalidFormat,
+            "Missing file size in current encrypted header".into(),
+            "coverage_decrypt_parse",
+            path,
+        ));
+    }
     let wrapped_file_key = decode_bytes(json.get("wrapped_file_key"));
     let key_wrap_nonce = decode_bytes(json.get("key_wrap_nonce"));
     let key_wrap_aad_hash = decode_bytes(json.get("key_wrap_aad_hash"));
     let content_nonce = decode_bytes(json.get("content_nonce"));
-    let content_chunk_size = json.get("chunk_size").and_then(|v| v.as_u64());
+    let content_chunk_size = match json.get("chunk_size") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or_else(|| {
+            file_error(
+                ErrorCode::FileInvalidFormat,
+                "Invalid chunk_size".into(),
+                "coverage_decrypt_parse",
+                path,
+            )
+        })?),
+    };
 
     let created_at = json
         .get("encrypted_at")
@@ -976,10 +1063,92 @@ fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, ClientError>
         .get("platform_metadata")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
         .filter(|metadata: &crate::PlatformFileMetadata| !metadata.is_empty());
-    let sparse_metadata = json
-        .get("sparse_metadata")
-        .and_then(|value| serde_json::from_value::<SparseFileMetadata>(value.clone()).ok())
-        .filter(SparseFileMetadata::is_effectively_sparse);
+    let sparse_metadata = match json.get("sparse_metadata") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<SparseFileMetadata>(value.clone()).map_err(|_| {
+                file_error(
+                    ErrorCode::FileInvalidFormat,
+                    "Invalid sparse_metadata".into(),
+                    "coverage_decrypt_parse",
+                    path,
+                )
+            })?,
+        ),
+    };
+    let invalid = |message: &str| {
+        file_error(
+            ErrorCode::FileInvalidFormat,
+            message.to_string(),
+            "coverage_decrypt_parse",
+            path,
+        )
+    };
+    let packed_size = match sparse_metadata.as_ref() {
+        Some(layout) => layout
+            .validated_packed_size(content_size)
+            .ok_or_else(|| invalid("Invalid sparse extent layout"))?,
+        None => content_size,
+    };
+    let mut ciphertext = Vec::new();
+    if let Some(chunk_size) = content_chunk_size {
+        if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE as u64 {
+            return Err(invalid("chunk_size must be between 1 and 64 MiB"));
+        }
+        let expected = chunked_encrypted_size(packed_size, chunk_size as usize)
+            .map_err(|e| invalid(&e.to_string()))?;
+        if expected != ciphertext_len {
+            return Err(invalid("Ciphertext size mismatch"));
+        }
+    } else {
+        if json
+            .get("file_size")
+            .and_then(|value| value.as_u64())
+            .is_some()
+            || json
+                .get("original_size")
+                .and_then(|value| value.as_u64())
+                .is_some()
+        {
+            let expected = packed_size
+                .checked_add(12 + 16)
+                .ok_or_else(|| invalid("Single-record ciphertext size overflow"))?;
+            if ciphertext_len != expected {
+                return Err(invalid("Ciphertext size mismatch"));
+            }
+        }
+        if content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
+            || ciphertext_len > MAX_IN_MEMORY_PLAINTEXT_BYTES + 12 + 16
+        {
+            return Err(invalid(
+                "Single-record ciphertext exceeds the 256 MiB in-memory limit",
+            ));
+        }
+        let reserve = usize::try_from(ciphertext_len)
+            .map_err(|_| invalid("Ciphertext length is too large"))?;
+        ciphertext
+            .try_reserve_exact(reserve)
+            .map_err(|_| invalid("Unable to reserve ciphertext memory"))?;
+        ciphertext.resize(reserve, 0);
+        reader.read_exact(&mut ciphertext).map_err(|e| {
+            storage_error(
+                ErrorCode::StorageRead,
+                e.to_string(),
+                "coverage_decrypt_read",
+            )
+        })?;
+        let mut extra = [0u8; 1];
+        if reader.read(&mut extra).map_err(|e| {
+            storage_error(
+                ErrorCode::StorageRead,
+                e.to_string(),
+                "coverage_decrypt_read",
+            )
+        })? != 0
+        {
+            return Err(invalid("Ciphertext length changed while reading"));
+        }
+    }
 
     let metadata = EncryptedFileMetadata {
         file_id,
@@ -993,7 +1162,7 @@ fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, ClientError>
         content_nonce,
         content_chunk_size,
         content_size,
-        encrypted_size: ciphertext.len() as u64,
+        encrypted_size: ciphertext_len,
         created_at,
         platform_metadata,
         sparse_metadata,
@@ -1059,6 +1228,34 @@ where
     Ok(1)
 }
 
+/// Export an authenticated plaintext copy without changing the encrypted
+/// source or its coverage enrollment. Existing data stays available when a
+/// Team entitlement has expired and the caller is restricted to reads.
+pub async fn export_encrypted_file<S, N>(
+    client: &Client<S, N>,
+    encrypted_path: &Path,
+    output_path: &Path,
+) -> Result<(), ClientError>
+where
+    S: Storage,
+    N: Network,
+{
+    if encrypted_path.extension() != Some(OsStr::new("encrypted")) {
+        return Err(ClientError::InvalidInput(
+            "Expected a .encrypted file".into(),
+        ));
+    }
+    let parsed = parse_encrypted_file(encrypted_path)?;
+    decrypt_parsed_file_to_path(
+        client,
+        encrypted_path,
+        parsed,
+        Some(output_path.to_path_buf()),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn decrypt_file_in_place_with_progress<S, N>(
     client: &Client<S, N>,
     path: &Path,
@@ -1122,6 +1319,7 @@ where
     let mut stack = vec![root.to_path_buf()];
     let mut decrypted = 0usize;
     let mut failed = 0usize;
+    let mut first_failure = None;
     let mut dir_mtimes: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
 
     while let Some(current) = stack.pop() {
@@ -1165,6 +1363,9 @@ where
                     Err(err) => {
                         failed += 1;
                         warn!("Failed to decrypt {}: {}", path.display(), err);
+                        if first_failure.is_none() {
+                            first_failure = Some(err.to_string());
+                        }
                     }
                 }
 
@@ -1183,6 +1384,13 @@ where
 
     for (dir, mtime) in dir_mtimes {
         preserve_directory_mtime(&dir, mtime);
+    }
+
+    if failed > 0 {
+        return Err(ClientError::InvalidState(format!(
+            "Restored {decrypted} protected file(s), but failed to authenticate or restore {failed}; remaining ciphertext was retained: {}",
+            first_failure.unwrap_or_else(|| "unknown error".into())
+        )));
     }
 
     Ok(decrypted)
@@ -1247,25 +1455,51 @@ where
     S: Storage,
     N: Network,
 {
-    let decrypted_data = client
-        .decrypt_file(&parsed.metadata)
-        .await
-        .map_err(|e| ClientError::InvalidState(e.to_string()))?;
-
     let validated_default = default_decrypted_path(source_path, parsed.original_name.as_deref())?;
     let output_path = output_override.unwrap_or(validated_default);
-
-    crate::file::safe_restore::write_new(&output_path, &decrypted_data).map_err(|e| {
-        storage_error(
-            ErrorCode::StorageWrite,
-            format!(
-                "Failed to write decrypted file {}: {}",
-                output_path.display(),
-                e
-            ),
-            "coverage_decrypt_write",
-        )
-    })?;
+    let streaming = parsed.metadata.header_version.unwrap_or(1) >= 2
+        && parsed.metadata.content_chunk_size.is_some();
+    if streaming {
+        let private_dir = tempfile::Builder::new()
+            .prefix("hybridcipher-remove-protection-")
+            .tempdir()
+            .map_err(|e| {
+                storage_error(
+                    ErrorCode::StorageWrite,
+                    e.to_string(),
+                    "coverage_decrypt_write",
+                )
+            })?;
+        let private_output = private_dir.path().join("authenticated.plain");
+        client
+            .decrypt_file_streaming_to_path(source_path, &parsed.metadata, &private_output)
+            .await?;
+        crate::file::safe_restore::publish_new(&output_path, &private_output).map_err(|e| {
+            storage_error(
+                ErrorCode::StorageWrite,
+                format!(
+                    "Failed to publish authenticated file {}: {e}",
+                    output_path.display()
+                ),
+                "coverage_decrypt_write",
+            )
+        })?;
+    } else {
+        let decrypted_data = client
+            .decrypt_file(&parsed.metadata)
+            .await
+            .map_err(|e| ClientError::InvalidState(e.to_string()))?;
+        crate::file::safe_restore::write_new(&output_path, &decrypted_data).map_err(|e| {
+            storage_error(
+                ErrorCode::StorageWrite,
+                format!(
+                    "Failed to write decrypted file {}: {e}",
+                    output_path.display()
+                ),
+                "coverage_decrypt_write",
+            )
+        })?;
+    }
 
     if let Err(err) = preserve_file_mtime(source_path, &output_path) {
         warn!(
@@ -1337,6 +1571,15 @@ fn default_decrypted_path(
 #[cfg(test)]
 mod security_regression {
     use super::*;
+    use crate::{
+        coverage::CoverageRootState,
+        epoch_key_source::EpochKeySource,
+        network::MockNetwork,
+        state::client::EpochState,
+        storage::{LocalFsStorage, Storage},
+        ClientConfig,
+    };
+    use hybridcipher_crypto::signatures::Ed25519KeyPair;
     #[test]
     fn removal_workflow_rejects_redirected_names() {
         let source = Path::new("protected/document.encrypted");
@@ -1353,6 +1596,174 @@ mod security_regression {
             default_decrypted_path(source, Some("document.txt")).unwrap(),
             Path::new("protected/document.txt")
         );
+    }
+
+    #[tokio::test]
+    async fn unenroll_without_decrypt_preserves_ciphertext_and_creates_no_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = Uuid::new_v4();
+        let storage = Arc::new(LocalFsStorage::new(dir.path().join("account")));
+        storage
+            .store_config(
+                "client_state",
+                &serde_json::json!({
+                    "epochs":{}, "current_epoch":0, "active_group_id":group,
+                    "migration":null,"active_rekey":null,"last_sync":Utc::now(),"version":1,
+                    "group_memberships":{},"auth_credentials":null,"invitation_keypair":null
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut config = ClientConfig::default();
+        config.migration_automation_enabled = false;
+        config.coverage_watchers_enabled = false;
+        let client = Client::with_client_config(
+            Ed25519KeyPair::generate(),
+            storage,
+            Arc::new(MockNetwork::new()),
+            config,
+        );
+        client.ensure_state_loaded().await.unwrap();
+
+        let protected = dir.path().join("protected");
+        fs::create_dir(&protected).unwrap();
+        let ciphertext = protected.join("secret.txt.encrypted");
+        let plaintext = protected.join("secret.txt");
+        let bytes = b"opaque ciphertext bytes";
+        fs::write(&ciphertext, bytes).unwrap();
+        let enrolled = client.coverage_enroll_root(&protected).await.unwrap();
+
+        let removed = client.coverage_unenroll_root(&protected).await.unwrap();
+        assert_eq!(removed.root_id, enrolled.root_id);
+        assert_eq!(removed.state, CoverageRootState::Unenrolled);
+        assert_eq!(fs::read(&ciphertext).unwrap(), bytes);
+        assert!(!plaintext.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_protection_rejects_truncated_and_forged_content_without_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = dir.path().join("account");
+        let group = Uuid::new_v4();
+        let storage = Arc::new(LocalFsStorage::new(&account));
+        let epoch = EpochState {
+            group_id: Some(group),
+            epoch_id: 1,
+            encryption_key: [42; 32],
+            key_source: EpochKeySource::Welcome,
+            members: vec![],
+            created_at: Utc::now(),
+            is_active: true,
+            file_count: 0,
+            marked_for_removal: false,
+            removal_eligible_at: None,
+        };
+        storage
+            .store_config(
+                "client_state",
+                &serde_json::json!({
+                    "epochs":{"1":[epoch]}, "current_epoch":1, "active_group_id":group,
+                    "migration":null,"active_rekey":null,"last_sync":Utc::now(),"version":1,
+                    "group_memberships":{},"auth_credentials":null,"invitation_keypair":null
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let mut config = ClientConfig::default();
+        config.migration_automation_enabled = false;
+        let client = Client::with_client_config(
+            Ed25519KeyPair::generate(),
+            storage,
+            Arc::new(MockNetwork::new()),
+            config,
+        );
+        client.ensure_state_loaded().await.unwrap();
+
+        let protected = dir.path().join("protected");
+        fs::create_dir(&protected).unwrap();
+        let source = protected.join("document.txt");
+        let encrypted = protected.join("document.txt.encrypted");
+        fs::write(&source, b"ABCDEFGH").unwrap();
+        client
+            .encrypt_file_streaming_with_id_to_path(
+                "document.txt",
+                &source,
+                &encrypted,
+                Some("document.txt"),
+                None,
+                "removal-fixture",
+                4,
+            )
+            .await
+            .unwrap();
+        fs::remove_file(&source).unwrap();
+        let original = fs::read(&encrypted).unwrap();
+        let enrolled = client.coverage_enroll_root(&protected).await.unwrap();
+
+        let mut truncated = original.clone();
+        truncated.truncate(truncated.len() - 20);
+        fs::write(&encrypted, &truncated).unwrap();
+        assert!(
+            unenroll_and_decrypt_with_progress(&client, protected.clone(), &mut |_| {})
+                .await
+                .is_err()
+        );
+        assert!(!source.exists());
+        assert_eq!(fs::read(&encrypted).unwrap(), truncated);
+        assert_eq!(
+            client
+                .coverage_roots()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|root| root.root_id == enrolled.root_id)
+                .unwrap()
+                .state,
+            CoverageRootState::Active
+        );
+
+        let separator = ENCRYPTED_FILE_SEPARATOR.as_bytes();
+        let split = original
+            .windows(separator.len())
+            .position(|part| part == separator)
+            .unwrap();
+        let mut header: Value = serde_json::from_slice(&original[..split]).unwrap();
+        header["file_size"] = serde_json::json!(4);
+        header["original_size"] = serde_json::json!(4);
+        header["encrypted_size"] = serde_json::json!(20);
+        let mut forged = serde_json::to_vec(&header).unwrap();
+        forged.extend_from_slice(separator);
+        forged.extend_from_slice(&original[split + separator.len()..split + separator.len() + 20]);
+        fs::write(&encrypted, &forged).unwrap();
+        assert!(
+            unenroll_and_decrypt_with_progress(&client, protected.clone(), &mut |_| {})
+                .await
+                .is_err()
+        );
+        assert!(!source.exists());
+        assert_eq!(fs::read(&encrypted).unwrap(), forged);
+        assert_eq!(
+            client
+                .coverage_roots()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|root| root.root_id == enrolled.root_id)
+                .unwrap()
+                .state,
+            CoverageRootState::Active
+        );
+
+        fs::write(&encrypted, &original).unwrap();
+        let outcome =
+            unenroll_and_decrypt_with_progress(&client, protected.clone(), &mut |_| {}).await;
+        assert!(outcome.is_ok(), "valid retry failed: {outcome:?}");
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.decrypted_files, 1);
+        assert_eq!(fs::read(&source).unwrap(), b"ABCDEFGH");
+        assert!(!encrypted.exists());
     }
 }
 

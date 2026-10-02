@@ -5,6 +5,8 @@ const {
     captureKeyedScrollPositions,
     restoreKeyedScrollPositions,
     filterProtectedFolders,
+    displayEnrolledPath,
+    isRoutineProviderReconciliation,
     buildAppModeUiModel,
     shouldExpandAdvancedSettings,
     getFolderRowStatusState,
@@ -15,9 +17,116 @@ const {
     buildFolderCoverageModel,
     buildCoverageCenterModel,
     buildPersonalDevicesModel,
+    formatDeviceFingerprintInput,
+    normalizeDeviceFingerprint,
     buildDeviceVerificationModel,
     buildDeviceVerificationCommand,
+    runFolderUnenrollFlow,
+    normalizeFolderMountStatus,
 } = require('./ui-utils');
+
+test('mount lookup treats only the missing-mount response as unmounted', () => {
+    assert.deepEqual(normalizeFolderMountStatus({ success: false, error: 'Mount not found' }),
+        { success: true, data: null });
+    assert.deepEqual(normalizeFolderMountStatus({ success: false, error: 'Provider unavailable' }),
+        { success: false, error: 'Provider unavailable' });
+});
+
+function unenrollFlowHarness({ choice, riskAccepted = true, mounted = false,
+    unmountAccepted = true, unmountSucceeded = true } = {}) {
+    const calls = [];
+    let isMounted = mounted;
+    const options = {
+        rootId: 'root-1',
+        path: '/sync/protected',
+        choose: async () => { calls.push('choose'); return choice; },
+        confirmCloudRisk: async () => { calls.push('risk'); return riskAccepted; },
+        checkMount: async () => { calls.push('check'); return { success: true, data: isMounted ? { mountpoint: '/mount' } : null }; },
+        confirmUnmount: async () => { calls.push('confirm-unmount'); return unmountAccepted; },
+        unmount: async () => { calls.push('unmount'); if (unmountSucceeded) isMounted = false; return unmountSucceeded; },
+        invokeCommand: async command => { calls.push(command); return { success: true, data: {} }; },
+    };
+    return { calls, options };
+}
+
+test('keeping encryption unenrolls without a cloud warning or decryption', async () => {
+    const { calls, options } = unenrollFlowHarness({ choice: 'primary' });
+    const outcome = await runFolderUnenrollFlow(options);
+    assert.equal(outcome.decrypt, false);
+    assert.deepEqual(calls, ['choose', 'check', 'unenroll_folder_keep_encrypted']);
+});
+
+test('decryption requires the cloud warning before mount checks or file changes', async () => {
+    const declined = unenrollFlowHarness({ choice: 'secondary', riskAccepted: false, mounted: true });
+    assert.equal(await runFolderUnenrollFlow(declined.options), null);
+    assert.deepEqual(declined.calls, ['choose', 'risk']);
+
+    const accepted = unenrollFlowHarness({ choice: 'secondary' });
+    assert.equal((await runFolderUnenrollFlow(accepted.options)).decrypt, true);
+    assert.deepEqual(accepted.calls, ['choose', 'risk', 'check', 'unenroll_folder_and_decrypt']);
+});
+
+test('canceling the choice leaves the mount and files untouched', async () => {
+    const { calls, options } = unenrollFlowHarness({ choice: 'tertiary', mounted: true });
+    assert.equal(await runFolderUnenrollFlow(options), null);
+    assert.deepEqual(calls, ['choose']);
+});
+
+test('mounted folders require safe unmount for either unenroll choice', async () => {
+    for (const choice of ['primary', 'secondary']) {
+        const declined = unenrollFlowHarness({ choice, mounted: true, unmountAccepted: false });
+        assert.equal(await runFolderUnenrollFlow(declined.options), null);
+        assert.equal(declined.calls.includes('unmount'), false);
+        assert.equal(declined.calls.some(call => call.startsWith('unenroll_folder_')), false);
+
+        const accepted = unenrollFlowHarness({ choice, mounted: true });
+        await runFolderUnenrollFlow(accepted.options);
+        assert.deepEqual(accepted.calls.slice(-4), [
+            'confirm-unmount', 'unmount', 'check',
+            choice === 'primary' ? 'unenroll_folder_keep_encrypted' : 'unenroll_folder_and_decrypt'
+        ]);
+    }
+});
+
+test('failed unmount never invokes an unenroll command', async () => {
+    const { calls, options } = unenrollFlowHarness({ choice: 'primary', mounted: true, unmountSucceeded: false });
+    await assert.rejects(runFolderUnenrollFlow(options), /Unmount failed/);
+    assert.equal(calls.some(call => call.startsWith('unenroll_folder_')), false);
+});
+
+test('folder status stays unmounting while the mount is still reported active', () => {
+    const row = getFolderRowStatusState({
+        isMounted: true,
+        isUnmounting: true,
+        syncStatus: { pending_conflict_count: 1 },
+        showSafetyAlert: true,
+    });
+    assert.equal(row.showUnmountingBadge, true);
+    assert.equal(row.showMountedBadge, false);
+    assert.equal(row.showAlertButton, false);
+    assert.equal(row.healthDotTone, null);
+
+    const detail = buildFolderDetailModel({
+        folder: { root_id: 'root-1', path: '/protected' },
+        isMounted: true,
+        isUnmounting: true,
+    });
+    assert.equal(detail.attention.mountStatusLabel, 'Unmounting');
+    assert.deepEqual(detail.secondaryActions.find(action => action.id === 'unmount'), {
+        id: 'unmount', label: 'Unmounting…', destructive: true, disabled: true,
+    });
+});
+
+test('unmounting status remains visible while mount disappearance is being confirmed', () => {
+    const row = getFolderRowStatusState({ isMounted: false, isUnmounting: true });
+    assert.equal(row.showUnmountingBadge, true);
+    const detail = buildFolderDetailModel({
+        folder: { root_id: 'root-1', path: '/protected' },
+        isMounted: false,
+        isUnmounting: true,
+    });
+    assert.equal(detail.attention.mountStatusLabel, 'Unmounting');
+});
 
 test('workspace status retries only for authenticated protection sections', () => {
     assert.equal(shouldRetryWorkspaceStatusAfterSessionRefresh(null), false);
@@ -52,6 +161,28 @@ test('filterProtectedFolders matches display names, basenames, and full paths', 
     assert.deepEqual(filterProtectedFolders(folders, 'missing'), []);
 });
 
+test('Windows enrolled paths display without the device prefix and keep their raw value', () => {
+    const drive = { path: '\\\\?\\C:\\Users\\xc\\Dropbox\\Hybridcipher\\_Dev' };
+    const unc = { path: '\\\\?\\UNC\\server\\share\\Vault' };
+    assert.equal(displayEnrolledPath(drive.path), 'C:\\Users\\xc\\Dropbox\\Hybridcipher\\_Dev');
+    assert.equal(displayEnrolledPath(unc.path), '\\\\server\\share\\Vault');
+    assert.equal(displayEnrolledPath('\\\\.\\pipe\\test'), '\\\\.\\pipe\\test');
+    assert.deepEqual(filterProtectedFolders([drive, unc], 'C:\\Users'), [drive]);
+    assert.deepEqual(filterProtectedFolders([drive, unc], '\\\\server\\share'), [unc]);
+    assert.equal(drive.path, '\\\\?\\C:\\Users\\xc\\Dropbox\\Hybridcipher\\_Dev');
+});
+
+test('brief Cloud Files reconciliation is routine but sustained or blocked work needs attention', () => {
+    const status = { safe_to_unmount: false, unsafe_reasons: [{ kind: 'provider_reconciliation' }] };
+    assert.equal(isRoutineProviderReconciliation(status, 0), true);
+    assert.equal(isRoutineProviderReconciliation(status, 29_999), true);
+    assert.equal(isRoutineProviderReconciliation(status, 30_000), false);
+    assert.equal(isRoutineProviderReconciliation({ ...status, last_error: 'provider stopped' }, 1000), false);
+    assert.equal(isRoutineProviderReconciliation({ ...status, unsafe_reasons: [
+        { kind: 'provider_reconciliation' }, { kind: 'pending_refresh', count: 1 },
+    ] }, 1000), false);
+});
+
 test('individual mode uses folder search and hides technical navigation', () => {
     assert.deepEqual(buildAppModeUiModel('individual'), {
         searchMode: 'folders',
@@ -60,9 +191,9 @@ test('individual mode uses folder search and hides technical navigation', () => 
         protectionNavigationLabel: 'Protection status',
     });
     assert.deepEqual(buildAppModeUiModel('team'), {
-        searchMode: 'commands',
-        searchPlaceholder: 'Search CLI commands…',
-        showTechnicalNavigation: true,
+        searchMode: 'folders',
+        searchPlaceholder: 'Search protected folders…',
+        showTechnicalNavigation: false,
         protectionNavigationLabel: 'Coverage Center',
     });
 });
@@ -171,6 +302,7 @@ test('getFolderRowStatusState keeps mounted rows green when no issues exist', ()
         }),
         {
             showMountedBadge: true,
+            showUnmountingBadge: false,
             showAlertButton: false,
             healthDotTone: 'green',
         }
@@ -804,6 +936,14 @@ test('buildPersonalDevicesModel keeps unverified ownership fields on setup devic
     assert.equal(model.setupDevices[0].email, 'member@example.com');
 });
 
+test('fingerprint entry accepts grouped or compact hex and rejects incomplete or invalid input', () => {
+    assert.equal(formatDeviceFingerprintInput('abcd12345678ef90'), 'ABCD 1234 5678 EF90');
+    assert.equal(normalizeDeviceFingerprint('abcd 1234 5678 ef90'), 'ABCD 1234 5678 EF90');
+    assert.equal(normalizeDeviceFingerprint('ABCD12345678EF90'), 'ABCD 1234 5678 EF90');
+    assert.equal(normalizeDeviceFingerprint('ABCD 1234'), null);
+    assert.equal(normalizeDeviceFingerprint('ABCD 1234 5678 EFG0'), null);
+});
+
 test('buildDeviceVerificationModel prefers user id and blocks missing identifiers', () => {
     assert.deepEqual(
         buildDeviceVerificationModel({
@@ -812,12 +952,12 @@ test('buildDeviceVerificationModel prefers user id and blocks missing identifier
                 email: 'member@example.com',
                 device_id: 'device-tablet',
             },
-            fingerprint: ' ABCD ',
+            fingerprint: ' abcd12345678ef90 ',
         }),
         {
             userIdentifier: '33333333-3333-3333-3333-333333333333',
             deviceId: 'device-tablet',
-            fingerprint: 'ABCD',
+            fingerprint: 'ABCD 1234 5678 EF90',
             canSubmit: true,
         }
     );
@@ -825,10 +965,14 @@ test('buildDeviceVerificationModel prefers user id and blocks missing identifier
     assert.equal(
         buildDeviceVerificationModel({
             device: { device_id: 'device-tablet' },
-            fingerprint: 'ABCD',
+            fingerprint: 'ABCD 1234 5678 EF90',
         }).canSubmit,
         false
     );
+    assert.equal(buildDeviceVerificationModel({
+        device: { user_id: 'member', device_id: 'tablet' },
+        fingerprint: 'ABCD',
+    }).canSubmit, false);
 });
 
 test('buildDeviceVerificationCommand constructs pin verify command', () => {
@@ -838,13 +982,13 @@ test('buildDeviceVerificationCommand constructs pin verify command', () => {
             email: 'member@example.com',
             device_id: 'device tablet',
         },
-        fingerprint: 'ABCD EFGH',
+        fingerprint: 'abcd12345678ef90',
         quoteArg: value => `"${String(value).replace(/"/g, '""')}"`,
     });
 
     assert.equal(
         command,
-        'hybridcipher pin verify "member@example.com" "device tablet" --fingerprint "ABCD EFGH"'
+        'hybridcipher pin verify "member@example.com" "device tablet" --fingerprint "ABCD 1234 5678 EF90"'
     );
     assert.equal(buildDeviceVerificationCommand({ device: {}, fingerprint: 'ABCD' }), null);
 });

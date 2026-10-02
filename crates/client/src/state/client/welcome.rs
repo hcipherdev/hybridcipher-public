@@ -52,8 +52,23 @@ impl<S: Storage, N: Network> Client<S, N> {
         };
 
         // Set as current epoch
+        if Self::get_epoch_state(&state, welcome_message.group_id, epoch_state.epoch_id)
+            .is_some_and(|existing| {
+                existing.key_source.is_verified()
+                    && existing.encryption_key != epoch_state.encryption_key
+            })
+        {
+            return Err(initialization::setup_error(
+                ErrorCode::SecurityTampering,
+                "Welcome encryption key conflicts with the locally verified group epoch",
+            ));
+        }
         Self::upsert_epoch_state(&mut state, welcome_message.group_id, epoch_state);
-        state.current_epoch = epoch_secrets.epoch_id;
+        if state.active_group_id.is_none()
+            || state.active_group_id == Some(welcome_message.group_id)
+        {
+            state.current_epoch = epoch_secrets.epoch_id;
+        }
 
         if let Some(membership) = state.group_memberships.get_mut(&welcome_message.group_id) {
             membership.current_epoch_id = Some(epoch_secrets.epoch_id);
@@ -102,128 +117,78 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         group_id: Uuid,
     ) -> Result<(), ClientError> {
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Fetching any available epoch from server for initial setup",
-            None,
-        );
-
-        let auth_token = self.get_auth_token().await?;
-        let session_info = self.get_session_info().await.ok();
-
-        let client = reqwest::Client::new();
-        let server_url = if let Some(info) = &session_info {
-            Self::resolve_server_base_url(info.server_url.clone())
-        } else {
-            self.active_server_base_url().await
-        };
-        let welcome_url = format!("{}/api/v1/groups/{}/welcome", server_url, group_id);
-
-        let response = client
-            .get(&welcome_url)
-            .header("Authorization", &format!("Bearer {}", auth_token))
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| ClientError::NetworkError {
-                context: ErrorContext::new(
-                    ErrorCode::NetworkConnection,
-                    format!("Failed to fetch Welcome messages: {:?}", e),
-                    "welcome_request".to_string(),
-                ),
-                retry_count: 0,
-                last_attempt: std::time::SystemTime::now(),
-                connection_state: "request_failed".to_string(),
-            })?;
-
-        if response.status() == StatusCode::PRECONDITION_REQUIRED {
-            let device_label = session_info
-                .as_ref()
-                .and_then(|info| info.device_id.clone())
-                .unwrap_or_else(|| "this device".to_string());
-
-            return Err(ClientError::InvalidState(format!(
-                "Device '{}' is awaiting approval. Use an existing trusted device to run `hybridcipher issue-welcome --device {}` and then rerun `hybridcipher process-welcome-messages`.",
-                device_label, device_label
-            )));
-        }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            if status == reqwest::StatusCode::BAD_REQUEST
-                && error_text.contains("Group has no current epoch")
-            {
-                let guidance = format!(
-                    "Group {} has no active epoch. Ask a group admin to run 'hybridcipher initialize-group --group-id {}' before encrypting files.",
-                    group_id, group_id
-                );
-                self.logger.log(
-                    crate::logging::LogLevel::Warn,
-                    &guidance,
-                    Some(&format!("group_id: {}", group_id)),
-                );
-                return Err(ClientError::InvalidState(guidance));
-            }
-
-            return Err(ClientError::NetworkError {
-                context: ErrorContext::new(
-                    ErrorCode::NetworkProtocol,
-                    format!("Server returned error {}: {}", status, error_text),
-                    "welcome_response".to_string(),
-                ),
-                retry_count: 0,
-                last_attempt: std::time::SystemTime::now(),
-                connection_state: "error_response".to_string(),
-            });
-        }
-
-        let welcome_response: WelcomeMessagesResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| ClientError::NetworkError {
-                    context: ErrorContext::new(
-                        ErrorCode::NetworkProtocol,
-                        format!("Failed to parse Welcome messages response: {:?}", e),
-                        "welcome_parsing".to_string(),
-                    ),
-                    retry_count: 0,
-                    last_attempt: std::time::SystemTime::now(),
-                    connection_state: "parse_error".to_string(),
-                })?;
-
-        if welcome_response.messages.is_empty() {
-            let guidance = format!(
-                "Server returned no Welcome messages for group {}. Initialize the group with 'hybridcipher initialize-group --group-id {}' before encrypting files.",
-                group_id, group_id
-            );
-            self.logger.log(
-                crate::logging::LogLevel::Warn,
-                &guidance,
-                Some(&format!("group_id: {}", group_id)),
-            );
-            return Err(ClientError::InvalidState(guidance));
-        }
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            &format!(
-                "Received {} Welcome messages from server",
-                welcome_response.messages.len()
-            ),
-            Some(&format!("group_id: {}", group_id)),
-        );
-
-        self.process_welcome_messages_for_epoch(welcome_response, group_id)
-            .await
+        self.fetch_committed_group_epoch(group_id).await.map(|_| ())
     }
 
+    pub(super) async fn fetch_committed_group_epoch(
+        &self,
+        group_id: Uuid,
+    ) -> Result<u64, ClientError> {
+        let auth_token = self.get_auth_token().await?;
+        let response = self
+            .fetch_server_welcome_messages(group_id, &auth_token)
+            .await?
+            .ok_or_else(|| {
+                initialization::setup_error(
+                    ErrorCode::GroupNotInitialized,
+                    "This group has no committed encryption epoch",
+                )
+            })?;
+        if response.group_id != group_id {
+            return Err(initialization::setup_error(
+                ErrorCode::SecurityTampering,
+                "Group key response does not match the requested group",
+            ));
+        }
+        let epoch_id = response.epoch_id;
+        let session = self.get_session_info().await?;
+        let invitation = self.ensure_invitation_keypair().await?;
+        let has_device_message = response.messages.iter().any(|message| {
+            message.recipient_device_id == invitation.device_id
+                && Some(message.recipient_user_id) == session.user_id
+                && message.group_id == group_id
+                && message.epoch_id == response.epoch_uuid
+                && message
+                    .expires_at
+                    .map_or(true, |expiry| expiry > Utc::now())
+        });
+        if !has_device_message || response.expires_at <= Utc::now() {
+            return Err(initialization::setup_error(
+                ErrorCode::GroupDeviceApprovalRequired,
+                "This device needs approval to receive group encryption keys",
+            ));
+        }
+        // Process only the canonical server Welcome. A locally proposed genesis key
+        // is never installed directly, even when POST returned success or conflict.
+        self.process_welcome_messages_inner(response, group_id)
+            .await?;
+        {
+            let state = self.state.read().await;
+            if !Self::get_epoch_state(&state, group_id, epoch_id)
+                .is_some_and(|epoch| epoch.key_source == EpochKeySource::Welcome && epoch.is_active)
+            {
+                return Err(initialization::setup_error(
+                    ErrorCode::GroupStateMissing,
+                    "The committed group encryption key is not available on this device",
+                ));
+            }
+        }
+        // Setup is ready only after a durable save, even during bulk-save debounce.
+        self.save_client_state_now().await?;
+        self.storage
+            .store_config(
+                &format!("committed_group_epoch_{group_id}"),
+                &epoch_id.to_string(),
+            )
+            .await?;
+        if let Some(user_id) = session.user_id {
+            let server_url = Self::resolve_server_base_url(session.server_url);
+            let pending_key =
+                initialization::pending_key(&server_url, user_id, &invitation.device_id, group_id);
+            self.storage.delete_config(&pending_key).await?;
+        }
+        Ok(epoch_id)
+    }
     pub(super) async fn fetch_server_welcome_messages(
         &self,
         group_id: Uuid,
@@ -263,10 +228,13 @@ impl<S: Storage, N: Network> Client<S, N> {
                 .and_then(|info| info.device_id.clone())
                 .unwrap_or_else(|| "this device".to_string());
 
-            return Err(ClientError::InvalidState(format!(
-                "Device '{}' is awaiting approval. Use an existing trusted device to run `hybridcipher issue-welcome --device {}` and then rerun `hybridcipher process-welcome-messages`.",
-                device_label, device_label
-            )));
+            return Err(initialization::setup_error(
+                ErrorCode::GroupDeviceApprovalRequired,
+                format!(
+                    "Device '{}' is awaiting approval from a trusted device",
+                    device_label
+                ),
+            ));
         }
 
         if !status.is_success() {
@@ -275,7 +243,8 @@ impl<S: Storage, N: Network> Client<S, N> {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            if status == StatusCode::BAD_REQUEST && error_text.contains("Group has no active epoch")
+            if initialization::group_api_error_code(status, &error_text)
+                == Some(ErrorCode::GroupNotInitialized)
             {
                 return Ok(None);
             }
@@ -1476,6 +1445,12 @@ impl<S: Storage, N: Network> Client<S, N> {
         group_id: uuid::Uuid,
     ) -> Result<(), ClientError> {
         let now = Utc::now();
+        if welcome_response.group_id != group_id {
+            return Err(initialization::setup_error(
+                ErrorCode::SecurityTampering,
+                "Welcome response does not match the requested group",
+            ));
+        }
 
         let mut message_ids = HashSet::new();
         for message in &welcome_response.messages {
@@ -1553,6 +1528,8 @@ impl<S: Storage, N: Network> Client<S, N> {
         let welcome_payload = match welcome_response.messages.iter().find(|msg| {
             msg.recipient_device_id == device_id
                 && msg.group_id == group_id
+                && msg.epoch_id == welcome_response.epoch_uuid
+                && session_user_id.is_none_or(|user_id| msg.recipient_user_id == user_id)
                 && msg.expires_at.map_or(true, |expiry| expiry > now)
         }) {
             Some(payload) => payload,
@@ -1642,6 +1619,12 @@ impl<S: Storage, N: Network> Client<S, N> {
             .process_server_welcome_message(&server_message, group_id, welcome_payload.epoch_id)
             .await?;
 
+        if epoch_secrets.epoch_id != welcome_response.epoch_id && !welcome_response.legacy_mapping {
+            return Err(initialization::setup_error(
+                ErrorCode::SecurityTampering,
+                "Welcome encryption key belongs to a different group epoch",
+            ));
+        }
         if epoch_secrets.epoch_id != welcome_response.epoch_id {
             self.logger.log(
                 crate::logging::LogLevel::Warn,
@@ -1670,8 +1653,19 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         {
             let mut state = self.state.write().await;
+            if Self::get_epoch_state(&state, group_id, new_epoch.epoch_id).is_some_and(|existing| {
+                existing.key_source.is_verified()
+                    && existing.encryption_key != new_epoch.encryption_key
+            }) {
+                return Err(initialization::setup_error(
+                    ErrorCode::SecurityTampering,
+                    "Welcome encryption key conflicts with the locally verified group epoch",
+                ));
+            }
             Self::upsert_epoch_state(&mut state, group_id, new_epoch);
-            state.current_epoch = welcome_response.epoch_id;
+            if state.active_group_id.is_none() || state.active_group_id == Some(group_id) {
+                state.current_epoch = welcome_response.epoch_id;
+            }
             if let Some(membership) = state.group_memberships.get_mut(&group_id) {
                 membership.current_epoch_id = Some(welcome_response.epoch_id);
             }
@@ -1906,405 +1900,6 @@ impl<S: Storage, N: Network> Client<S, N> {
         let mut state = self.state.write().await;
         state.invitation_keypair = Some(keypair.clone());
         Ok(keypair)
-    }
-
-    /// Enhanced epoch creation that uses group-specific information with specified epoch ID
-    ///
-    /// This ensures proper coordination with server-side epoch management by using
-    /// the epoch ID determined by the coordination logic.
-    pub(super) async fn create_genesis_epoch_for_group_with_id(
-        &self,
-        group_id: Uuid,
-        epoch_id: u64,
-    ) -> Result<u64, ClientError> {
-        let membership = {
-            let state = self.state.read().await;
-            state.group_memberships.get(&group_id).cloned()
-        };
-
-        // Generate epoch key using secure random generation
-        let mut epoch_key = [0u8; 32];
-        use rand::rngs::OsRng;
-        use rand::RngCore;
-        let mut rng = OsRng;
-        rng.fill_bytes(&mut epoch_key);
-
-        // Upload epoch to server for group members using the specified epoch_id
-        self.upload_group_epoch_to_server(group_id, epoch_id, &epoch_key)
-            .await?;
-
-        // Create epoch state with the specified epoch_id
-        let epoch_state = EpochState {
-            group_id: Some(group_id),
-            epoch_id,
-            encryption_key: epoch_key,
-            key_source: EpochKeySource::LocalInit,
-            members: membership
-                .as_ref()
-                .map(|m| m.members.clone())
-                .unwrap_or_default(),
-            created_at: Utc::now(),
-            is_active: true,
-            file_count: 0,
-            marked_for_removal: false,
-            removal_eligible_at: None,
-        };
-
-        // Store the epoch state
-        {
-            let mut state = self.state.write().await;
-            Self::upsert_epoch_state(&mut state, group_id, epoch_state);
-            state.current_epoch = epoch_id;
-
-            if let Some(mut existing) = membership.clone() {
-                existing.current_epoch_id = Some(epoch_id);
-                existing.last_sync = Utc::now();
-                state.group_memberships.insert(group_id, existing);
-            }
-        }
-
-        self.save_client_state().await?;
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            &format!("Created genesis epoch {} for group {}", epoch_id, group_id),
-            membership
-                .as_ref()
-                .map(|m| format!("group_name: {}", m.group_name))
-                .or_else(|| Some(format!("group_id: {}", group_id)))
-                .as_deref(),
-        );
-
-        Ok(epoch_id)
-    }
-
-    /// Initialize a group's genesis epoch on the server and persist it locally
-    pub async fn initialize_group_epoch(
-        &self,
-        group_id: Uuid,
-        epoch_id: u64,
-    ) -> Result<u64, ClientError> {
-        self.ensure_state_loaded().await?;
-        self.create_genesis_epoch_for_group_with_id(group_id, epoch_id)
-            .await
-    }
-
-    /// Upload epoch key to server for group sharing
-    pub(super) async fn upload_group_epoch_to_server(
-        &self,
-        group_id: Uuid,
-        epoch_id: u64,
-        encryption_key: &[u8],
-    ) -> Result<(), ClientError> {
-        // Load session information for authenticated request
-        let session_info = match self.get_session_info().await {
-            Ok(info) => info,
-            Err(e) => {
-                self.logger.log(
-                    crate::logging::LogLevel::Warn,
-                    &format!("Unable to load session information for epoch upload: {}", e),
-                    Some("Run 'hybridcipher login' and retry"),
-                );
-                return Err(e);
-            }
-        };
-        let auth_token = session_info.token.clone();
-
-        if !self.validate_auth_token(&auth_token).await? {
-            self.logger.log(
-                crate::logging::LogLevel::Error,
-                "Authentication token rejected before epoch upload",
-                Some("Please run 'hybridcipher login' to refresh credentials"),
-            );
-            return Err(ClientError::InvalidState(
-                "Authentication token is invalid or expired. Please run 'hybridcipher login' to authenticate"
-                    .to_string(),
-            ));
-        }
-
-        let session_user_id = session_info.user_id.ok_or_else(|| {
-            self.logger.log(
-                crate::logging::LogLevel::Error,
-                "Session data missing user identifier; cannot initialize epoch",
-                Some("Run 'hybridcipher login' to refresh credentials"),
-            );
-            ClientError::InvalidState(
-                "Session is missing user information. Please log in again before initializing the group"
-                    .to_string(),
-            )
-        })?;
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 1: Starting welcome message construction",
-            Some(&format!(
-                "user_id: {}, epoch_id: {}",
-                session_user_id, epoch_id
-            )),
-        );
-
-        let invitation_keypair = self.ensure_invitation_keypair().await?;
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 2: Invitation keypair obtained",
-            Some(&format!("device_id: {}", invitation_keypair.device_id)),
-        );
-
-        let welcome_manager = WelcomeManager::new(self.storage.clone(), invitation_keypair.clone());
-        let invitation_public_key = match invitation_keypair.invitation_public_key() {
-            Ok(key) => {
-                self.logger.log(
-                    crate::logging::LogLevel::Info,
-                    "Step 3: Invitation public key extracted successfully",
-                    Some(&format!("key_length: {}", key.as_bytes().len())),
-                );
-                key
-            }
-            Err(e) => {
-                self.logger.log(
-                    crate::logging::LogLevel::Error,
-                    &format!(
-                        "Step 3 FAILED: Could not extract invitation public key: {}",
-                        e
-                    ),
-                    None,
-                );
-                return Err(e);
-            }
-        };
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 4: Starting epoch key encryption",
-            Some(&format!("epoch_key_length: {}", encryption_key.len())),
-        );
-
-        let encrypted_epoch_key = match welcome_manager
-            .encrypt_epoch_key_for_device(encryption_key, &invitation_public_key)
-        {
-            Ok(encrypted) => {
-                self.logger.log(
-                    crate::logging::LogLevel::Info,
-                    "Step 4: Epoch key encryption successful",
-                    Some(&format!("encrypted_length: {}", encrypted.len())),
-                );
-                encrypted
-            }
-            Err(e) => {
-                self.logger.log(
-                    crate::logging::LogLevel::Error,
-                    &format!("Step 4 FAILED: Epoch key encryption failed: {}", e),
-                    None,
-                );
-                return Err(e);
-            }
-        };
-
-        let signing_public_key = self.device_identity.public_key_bytes().to_vec();
-        let created_at = Utc::now();
-        let expires_at = Some(created_at + Duration::days(7));
-        let epoch_uuid = EpochIdMapper::u64_to_uuid(epoch_id, group_id.as_bytes());
-
-        let signable = ServerWelcomeSignable::new(
-            group_id,
-            epoch_uuid,
-            &invitation_keypair.device_id,
-            &encrypted_epoch_key,
-            created_at,
-            expires_at,
-        );
-
-        let signable_bytes = signable.to_bytes().map_err(|e| {
-            self.logger.log(
-                crate::logging::LogLevel::Error,
-                &format!(
-                    "Step 5 FAILED: Unable to serialize welcome message for signing: {}",
-                    e
-                ),
-                None,
-            );
-            ClientError::SerializationError(format!(
-                "Failed to serialize welcome message for signing: {}",
-                e
-            ))
-        })?;
-
-        let signature = self.device_identity.sign(&signable_bytes).to_vec();
-
-        let welcome_message = GeneratedWelcomeMessage {
-            recipient_user_id: session_user_id,
-            device_id: invitation_keypair.device_id.clone(),
-            encrypted_epoch_key,
-            signature,
-            signing_public_key,
-            created_at,
-            expires_at,
-        };
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 5: Welcome message constructed",
-            Some(&format!(
-                "recipient: {}, device: {}, encrypted_key_len: {}",
-                welcome_message.recipient_user_id,
-                welcome_message.device_id,
-                welcome_message.encrypted_epoch_key.len()
-            )),
-        );
-
-        let request_body = GenesisInitRequestBody {
-            client_epoch_id: epoch_id,
-            welcome_messages: vec![welcome_message],
-        };
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 6: Request body constructed",
-            Some(&format!(
-                "epoch_id: {}, welcome_msg_count: {}",
-                request_body.client_epoch_id,
-                request_body.welcome_messages.len()
-            )),
-        );
-
-        let base_server_url = Self::resolve_server_base_url(session_info.server_url.clone());
-        let trimmed_server_url = base_server_url.trim_end_matches('/');
-        let init_url = if trimmed_server_url.ends_with("/api/v1") {
-            format!("{}/groups/{}/initialize", trimmed_server_url, group_id)
-        } else {
-            format!(
-                "{}/api/v1/groups/{}/initialize",
-                trimmed_server_url, group_id
-            )
-        };
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 7: Sending request to server",
-            Some(&format!("url: {}", init_url)),
-        );
-
-        let client = reqwest::Client::new();
-
-        // Try to serialize the request body to check for serialization issues
-        let _serialized_body = match serde_json::to_string(&request_body) {
-            Ok(json) => {
-                self.logger.log(
-                    crate::logging::LogLevel::Info,
-                    "Step 7a: Request body serialization successful",
-                    Some(&format!("json_length: {}", json.len())),
-                );
-                json
-            }
-            Err(e) => {
-                self.logger.log(
-                    crate::logging::LogLevel::Error,
-                    &format!("Step 7a FAILED: Request body serialization failed: {}", e),
-                    None,
-                );
-                return Err(ClientError::InvalidState(format!(
-                    "Failed to serialize request body: {}",
-                    e
-                )));
-            }
-        };
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 8: Making HTTP request",
-            Some(&format!(
-                "auth_token_prefix: {}...",
-                &auth_token[..std::cmp::min(20, auth_token.len())]
-            )),
-        );
-
-        let response = client
-            .post(&init_url)
-            .header("Authorization", format!("Bearer {}", auth_token))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| {
-                self.logger.log(
-                    crate::logging::LogLevel::Error,
-                    &format!("Step 8 FAILED: HTTP request failed: {}", e),
-                    Some(&format!("error_type: {:?}", e)),
-                );
-                ClientError::network_error(
-                    ErrorCode::NetworkConnection,
-                    format!("Failed to submit genesis initialization request: {}", e),
-                    "upload_group_epoch_to_server".to_string(),
-                    1,
-                    "rejected".to_string(),
-                )
-            })?;
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 9: HTTP request successful, checking response",
-            Some(&format!("status: {}", response.status())),
-        );
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            self.logger.log(
-                crate::logging::LogLevel::Error,
-                &format!("Step 9 FAILED: Server returned error status"),
-                Some(&format!("status: {}, error: {}", status, error_text)),
-            );
-
-            return Err(ClientError::network_error(
-                ErrorCode::NetworkProtocol,
-                format!(
-                    "Genesis initialization failed with status {}: {}",
-                    status, error_text
-                ),
-                "upload_group_epoch_to_server".to_string(),
-                1,
-                "rejected".to_string(),
-            ));
-        }
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            "Step 10: Response status OK, parsing JSON",
-            None,
-        );
-
-        let response_body: GenesisInitResponseBody = response.json().await.map_err(|e| {
-            self.logger.log(
-                crate::logging::LogLevel::Error,
-                &format!("Step 10 FAILED: Response JSON parsing failed: {}", e),
-                None,
-            );
-            ClientError::network_error(
-                ErrorCode::NetworkProtocol,
-                format!("Failed to parse genesis initialization response: {}", e),
-                "upload_group_epoch_to_server".to_string(),
-                0,
-                "decode".to_string(),
-            )
-        })?;
-
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            &format!(
-                "Initialized genesis epoch {} (UUID {}) for group {}",
-                response_body.epoch_number, response_body.epoch_id, group_id
-            ),
-            Some(&format!(
-                "welcome_messages: {}",
-                response_body.welcome_message_count
-            )),
-        );
-
-        Ok(())
     }
 
     /// Generate a signed, hybrid-encrypted Welcome payload for a join card using the current epoch state

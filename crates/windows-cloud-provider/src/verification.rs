@@ -38,13 +38,23 @@ pub fn child(args: &[String]) -> CheckResult<()> {
             fs::write(&temporary, b"intentional native atomic edit")?;
             fs::rename(temporary, path)?;
         }
-        "rename" => {
+        "delete" => fs::remove_file(path)?,
+        "rename" | "rename-busy" => {
             let destination = PathBuf::from(args.get(2).ok_or("missing rename destination")?);
             require(
                 path.parent() == destination.parent(),
                 "verification rename must stay in its fixture directory",
             )?;
+            let reader = if operation == "rename-busy" {
+                Some(fs::File::open(&path)?)
+            } else {
+                None
+            };
             fs::rename(path, destination)?;
+            if reader.is_some() {
+                // Cross the periodic refresh boundary with an external reader still open.
+                std::thread::sleep(Duration::from_secs(6));
+            }
         }
         _ => return Err("unknown verification child operation".into()),
     }
@@ -90,7 +100,10 @@ fn seed_duplicates(
     let paths = host.runtime_paths(registration.root_id)?;
     let _lease = RootWriterLease::acquire(registration.root_id, &paths.writer_lock_path)?;
     let mut journal = CloudMutationJournal::empty(registration.root_id);
-    journal.generation = 1000;
+    journal.generation =
+        recover_mutation_journal_for_writer(&paths.journal_path, registration.root_id)?
+            .generation
+            .saturating_add(1000);
     journal.next_sequence = 122;
     for sequence in 1..=122 {
         let mut record = CloudMutationRecord::new(
@@ -164,6 +177,8 @@ async fn run_async(base: &Path) -> CheckResult<serde_json::Value> {
         ("sparse-legacy.md", 80, 2, true),
         ("current.md", 192, 3, false),
         ("offline-legacy.md", 64, 2, false),
+        ("split-original.md", 48, 3, false),
+        ("split-destination.md", 96, 3, false),
     ];
     for (name, size, version, sparse) in names {
         compatibility_fixtures::fixture(&encrypted, name, size, version, sparse, group);
@@ -279,8 +294,44 @@ async fn run_async(base: &Path) -> CheckResult<serde_json::Value> {
         fs::write(base.join("phase.txt"), "offline-rename").ok();
         require(external("rename",&mount.join("offline-legacy.md"),Some(&mount.join("offline-renamed.md"))).await?.status.success(),"external offline rename failed")?;
         wait_until(|| hybridcipher_provider_core::EncryptedInventory::new(root,&encrypted).scan().ok().is_some_and(|entries| entries.iter().any(|e| e.relative_path=="offline-renamed.md" && e.metadata.as_ref().is_some_and(|m| m.header_version==Some(3)))) && host.read_runtime_status(root).is_ok_and(|s| s.pending_operation_count==0),"offline rename without self-hydration").await?;
+        fs::write(base.join("phase.txt"), "hydrated-busy-renames").ok();
+        let current_id = entries.iter().find(|e| e.relative_path == "current.md").unwrap().identity.file_id.clone();
+        for (source, target, mode) in [("current.md", "hydrated-renamed.md", "rename-busy"),
+            ("hydrated-renamed.md", "current.md", "rename")] {
+            require(external(mode, &mount.join(source), Some(&mount.join(target))).await?.status.success(), "hydrated rename failed in client process")?;
+            wait_until(|| hybridcipher_provider_core::EncryptedInventory::new(root, &encrypted).scan().ok().is_some_and(|entries|
+                !entries.iter().any(|e| e.relative_path == source)
+                && entries.iter().any(|e| e.relative_path == target && e.identity.file_id == current_id))
+                && host.read_runtime_status(root).is_ok_and(|s| s.pending_operation_count == 0), "hydrated rename retains identity").await?;
+            require(!mount.join(source).exists(), "refresh resurrected the original name")?;
+            let read = external("read", &mount.join(target), None).await?;
+            require(read.status.success() && String::from_utf8_lossy(&read.stdout).trim() == format!("192:{:x}", Sha256::digest(vec![42;192])), "hydrated rename changed content")?;
+        }
+        fs::write(base.join("phase.txt"), "split-identity-recovery").ok();
+        let split_source = entries.iter().find(|e| e.relative_path == "split-original.md").unwrap();
+        let split_target = entries.iter().find(|e| e.relative_path == "split-destination.md").unwrap();
+        let split_before = fs::read(&split_target.encrypted_path)?;
+        host.stop_root_for_restart(root).await?;
+        seed_duplicates(&host, &registration, split_source, "split-destination.md")?;
+        host.start_root_with_bridge(root, bridge.clone()).await?;
+        let operation = host.read_runtime_status(root)?.pending_operations.first().ok_or("split rename fixture was not recovered")?.id;
+        require(host.resolve_pending_operation(root, operation, PendingOperationResolution::KeepRenamedFile).await.is_err(), "kept destination while original still existed")?;
+        require(external("delete", &mount.join("split-original.md"), None).await?.status.success(), "fixture original deletion failed")?;
+        wait_until(|| !split_source.encrypted_path.exists(), "original deletion encrypted commit").await?;
+        require(host.resolve_pending_operation(root, operation, PendingOperationResolution::RetryRename).await.is_err(), "retry overwrote a different destination identity")?;
+        require(host.resolve_pending_operation(root, operation, PendingOperationResolution::KeepOriginalName).await.is_err(), "kept missing original")?;
+        let mut damaged = split_before.clone();
+        *damaged.last_mut().ok_or("empty split ciphertext")? ^= 1;
+        fs::write(&split_target.encrypted_path, damaged)?;
+        require(host.resolve_pending_operation(root, operation, PendingOperationResolution::KeepRenamedFile).await.is_err(), "kept corrupt destination")?;
+        require(host.read_runtime_status(root)?.pending_operation_count == 1, "verification failure discarded intent")?;
+        fs::write(&split_target.encrypted_path, &split_before)?;
+        host.resolve_pending_operation(root, operation, PendingOperationResolution::KeepRenamedFile).await?;
+        require(host.read_runtime_status(root)?.pending_operation_count == 0, "kept renamed file stayed pending")?;
+        require(fs::read(&split_target.encrypted_path)? == split_before, "keep renamed file changed ciphertext")?;
+        require(external("read", &mount.join("split-destination.md"), None).await?.status.success(), "kept destination is unreadable")?;
         require(host.check_root_health(root)?.operational.is_some_and(|o| o.healthy),"provider health failed during isolated acceptance")?;
-        Ok(serde_json::json!({"passed":true,"root_id":root,"legacy_reads":true,"strict_before_consent":true,"current_after_decline":true,"consent_survives_restart":true,"readonly_ciphertext_unchanged":true,"duplicates_before":122,"duplicates_after":1,"both_rename_resolutions":true,"already_committed_rename":true,"atomic_editor_upgrade_and_exact_backup":true,"offline_rename":true,"provider_healthy":true,"corrupt_file_isolated":true}))
+        Ok(serde_json::json!({"passed":true,"root_id":root,"legacy_reads":true,"strict_before_consent":true,"current_after_decline":true,"consent_survives_restart":true,"readonly_ciphertext_unchanged":true,"duplicates_before":122,"duplicates_after":1,"both_rename_resolutions":true,"already_committed_rename":true,"atomic_editor_upgrade_and_exact_backup":true,"offline_rename":true,"hydrated_busy_rename":true,"split_identity_recovery":true,"corrupt_destination_keeps_intent":true,"provider_healthy":true,"corrupt_file_isolated":true}))
     }.await;
     let stopped = host.stop_root_for_restart(root).await;
     let unregistered = if stopped.is_ok() {

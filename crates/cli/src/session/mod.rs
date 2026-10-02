@@ -161,6 +161,9 @@ mod tests {
             server_url: "https://server-four".to_string(),
             token: "token".to_string(),
             refresh_token: String::new(),
+            team_entitlement: None,
+            team_revoked: false,
+            pending_team_requests: Vec::new(),
             opaque_export_key: None,
             device_binding: String::new(),
             device_keypair: None,
@@ -305,6 +308,7 @@ mod tests {
 #[derive(Debug, Clone)]
 pub struct GroupInfo {
     pub id: String,
+    pub organization_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub role: String,
@@ -530,6 +534,7 @@ const ACCOUNT_KEY_CACHE_FILE: &str = ".account_key_cache";
 const DEVICE_KEY_FILE: &str = "device_key.protected";
 const KEYSTORE_SERVICE_NAME: &str = "hybridcipher";
 const SESSION_FILE_AAD: &[u8] = b"hybridcipher/session";
+const TEAM_REQUEST_QUEUE_AAD: &[u8] = b"hybridcipher/cli_team_requests/v1";
 const DEVICE_KEYPAIR_FILE_AAD: &[u8] = b"hybridcipher/device_keypair";
 const INVITATION_KEYPAIR_FILE_AAD: &[u8] = b"hybridcipher/localfs/invitation_keypair";
 const LEGACY_INVITATION_KEYPAIR_FILE_AAD: &[u8] = b"hybridcipher/invitation_keypair";
@@ -637,6 +642,10 @@ struct CachedGroupMetadata {
     name: String,
     #[serde(default)]
     role: Option<String>,
+    #[serde(default)]
+    organization_id: Option<String>,
+    #[serde(default)]
+    organization_known: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -677,22 +686,33 @@ impl CachedMemberInfo {
 }
 
 impl GroupMetadataCache {
-    fn insert(&mut self, group_id: &str, name: &str, role: Option<&str>) -> bool {
+    fn insert(
+        &mut self,
+        group_id: &str,
+        name: &str,
+        role: Option<&str>,
+        organization_id: Option<&str>,
+    ) -> bool {
         let key = normalize_group_id_key(group_id);
         let name_value = name.trim().to_string();
         let role_value = role.map(|value| value.trim().to_string());
+        let organization_value = organization_id.map(str::to_string);
         let mut changed = false;
 
         match self.by_id.get(&key) {
             Some(existing)
                 if existing.name == name_value
-                    && existing.role.as_deref() == role_value.as_deref() => {}
+                    && existing.role.as_deref() == role_value.as_deref()
+                    && existing.organization_known
+                    && existing.organization_id == organization_value => {}
             _ => {
                 self.by_id.insert(
                     key,
                     CachedGroupMetadata {
                         name: name_value,
                         role: role_value,
+                        organization_id: organization_value,
+                        organization_known: true,
                     },
                 );
                 changed = true;
@@ -706,7 +726,19 @@ impl GroupMetadataCache {
         let key = normalize_group_id_key(group_id);
         self.by_id.get(&key).map(|entry| entry.name.as_str())
     }
+
+    fn organization_for_id(&self, group_id: &str) -> Option<Option<&str>> {
+        let key = normalize_group_id_key(group_id);
+        self.by_id
+            .get(&key)
+            .filter(|entry| entry.organization_known)
+            .map(|entry| entry.organization_id.as_deref())
+    }
 }
+
+#[cfg(test)]
+#[path = "../../test/team_groups/test_group_cache.rs"]
+mod team_group_cache_tests;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountProtectionMetadata {
@@ -1914,6 +1946,12 @@ pub struct Session {
     /// Refresh token issued by the server
     #[serde(default)]
     pub refresh_token: String,
+    #[serde(default)]
+    pub team_entitlement: Option<String>,
+    #[serde(default)]
+    pub team_revoked: bool,
+    #[serde(default)]
+    pub pending_team_requests: Vec<hybridcipher_client::team_requests::PendingTeamRequest>,
     /// OPAQUE export key (base64) for password-derived wrapping (e.g., coverage registry)
     #[serde(default)]
     pub opaque_export_key: Option<String>,
@@ -2044,7 +2082,7 @@ impl SessionManager {
         } else {
             dirs::home_dir()
                 .ok_or_else(|| CliError::configuration("Could not determine home directory"))?
-                .join(".hybridcipher")
+                .join(hybridcipher_client::config_loader::account_data_location())
         };
 
         ensure_clean_multi_user_structure(&base_config_dir)?;
@@ -2835,15 +2873,24 @@ impl SessionManager {
     }
 
     pub async fn cache_group_metadata(&self, groups: &[GroupInfo]) -> Result<(), CliError> {
-        if groups.is_empty() {
-            return Ok(());
-        }
-
         let mut cache = self.load_group_metadata_cache().await?;
         let mut changed = false;
+        for (id, entry) in &mut cache.by_id {
+            if !groups.iter().any(|group| group.id.eq_ignore_ascii_case(id))
+                && entry.role.as_deref() != Some("removed")
+            {
+                entry.role = Some("removed".into());
+                changed = true;
+            }
+        }
 
         for group in groups {
-            if cache.insert(&group.id, &group.name, Some(&group.role)) {
+            if cache.insert(
+                &group.id,
+                &group.name,
+                Some(&group.role),
+                group.organization_id.as_deref(),
+            ) {
                 changed = true;
             }
         }
@@ -2865,6 +2912,18 @@ impl SessionManager {
             Ok(group_uuid) => self.group_label(&group_uuid).await,
             Err(_) => trimmed.to_string(),
         }
+    }
+
+    /// Distinguishes a cached Personal group from an older cache entry whose
+    /// organization was never recorded.
+    pub async fn cached_group_organization(
+        &self,
+        group_id: &uuid::Uuid,
+    ) -> Result<Option<Option<String>>, CliError> {
+        let cache = self.load_group_metadata_cache().await?;
+        Ok(cache
+            .organization_for_id(&group_id.to_string())
+            .map(|organization| organization.map(str::to_string)))
     }
 
     pub async fn group_label(&self, group_id: &uuid::Uuid) -> String {
@@ -3336,6 +3395,22 @@ impl SessionManager {
         self.current_session.lock().unwrap().clone()
     }
 
+    /// Open protected local data without extending authentication or write access.
+    pub fn require_local_data_access(&self) -> Result<(), CliError> {
+        if self.is_authenticated() {
+            return Ok(());
+        }
+        if self.current_session().is_some_and(|saved| {
+            saved
+                .team_entitlement
+                .as_deref()
+                .is_some_and(|token| !token.is_empty())
+        }) {
+            return Ok(());
+        }
+        Err(CliError::authentication("Sign in to open account data"))
+    }
+
     /// Check if user is authenticated with comprehensive validation
     pub fn is_authenticated(&self) -> bool {
         // Try to load session from disk if not already in memory
@@ -3685,10 +3760,19 @@ impl SessionManager {
         }
 
         if chrono::Utc::now() >= session.expires_at {
-            self.secure_file_deletion(&context.session_file)?;
-            *self.current_session.lock().unwrap() = None;
-            self.drop_state_key_memory();
-            return Ok(());
+            // Protected, device-bound account state can reopen existing local
+            // data after licensing-key retirement. This does not renew auth or
+            // authorize writes; shared runtime checks still verify every grant.
+            let team_data_access = session
+                .team_entitlement
+                .as_deref()
+                .is_some_and(|token| !token.is_empty());
+            if !team_data_access {
+                self.secure_file_deletion(&context.session_file)?;
+                *self.current_session.lock().unwrap() = None;
+                self.drop_state_key_memory();
+                return Ok(());
+            }
         }
 
         if !self.validate_device_binding(&session) {
@@ -3915,6 +3999,44 @@ impl SessionManager {
     pub fn user_config_dir(&self) -> Option<PathBuf> {
         self.current_user_context()
             .map(|ctx| ctx.config_dir.clone())
+    }
+
+    /// The account's encrypted administration journal is separate from its
+    /// login session so pending requests survive logout and reauthentication.
+    pub fn load_team_request_queue(
+        &self,
+    ) -> Result<Vec<hybridcipher_client::team_requests::PendingTeamRequest>, CliError> {
+        let path = self
+            .user_config_dir()
+            .ok_or_else(|| CliError::session("No account selected"))?
+            .join("cli_team_requests.protected.json");
+        let Some((content, protected)) = self.read_protected_file(&path, TEAM_REQUEST_QUEUE_AAD)?
+        else {
+            return Ok(Vec::new());
+        };
+        if !protected {
+            return Err(CliError::decryption(
+                "Team request journal is not protected",
+            ));
+        }
+        serde_json::from_str(&content)
+            .map_err(|err| CliError::format(format!("Invalid Team request journal: {err}")))
+    }
+
+    pub fn store_team_request_queue(
+        &self,
+        requests: &[hybridcipher_client::team_requests::PendingTeamRequest],
+    ) -> Result<(), CliError> {
+        let path = self
+            .user_config_dir()
+            .ok_or_else(|| CliError::session("No account selected"))?
+            .join("cli_team_requests.protected.json");
+        let temporary = path.with_extension("tmp");
+        let content = serde_json::to_string(requests)
+            .map_err(|err| CliError::format(format!("Cannot serialize Team requests: {err}")))?;
+        self.write_protected_file(&temporary, &content, TEAM_REQUEST_QUEUE_AAD)?;
+        std::fs::rename(&temporary, &path)
+            .map_err(|err| CliError::session(format!("Cannot save Team request journal: {err}")))
     }
 
     /// Location for the unified recovery artifact for the active user.
@@ -4541,6 +4663,7 @@ impl SessionManager {
             std::sync::Arc::new(network),
             client_config,
         );
+        self.configure_client_write_access(&client).await?;
 
         if automation_enabled {
             if let Err(err) = client.auto_sync_welcome_messages("startup").await {
@@ -4599,6 +4722,8 @@ impl SessionManager {
             client_config,
         );
 
+        self.configure_client_write_access(&client).await?;
+
         if let Ok(Some(active_group)) = self.current_group_id().await {
             if let Err(err) = client.use_group(active_group).await {
                 tracing::warn!(
@@ -4610,6 +4735,59 @@ impl SessionManager {
         }
 
         Ok(client)
+    }
+
+    pub async fn configure_client_write_access<
+        S: Storage,
+        N: hybridcipher_client::network::Network,
+    >(
+        &self,
+        client: &Client<S, N>,
+    ) -> Result<(), CliError> {
+        let saved = self
+            .current_session()
+            .ok_or_else(|| CliError::session("No account is open"))?;
+        client
+            .configure_local_write_access(
+                hybridcipher_client::local_write_access::LocalWriteAccess {
+                    issuer: saved
+                        .server_url
+                        .trim_end_matches('/')
+                        .trim_end_matches("/api/v1")
+                        .to_string(),
+                    user_id: saved.user_id.clone(),
+                    entitlement: saved.team_entitlement.clone(),
+                    revoked: saved.team_revoked,
+                },
+            )
+            .await
+            .map_err(|err| CliError::permission(err.to_string()))
+    }
+
+    pub async fn persist_local_write_access(&self) -> Result<(), CliError> {
+        let saved = self
+            .current_session()
+            .ok_or_else(|| CliError::session("No account is open"))?;
+        let access = hybridcipher_client::local_write_access::LocalWriteAccess {
+            issuer: saved
+                .server_url
+                .trim_end_matches('/')
+                .trim_end_matches("/api/v1")
+                .to_string(),
+            user_id: saved.user_id.clone(),
+            entitlement: saved.team_entitlement.clone(),
+            revoked: saved.team_revoked,
+        };
+        let raw =
+            serde_json::to_string(&access).map_err(|err| CliError::session(err.to_string()))?;
+        self.current_storage()?
+            .store_config(hybridcipher_client::local_write_access::STORAGE_KEY, &raw)
+            .await
+            .map_err(|err| CliError::storage(err.to_string()))?;
+        self.current_storage()?
+            .store_config("local_server_write_access", &raw)
+            .await
+            .map_err(|err| CliError::storage(err.to_string()))
     }
 
     /// Get or create a persistent device keypair (for local operations)
@@ -5549,6 +5727,13 @@ impl SessionManager {
     }
 
     async fn load_cached_group_uuid(&self) -> Result<Option<uuid::Uuid>, CliError> {
+        if crate::ui::desktop::enabled() {
+            if let Ok(group) = std::env::var("HYBRIDCIPHER_DESKTOP_GROUP") {
+                let id = uuid::Uuid::parse_str(&group)
+                    .map_err(|_| CliError::invalid_input("Invalid desktop group scope"))?;
+                return Ok(Some(id));
+            }
+        }
         let storage = self.current_storage()?;
 
         // Ensure the device/state key is available before attempting to read
@@ -6195,6 +6380,9 @@ impl SessionManager {
             server_url: server_url.to_string(),
             token: login_result.access_token.clone(),
             refresh_token: login_result.refresh_token.clone(),
+            team_entitlement: None,
+            team_revoked: false,
+            pending_team_requests: Vec::new(),
             opaque_export_key: Some(general_purpose::STANDARD.encode(login_result.export_key)),
             device_binding: String::new(), // populated in store_session
             device_keypair: Some(keypair_data),
@@ -6525,6 +6713,10 @@ impl SessionManager {
     fn parse_group_info(&self, group: &serde_json::Value) -> Option<GroupInfo> {
         Some(GroupInfo {
             id: group.get("id")?.as_str()?.to_string(),
+            organization_id: group
+                .get("organization_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
             name: group.get("name")?.as_str()?.to_string(),
             description: group
                 .get("description")

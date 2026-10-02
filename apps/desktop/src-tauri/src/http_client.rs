@@ -188,6 +188,8 @@ pub enum GroupRole {
 #[derive(Debug, Deserialize)]
 pub struct GroupInfo {
     pub id: Uuid,
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
     pub name: String,
     pub description: Option<String>,
     pub creator_id: Uuid,

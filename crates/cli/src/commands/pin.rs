@@ -573,9 +573,11 @@ async fn handle_pin_add(
             .map_err(|e| CliError::Io(format!("Failed to flush stdout: {}", e)))?;
 
         let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+        if crate::ui::desktop::enabled() {
+            input = crate::ui::desktop::request("text", "Enter the HybridCipher pinning URL from the other device", None)?;
+        } else {
+            io::stdin().read_line(&mut input).map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+        }
 
         let url = input.trim();
         let parsed = hybridcipher_client::pinning::parse_and_verify_signed_pinning_url_with_policy(
@@ -650,9 +652,11 @@ async fn handle_pin_add(
             .map_err(|e| CliError::Io(format!("Failed to flush stdout: {}", e)))?;
 
         let mut confirm = String::new();
-        io::stdin()
-            .read_line(&mut confirm)
-            .map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+        if crate::ui::desktop::enabled() {
+            confirm = if crate::ui::desktop::confirmation("Does this fingerprint match the requesting device?", false)? { "y" } else { "n" }.into();
+        } else {
+            io::stdin().read_line(&mut confirm).map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+        }
 
         match confirm.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => {
@@ -1211,9 +1215,11 @@ async fn handle_pin_remove(
         io::stdout().flush().unwrap();
 
         let mut confirm = String::new();
-        io::stdin()
-            .read_line(&mut confirm)
-            .map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+        if crate::ui::desktop::enabled() {
+            confirm = if crate::ui::desktop::confirmation("Remove this pinned key?", false)? { "y" } else { "n" }.into();
+        } else {
+            io::stdin().read_line(&mut confirm).map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+        }
 
         if confirm.trim().to_lowercase() != "y" && confirm.trim().to_lowercase() != "yes" {
             println!("❌ Remove operation cancelled");

@@ -20,7 +20,11 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use hybridcipher_client::{
-    file::encrypt::{write_encrypted_file, SerializedEncryptedHeader, SparseFileMetadata},
+    file::encrypt::{
+        chunked_encrypted_size, read_encrypted_header, write_encrypted_file,
+        SerializedEncryptedHeader, SparseFileMetadata, MAX_CONTENT_CHUNK_SIZE,
+        MAX_IN_MEMORY_PLAINTEXT_BYTES,
+    },
     EncryptedFileMetadata,
 };
 #[cfg(unix)]
@@ -34,7 +38,7 @@ use std::cmp;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -59,7 +63,6 @@ pub const ATTR_TTL: Duration = Duration::from_secs(1);
 /// Time-to-live for directory entries (in seconds)
 pub const ENTRY_TTL: Duration = Duration::from_secs(1);
 
-const ENCRYPTED_SEPARATOR: &[u8] = b"\n---ENCRYPTED_DATA---\n";
 const ENCRYPTED_TMP_DIR_NAME: &str = ".hybridcipher-tmp";
 const MOUNT_JOURNAL_DIR_NAME: &str = ".hybridcipher-mount-journal";
 const MOUNT_RETENTION_DIR_NAME: &str = ".hybridcipher-retention";
@@ -3164,22 +3167,22 @@ fn permissions_from(metadata: &fs::Metadata, _default_mode: u16) -> u16 {
 }
 
 fn parse_encrypted_file(path: &Path) -> Result<EncryptedFileMetadata> {
-    let raw = fs::read(path).with_context(|| {
+    let file = fs::File::open(path).with_context(|| {
         format!(
             "Failed to read encrypted file payload from {}",
             path.display()
         )
     })?;
+    let file_len = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let metadata_bytes = read_encrypted_header(&mut reader)
+        .with_context(|| format!("Invalid encrypted header for {}", path.display()))?;
+    let ciphertext_offset = reader.stream_position()?;
+    let ciphertext_len = file_len
+        .checked_sub(ciphertext_offset)
+        .ok_or_else(|| anyhow!("Encrypted file is shorter than its header"))?;
 
-    let separator_pos = raw
-        .windows(ENCRYPTED_SEPARATOR.len())
-        .position(|window| window == ENCRYPTED_SEPARATOR)
-        .ok_or_else(|| anyhow!("Encrypted file {} missing separator marker", path.display()))?;
-
-    let metadata_bytes = &raw[..separator_pos];
-    let ciphertext = raw[separator_pos + ENCRYPTED_SEPARATOR.len()..].to_vec();
-
-    let json: Value = serde_json::from_slice(metadata_bytes)
+    let json: Value = serde_json::from_slice(&metadata_bytes)
         .with_context(|| format!("Failed to parse encrypted metadata for {}", path.display()))?;
 
     let file_id = json
@@ -3197,8 +3200,16 @@ fn parse_encrypted_file(path: &Path) -> Result<EncryptedFileMetadata> {
         .get("file_size")
         .and_then(|v| v.as_u64())
         .or_else(|| json.get("original_size").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-    let content_chunk_size = json.get("chunk_size").and_then(|v| v.as_u64());
+        .ok_or_else(|| {
+            anyhow!(
+                "Encrypted metadata missing file size for {}",
+                path.display()
+            )
+        })?;
+    let content_chunk_size = json
+        .get("chunk_size")
+        .map(|value| value.as_u64().ok_or_else(|| anyhow!("Invalid chunk size")))
+        .transpose()?;
 
     let _original_name = json
         .get("original_name")
@@ -3231,8 +3242,13 @@ fn parse_encrypted_file(path: &Path) -> Result<EncryptedFileMetadata> {
 
     let header_version = json
         .get("header_version")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| u32::try_from(number).ok())
+                .ok_or_else(|| anyhow!("Invalid header version"))
+        })
+        .transpose()?;
     let wrapped_file_key = json
         .get("wrapped_file_key")
         .and_then(|v| v.as_str())
@@ -3255,8 +3271,55 @@ fn parse_encrypted_file(path: &Path) -> Result<EncryptedFileMetadata> {
         .filter(|metadata: &hybridcipher_client::PlatformFileMetadata| !metadata.is_empty());
     let sparse_metadata = json
         .get("sparse_metadata")
-        .and_then(|value| serde_json::from_value::<SparseFileMetadata>(value.clone()).ok())
-        .filter(SparseFileMetadata::is_effectively_sparse);
+        .map(|value| {
+            serde_json::from_value::<SparseFileMetadata>(value.clone())
+                .map_err(|error| anyhow!("Invalid sparse metadata: {error}"))
+        })
+        .transpose()?;
+    let packed_size = match sparse_metadata.as_ref() {
+        Some(layout) => layout
+            .validated_packed_size(content_size)
+            .ok_or_else(|| anyhow!("Invalid sparse extent layout"))?,
+        None => content_size,
+    };
+    let sparse_metadata = sparse_metadata.filter(SparseFileMetadata::is_effectively_sparse);
+
+    if content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
+        || ciphertext_len > MAX_IN_MEMORY_PLAINTEXT_BYTES + MAX_CONTENT_CHUNK_SIZE as u64
+    {
+        return Err(anyhow!("File exceeds the 256 MiB in-memory mount limit"));
+    }
+    let expected = if let Some(chunk_size) = content_chunk_size {
+        let chunk_size =
+            usize::try_from(chunk_size).map_err(|_| anyhow!("Chunk size is too large"))?;
+        chunked_encrypted_size(packed_size, chunk_size)
+            .map_err(|error| anyhow!("Invalid chunked ciphertext: {error}"))?
+    } else {
+        if ciphertext_len < 12 + 16 {
+            return Err(anyhow!("Single-record ciphertext is too short"));
+        }
+        ciphertext_len
+    };
+    if ciphertext_len != expected {
+        return Err(anyhow!("Ciphertext size mismatch"));
+    }
+    if let Some(declared) = json.get("encrypted_size") {
+        if declared.as_u64() != Some(ciphertext_len) {
+            return Err(anyhow!("Declared ciphertext size mismatch"));
+        }
+    }
+    let length =
+        usize::try_from(ciphertext_len).map_err(|_| anyhow!("Ciphertext length is too large"))?;
+    let mut ciphertext = Vec::new();
+    ciphertext
+        .try_reserve_exact(length)
+        .map_err(|_| anyhow!("Unable to reserve ciphertext memory"))?;
+    ciphertext.resize(length, 0);
+    reader.read_exact(&mut ciphertext)?;
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(anyhow!("Encrypted file changed while reading"));
+    }
 
     Ok(EncryptedFileMetadata {
         file_id,
@@ -3270,7 +3333,7 @@ fn parse_encrypted_file(path: &Path) -> Result<EncryptedFileMetadata> {
         content_nonce,
         content_chunk_size,
         content_size,
-        encrypted_size: ciphertext.len() as u64,
+        encrypted_size: ciphertext_len,
         created_at,
         platform_metadata,
         sparse_metadata,
@@ -3494,6 +3557,15 @@ where
 
     /// File open implementation with handle management
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        if (flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0)
+            && tokio::task::block_in_place(|| {
+                self.runtime.block_on(self.client.require_local_write())
+            })
+            .is_err()
+        {
+            reply.error(libc::EROFS);
+            return;
+        }
         debug!("FUSE open: inode={}, flags={}", ino, flags);
 
         if let Some(file_info) = self.inode_map.get(&ino) {
@@ -3527,6 +3599,12 @@ where
         flags: i32,
         reply: ReplyCreate,
     ) {
+        if tokio::task::block_in_place(|| self.runtime.block_on(self.client.require_local_write()))
+            .is_err()
+        {
+            reply.error(libc::EROFS);
+            return;
+        }
         let name_str = match name.to_str() {
             Some(n) if !n.is_empty() => n,
             _ => {
@@ -3638,6 +3716,12 @@ where
         umask: u32,
         reply: ReplyEntry,
     ) {
+        if tokio::task::block_in_place(|| self.runtime.block_on(self.client.require_local_write()))
+            .is_err()
+        {
+            reply.error(libc::EROFS);
+            return;
+        }
         let name_str = match name.to_str() {
             Some(n) if !n.is_empty() => n,
             _ => {
@@ -3758,6 +3842,12 @@ where
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        if tokio::task::block_in_place(|| self.runtime.block_on(self.client.require_local_write()))
+            .is_err()
+        {
+            reply.error(libc::EROFS);
+            return;
+        }
         debug!(
             "FUSE write: inode={}, offset={}, size={}",
             ino,
@@ -3843,6 +3933,12 @@ where
 
     /// Remove a file from the filesystem
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if tokio::task::block_in_place(|| self.runtime.block_on(self.client.require_local_write()))
+            .is_err()
+        {
+            reply.error(libc::EROFS);
+            return;
+        }
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -3894,6 +3990,12 @@ where
 
     /// Remove an empty directory
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if tokio::task::block_in_place(|| self.runtime.block_on(self.client.require_local_write()))
+            .is_err()
+        {
+            reply.error(libc::EROFS);
+            return;
+        }
         let name_str = match name.to_str() {
             Some(n) if !n.is_empty() => n,
             _ => {
@@ -3956,6 +4058,12 @@ where
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        if tokio::task::block_in_place(|| self.runtime.block_on(self.client.require_local_write()))
+            .is_err()
+        {
+            reply.error(libc::EROFS);
+            return;
+        }
         let old_name = match name.to_str() {
             Some(n) if !n.is_empty() => n,
             _ => {
@@ -4378,6 +4486,12 @@ where
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        if tokio::task::block_in_place(|| self.runtime.block_on(self.client.require_local_write()))
+            .is_err()
+        {
+            reply.error(libc::EROFS);
+            return;
+        }
         debug!("FUSE setattr: inode={}, size={:?}", ino, size);
 
         // Get file info
@@ -4646,7 +4760,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn test_ciphertext(content: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 12];
+        bytes.extend_from_slice(content);
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes
+    }
+
     fn test_metadata(file_path: &str, content: &[u8]) -> EncryptedFileMetadata {
+        let ciphertext = test_ciphertext(content);
         EncryptedFileMetadata {
             file_id: Uuid::new_v4().to_string(),
             file_path: file_path.to_string(),
@@ -4659,11 +4781,11 @@ mod tests {
             content_nonce: Some(vec![4; 12]),
             content_chunk_size: None,
             content_size: content.len() as u64,
-            encrypted_size: content.len() as u64,
+            encrypted_size: ciphertext.len() as u64,
             created_at: Utc::now(),
             platform_metadata: None,
             sparse_metadata: None,
-            encrypted_content: content.to_vec(),
+            encrypted_content: ciphertext,
         }
     }
 
@@ -4693,7 +4815,17 @@ mod tests {
         persist_encrypted_file(&target, &test_metadata("doc.txt", b"new")).unwrap();
 
         let parsed = parse_encrypted_file(&target).unwrap();
-        assert_eq!(parsed.encrypted_content, b"new");
+        assert_eq!(parsed.encrypted_content, test_ciphertext(b"new"));
+    }
+
+    #[test]
+    fn mount_parser_rejects_forged_chunk_size_before_loading_ciphertext() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("forged.encrypted");
+        let mut metadata = test_metadata("forged.txt", b"content");
+        metadata.content_chunk_size = Some(u64::MAX);
+        persist_encrypted_file(&target, &metadata).unwrap();
+        assert!(parse_encrypted_file(&target).is_err());
     }
 
     #[test]
@@ -4793,7 +4925,7 @@ mod tests {
         assert!(target.exists());
         assert_eq!(
             parse_encrypted_file(&target).unwrap().encrypted_content,
-            b"recovered"
+            test_ciphertext(b"recovered")
         );
     }
 
@@ -4843,7 +4975,7 @@ mod tests {
         assert!(!staged.journal_path.exists());
         assert_eq!(
             parse_encrypted_file(&target).unwrap().encrypted_content,
-            b"old"
+            test_ciphertext(b"old")
         );
         let status = collect_mount_runtime_status(root).unwrap();
         assert_eq!(status.corrupted_encrypted_file_count, 1);
@@ -4903,7 +5035,7 @@ mod tests {
         assert!(!tmp_path.exists());
         assert_eq!(
             parse_encrypted_file(&target).unwrap().encrypted_content,
-            b"newer"
+            test_ciphertext(b"newer")
         );
         assert_eq!(
             collect_mount_runtime_status(root)

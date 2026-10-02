@@ -189,10 +189,14 @@ impl DesktopCloudProviderManager {
             )
             .map_err(|e| e.to_string())?,
         );
-        let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge_with_compatibility(
-            client.clone(),
-            compatibility,
-        );
+        let bridge =
+            hybridcipher_windows_cloud_provider::local_provider_bridge_for_root_with_compatibility(
+                client.clone(),
+                root_id,
+                compatibility,
+            )
+            .await
+            .map_err(|err| err.to_string())?;
         let host = hybridcipher_windows_cloud_provider::CloudProviderHost::with_provider_bridge(
             hybridcipher_windows_cloud_provider::ProviderHostConfig {
                 user_config_dir,
@@ -441,6 +445,21 @@ impl DesktopCloudProviderManager {
     }
 
     #[cfg(target_os = "windows")]
+    pub async fn recheck_cloud_files_conflicts(&self, root_id: Uuid) -> Result<(), String> {
+        let host = {
+            let running = self.running.lock().await;
+            running
+                .get(&root_id)
+                .ok_or_else(|| format!("Cloud Files root {root_id} is not running"))?
+                .host
+                .clone()
+        };
+        host.recheck_conflicts(root_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(target_os = "windows")]
     pub async fn check_root_health(
         &self,
         root_id: Uuid,
@@ -573,9 +592,11 @@ impl DesktopCloudProviderManager {
             &NativeMacFileProviderSystemDomainRegistrar,
         )?;
         let excluded_patterns = client.excluded_file_patterns();
-        let crypto = Arc::new(hybridcipher_macos_file_provider::ClientMountCrypto::new(
-            client,
-        ));
+        let crypto = Arc::new(
+            hybridcipher_macos_file_provider::ClientMountCrypto::for_root(client, root_id)
+                .await
+                .map_err(|err| err.to_string())?,
+        );
         if let Err(err) = host
             .start_root_with_crypto_and_exclusions(root_id, crypto, excluded_patterns)
             .await
@@ -653,9 +674,14 @@ impl DesktopCloudProviderManager {
             }
 
             let excluded_patterns = client.excluded_file_patterns();
-            let crypto = Arc::new(hybridcipher_macos_file_provider::ClientMountCrypto::new(
-                client.clone(),
-            ));
+            let crypto = Arc::new(
+                hybridcipher_macos_file_provider::ClientMountCrypto::for_root(
+                    client.clone(),
+                    registration.root_id,
+                )
+                .await
+                .map_err(|err| err.to_string())?,
+            );
             let restart_result = host
                 .start_root_with_crypto_and_exclusions(
                     registration.root_id,

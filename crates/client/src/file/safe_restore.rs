@@ -1,7 +1,7 @@
 //! Confined, non-overwriting plaintext restoration.
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read},
     path::{Component, Path, PathBuf},
 };
 
@@ -55,6 +55,17 @@ pub fn destination(source: &Path, name: Option<&str>) -> io::Result<PathBuf> {
 /// Create a new plaintext file. Windows ancestor handles prevent directory
 /// replacement while writing; reparse points and existing outputs are rejected.
 pub fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
+    write_new_from_reader(path, &mut io::Cursor::new(data))
+}
+
+/// Publish a fully authenticated private restore through the same guarded,
+/// non-overwriting destination check as write_new, without loading it in memory.
+pub fn publish_new(path: &Path, authenticated_private_path: &Path) -> io::Result<()> {
+    let mut source = File::open(authenticated_private_path)?;
+    write_new_from_reader(path, &mut source)
+}
+
+fn write_new_from_reader(path: &Path, source: &mut impl Read) -> io::Result<()> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -140,8 +151,12 @@ pub fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
         .open(&absolute)?;
     // Retain ciphertext on every error. A partial output is a visible conflict
     // for recovery, and must never cause the source to be removed.
-    file.write_all(data)?;
-    file.sync_all()?;
+    let result = io::copy(source, &mut file).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(err) = result {
+        let _ = fs::remove_file(&absolute);
+        return Err(err);
+    }
     drop(directory_guards);
     Ok(())
 }
@@ -182,6 +197,19 @@ mod security_regression {
         fs::remove_dir(root).unwrap();
     }
 
+    #[test]
+    fn publishes_authenticated_private_file_without_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private.plain");
+        let output = root.path().join("published.txt");
+        fs::write(&private, b"authenticated").unwrap();
+        publish_new(&output, &private).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"authenticated");
+        assert!(publish_new(&output, &private).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"authenticated");
+        assert_eq!(fs::read(&private).unwrap(), b"authenticated");
+    }
+
     #[cfg(windows)]
     #[test]
     fn refuses_windows_junction_escape() {
@@ -190,7 +218,8 @@ mod security_regression {
         fs::create_dir(&outside).unwrap();
         let junction = root.path().join("redirect");
         let command = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32").join("cmd.exe");
+            .join("System32")
+            .join("cmd.exe");
         let result = std::process::Command::new(command)
             .args(["/d", "/c", "mklink", "/J"])
             .arg(junction.to_string_lossy().trim_start_matches("\\\\?\\"))
@@ -202,7 +231,12 @@ mod security_regression {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert_eq!(write_new(&junction.join("escaped.txt"), b"secret").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            write_new(&junction.join("escaped.txt"), b"secret")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert!(!outside.join("escaped.txt").exists());
         fs::remove_dir(&junction).unwrap();
     }

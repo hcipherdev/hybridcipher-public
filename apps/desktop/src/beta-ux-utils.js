@@ -39,7 +39,7 @@
         return {
             kind: 'generic',
             title: 'HybridCipher could not protect this folder',
-            detail: 'Review the terminal output for the exact CLI error, then retry after correcting the path or permissions.',
+            detail: 'Review the error details, then retry after correcting the path or permissions.',
             retryLabel: 'Try again',
         };
     }
@@ -101,7 +101,7 @@
         return [
             modePrefix,
             folderPath ? `Folder: ${folderPath}.` : '',
-            'Review the embedded terminal output for the mount command, then retry if needed.',
+            'Review the mount error details, then retry if needed.',
             'Before retrying, check whether the folder is already mounted.'
         ].filter(Boolean).join(' ');
     }

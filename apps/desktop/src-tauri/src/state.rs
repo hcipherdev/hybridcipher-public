@@ -10,12 +10,18 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::async_runtime::Mutex;
+use zeroize::Zeroize;
+
+fn default_persistent_session() -> bool {
+    true
+}
 
 /// Application state shared across all Tauri commands
 pub struct AppState {
     pub client: Arc<HybridCipherClient>,
     pub cli_schema: Arc<CliSchemaManager>,
     pub session: Arc<Mutex<Option<UserSession>>>,
+    pub team_queue: Arc<Mutex<()>>,
     pub mount_manager: Arc<MountManager>,
     pub local_client: Arc<LocalClientProvider>,
     pub cloud_provider: Arc<DesktopCloudProviderManager>,
@@ -28,15 +34,45 @@ pub struct UserSession {
     pub token: String,
     #[serde(default)]
     pub refresh_token: String,
+    #[serde(default)]
+    pub team_entitlement: Option<String>,
+    #[serde(default)]
+    pub team_revoked: bool,
+    #[serde(default)]
+    pub pending_team_requests: Vec<hybridcipher_client::team_requests::PendingTeamRequest>,
     pub expires_at: i64,
     pub user_id: String,
     #[serde(default)]
     pub server_url: Option<String>,
     #[serde(default)]
     pub opaque_export_key: Option<String>,
+    /// Existing saved sessions predate this field and remain persistent.
+    #[serde(default = "default_persistent_session")]
+    pub persistent: bool,
+}
+
+impl Drop for UserSession {
+    fn drop(&mut self) {
+        self.token.zeroize();
+        self.refresh_token.zeroize();
+        if let Some(key) = &mut self.opaque_export_key {
+            key.zeroize();
+        }
+    }
 }
 
 impl AppState {
+    pub fn has_cached_team_data_access(&self, session: &UserSession) -> bool {
+        // The session was unlocked from protected account storage. Existing
+        // ciphertext keys remain usable after an old licensing key is retired.
+        // Every write still requires a currently verifiable signed entitlement;
+        // every server request still requires normal, unexpired authentication.
+        session
+            .team_entitlement
+            .as_deref()
+            .is_some_and(|token| !token.is_empty())
+    }
+
     /// Check if user is authenticated
     pub async fn is_authenticated(&self) -> bool {
         let session = self.session.lock().await;
@@ -58,9 +94,14 @@ impl AppState {
         // Get session info before clearing
         let session_info = {
             let session = self.session.lock().await;
-            session
-                .as_ref()
-                .map(|s| (s.email.clone(), self.client.server_url().to_string()))
+            session.as_ref().map(|s| {
+                (
+                    s.email.clone(),
+                    s.server_url
+                        .clone()
+                        .unwrap_or_else(|| self.client.server_url().to_string()),
+                )
+            })
         };
 
         self.cloud_provider
@@ -73,7 +114,6 @@ impl AppState {
         if let Some((email, server_url)) = session_info.as_ref() {
             let session_store = crate::session::SessionStore::new()?;
             session_store.delete_session(email, server_url)?;
-            session_store.clear_active_user()?;
         }
 
         // Clear from memory
@@ -92,9 +132,10 @@ impl AppState {
     /// This should be called when logging in from the desktop app
     pub async fn save_session_with_password(
         &self,
-        user_session: UserSession,
+        mut user_session: UserSession,
         password: &str,
     ) -> Result<(), String> {
+        user_session.persistent = true;
         let server_url = self.client.server_url().to_string();
 
         // Create session store and initialize account protection with password
@@ -108,6 +149,12 @@ impl AppState {
         session_store
             .save_session_with_password(&persisted, password)
             .map_err(|e| format!("Failed to save session: {}", e))?;
+        user_session.pending_team_requests =
+            session_store.load_team_requests(&user_session.email, &server_url)?;
+        if !user_session.pending_team_requests.is_empty() {
+            session_store
+                .save_session(&self.build_persisted_session(&user_session, &server_url))?;
+        }
 
         tracing::info!("Session saved with password for: {}", user_session.email);
 
@@ -115,22 +162,44 @@ impl AppState {
         self.complete_session_setup(user_session, &server_url).await
     }
 
+    /// Start a desktop-only session. Stop same-account CLI mounts before
+    /// removing the old shared session and automatic-unlock cache.
+    pub async fn save_temporary_session(
+        &self,
+        mut user_session: UserSession,
+    ) -> Result<(), String> {
+        user_session.persistent = false;
+        let server_url = self.client.server_url().to_string();
+        self.client.session_keys()?;
+        crate::commands::stop_cli_mounts_for_session_transition(self, &user_session.email).await?;
+        let session_store = crate::session::SessionStore::new_without_key_cache_migration()?;
+        session_store.delete_session(&user_session.email, &server_url)?;
+        self.complete_session_setup(user_session, &server_url).await
+    }
+
     /// Save session when account key is already cached (from CLI or previous desktop login)
     pub async fn save_session(
         &self,
-        user_session: UserSession,
+        mut user_session: UserSession,
         persist: bool,
     ) -> Result<(), String> {
         let server_url = self.client.server_url().to_string();
 
         // Save to disk in CLI-compatible format if requested
         if persist {
+            user_session.persistent = true;
             let session_store = crate::session::SessionStore::new()
                 .map_err(|e| format!("Failed to create session store: {}", e))?;
 
             // Check if account key is already cached (CLI logged in, or previous desktop login)
             if !session_store.has_account_key_cached(&user_session.email, &server_url) {
                 return Err("No encryption keys found. Use save_session_with_password for first-time login.".to_string());
+            }
+
+            let durable_requests =
+                session_store.load_team_requests(&user_session.email, &server_url)?;
+            if !durable_requests.is_empty() {
+                user_session.pending_team_requests = durable_requests;
             }
 
             let persisted = self.build_persisted_session(&user_session, &server_url);
@@ -141,9 +210,7 @@ impl AppState {
 
             tracing::info!("Session saved (CLI compatible) for: {}", user_session.email);
         } else {
-            // Just store in memory
-            let mut session = self.session.lock().await;
-            *session = Some(user_session.clone());
+            return self.save_temporary_session(user_session).await;
         }
 
         // Complete session setup
@@ -168,6 +235,9 @@ impl AppState {
             server_url: server_url.to_string(),
             token: user_session.token.clone(),
             refresh_token: user_session.refresh_token.clone(),
+            team_entitlement: user_session.team_entitlement.clone(),
+            team_revoked: user_session.team_revoked,
+            pending_team_requests: user_session.pending_team_requests.clone(),
             opaque_export_key: user_session.opaque_export_key.clone(),
             device_binding: generate_device_binding(),
             device_keypair: None,
@@ -196,12 +266,6 @@ impl AppState {
         user_session: UserSession,
         server_url: &str,
     ) -> Result<(), String> {
-        // Store in memory
-        {
-            let mut session = self.session.lock().await;
-            *session = Some(user_session.clone());
-        }
-
         // Initialize mount manager scope
         let scope_id = format!("{}::{}", user_session.email, user_session.device_id);
         self.mount_manager
@@ -209,9 +273,27 @@ impl AppState {
             .await?;
 
         // Initialize local client for this session
-        self.local_client
-            .initialize_for_session(&user_session, server_url)
-            .await?;
+        if user_session.persistent {
+            self.local_client
+                .initialize_for_session(&user_session, server_url)
+                .await?;
+        } else {
+            let (account_key, state_key) = self.client.session_keys()?;
+            self.local_client
+                .initialize_for_session_with_keys(
+                    &user_session,
+                    server_url,
+                    &account_key,
+                    &state_key,
+                )
+                .await?;
+        }
+
+        // Publish authentication only after the local client can serve it.
+        {
+            let mut session = self.session.lock().await;
+            *session = Some(user_session.clone());
+        }
 
         // Sync Welcome messages to load epoch keys (critical for decryption!)
         self.sync_welcome_messages_after_login().await;
@@ -223,6 +305,11 @@ impl AppState {
 
     /// Persist refreshed session credentials without re-running full initialization.
     pub async fn persist_refreshed_session(&self, user_session: UserSession) -> Result<(), String> {
+        if !user_session.persistent {
+            let mut session = self.session.lock().await;
+            *session = Some(user_session);
+            return Ok(());
+        }
         let server_url = user_session
             .server_url
             .clone()
@@ -245,6 +332,22 @@ impl AppState {
         let mut session = self.session.lock().await;
         *session = Some(user_session);
         Ok(())
+    }
+
+    pub async fn persist_team_queue(&self, user_session: UserSession) -> Result<(), String> {
+        if !user_session.persistent {
+            return Err("Offline Team requests require a saved account".into());
+        }
+        let server_url = user_session
+            .server_url
+            .as_deref()
+            .unwrap_or(self.client.server_url());
+        crate::session::SessionStore::new()?.save_team_requests(
+            &user_session.email,
+            server_url,
+            &user_session.pending_team_requests,
+        )?;
+        self.persist_refreshed_session(user_session).await
     }
 
     /// Check if account key is cached for a user (CLI already logged in)
@@ -304,20 +407,34 @@ impl AppState {
 
         // Try to load the most recent session
         for (email, server_url) in sessions {
-            match session_store.load_session(&email, &server_url) {
+            match session_store.load_session_for_offline(&email, &server_url) {
                 Ok(Some(persisted_session)) => {
-                    if persisted_session.is_valid() {
+                    let offline_team_data = persisted_session
+                        .team_entitlement
+                        .as_deref()
+                        .is_some_and(|token| !token.is_empty());
+                    if persisted_session.is_valid() || offline_team_data {
                         tracing::info!("Restored valid session for user: {}", email);
 
+                        let durable_requests =
+                            session_store.load_team_requests(&email, &server_url)?;
                         let user_session = UserSession {
                             email: persisted_session.email.clone(),
                             device_id: persisted_session.device_id.clone(),
                             token: persisted_session.token.clone(),
                             refresh_token: persisted_session.refresh_token.clone(),
+                            team_entitlement: persisted_session.team_entitlement.clone(),
+                            team_revoked: persisted_session.team_revoked,
+                            pending_team_requests: if durable_requests.is_empty() {
+                                persisted_session.pending_team_requests.clone()
+                            } else {
+                                durable_requests
+                            },
                             expires_at: persisted_session.expires_at.timestamp(),
                             user_id: persisted_session.user_id.clone(),
                             server_url: Some(server_url.clone()),
                             opaque_export_key: persisted_session.opaque_export_key.clone(),
+                            persistent: true,
                         };
 
                         // Store in memory
@@ -337,12 +454,14 @@ impl AppState {
                             .await?;
 
                         // Sync Welcome messages to load epoch keys
-                        self.sync_welcome_messages_after_login().await;
-                        self.reconcile_file_provider_roots_after_session_setup(
-                            &user_session,
-                            &server_url,
-                        )
-                        .await;
+                        if persisted_session.is_valid() {
+                            self.sync_welcome_messages_after_login().await;
+                            self.reconcile_file_provider_roots_after_session_setup(
+                                &user_session,
+                                &server_url,
+                            )
+                            .await;
+                        }
 
                         return Ok(Some(user_session));
                     }
@@ -451,4 +570,39 @@ fn compute_session_integrity(
     hasher.update(session.token.as_bytes());
     hasher.update(created_at.to_rfc3339().as_bytes());
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod session_policy_tests {
+    use super::*;
+
+    #[test]
+    fn restored_legacy_desktop_session_defaults_to_persistent() {
+        let session: UserSession = serde_json::from_value(serde_json::json!({
+            "email": "saved@example.invalid",
+            "device_id": "device-a",
+            "token": "access",
+            "refresh_token": "refresh",
+            "expires_at": 123,
+            "user_id": "user-a"
+        }))
+        .unwrap();
+        assert!(session.persistent);
+    }
+
+    #[test]
+    fn temporary_desktop_session_serializes_its_policy() {
+        let session: UserSession = serde_json::from_value(serde_json::json!({
+            "email": "temporary@example.invalid",
+            "device_id": "device-a",
+            "token": "access",
+            "refresh_token": "refresh",
+            "expires_at": 123,
+            "user_id": "user-a",
+            "persistent": false
+        }))
+        .unwrap();
+        assert!(!session.persistent);
+        assert_eq!(serde_json::to_value(&session).unwrap()["persistent"], false);
+    }
 }

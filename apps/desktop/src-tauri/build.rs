@@ -5,21 +5,88 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
+    validate_platform_app_version();
     build_macos_file_provider_bridge();
     stage_bundled_cli();
     let mut attributes = tauri_build::Attributes::new();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=windows/identity/app.manifest.in");
+        println!("cargo:rerun-if-changed=windows/identity/app.store.manifest");
         println!("cargo:rerun-if-env-changed=HYBRIDCIPHER_WINDOWS_IDENTITY_PUBLISHER");
-        let publisher = std::env::var("HYBRIDCIPHER_WINDOWS_IDENTITY_PUBLISHER")
-            .unwrap_or_else(|_| "CN=HybridCipher Team".to_string());
-        let manifest = include_str!("windows/identity/app.manifest.in")
-            .replace("@PUBLISHER@", &publisher)
-            .replace("@APPLICATION_ID@", "HybridCipher");
+        println!("cargo:rerun-if-env-changed=HYBRIDCIPHER_WINDOWS_IDENTITY_NAME");
+        println!("cargo:rerun-if-env-changed=HYBRIDCIPHER_WINDOWS_STORE_MSIX");
+        let manifest = if std::env::var("HYBRIDCIPHER_WINDOWS_STORE_MSIX").as_deref() == Ok("1") {
+            include_str!("windows/identity/app.store.manifest").to_string()
+        } else {
+            let publisher = std::env::var("HYBRIDCIPHER_WINDOWS_IDENTITY_PUBLISHER")
+                .unwrap_or_else(|_| "CN=HybridCipher Team".to_string());
+            let package_name = std::env::var("HYBRIDCIPHER_WINDOWS_IDENTITY_NAME")
+                .unwrap_or_else(|_| "HybridCipher.Desktop".to_string());
+            assert!(
+                package_name == "HybridCipher.Desktop"
+                    || package_name == "HybridCipher.Desktop.local-signed-test",
+                "unsupported Windows sparse identity name"
+            );
+            include_str!("windows/identity/app.manifest.in")
+                .replace("@PUBLISHER@", &publisher)
+                .replace("@APPLICATION_ID@", "HybridCipher")
+                .replace("HybridCipher.Desktop", &package_name)
+        };
         let windows = tauri_build::WindowsAttributes::new().app_manifest(manifest);
         attributes = attributes.windows_attributes(windows);
     }
     tauri_build::try_build(attributes).expect("failed to run Tauri build script")
+}
+
+fn validate_platform_app_version() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let config_path = match target_os.as_str() {
+        "windows" => "tauri.windows.conf.json",
+        "macos" => "tauri.macos.conf.json",
+        _ => return,
+    };
+    println!("cargo:rerun-if-changed={config_path}");
+    println!("cargo:rerun-if-env-changed=TAURI_CONFIG");
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_path)
+            .unwrap_or_else(|error| panic!("Cannot read app version from {config_path}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("Invalid app version config {config_path}: {error}"));
+    let version = config["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{config_path} must define a version string"));
+    let components: Vec<_> = version.split('.').collect();
+    assert!(
+        components.len() == 3
+            && components.iter().all(|part| {
+                !part.is_empty()
+                    && part.bytes().all(|byte| byte.is_ascii_digit())
+                    && (part.len() == 1 || !part.starts_with('0'))
+                    && part.parse::<u64>().is_ok()
+            }),
+        "{config_path} version must be numeric major.minor.patch"
+    );
+    if target_os == "windows" {
+        let limits = [255, 255, 65535];
+        assert!(
+            components
+                .iter()
+                .zip(limits)
+                .all(|(part, limit)| part.parse::<u64>().unwrap() <= limit),
+            "{config_path} version exceeds Windows MSI/MSIX limits"
+        );
+    }
+    if let Ok(overlay) = std::env::var("TAURI_CONFIG") {
+        let overlay: serde_json::Value =
+            serde_json::from_str(&overlay).expect("Invalid TAURI_CONFIG JSON");
+        if let Some(override_version) = overlay.get("version") {
+            assert_eq!(
+                override_version.as_str(),
+                Some(version),
+                "App version overrides are forbidden; edit only {config_path}"
+            );
+        }
+    }
 }
 
 fn build_macos_file_provider_bridge() {

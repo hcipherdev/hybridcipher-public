@@ -5,7 +5,7 @@
     "resources": {
       "resources/bin/": "resources/bin/",
       "../legal/": "legal/",
-      "../release-notes/": "release-notes/",
+      "../release-notes/releases.windows.json": "release-notes/releases.json",
       "windows/identity/dist/HybridCipher.identity.msix": "HybridCipher.identity.msix",
       "windows/identity/dist/register-identity.ps1": "register-identity.ps1",
       "windows/identity/dist/Assets/": "Assets/"

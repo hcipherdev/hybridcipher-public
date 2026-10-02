@@ -342,7 +342,7 @@ pub async fn handle_mount(
 ) -> Result<(), CliError> {
     ui::section("Mount Encrypted Files");
 
-    session_manager.require_auth()?;
+    session_manager.require_local_data_access()?;
 
     // Determine root_id and encrypted_dir
     let (final_root_id, encrypted_dir) = if let Some(root_id) = root_id {
@@ -859,9 +859,12 @@ pub async fn handle_mount(
                 // Clone client for the async block
                 let client_for_sync = client.clone();
                 Ok(Box::pin(async move {
-                    let client_crypto = hybridcipher_provider_core::ClientMountCrypto::new(
+                    let client_crypto = hybridcipher_provider_core::ClientMountCrypto::for_root(
                         Arc::new(client_for_sync.clone()),
-                    );
+                        root_id,
+                    )
+                    .await
+                    .map_err(|err| CliError::mount(err.to_string()))?;
                     run_sync_mount_with_config(
                         &client_for_sync,
                         &client_crypto,
@@ -1151,16 +1154,42 @@ pub async fn handle_mount_command(
     session_manager: &SessionManager,
     command: MountCommands,
 ) -> Result<(), CliError> {
-    session_manager.require_auth()?;
+    session_manager.require_local_data_access()?;
     match command {
         MountCommands::Status { root_id } => handle_mount_status(session_manager, root_id).await,
         MountCommands::Dehydrate { root_id } => {
+            require_mount_write_access(session_manager, root_id).await?;
             handle_mount_dehydrate(session_manager, root_id).await
         }
         MountCommands::Reset { root_id, force } => {
+            require_mount_write_access(session_manager, root_id).await?;
             handle_mount_reset(session_manager, root_id, force).await
         }
     }
+}
+
+async fn require_mount_write_access(
+    session_manager: &SessionManager,
+    root_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    let mounted = resolve_target_mount_state(session_manager, root_id)?;
+    let client = session_manager.create_local_client().await?;
+    let root = client
+        .coverage_roots()
+        .await?
+        .into_iter()
+        .find(|root| root.root_id == mounted.root_id)
+        .ok_or_else(|| {
+            CliError::mount("The mounted root's group is unavailable; refresh the enrolled roots")
+        })?;
+    let group_id = root
+        .group_id
+        .or(client.active_group_id_opt().await)
+        .ok_or_else(|| CliError::mount("The mounted root has no group identity"))?;
+    client
+        .require_local_write_for_group(group_id)
+        .await
+        .map_err(|error| CliError::permission(error.to_string()))
 }
 
 async fn handle_mount_status(
@@ -1348,7 +1377,17 @@ pub async fn handle_conflict_command(
     session_manager: &SessionManager,
     command: ConflictCommands,
 ) -> Result<(), CliError> {
-    session_manager.require_auth()?;
+    session_manager.require_local_data_access()?;
+    match &command {
+        ConflictCommands::List { .. } | ConflictCommands::Show { .. } => {}
+        ConflictCommands::UseMounted { root_id, .. }
+        | ConflictCommands::UseConflict { root_id, .. }
+        | ConflictCommands::MergeText { root_id, .. }
+        | ConflictCommands::SaveAsNew { root_id, .. }
+        | ConflictCommands::ArchiveDismiss { root_id, .. } => {
+            require_mount_write_access(session_manager, *root_id).await?
+        }
+    }
     ui::section("Sync-Mount Conflicts");
 
     match command {
@@ -1514,7 +1553,15 @@ pub async fn handle_recovery_command(
     session_manager: &SessionManager,
     command: MountRecoveryCommands,
 ) -> Result<(), CliError> {
-    session_manager.require_auth()?;
+    session_manager.require_local_data_access()?;
+    match &command {
+        MountRecoveryCommands::List { .. } | MountRecoveryCommands::Show { .. } => {}
+        MountRecoveryCommands::ReplaceMounted { root_id, .. }
+        | MountRecoveryCommands::SaveAsNew { root_id, .. }
+        | MountRecoveryCommands::ArchiveDismiss { root_id, .. } => {
+            require_mount_write_access(session_manager, *root_id).await?
+        }
+    }
     ui::section("Sync-Mount Recovery Copies");
 
     match command {
@@ -2014,7 +2061,7 @@ fn process_is_running(pid: u32) -> bool {
 }
 
 async fn active_enrolled_roots(session_manager: &SessionManager) -> Result<Vec<PathBuf>, CliError> {
-    let client = session_manager.create_client().await?;
+    let client = session_manager.create_local_client().await?;
     let mut roots = client.coverage_roots().await?;
     roots.retain(|root| root.state == CoverageRootState::Active);
     roots.sort_by(|a, b| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()));
@@ -2025,7 +2072,7 @@ async fn active_enrolled_roots(session_manager: &SessionManager) -> Result<Vec<P
 async fn active_enrolled_roots_with_ids(
     session_manager: &SessionManager,
 ) -> Result<Vec<CoverageRoot>, CliError> {
-    let client = session_manager.create_client().await?;
+    let client = session_manager.create_local_client().await?;
     let mut roots = client.coverage_roots().await?;
     roots.retain(|root| root.state == CoverageRootState::Active);
     roots.sort_by(|a, b| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()));
@@ -2054,7 +2101,7 @@ async fn hydrate_unmanaged_files_before_mount(
     session_manager: &SessionManager,
     root_id: Uuid,
 ) -> Result<(), CliError> {
-    let client = session_manager.create_client().await?;
+    let client = session_manager.create_local_client().await?;
     let mut roots = client.coverage_roots().await?;
     let Some(root) = roots
         .drain(..)
@@ -2066,6 +2113,18 @@ async fn hydrate_unmanaged_files_before_mount(
         );
         return Ok(());
     };
+
+    let group_id = root.group_id.or(client.active_group_id_opt().await);
+    if group_id.is_none()
+        || client
+            .require_local_write_for_group(group_id.unwrap())
+            .await
+            .is_err()
+    {
+        // Existing encrypted files can still mount for reads. Leave unmanaged
+        // files and pending edits untouched until write authorization returns.
+        return Ok(());
+    }
 
     ui::info("Checking protected folder for unmanaged plaintext before mount...");
     let outcome = coverage_workflows::hydrate_existing_root(&client, root)
@@ -2211,10 +2270,14 @@ async fn run_cloud_files_mount(
         .map_err(|err| err.to_string())?;
     host.register_root(&registration)
         .map_err(|err| err.to_string())?;
-    let bridge = hybridcipher_windows_cloud_provider::local_provider_bridge_with_compatibility(
-        Arc::new(client),
-        compatibility,
-    );
+    let bridge =
+        hybridcipher_windows_cloud_provider::local_provider_bridge_for_root_with_compatibility(
+            Arc::new(client),
+            root_id,
+            compatibility,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
     if let Err(error) = host.start_root_with_bridge(root_id, bridge.clone()).await {
         return Err(host
             .cleanup_failed_root_start_after_error(
@@ -2377,9 +2440,11 @@ async fn run_macos_file_provider_mount(
     host.register_system_domain(&registration)
         .map_err(|err| err.to_string())?;
     let excluded_patterns = client.excluded_file_patterns();
-    let crypto = Arc::new(hybridcipher_provider_core::ClientMountCrypto::new(
-        Arc::new(client),
-    ));
+    let crypto = Arc::new(
+        hybridcipher_provider_core::ClientMountCrypto::for_root(Arc::new(client), root_id)
+            .await
+            .map_err(|err| err.to_string())?,
+    );
     host.start_root_with_crypto_and_exclusions(root_id, crypto, excluded_patterns)
         .await
         .map_err(|err| err.to_string())?;
@@ -2925,6 +2990,9 @@ fn format_mount_safety_reason(mountpoint: &Path, reason: &MountSafetyReason) -> 
         MountSafetyReason::PendingRefresh { count } => format!(
             "{count} pending plaintext refresh(es) are still rebuilding the local mount state."
         ),
+        MountSafetyReason::ProviderReconciliation => {
+            "Cloud Files is checking the mounted folder for changes.".to_string()
+        }
         MountSafetyReason::Conflict {
             count,
             edited_count,
@@ -3234,7 +3302,10 @@ fn runtime_state_requested_unmount(path: &Path) -> Result<bool, CliError> {
 }
 
 fn default_encrypted_candidate() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".hybridcipher").join("encrypted"))
+    dirs::home_dir().map(|home| {
+        home.join(hybridcipher_client::config_loader::account_data_location())
+            .join("encrypted")
+    })
 }
 
 fn default_enrolled_index(
@@ -3276,7 +3347,7 @@ fn determine_mountpoint(encrypted_dir: &Path, root_id: Uuid) -> Result<PathBuf, 
     let home = dirs::home_dir().ok_or_else(|| {
         CliError::configuration("Unable to resolve home directory for mount allocation")
     })?;
-    let base = home.join(".hybridcipher");
+    let base = home.join(hybridcipher_client::config_loader::account_data_location());
     fs::create_dir_all(&base).map_err(|e| {
         CliError::configuration(format!(
             "Failed to prepare base mount directory {}: {}",
@@ -3427,7 +3498,7 @@ fn clean_and_prepare_mountpoint(path: &Path) -> Result<(), CliError> {
     let home = dirs::home_dir().ok_or_else(|| {
         CliError::configuration("Unable to resolve home directory for safety check")
     })?;
-    let hybridcipher_base = home.join(".hybridcipher");
+    let hybridcipher_base = home.join(hybridcipher_client::config_loader::account_data_location());
 
     // Ensure path is under .hybridcipher and ends with _mount
     if !path.starts_with(&hybridcipher_base) {
@@ -3508,7 +3579,7 @@ fn cleanup_mountpoint_safe(path: &Path) -> Result<(), CliError> {
     let home = dirs::home_dir().ok_or_else(|| {
         CliError::configuration("Unable to resolve home directory for safety check")
     })?;
-    let hybridcipher_base = home.join(".hybridcipher");
+    let hybridcipher_base = home.join(hybridcipher_client::config_loader::account_data_location());
 
     // Ensure path is under .hybridcipher and ends with _mount
     if !path.starts_with(&hybridcipher_base) {
@@ -3595,7 +3666,7 @@ fn ensure_mountpoint_cleanup_target(path: &Path) -> Result<(), CliError> {
     let home = dirs::home_dir().ok_or_else(|| {
         CliError::configuration("Unable to resolve home directory for safety check")
     })?;
-    let hybridcipher_base = home.join(".hybridcipher");
+    let hybridcipher_base = home.join(hybridcipher_client::config_loader::account_data_location());
 
     if !mountpoint_is_under_hybridcipher_base(path, &hybridcipher_base) {
         return Err(CliError::mount(format!(
@@ -4125,6 +4196,8 @@ mod tests {
                 last_hydration_success_at: Some(observed_at),
                 hydration_failure: Some("latest hydration failed".into()),
                 last_hydration_failure_at: Some(observed_at),
+                transfer_health_state: Default::default(),
+                last_hydration_transfer: None,
                 persistence_error: None,
                 assessed_at: observed_at,
                 healthy: false,
@@ -4136,6 +4209,7 @@ mod tests {
             safe_to_unmount: false,
             pending_mutation_count: Some(2),
             pending_refresh_count: Some(1),
+            reconciliation_in_progress: Some(false),
             conflict_count: Some(3),
             durable_observed_at: chrono::Utc::now(),
             registration_source: Some(

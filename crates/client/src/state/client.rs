@@ -7,8 +7,9 @@ use crate::errors::{ErrorCode, ErrorContext};
 use crate::file::encrypt::{
     build_wrap_aad, chunked_encrypted_size, derive_chunk_nonce, encrypt_content,
     encrypt_content_chunked, generate_file_id, hash_wrap_aad, serialize_encrypted_header,
-    write_encrypted_file_atomic_for_coverage, PlatformFileMetadata,
-    SerializedEncryptedHeader, SparseFileMetadata, AEAD_TAG_SIZE, CHUNKED_HEADER_VERSION,
+    write_encrypted_file_atomic_for_coverage, PlatformFileMetadata, SerializedEncryptedHeader,
+    SparseFileMetadata, AEAD_TAG_SIZE, CHUNKED_HEADER_VERSION, MAX_CONTENT_CHUNK_SIZE,
+    MAX_IN_MEMORY_PLAINTEXT_BYTES,
 };
 use crate::invitation::InvitationKeyPair;
 use crate::network::Network;
@@ -114,6 +115,8 @@ mod coverage;
 mod coverage_filesystem;
 mod files;
 mod groups;
+mod initialization;
+mod local_write_access;
 mod persistence;
 mod rekey;
 mod security;
@@ -248,7 +251,7 @@ impl From<(uuid::Uuid, GeneratedWelcomeMessage)> for SelfIssuedWelcomePayload {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GenesisInitRequestBody {
     pub client_epoch_id: u64,
     pub welcome_messages: Vec<GeneratedWelcomeMessage>,
@@ -270,12 +273,12 @@ struct ServerInfoSigningKey {
     public_key: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct GenesisInitResponseBody {
-    pub epoch_id: String,
-    pub epoch_number: u64,
-    #[serde(default)]
-    pub welcome_message_count: usize,
+/// Whether a committed group epoch is usable by this device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GroupInitializationReadiness {
+    Ready { epoch_id: u64 },
+    WaitingDeviceApproval,
 }
 
 /// Metadata for an encrypted file with all necessary information for decryption
@@ -2063,6 +2066,9 @@ mod rekey_tests {
 /// - Epoch operations are atomic to prevent race conditions
 /// - Migration state is consistent across concurrent file operations
 pub struct Client<S: Storage, N: Network> {
+    local_group_id: Option<Uuid>,
+    local_access_refresh: Arc<Mutex<Option<std::time::Instant>>>,
+    local_write_identity: Arc<std::sync::RwLock<Option<(String, String)>>>,
     /// Device identity key pair for signing operations
     device_identity: Ed25519KeyPair,
 
@@ -2133,6 +2139,9 @@ pub struct Client<S: Storage, N: Network> {
 impl<S: Storage, N: Network> Clone for Client<S, N> {
     fn clone(&self) -> Self {
         Self {
+            local_group_id: self.local_group_id,
+            local_access_refresh: self.local_access_refresh.clone(),
+            local_write_identity: self.local_write_identity.clone(),
             device_identity: self.device_identity.clone(),
             storage: self.storage.clone(),
             network: self.network.clone(),
@@ -2629,7 +2638,15 @@ pub enum MigrationPhase {
 impl<S: Storage, N: Network> Client<S, N> {
     /// Return the currently selected group ID if available.
     pub async fn active_group_id_opt(&self) -> Option<Uuid> {
-        self.state.read().await.active_group_id
+        self.local_group_id
+            .or(self.state.read().await.active_group_id)
+    }
+
+    /// Bind local file operations to a mounted root, independently of UI selection.
+    pub fn for_local_group(&self, group_id: Uuid) -> Self {
+        let mut scoped = self.clone();
+        scoped.local_group_id = Some(group_id);
+        scoped
     }
     fn upsert_epoch_state(state: &mut ClientState, group_id: Uuid, mut epoch_state: EpochState) {
         epoch_state.group_id = Some(group_id);
@@ -2952,6 +2969,9 @@ impl<S: Storage, N: Network> Client<S, N> {
         );
 
         let client = Self {
+            local_group_id: None,
+            local_access_refresh: Arc::new(Mutex::new(None)),
+            local_write_identity: Arc::new(std::sync::RwLock::new(None)),
             device_identity,
             storage,
             network,
@@ -3113,7 +3133,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
     fn load_active_user_server_url() -> Option<String> {
         let path = Self::resolve_home_dir()?
-            .join(".hybridcipher")
+            .join(crate::config_loader::account_data_location())
             .join("global")
             .join("active_user.json");
 

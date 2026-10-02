@@ -7,8 +7,9 @@
 //! - Comprehensive error handling and validation
 
 use super::encrypt::{
-    build_wrap_aad, derive_chunk_nonce, hash_wrap_aad, normalize_file_identifier,
-    FileEncryptionMetadata, AEAD_TAG_SIZE,
+    build_wrap_aad, chunked_encrypted_size, derive_chunk_nonce, hash_wrap_aad,
+    normalize_file_identifier, FileEncryptionMetadata, AEAD_TAG_SIZE, MAX_CONTENT_CHUNK_SIZE,
+    MAX_IN_MEMORY_PLAINTEXT_BYTES,
 };
 use crate::{
     epoch::EpochManager,
@@ -444,13 +445,40 @@ impl<S: Storage, N: Network> FileDecryption<S, N> {
         file_key: &AeadKey,
         file_metadata: &FileEncryptionMetadata,
     ) -> Result<Vec<u8>, DecryptionError> {
+        if file_metadata.file_size > MAX_IN_MEMORY_PLAINTEXT_BYTES {
+            return Err(DecryptionError::DecryptionFailure(
+                "Plaintext exceeds the 256 MiB in-memory limit".into(),
+            ));
+        }
         if let Some(chunk_size) = file_metadata.content_chunk_size {
+            let chunk_size = usize::try_from(chunk_size).map_err(|_| {
+                DecryptionError::DecryptionFailure("chunk_size is too large".into())
+            })?;
             return self.decrypt_content_chunked(
                 encrypted_content,
                 file_key,
                 file_metadata,
-                chunk_size as usize,
+                chunk_size,
             );
+        }
+
+        if encrypted_content.len() as u64 > MAX_IN_MEMORY_PLAINTEXT_BYTES + AEAD_TAG_SIZE as u64 {
+            return Err(DecryptionError::DecryptionFailure(
+                "Single-record ciphertext exceeds the 256 MiB in-memory limit".into(),
+            ));
+        }
+        if file_metadata.header_version >= 3 {
+            let expected = file_metadata
+                .original_size
+                .checked_add(AEAD_TAG_SIZE as u64)
+                .ok_or_else(|| {
+                    DecryptionError::DecryptionFailure("Ciphertext size overflow".into())
+                })?;
+            if encrypted_content.len() as u64 != expected {
+                return Err(DecryptionError::DecryptionFailure(
+                    "Ciphertext size mismatch".into(),
+                ));
+            }
         }
 
         // Create nonce for content decryption
@@ -475,9 +503,16 @@ impl<S: Storage, N: Network> FileDecryption<S, N> {
         file_metadata: &FileEncryptionMetadata,
         chunk_size: usize,
     ) -> Result<Vec<u8>, DecryptionError> {
-        if chunk_size == 0 {
+        if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE {
             return Err(DecryptionError::DecryptionFailure(
-                "chunk_size must be greater than 0".to_string(),
+                "chunk_size must be between 1 and 64 MiB".to_string(),
+            ));
+        }
+        let expected = chunked_encrypted_size(file_metadata.file_size, chunk_size)
+            .map_err(|err| DecryptionError::DecryptionFailure(err.to_string()))?;
+        if encrypted_content.len() as u64 != expected {
+            return Err(DecryptionError::DecryptionFailure(
+                "Chunked ciphertext size mismatch".into(),
             ));
         }
 
@@ -490,21 +525,31 @@ impl<S: Storage, N: Network> FileDecryption<S, N> {
         let mut base_nonce = [0u8; 12];
         base_nonce.copy_from_slice(&file_metadata.content_nonce);
 
-        let total_size = file_metadata.file_size as usize;
-        let mut output = Vec::with_capacity(total_size);
+        let total_size = usize::try_from(file_metadata.file_size).map_err(|_| {
+            DecryptionError::DecryptionFailure("Plaintext size is too large".into())
+        })?;
+        let mut output = Vec::new();
+        output.try_reserve_exact(total_size).map_err(|_| {
+            DecryptionError::DecryptionFailure("Unable to reserve plaintext".into())
+        })?;
         let mut offset = 0usize;
         let mut remaining = total_size;
         let mut chunk_index = 0u64;
 
         while remaining > 0 {
             let plain_len = usize::min(chunk_size, remaining);
-            let cipher_len = plain_len + AEAD_TAG_SIZE;
-            if offset + cipher_len > encrypted_content.len() {
+            let cipher_len = plain_len.checked_add(AEAD_TAG_SIZE).ok_or_else(|| {
+                DecryptionError::DecryptionFailure("Chunk length overflows".into())
+            })?;
+            let next = offset.checked_add(cipher_len).ok_or_else(|| {
+                DecryptionError::DecryptionFailure("Ciphertext offset overflows".into())
+            })?;
+            if next > encrypted_content.len() {
                 return Err(DecryptionError::DecryptionFailure(
                     "Chunked ciphertext truncated".to_string(),
                 ));
             }
-            let chunk_cipher = &encrypted_content[offset..offset + cipher_len];
+            let chunk_cipher = &encrypted_content[offset..next];
 
             let nonce_bytes = derive_chunk_nonce(&base_nonce, chunk_index);
             let nonce = AeadNonce::from_bytes(&nonce_bytes).map_err(|e| {
@@ -521,7 +566,7 @@ impl<S: Storage, N: Network> FileDecryption<S, N> {
                 })?;
             output.extend_from_slice(&plaintext);
 
-            offset += cipher_len;
+            offset = next;
             remaining -= plain_len;
             chunk_index += 1;
         }

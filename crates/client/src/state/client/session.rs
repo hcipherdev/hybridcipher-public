@@ -149,15 +149,6 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let session_content = self.decrypt_session_if_needed(&session_path, session_content_raw)?;
 
-        self.logger.log(
-            crate::logging::LogLevel::Info,
-            &format!("Session file content length: {}", session_content.len()),
-            Some(&format!(
-                "first_100_chars: {}",
-                &session_content[..std::cmp::min(100, session_content.len())]
-            )),
-        );
-
         // Try to parse as TOML first (new format), then JSON (legacy fallback)
         let session_info = if session_path.extension().and_then(|s| s.to_str()) == Some("toml") {
             self.parse_toml_session(&session_content)?
@@ -350,7 +341,7 @@ impl<S: Storage, N: Network> Client<S, N> {
             )
         })?;
 
-        let hybridcipher_dir = home_dir.join(".hybridcipher");
+        let hybridcipher_dir = home_dir.join(crate::config_loader::account_data_location());
 
         // First check for active user
         let active_user_file = hybridcipher_dir.join("global/active_user.json");
@@ -714,12 +705,14 @@ impl<S: Storage, N: Network> Client<S, N> {
 
     pub(super) async fn require_active_group(&self, operation: &str) -> Result<Uuid, ClientError> {
         let state = self.state.read().await;
-        state.active_group_id.ok_or_else(|| {
-            ClientError::InvalidState(format!(
+        self.local_group_id
+            .or(state.active_group_id)
+            .ok_or_else(|| {
+                ClientError::InvalidState(format!(
                 "No active group selected. Run 'hybridcipher switch-group <group-id>' before {}.",
                 operation
             ))
-        })
+            })
     }
 
     /// Generate or refresh authentication credentials

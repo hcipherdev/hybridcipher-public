@@ -13,6 +13,45 @@ Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $PackageName = "HybridCipher.Desktop"
+
+function Test-InstalledPackagePayload {
+    param([string]$PackagePath, [string]$InstalledPath)
+    $Root = [IO.Path]::GetFullPath($InstalledPath).TrimEnd('\') + '\'
+    $PackageArchive = [IO.Compression.ZipFile]::OpenRead($PackagePath)
+    try {
+        foreach ($Entry in $PackageArchive.Entries) {
+            # These describe/sign the package, not its installed application payload.
+            if ($Entry.FullName -in @('AppxBlockMap.xml', 'AppxSignature.p7x', '[Content_Types].xml', 'AppxMetadata/CodeIntegrity.cat') -or $Entry.FullName.EndsWith('/')) { continue }
+            $InstalledFile = [IO.Path]::GetFullPath((Join-Path $Root $Entry.FullName))
+            if (-not $InstalledFile.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $InstalledFile -PathType Leaf)) { return $false }
+            $ExpectedStream = $Entry.Open()
+            $ActualStream = [IO.File]::OpenRead($InstalledFile)
+            try {
+                if ($Entry.FullName -eq 'AppxManifest.xml') {
+                    # Windows removes a UTF-8 BOM when staging the manifest.
+                    # Compare the exact decoded text so that a BOM alone does
+                    # not make an otherwise identical registration look stale.
+                    $ExpectedReader = [IO.StreamReader]::new($ExpectedStream)
+                    $ActualReader = [IO.StreamReader]::new($ActualStream)
+                    if ($ExpectedReader.ReadToEnd() -cne $ActualReader.ReadToEnd()) { return $false }
+                } else {
+                    $Hasher = [Security.Cryptography.SHA256]::Create()
+                    try {
+                        $ExpectedHash = [Convert]::ToBase64String($Hasher.ComputeHash($ExpectedStream))
+                        $ActualHash = [Convert]::ToBase64String($Hasher.ComputeHash($ActualStream))
+                        if ($ExpectedHash -cne $ActualHash) { return $false }
+                    } finally {
+                        $Hasher.Dispose()
+                    }
+                }
+            } finally {
+                $ExpectedStream.Dispose()
+                $ActualStream.Dispose()
+            }
+        }
+        return $true
+    } finally { $PackageArchive.Dispose() }
+}
 if ($Mode -eq "Uninstall") {
     Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue |
         Remove-AppxPackage -ErrorAction Stop
@@ -41,6 +80,10 @@ try {
         $Reader.Dispose()
     }
     $DesiredVersion = [version]$Manifest.Package.Identity.Version
+    $DesiredPublisher = [string]$Manifest.Package.Identity.Publisher
+    if ([string]$Manifest.Package.Identity.Name -ne $PackageName) {
+        throw "Unexpected identity package name"
+    }
 } finally {
     $Archive.Dispose()
 }
@@ -48,20 +91,19 @@ try {
 $Existing = Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue |
     Select-Object -First 1
 if ($null -ne $Existing -and [version]$Existing.Version -eq $DesiredVersion) {
-    $Executable = Join-Path $InstallDirectory "hybridcipher-desktop.exe"
-    if (Test-Path -LiteralPath $Executable -PathType Leaf) {
-        # GUI-subsystem executables do not reliably initialize PowerShell's
-        # $LASTEXITCODE. Start the cleanup explicitly and read the waited
-        # process result so repair installs always get a defined exit code.
-        $CleanupProcess = Start-Process -FilePath $Executable `
-            -ArgumentList "--unregister-shell-roots" `
-            -Wait `
-            -PassThru
-        if ($CleanupProcess.ExitCode -ne 0) {
-            throw "HybridCipher could not safely remove Explorer sync roots before identity repair"
-        }
+    # Desktop updates often retain the same sparse identity. Reusing it must not
+    # run uninstall cleanup: mounted files and pending operations belong to the user.
+    $PackageManager = New-Object Windows.Management.Deployment.PackageManager
+    $RegisteredPackage = $PackageManager.FindPackageForUser('', $Existing.PackageFullName)
+    $ExternalLocation = $RegisteredPackage.EffectiveExternalLocation
+    $SameLocation = $null -ne $ExternalLocation -and
+        [IO.Path]::GetFullPath($ExternalLocation.Path).TrimEnd('\') -ieq $InstallDirectory.TrimEnd('\')
+    if ($Existing.Publisher -eq $DesiredPublisher -and [string]$Existing.Status -eq 'Ok' -and
+        $SameLocation -and (Test-InstalledPackagePayload -PackagePath $MsixPath -InstalledPath $Existing.InstallLocation)) {
+        Write-Output "Existing HybridCipher identity verified. Explorer registrations and pending work were preserved."
+        exit 0
     }
-    Remove-AppxPackage -Package $Existing.PackageFullName -ErrorAction Stop
+    throw "The existing same-version HybridCipher identity differs in payload, publisher, status, or install location. No Explorer roots were removed. Use an installer with a newer identity-package version or repair the existing registration."
 }
 
 Add-AppxPackage -Path $MsixPath -ExternalLocation $InstallDirectory -ErrorAction Stop

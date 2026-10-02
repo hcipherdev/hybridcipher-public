@@ -165,11 +165,117 @@ impl CallbackContext {
                 }
                 self.validate_original_name(&record).await
             }
+            super::PendingOperationResolution::KeepRenamedFile => {
+                if journal
+                    .records
+                    .iter()
+                    .any(|other| other.id != id && super::pending::touches(other, &record))
+                {
+                    return Err(super::unsafe_replay_error(
+                        &record,
+                        "Other pending work depends on this rename; resolve that work first",
+                    ));
+                }
+                self.validate_kept_destination(&record).await
+            }
         };
         let error = result.as_ref().err().map(ToString::to_string);
         self.finish_pending_attempt(id, result)?;
         if let Some(error) = error {
             return Err(CloudProviderError::Callback(error));
+        }
+        Ok(())
+    }
+
+    /// Explicitly keep a separately imported destination after the user removed the
+    /// old file. This accepts that file as it stands, not as proof of the old rename.
+    /// It only retires intent; no content, identity or in-sync flags are changed.
+    async fn validate_kept_destination(&self, record: &CloudMutationRecord) -> Result<()> {
+        super::replay_expected_version(record, self.registration.root_id)?;
+        let target = record
+            .target_relative_path
+            .as_deref()
+            .ok_or_else(|| super::unsafe_replay_error(record, "Rename destination is missing"))?;
+        let original_path = self.registration.sync_root_path.join(&record.relative_path);
+        let target_path = self.registration.sync_root_path.join(target);
+        if original_path.exists() || !target_path.exists() {
+            return Err(super::unsafe_replay_error(record, "Keep renamed file requires the original to be absent and the renamed file to be present. No files were changed."));
+        }
+        super::validate_replay_plaintext_path(
+            record,
+            &self.registration.sync_root_path,
+            &target_path,
+            target,
+        )?;
+        let locked = CloudFileOplock::acquire_exclusive(&target_path)?;
+        let identity = locked.identity()?;
+        let residency = locked.data_residency()?;
+        let state = self.state_store.load()?;
+        let item = state.items.get(&identity.object_id).ok_or_else(|| {
+            super::unsafe_replay_error(record, "Renamed file identity is not registered")
+        })?;
+        if identity.root_id != self.registration.root_id
+            || item.relative_path != target
+            || item.dirty
+            || !residency.in_sync
+            || residency.modified_data_size != 0
+            || state
+                .conflicts
+                .iter()
+                .any(|c| c.object_id == identity.object_id)
+        {
+            return Err(super::unsafe_replay_error(record, "Renamed file has uncommitted or conflicting changes; preserve them before keeping this file"));
+        }
+        let entries = self
+            .bridge
+            .inventory(self.registration.root_id, &self.registration.encrypted_root)
+            .await?;
+        let old_id = record.identity.as_ref().and_then(|id| id.file_id.as_ref());
+        let destination = entries
+            .iter()
+            .find(|e| e.relative_path == target)
+            .ok_or_else(|| {
+                super::unsafe_replay_error(record, "Renamed file has not been encrypted yet")
+            })?;
+        if entries.iter().any(|e| {
+            e.relative_path == record.relative_path
+                || (old_id.is_some()
+                    && e.identity.file_id.as_ref() == old_id
+                    && e.relative_path != target)
+        }) || destination.identity.file_id.as_deref() != Some(identity.object_id.as_str())
+            || destination.content_version() != item.content_version
+            || destination.kind != ProviderEntryKind::File
+        {
+            return Err(super::unsafe_replay_error(record, "The encrypted original still exists or the renamed file's identity/version changed. No files were changed."));
+        }
+        // Authenticate through the authorized decoder, including for offline files.
+        let temporary = PendingPlaintext(
+            self.runtime_paths
+                .cache_dir
+                .join(format!(".verify-{}.plain", Uuid::new_v4())),
+        );
+        self.bridge
+            .hydrate_file_to_path(destination, &temporary.0)
+            .await?;
+        let fresh = self
+            .bridge
+            .inventory(self.registration.root_id, &self.registration.encrypted_root)
+            .await?;
+        if original_path.exists()
+            || !locked.is_in_sync()?
+            || fresh
+                .iter()
+                .any(|e| e.relative_path == record.relative_path)
+            || !fresh.iter().any(|e| {
+                e.relative_path == target
+                    && e.identity.file_id == destination.identity.file_id
+                    && e.content_version() == destination.content_version()
+            })
+        {
+            return Err(super::unsafe_replay_error(
+                record,
+                "Files changed during verification; retry after synchronization finishes",
+            ));
         }
         Ok(())
     }
@@ -287,7 +393,7 @@ impl CallbackContext {
             }
             return Err(super::unsafe_replay_error(
                 record,
-                "Destination is occupied or has a conflicting content version",
+                "Destination is occupied or has a conflicting content version. If the original was removed and you want to retain the current destination, choose Keep renamed file.",
             ));
         }
         let source = source.ok_or_else(|| {

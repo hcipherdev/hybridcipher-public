@@ -13,7 +13,7 @@ this repository, so this explainer treats them as external systems.
 Included here:
 
 - `apps/desktop/`: desktop frontend, Tauri shell, legal docs, release metadata,
-  icon assets, and the optional feedback API helper
+  and icon assets
 - `crates/cli/`: the user-facing `hybridcipher` command-line interface
 - `crates/client/`: shared client workflow and state logic reused by desktop,
   CLI, and optional mount flows

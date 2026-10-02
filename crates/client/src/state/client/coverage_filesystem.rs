@@ -733,11 +733,10 @@ impl<S: Storage, N: Network> Client<S, N> {
     ) -> Option<EncryptedFileMetadata> {
         let file_id = header_json.get("file_id")?.as_str()?.to_string();
         let epoch_id = header_json.get("epoch_id")?.as_u64()?;
-        let header_version = header_json
-            .get("header_version")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(1);
+        let header_version = match header_json.get("header_version") {
+            None => 1,
+            Some(value) => u32::try_from(value.as_u64()?).ok()?,
+        };
 
         let group_id = header_json
             .get("group_id")
@@ -756,20 +755,58 @@ impl<S: Storage, N: Network> Client<S, N> {
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|| chrono::Utc::now());
 
-        let content_size = header_json
+        let content_size_field = header_json
             .get("file_size")
             .and_then(|v| v.as_u64())
-            .or_else(|| header_json.get("original_size").and_then(|v| v.as_u64()))
-            .unwrap_or(0);
-        let content_chunk_size = header_json.get("chunk_size").and_then(|v| v.as_u64());
+            .or_else(|| header_json.get("original_size").and_then(|v| v.as_u64()));
+        if header_version >= 3 && content_size_field.is_none() {
+            return None;
+        }
+        let content_size = content_size_field.unwrap_or(0);
+        let content_chunk_size = match header_json.get("chunk_size") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_u64()?),
+        };
         let platform_metadata = header_json
             .get("platform_metadata")
             .and_then(|value| serde_json::from_value::<PlatformFileMetadata>(value.clone()).ok())
             .filter(|metadata| !metadata.is_empty());
-        let sparse_metadata = header_json
-            .get("sparse_metadata")
-            .and_then(|value| serde_json::from_value::<SparseFileMetadata>(value.clone()).ok())
-            .filter(SparseFileMetadata::is_effectively_sparse);
+        let parsed_sparse_metadata = match header_json.get("sparse_metadata") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(serde_json::from_value::<SparseFileMetadata>(value.clone()).ok()?),
+        };
+        if let Some(layout) = parsed_sparse_metadata.as_ref() {
+            layout.validated_packed_size(content_size)?;
+        }
+        let sparse_metadata =
+            parsed_sparse_metadata.filter(SparseFileMetadata::is_effectively_sparse);
+        let packed_size = match sparse_metadata.as_ref() {
+            Some(layout) => layout.validated_packed_size(content_size)?,
+            None => content_size,
+        };
+        if content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
+            || packed_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
+        {
+            return None;
+        }
+        if let Some(chunk_size) = content_chunk_size {
+            let chunk_size = usize::try_from(chunk_size).ok()?;
+            if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE {
+                return None;
+            }
+            if chunked_encrypted_size(packed_size, chunk_size).ok()? != ciphertext.len() as u64 {
+                return None;
+            }
+        } else {
+            if content_size_field.is_some()
+                && ciphertext.len() as u64 != packed_size.checked_add(12 + AEAD_TAG_SIZE as u64)?
+            {
+                return None;
+            }
+            if ciphertext.len() as u64 > MAX_IN_MEMORY_PLAINTEXT_BYTES + 12 + AEAD_TAG_SIZE as u64 {
+                return None;
+            }
+        }
 
         let stored_file_path = header_json
             .get("file_path")
@@ -819,18 +856,30 @@ impl<S: Storage, N: Network> Client<S, N> {
     }
 
     pub(super) fn parse_encrypted_file_metadata(path: &Path) -> Option<EncryptedFileMetadata> {
-        use std::io::Read;
+        use std::io::{BufReader, Read, Seek};
 
-        let mut file = std::fs::File::open(path).ok()?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).ok()?;
-        let sep_pos = buffer
-            .windows(ENCRYPTED_FILE_SEPARATOR.len())
-            .position(|w| w == ENCRYPTED_FILE_SEPARATOR)?;
-        let header_bytes = &buffer[..sep_pos];
-        let ciphertext = buffer[sep_pos + ENCRYPTED_FILE_SEPARATOR.len()..].to_vec();
-
-        let json: serde_json::Value = serde_json::from_slice(header_bytes).ok()?;
+        let file = std::fs::File::open(path).ok()?;
+        let file_len = file.metadata().ok()?.len();
+        let mut reader = BufReader::new(file);
+        let header_bytes = crate::file::encrypt::read_encrypted_header(&mut reader).ok()?;
+        let offset = reader.stream_position().ok()?;
+        let ciphertext_len = file_len.checked_sub(offset)?;
+        let max_ciphertext = MAX_IN_MEMORY_PLAINTEXT_BYTES
+            .checked_add(MAX_IN_MEMORY_PLAINTEXT_BYTES / 16)?
+            .checked_add(12 + AEAD_TAG_SIZE as u64)?;
+        if ciphertext_len > max_ciphertext {
+            return None;
+        }
+        let json: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+        let mut ciphertext = Vec::new();
+        let reserve = usize::try_from(ciphertext_len).ok()?;
+        ciphertext.try_reserve_exact(reserve).ok()?;
+        ciphertext.resize(reserve, 0);
+        reader.read_exact(&mut ciphertext).ok()?;
+        let mut extra = [0u8; 1];
+        if reader.read(&mut extra).ok()? != 0 {
+            return None;
+        }
 
         Self::parse_encrypted_metadata_from_parts(path, &json, ciphertext)
     }

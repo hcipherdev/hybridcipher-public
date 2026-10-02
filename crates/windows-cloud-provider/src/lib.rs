@@ -10,10 +10,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 pub use hybridcipher_provider_core::{
-    local_provider_bridge, local_provider_bridge_with_compatibility, ClientMountCrypto,
-    ExpectedProviderVersion, LocalProviderBridge, LocalProviderClient, MountSafetyReason,
-    MountSyncRuntimeStatus, ProviderBridge, ProviderContentVersion, ProviderEntryKind,
-    VaultCompatibility, VaultCompatibilityStatus,
+    local_provider_bridge, local_provider_bridge_for_root_with_compatibility,
+    local_provider_bridge_with_compatibility, ClientMountCrypto, ExpectedProviderVersion,
+    LocalProviderBridge, LocalProviderClient, MountSafetyReason, MountSyncRuntimeStatus,
+    ProviderBridge, ProviderContentVersion, ProviderEntryKind, VaultCompatibility,
+    VaultCompatibilityStatus,
 };
 use hybridcipher_provider_core::{
     EncryptedInventory, FileIdentityV1, ProviderCoreError, ProviderEntry, Result as ProviderResult,
@@ -441,6 +442,8 @@ pub struct CloudRootHealthResponse {
     pub safe_to_unmount: bool,
     pub pending_mutation_count: Option<usize>,
     pub pending_refresh_count: Option<usize>,
+    #[serde(default)]
+    pub reconciliation_in_progress: Option<bool>,
     pub conflict_count: Option<usize>,
     pub durable_observed_at: DateTime<Utc>,
     pub registration_source: Option<DurableInspectionSource>,
@@ -3135,6 +3138,53 @@ fn paths_equal_for_platform(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn existing_directories_equal(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => paths_equal_for_platform(&left, &right),
+        _ => false,
+    }
+}
+
+fn reuse_existing_registration_paths(
+    existing: &CloudRootRegistration,
+    requested: &mut CloudRootRegistration,
+) -> Result<()> {
+    for (label, stored, incoming) in [
+        ("mount", &existing.sync_root_path, &requested.sync_root_path),
+        (
+            "source",
+            &existing.encrypted_root,
+            &requested.encrypted_root,
+        ),
+    ] {
+        let stored_canonical = fs::canonicalize(stored).map_err(|error| {
+            CloudProviderError::Callback(format!(
+                "root {} stored {label} path {} cannot be resolved: {error}",
+                requested.root_id,
+                stored.display()
+            ))
+        })?;
+        let incoming_canonical = fs::canonicalize(incoming).map_err(|error| {
+            CloudProviderError::Callback(format!(
+                "root {} requested {label} path {} cannot be resolved: {error}",
+                requested.root_id,
+                incoming.display()
+            ))
+        })?;
+        if !paths_equal_for_platform(&stored_canonical, &incoming_canonical) {
+            return Err(CloudProviderError::Callback(format!(
+                "root {} {label} path differs: stored {}, requested {}",
+                requested.root_id,
+                stored.display(),
+                incoming.display()
+            )));
+        }
+    }
+    requested.sync_root_path = existing.sync_root_path.clone();
+    requested.encrypted_root = existing.encrypted_root.clone();
+    Ok(())
+}
+
 async fn wait_for_root_dehydrated_filtered(
     sync_root_path: &Path,
     timeout: Duration,
@@ -4459,6 +4509,9 @@ impl WindowsProjectedBridge {
 
 #[async_trait]
 impl ProviderBridge for WindowsProjectedBridge {
+    async fn check_write_access(&self) -> ProviderResult<()> {
+        self.inner.check_write_access().await
+    }
     fn compatibility_status(&self) -> Option<VaultCompatibilityStatus> {
         self.inner.compatibility_status()
     }
@@ -4694,12 +4747,70 @@ struct RemoteReconciliationPlan {
     removed_items: Vec<(String, String)>,
 }
 
+fn prune_synced_cloud_conflicts(
+    state: &mut CloudRootPersistentState,
+    sync_root_path: &Path,
+    local_dispositions: &HashMap<String, LocalRefreshDisposition>,
+    pending: &[CloudMutationRecord],
+) {
+    let items = &state.items;
+    state.conflicts.retain(|conflict| {
+        let Some(item) = items.get(&conflict.object_id) else {
+            return true;
+        };
+        item.dirty
+            || conflict.actual_version.is_some()
+            || item.identity.kind != ProviderEntryKind::File
+            || item.relative_path != conflict.relative_path
+            || conflict.local_plaintext_path.as_ref().is_some_and(|path| {
+                !paths_equal_for_platform(
+                    path,
+                    &sync_root_path.join(item.relative_path.replace('/', "\\")),
+                )
+            })
+            || local_dispositions.get(&conflict.object_id) != Some(&LocalRefreshDisposition::Safe)
+            || pending::reserves_path(pending, &item.relative_path)
+            || pending.iter().any(|record| {
+                record
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.file_id.as_deref())
+                    .is_some_and(|file_id| file_id == conflict.object_id)
+                    || record
+                        .relative_path
+                        .eq_ignore_ascii_case(&item.relative_path)
+                    || record
+                        .target_relative_path
+                        .as_deref()
+                        .is_some_and(|target| target.eq_ignore_ascii_case(&item.relative_path))
+            })
+    });
+}
+
 fn plan_remote_reconciliation(
     registration: &CloudRootRegistration,
     current_state: &CloudRootPersistentState,
     current_inventory: &HashMap<String, ProviderEntry>,
     entries: &[ProviderEntry],
     local_dispositions: &HashMap<String, LocalRefreshDisposition>,
+) -> Result<RemoteReconciliationPlan> {
+    plan_remote_reconciliation_with_pending(
+        registration,
+        current_state,
+        current_inventory,
+        entries,
+        local_dispositions,
+        &[],
+    )
+}
+
+fn plan_remote_reconciliation_with_pending(
+    registration: &CloudRootRegistration,
+    current_state: &CloudRootPersistentState,
+    current_inventory: &HashMap<String, ProviderEntry>,
+    entries: &[ProviderEntry],
+    local_dispositions: &HashMap<String, LocalRefreshDisposition>,
+    pending: &[CloudMutationRecord],
 ) -> Result<RemoteReconciliationPlan> {
     let mut proposed_state = current_state.clone();
     let mut placeholders = Vec::new();
@@ -4736,6 +4847,19 @@ fn plan_remote_reconciliation(
             .as_ref()
             .and_then(|object_id| current_state.items.get(object_id))
             .cloned();
+        if pending::reserves_path(pending, &entry.relative_path)
+            || previous
+                .as_ref()
+                .is_some_and(|item| pending::reserves_path(pending, &item.relative_path))
+        {
+            if let Some(id) = previous_object_id.as_ref() {
+                seen.insert(id.clone());
+                if let Some(existing) = current_inventory.get(id) {
+                    inventory_entries.push((id.clone(), existing.clone()));
+                }
+            }
+            continue;
+        }
         let disposition = previous_object_id
             .as_ref()
             .and_then(|object_id| local_dispositions.get(object_id))
@@ -4847,6 +4971,12 @@ fn plan_remote_reconciliation(
         .map(|(object_id, item)| (object_id.clone(), item.clone()))
         .collect::<Vec<_>>();
     for (object_id, item) in missing {
+        if pending::reserves_path(pending, &item.relative_path) {
+            if let Some(existing) = current_inventory.get(&object_id) {
+                inventory_entries.push((object_id, existing.clone()));
+            }
+            continue;
+        }
         let descendant_dispositions =
             current_state
                 .items
@@ -5052,18 +5182,14 @@ impl CloudProviderHost {
             }
         }
         if let Some(existing) = self.load_registration(registration.root_id)? {
-            if existing.sync_root_path != registration.sync_root_path
-                || existing.encrypted_root != registration.encrypted_root
-            {
-                return Err(CloudProviderError::Callback(format!(
-                    "root {} is already registered with different source or mount paths",
-                    registration.root_id
-                )));
-            }
+            reuse_existing_registration_paths(&existing, &mut registration)?;
             if existing.registration_kind == CloudRootRegistrationKind::LegacyCfApi
                 && registration.registration_kind == CloudRootRegistrationKind::ShellIntegrated
             {
                 self.migrate_legacy_registration_to_shell(&existing)?;
+            } else {
+                platform::register_root(&existing)?;
+                return Ok(());
             }
         }
         platform::register_root(&registration)?;
@@ -5994,10 +6120,12 @@ impl CloudProviderHost {
         let pending_mutation_count = journal
             .as_ref()
             .map(|inspection| inspection.value.records.len());
-        let pending_refresh_count = state.as_ref().map(|inspection| {
-            inspection.value.ingestion_in_progress
-                + usize::from(inspection.value.reconciliation_in_progress)
-        });
+        let pending_refresh_count = state
+            .as_ref()
+            .map(|inspection| inspection.value.ingestion_in_progress);
+        let reconciliation_in_progress = state
+            .as_ref()
+            .map(|inspection| inspection.value.reconciliation_in_progress);
         let conflict_count = state
             .as_ref()
             .map(|inspection| inspection.value.conflicts.len());
@@ -6019,6 +6147,7 @@ impl CloudProviderHost {
             safe_to_unmount,
             pending_mutation_count,
             pending_refresh_count,
+            reconciliation_in_progress,
             conflict_count,
             durable_observed_at: observed_at,
             registration_source: registration.as_ref().map(|inspection| inspection.source),
@@ -6048,6 +6177,30 @@ impl CloudProviderHost {
             );
         }
         Ok(status)
+    }
+
+    pub fn read_conflicts(&self, root_id: Uuid) -> Result<Vec<CloudConflictRecord>> {
+        let paths = self.read_only_runtime_paths(root_id)?;
+        let state = CloudStateStore::new(paths.state_path, root_id)
+            .inspect()?
+            .ok_or_else(|| {
+                CloudProviderError::Callback(format!(
+                    "Cloud Files durable state is missing for root {root_id}"
+                ))
+            })?;
+        Ok(state.value.conflicts)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub async fn recheck_conflicts(&self, root_id: Uuid) -> Result<()> {
+        let barrier = self
+            .connections
+            .lock()
+            .map_err(|_| CloudProviderError::Callback("connection registry lock poisoned".into()))?
+            .get(&root_id)
+            .ok_or_else(|| CloudProviderError::Callback("Cloud Files root is not running".into()))?
+            .shutdown_barrier();
+        barrier.recheck_conflicts().await
     }
 
     // Shutdown must recheck the journal after disconnect, when a live heartbeat
@@ -6290,6 +6443,12 @@ impl CloudProviderHost {
         status: &mut MountSyncRuntimeStatus,
         state: &CloudRootPersistentState,
     ) {
+        status.pending_conflict_count = state.conflicts.len();
+        status.conflict_paths = state
+            .conflicts
+            .iter()
+            .map(|conflict| conflict.relative_path.clone())
+            .collect();
         if !state.conflicts.is_empty() {
             status.unsafe_reasons.push(MountSafetyReason::Conflict {
                 count: state.conflicts.len(),
@@ -6306,14 +6465,18 @@ impl CloudProviderHost {
                     .collect(),
             });
         }
-        let pending_refresh =
-            state.ingestion_in_progress + usize::from(state.reconciliation_in_progress);
-        if pending_refresh > 0 {
+        status.pending_refresh_count = state.ingestion_in_progress;
+        if state.ingestion_in_progress > 0 {
             status
                 .unsafe_reasons
                 .push(MountSafetyReason::PendingRefresh {
-                    count: pending_refresh,
+                    count: state.ingestion_in_progress,
                 });
+        }
+        if state.reconciliation_in_progress {
+            status
+                .unsafe_reasons
+                .push(MountSafetyReason::ProviderReconciliation);
         }
         status.safe_to_unmount = state.safe_to_unmount(status.pending_writeback_count);
     }
@@ -6663,6 +6826,75 @@ mod tests {
     use super::*;
     use hybridcipher_provider_core::ProviderEntryKind;
     use std::collections::HashMap;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn existing_root_reuses_extended_paths_and_preserves_recovery_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let mount = temp.path().join("mount");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&mount).unwrap();
+        let recovery = temp.path().join("recovery.json");
+        fs::write(&recovery, b"pending recovery state").unwrap();
+        let stored_source = fs::canonicalize(&source).unwrap();
+        let stored_mount = fs::canonicalize(&mount).unwrap();
+        assert!(stored_source.to_string_lossy().starts_with(r"\\?\"));
+        assert!(stored_mount.to_string_lossy().starts_with(r"\\?\"));
+        let existing = CloudRootRegistration {
+            root_id: Uuid::new_v4(),
+            sync_root_path: stored_mount.clone(),
+            encrypted_root: stored_source.clone(),
+            display_name: "old".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
+        };
+        let mut requested = existing.clone();
+        requested.encrypted_root = source;
+        requested.sync_root_path = mount;
+        assert!(existing_directories_equal(
+            &existing.sync_root_path,
+            &requested.sync_root_path
+        ));
+        reuse_existing_registration_paths(&existing, &mut requested).unwrap();
+        assert_eq!(requested.encrypted_root, stored_source);
+        assert_eq!(requested.sync_root_path, stored_mount);
+        assert_eq!(fs::read(&recovery).unwrap(), b"pending recovery state");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn existing_root_rejects_different_or_missing_paths_without_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let mount = temp.path().join("mount");
+        let other = temp.path().join("other");
+        for path in [&source, &mount, &other] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let existing = CloudRootRegistration {
+            root_id: Uuid::new_v4(),
+            sync_root_path: mount.clone(),
+            encrypted_root: source.clone(),
+            display_name: "old".to_string(),
+            registration_kind: CloudRootRegistrationKind::LegacyCfApi,
+            shell_sync_root_id: None,
+        };
+        let mut changed = existing.clone();
+        changed.encrypted_root = other;
+        assert!(reuse_existing_registration_paths(&existing, &mut changed)
+            .unwrap_err()
+            .to_string()
+            .contains("source path differs"));
+        assert_eq!(existing.encrypted_root, source);
+        let mut missing = existing.clone();
+        missing.sync_root_path = temp.path().join("missing");
+        assert!(reuse_existing_registration_paths(&existing, &mut missing)
+            .unwrap_err()
+            .to_string()
+            .contains("requested mount path"));
+        assert!(mount.is_dir());
+    }
 
     #[test]
     fn dehydrate_summary_rejects_any_unverified_file() {
@@ -12548,6 +12780,44 @@ mod tests {
     }
 
     #[test]
+    fn pending_rename_blocks_source_resurrection_destination_import_and_remote_delete() {
+        let (registration, current, inventory, _) = reconciliation_fixture();
+        let source = inventory["stable-file-id"].clone();
+        let mut destination = source.clone();
+        destination.relative_path = "docs/renamed.txt".into();
+        destination.identity.relative_path = destination.relative_path.clone();
+        destination.identity.file_id = Some("separately-imported-id".into());
+        let mut record = CloudMutationRecord::new(
+            CloudMutationKind::Rename,
+            registration.root_id,
+            &source.relative_path,
+            Some(source.identity.clone()),
+        );
+        record.target_relative_path = Some(destination.relative_path.clone());
+        let dispositions =
+            HashMap::from([("stable-file-id".into(), LocalRefreshDisposition::Missing)]);
+        for incoming in [vec![source.clone()], vec![source, destination], vec![]] {
+            let plan = plan_remote_reconciliation_with_pending(
+                &registration,
+                &current,
+                &inventory,
+                &incoming,
+                &dispositions,
+                &[record.clone()],
+            )
+            .unwrap();
+            assert!(plan.placeholders.is_empty());
+            assert!(plan.removed_items.is_empty());
+            assert_eq!(plan.proposed_state.items.len(), 1);
+            assert_eq!(
+                plan.proposed_state.items["stable-file-id"].relative_path,
+                "docs/report.txt"
+            );
+            assert_eq!(plan.inventory_entries.len(), 1);
+        }
+    }
+
+    #[test]
     fn reconciliation_recreates_unchanged_placeholder_missing_from_disk() {
         let (registration, current, inventory, _) = reconciliation_fixture();
         let unchanged = inventory["stable-file-id"].clone();
@@ -12750,6 +13020,89 @@ mod tests {
             remote.content_version()
         );
         assert!(plan.placeholders.is_empty());
+    }
+
+    #[test]
+    fn synced_conflict_is_retired_only_without_local_or_pending_work() {
+        let (registration, mut state, _, _) = reconciliation_fixture();
+        let item = state.items["stable-file-id"].clone();
+        state.conflicts.push(CloudConflictRecord {
+            id: Uuid::new_v4(),
+            object_id: item.identity.object_id.clone(),
+            relative_path: item.relative_path.clone(),
+            expected_version: item.content_version.clone(),
+            actual_version: None,
+            local_plaintext_path: Some(registration.sync_root_path.join(&item.relative_path)),
+            created_at: Utc::now(),
+        });
+        let safe = HashMap::from([(
+            item.identity.object_id.clone(),
+            LocalRefreshDisposition::Safe,
+        )]);
+        let dirty = HashMap::from([(
+            item.identity.object_id.clone(),
+            LocalRefreshDisposition::Dirty,
+        )]);
+        let mut pending = CloudMutationRecord::new(
+            CloudMutationKind::Writeback,
+            registration.root_id,
+            item.relative_path.clone(),
+            None,
+        );
+        pending.plaintext_path = Some(registration.sync_root_path.join(&item.relative_path));
+
+        let mut blocked = state.clone();
+        prune_synced_cloud_conflicts(&mut blocked, &registration.sync_root_path, &dirty, &[]);
+        assert_eq!(blocked.conflicts.len(), 1);
+        prune_synced_cloud_conflicts(
+            &mut blocked,
+            &registration.sync_root_path,
+            &safe,
+            &[pending],
+        );
+        assert_eq!(blocked.conflicts.len(), 1);
+        let mut status = MountSyncRuntimeStatus::default();
+        CloudProviderHost::apply_persistent_safety(&mut status, &blocked);
+        assert_eq!(status.pending_conflict_count, 1);
+        assert_eq!(status.conflict_paths, vec![item.relative_path.clone()]);
+
+        let mut divergent = state.clone();
+        divergent.conflicts[0].actual_version = item.content_version.clone();
+        prune_synced_cloud_conflicts(&mut divergent, &registration.sync_root_path, &safe, &[]);
+        assert_eq!(divergent.conflicts.len(), 1);
+
+        let mut moved_copy = state.clone();
+        moved_copy.conflicts[0].local_plaintext_path = Some(PathBuf::from("other/local-copy.md"));
+        prune_synced_cloud_conflicts(&mut moved_copy, &registration.sync_root_path, &safe, &[]);
+        assert_eq!(moved_copy.conflicts.len(), 1);
+
+        prune_synced_cloud_conflicts(&mut state, &registration.sync_root_path, &safe, &[]);
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn reconciliation_status_is_distinct_from_pending_refresh() {
+        let mut state = CloudRootPersistentState::empty(Uuid::new_v4());
+        state.reconciliation_in_progress = true;
+        let mut status = MountSyncRuntimeStatus::default();
+        CloudProviderHost::apply_persistent_safety(&mut status, &state);
+        assert!(!status.safe_to_unmount);
+        assert_eq!(status.pending_refresh_count, 0);
+        assert_eq!(
+            status.unsafe_reasons,
+            vec![MountSafetyReason::ProviderReconciliation]
+        );
+
+        state.reconciliation_in_progress = false;
+        state.ingestion_in_progress = 1;
+        let mut status = MountSyncRuntimeStatus::default();
+        CloudProviderHost::apply_persistent_safety(&mut status, &state);
+        assert!(!status.safe_to_unmount);
+        assert_eq!(status.pending_refresh_count, 1);
+        assert_eq!(
+            status.unsafe_reasons,
+            vec![MountSafetyReason::PendingRefresh { count: 1 }]
+        );
     }
 
     #[test]
@@ -13018,13 +13371,14 @@ mod ipc {
 mod platform {
     use super::{
         actionable_callback_handler_outcome, begin_provider_shutdown_barrier,
-        complete_callback_once, drain_provider_background_tasks, hydration_completion_range,
-        hydration_transfer_ranges, paths_equal_for_platform, plan_remote_reconciliation,
-        startup_error_after_disconnect, validate_hydration_request, CallbackHealthObservation,
-        CloudCallbackKind, CloudHydrationExecuteResult, CloudHydrationTransferTelemetry,
-        CloudMutationJournal, CloudMutationKind, CloudMutationRecord, CloudObjectIdentityV2,
-        CloudPlaceholderEntry, CloudProviderError, CloudProviderHost, CloudProviderStatus,
-        CloudRootProbeKind, CloudRootRegistration, CloudRootRegistrationKind, CloudRootStartError,
+        complete_callback_once, drain_provider_background_tasks, existing_directories_equal,
+        hydration_completion_range, hydration_transfer_ranges,
+        plan_remote_reconciliation_with_pending, startup_error_after_disconnect,
+        validate_hydration_request, CallbackHealthObservation, CloudCallbackKind,
+        CloudHydrationExecuteResult, CloudHydrationTransferTelemetry, CloudMutationJournal,
+        CloudMutationKind, CloudMutationRecord, CloudObjectIdentityV2, CloudPlaceholderEntry,
+        CloudProviderError, CloudProviderHost, CloudProviderStatus, CloudRootProbeKind,
+        CloudRootRegistration, CloudRootRegistrationKind, CloudRootStartError,
         CloudRootStartResult, CloudRuntimePaths, CloudStateStore, DehydrateRootSummary,
         ExpectedProviderVersion, HydrationCancellationRegistry, HydrationCancellationToken,
         HydrationTemporaryFile, HydrationWorkerGate, LocalRefreshDisposition,
@@ -13131,7 +13485,55 @@ mod platform {
     use zeroize::Zeroizing;
 
     const HYBRIDCIPHER_PROVIDER_ID: GUID = GUID::from_u128(0x9c9eb75e_7e0b_47f4_8f33_546c1a3a38c4);
-    const HYBRIDCIPHER_PACKAGE_NAME: &str = "HybridCipher.Desktop";
+    const HYBRIDCIPHER_LOCAL_PACKAGE_NAME: &str = "HybridCipher.Desktop";
+    const HYBRIDCIPHER_LOCAL_TEST_PACKAGE_NAME: &str = "HybridCipher.Desktop.local-signed-test";
+    const HYBRIDCIPHER_STORE_PACKAGE_NAME: &str = "HybridCipher.HybridCipher";
+    const HYBRIDCIPHER_STORE_PACKAGE_FAMILY: &str = "HybridCipher.HybridCipher_1m8xk49k1ft0w";
+    const HYBRIDCIPHER_TEST_STORE_PACKAGE_NAME: &str = "HybridCipher.HybridCipherTest";
+    const HYBRIDCIPHER_TEST_STORE_PACKAGE_FAMILY: &str =
+        "HybridCipher.HybridCipherTest_1m8xk49k1ft0w";
+
+    fn is_supported_package_identity(name: &str, family: &str) -> bool {
+        name == HYBRIDCIPHER_LOCAL_PACKAGE_NAME
+            || name == HYBRIDCIPHER_LOCAL_TEST_PACKAGE_NAME
+            || (name == HYBRIDCIPHER_STORE_PACKAGE_NAME
+                && family == HYBRIDCIPHER_STORE_PACKAGE_FAMILY)
+            || (name == HYBRIDCIPHER_TEST_STORE_PACKAGE_NAME
+                && family == HYBRIDCIPHER_TEST_STORE_PACKAGE_FAMILY)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn package_identity_accepts_store_and_local_but_rejects_unrelated_families() {
+        assert!(is_supported_package_identity(
+            "HybridCipher.HybridCipher",
+            "HybridCipher.HybridCipher_1m8xk49k1ft0w"
+        ));
+        assert!(is_supported_package_identity(
+            "HybridCipher.Desktop",
+            "HybridCipher.Desktop_any-local-publisher"
+        ));
+        assert!(is_supported_package_identity(
+            "HybridCipher.Desktop.local-signed-test",
+            "HybridCipher.Desktop.local-signed-test_any-local-publisher"
+        ));
+        assert!(is_supported_package_identity(
+            "HybridCipher.HybridCipherTest",
+            "HybridCipher.HybridCipherTest_1m8xk49k1ft0w"
+        ));
+        assert!(!is_supported_package_identity(
+            "HybridCipher.HybridCipherTest",
+            "HybridCipher.HybridCipherTest_anotherpublisher"
+        ));
+        assert!(!is_supported_package_identity(
+            "HybridCipher.HybridCipher",
+            "HybridCipher.HybridCipher_anotherpublisher"
+        ));
+        assert!(!is_supported_package_identity(
+            "Unrelated.App",
+            "Unrelated.App_1m8xk49k1ft0w"
+        ));
+    }
     const WINDOWS_TICKS_PER_SECOND: i64 = 10_000_000;
     const SECONDS_FROM_1601_TO_UNIX_EPOCH: i64 = 11_644_473_600;
     const HYDRATION_CALLBACK_TIMEOUT: Duration = Duration::from_secs(50);
@@ -13380,9 +13782,10 @@ mod platform {
             ))
         })?;
         let package_name = package.Id()?.Name()?.to_string_lossy();
-        if package_name != HYBRIDCIPHER_PACKAGE_NAME {
+        let package_family = package.Id()?.FamilyName()?.to_string_lossy();
+        if !is_supported_package_identity(&package_name, &package_family) {
             return Err(CloudProviderError::Callback(format!(
-                "HybridCipher's Windows package identity is '{package_name}', expected '{HYBRIDCIPHER_PACKAGE_NAME}'. Repair or reinstall HybridCipher"
+                "HybridCipher's Windows package identity '{package_name}' (family '{package_family}') is unsupported. Repair or reinstall HybridCipher"
             )));
         }
         Ok(package)
@@ -13414,7 +13817,7 @@ mod platform {
         let id = HSTRING::from(sync_root_id);
         if let Ok(existing) = StorageProviderSyncRootManager::GetSyncRootInformationForId(&id) {
             let existing_path = existing.Path()?.Path()?.to_string_lossy();
-            if paths_equal_for_platform(Path::new(&existing_path), &registration.sync_root_path) {
+            if existing_directories_equal(Path::new(&existing_path), &registration.sync_root_path) {
                 tracing::info!(
                     root_id = %registration.root_id,
                     shell_sync_root_id = sync_root_id,
@@ -13581,7 +13984,7 @@ mod platform {
                 ))
             })?;
         let registered_path = info.Path()?.Path()?.to_string_lossy();
-        if !paths_equal_for_platform(Path::new(&registered_path), &registration.sync_root_path) {
+        if !existing_directories_equal(Path::new(&registered_path), &registration.sync_root_path) {
             return Err(CloudProviderError::Callback(format!(
                 "Windows Shell sync-root registration {id} points to {registered_path}, expected {}",
                 registration.sync_root_path.display()
@@ -14082,7 +14485,7 @@ mod platform {
             drop(startup_gate);
             return Err(cleanup_connected_startup_failure(&mut connected, &context, err).await);
         }
-        if let Err(err) = context.reconcile_remote_inventory_locked().await {
+        if let Err(err) = context.ingest_local_tree_locked().await {
             let recovery_error = context.mark_startup_recovery_failed(&err).err();
             context.startup_activity.begin_shutdown();
             drop(startup_gate);
@@ -14091,7 +14494,7 @@ mod platform {
                 cleanup_connected_startup_failure(&mut connected, &context, startup_error).await,
             );
         }
-        if let Err(err) = context.ingest_local_tree_locked().await {
+        if let Err(err) = context.reconcile_remote_inventory_locked().await {
             let recovery_error = context.mark_startup_recovery_failed(&err).err();
             context.startup_activity.begin_shutdown();
             drop(startup_gate);
@@ -14399,6 +14802,10 @@ mod platform {
     }
 
     impl CloudRootShutdownBarrier {
+        pub async fn recheck_conflicts(&self) -> Result<()> {
+            self.context.reconcile_remote_inventory().await
+        }
+
         pub fn compatibility_status(&self) -> Option<super::VaultCompatibilityStatus> {
             self.context.bridge.compatibility_status()
         }
@@ -14559,6 +14966,7 @@ mod platform {
 
     include!("pending_native.rs");
     struct CallbackContext {
+        read_only_view: Mutex<Option<hybridcipher_provider_core::ReadOnlyMount>>,
         registration: CloudRootRegistration,
         bridge: Arc<dyn ProviderBridge>,
         runtime_paths: CloudRuntimePaths,
@@ -14577,6 +14985,16 @@ mod platform {
 
     struct IngestionStateGuard<'a> {
         store: &'a CloudStateStore,
+    }
+
+    impl Drop for CallbackContext {
+        fn drop(&mut self) {
+            if let Ok(Some(guard)) = self.read_only_view.get_mut().map(|guard| guard.as_mut()) {
+                if let Err(err) = guard.restore() {
+                    tracing::error!("Mount permission recovery retained for next startup: {err}");
+                }
+            }
+        }
     }
 
     impl<'a> IngestionStateGuard<'a> {
@@ -14641,6 +15059,24 @@ mod platform {
     }
 
     impl CallbackContext {
+        async fn refresh_write_access(&self) -> Result<bool> {
+            let denied = self.bridge.check_write_access().await.is_err();
+            let mut guard = self.read_only_view.lock().map_err(|_| {
+                CloudProviderError::Callback("Mount permission lock unavailable".into())
+            })?;
+            if denied && guard.is_none() {
+                *guard = Some(hybridcipher_provider_core::ReadOnlyMount::open(
+                    &self.registration.sync_root_path,
+                    self.runtime_paths
+                        .state_path
+                        .with_extension("permissions.json"),
+                )?);
+            }
+            if let Some(guard) = guard.as_mut() {
+                guard.set_read_only(denied)?;
+            }
+            Ok(denied)
+        }
         fn new(
             registration: CloudRootRegistration,
             bridge: Arc<dyn ProviderBridge>,
@@ -14659,6 +15095,7 @@ mod platform {
                 CloudStateStore::new(runtime_paths.state_path.clone(), registration.root_id);
             Self {
                 registration,
+                read_only_view: Mutex::new(None),
                 bridge,
                 runtime_paths,
                 runtime,
@@ -14708,6 +15145,15 @@ mod platform {
             })?;
             inventory.insert(identity.object_id.clone(), entry);
             Ok(identity)
+        }
+
+        fn clear_committed_conflicts(&self, identity: &CloudObjectIdentityV2) -> Result<()> {
+            self.state_store.transaction(|state| {
+                state
+                    .conflicts
+                    .retain(|conflict| conflict.object_id != identity.object_id);
+                Ok(())
+            })
         }
 
         fn remove_identity(&self, identity: &CloudObjectIdentityV2) -> Result<()> {
@@ -14876,9 +15322,14 @@ mod platform {
         }
 
         async fn reconcile_remote_inventory(&self) -> Result<()> {
+            if self.refresh_write_access().await? {
+                return Ok(());
+            }
             self.startup_activity.ensure_wait_allowed()?;
             let _operation = self.operation_lock.lock().await;
             self.startup_activity.ensure_running()?;
+            // Observe local moves before projecting the encrypted namespace back to Windows.
+            self.ingest_local_tree_locked().await?;
             self.reconcile_remote_inventory_locked().await
         }
 
@@ -14899,12 +15350,14 @@ mod platform {
                     .clone();
                 let (local_dispositions, mut guards) =
                     self.acquire_reconciliation_guards(&current_state);
-                let plan = plan_remote_reconciliation(
+                let journal = self.read_journal()?;
+                let mut plan = plan_remote_reconciliation_with_pending(
                     &self.registration,
                     &current_state,
                     &current_inventory,
                     &entries,
                     &local_dispositions,
+                    &journal.records,
                 )?;
 
                 apply_reconciliation_placeholders(
@@ -14923,6 +15376,15 @@ mod platform {
                         guards.remove(&object_id),
                     )?;
                 }
+
+                // Retire an old conflict only after Windows reports the local
+                // placeholder in sync and no mutation still owns its path.
+                super::prune_synced_cloud_conflicts(
+                    &mut plan.proposed_state,
+                    &self.registration.sync_root_path,
+                    &local_dispositions,
+                    &journal.records,
+                );
 
                 self.state_store
                     .replace_if_generation(current_state.generation, plan.proposed_state)?;
@@ -14962,7 +15424,9 @@ mod platform {
                     .sync_root_path
                     .join(item.relative_path.replace('/', "\\"));
                 if !path.exists() {
-                    dispositions.insert(object_id.clone(), LocalRefreshDisposition::Missing);
+                    // A local move may happen after the ingestion scan. Do not resurrect
+                    // its old name before the next scan can capture the stable identity.
+                    dispositions.insert(object_id.clone(), LocalRefreshDisposition::Busy);
                     continue;
                 }
                 if item.identity.kind == ProviderEntryKind::Directory {
@@ -15030,12 +15494,24 @@ mod platform {
                     continue;
                 }
 
-                if self.read_journal()?.records.iter().any(|r| {
-                    r.kind == CloudMutationKind::Writeback && r.relative_path == relative_path
-                }) {
+                let journal = self.read_journal()?;
+                if super::pending::reserves_path(&journal.records, &relative_path)
+                    || journal.records.iter().any(|r| {
+                        r.kind == CloudMutationKind::Writeback && r.relative_path == relative_path
+                    })
+                {
                     continue;
                 }
-                if let Some(identity) = self.known_local_placeholder_identity(&path)? {
+                let known_identity = match self.known_local_placeholder_identity(&path) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        tracing::debug!(
+                            "Deferring ingestion until placeholder identity is readable: {error}"
+                        );
+                        continue;
+                    }
+                };
+                if let Some(identity) = known_identity {
                     match self
                         .ingest_local_placeholder_rename(&path, &relative_path, identity)
                         .await
@@ -15116,6 +15592,8 @@ mod platform {
                                     relative_path,
                                     err
                                 );
+                            } else {
+                                self.clear_committed_conflicts(&identity)?;
                             }
                         }
                         Err(CloudProviderError::ProviderCore(
@@ -15220,6 +15698,8 @@ mod platform {
                                 relative_path,
                                 err
                             );
+                        } else {
+                            self.clear_committed_conflicts(&identity)?;
                         }
                     }
                     Err(CloudProviderError::ProviderCore(ProviderCoreError::ContentConflict {
@@ -15342,29 +15822,24 @@ mod platform {
             {
                 return Ok(None);
             }
-            let guard = match CloudFileOplock::acquire_exclusive(path) {
-                Ok(guard) => guard,
-                Err(err) => {
-                    tracing::debug!(
-                        "Could not inspect local placeholder identity for {}: {}",
-                        path.display(),
-                        err
-                    );
-                    return Ok(None);
-                }
-            };
-            match guard.identity() {
-                Ok(identity) if identity.root_id == self.registration.root_id => Ok(Some(identity)),
-                Ok(_) => Ok(None),
-                Err(err) => {
-                    tracing::debug!(
-                        "Could not decode local placeholder identity for {}: {}",
-                        path.display(),
-                        err
-                    );
-                    Ok(None)
-                }
+            let guard = CloudFileOplock::acquire_exclusive(path)?;
+            let identity = guard.identity()?;
+            if identity.root_id != self.registration.root_id {
+                return Err(CloudProviderError::Callback(
+                    "Placeholder belongs to another root; ingestion deferred".into(),
+                ));
             }
+            if !self
+                .state_store
+                .load()?
+                .items
+                .contains_key(&identity.object_id)
+            {
+                return Err(CloudProviderError::Callback(
+                    "Placeholder identity is not registered; ingestion deferred".into(),
+                ));
+            }
+            Ok(Some(identity))
         }
 
         async fn ingest_local_placeholder_rename(
@@ -15530,15 +16005,21 @@ mod platform {
 
         let periodic_context = context;
         let periodic_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.tick().await;
+            let mut ticks = 0u8;
             loop {
                 interval.tick().await;
+                if let Err(err) = periodic_context.refresh_write_access().await {
+                    tracing::warn!("Cloud Files access update failed: {}", err);
+                    continue;
+                }
+                ticks = (ticks + 1) % 5;
+                if ticks != 0 {
+                    continue;
+                }
                 if let Err(err) = periodic_context.reconcile_remote_inventory().await {
                     tracing::warn!("Cloud Files periodic reconciliation failed: {}", err);
-                }
-                if let Err(err) = periodic_context.ingest_local_tree().await {
-                    tracing::warn!("Cloud Files periodic local ingestion failed: {}", err);
                 }
             }
         });
@@ -16596,6 +17077,11 @@ mod platform {
                             .unwrap_or_default()
                     });
             let existing_entry = self.entry_for_identity(&identity)?;
+            if super::pending::reserves_path(&self.read_journal()?.records, &relative_path) {
+                // Keep edits available for the rename's own checked write. An independent
+                // writeback here would allocate/commit a competing destination version.
+                return Ok(());
+            }
             if normalize_relative_path(&existing_entry.relative_path)
                 != normalize_relative_path(&relative_path)
                 && self.runtime.block_on(self.ingest_local_placeholder_rename(
@@ -16667,13 +17153,15 @@ mod platform {
             };
             self.remove_identity(&identity)?;
             self.remove_cache_for_identity(&identity);
-            let _ = self.upsert_committed_entry(writeback)?;
+            let committed_identity = self.upsert_committed_entry(writeback)?;
             CloudFileOplock::acquire_exclusive(&full_path)?.mark_in_sync()?;
+            self.clear_committed_conflicts(&committed_identity)?;
             self.clear_pending_mutation(mutation_id)?;
             Ok(())
         }
 
         unsafe fn handle_delete(&self, info: &CF_CALLBACK_INFO) -> Result<NTSTATUS> {
+            self.runtime.block_on(self.bridge.check_write_access())?;
             self.startup_activity.ensure_wait_allowed()?;
             if let Some(full_path) = normalized_path_from_callback(info) {
                 if let Some(relative_path) =

@@ -38,6 +38,12 @@ const quoteShellArgValue = typeof securityUtils.quoteShellArg === 'function'
         return `'${text.replace(/'/g, `'\"'\"'`)}'`;
     };
 const uiUtils = window.HybridCipherUiUtils || {};
+const displayEnrolledPathValue = typeof uiUtils.displayEnrolledPath === 'function'
+    ? uiUtils.displayEnrolledPath
+    : path => String(path || '');
+const isRoutineProviderReconciliationValue = typeof uiUtils.isRoutineProviderReconciliation === 'function'
+    ? uiUtils.isRoutineProviderReconciliation
+    : () => false;
 const filterProtectedFoldersValue = typeof uiUtils.filterProtectedFolders === 'function'
     ? uiUtils.filterProtectedFolders
     : (folders, query) => {
@@ -55,9 +61,9 @@ const filterProtectedFoldersValue = typeof uiUtils.filterProtectedFolders === 'f
 const buildAppModeUiModelValue = typeof uiUtils.buildAppModeUiModel === 'function'
     ? uiUtils.buildAppModeUiModel
     : appMode => ({
-        searchMode: appMode === 'individual' ? 'folders' : 'commands',
-        searchPlaceholder: appMode === 'individual' ? 'Search protected folders…' : 'Search CLI commands…',
-        showTechnicalNavigation: appMode !== 'individual',
+        searchMode: 'folders',
+        searchPlaceholder: 'Search protected folders…',
+        showTechnicalNavigation: false,
         protectionNavigationLabel: appMode === 'individual' ? 'Protection status' : 'Coverage Center',
     });
 const shouldExpandAdvancedSettingsValue = typeof uiUtils.shouldExpandAdvancedSettings === 'function'
@@ -110,10 +116,19 @@ const getEmbeddedTerminalHeaderTitleValue = typeof uiUtils.getEmbeddedTerminalHe
     : () => 'Embedded Terminal';
 const getFolderRowStatusStateValue = typeof uiUtils.getFolderRowStatusState === 'function'
     ? uiUtils.getFolderRowStatusState
-    : ({ isMounted = false, syncStatus = null, showSafetyAlert = false } = {}) => {
+    : ({ isMounted = false, isUnmounting = false, syncStatus = null, showSafetyAlert = false } = {}) => {
+        if (isUnmounting) {
+            return {
+                showMountedBadge: false,
+                showUnmountingBadge: true,
+                showAlertButton: false,
+                healthDotTone: null,
+            };
+        }
         if (!isMounted) {
             return {
                 showMountedBadge: false,
+                showUnmountingBadge: false,
                 showAlertButton: false,
                 healthDotTone: null,
             };
@@ -125,6 +140,7 @@ const getFolderRowStatusStateValue = typeof uiUtils.getFolderRowStatusState === 
 
         return {
             showMountedBadge: true,
+            showUnmountingBadge: false,
             showAlertButton: Boolean(showSafetyAlert),
             healthDotTone: hasConflicts || hasRecoveryCopies ? 'red' : 'green',
         };
@@ -285,7 +301,7 @@ const buildFolderCoverageModelValue = typeof uiUtils.buildFolderCoverageModel ==
     };
 const buildFolderDetailModelValue = typeof uiUtils.buildFolderDetailModel === 'function'
     ? uiUtils.buildFolderDetailModel
-    : ({ folder = {}, mountInfo = null, isMounted = false, coverageReview = null } = {}) => ({
+    : ({ folder = {}, mountInfo = null, isMounted = false, isUnmounting = false, coverageReview = null } = {}) => ({
         displayName: folder.name || '',
         path: folder.path || '',
         isMounted: Boolean(isMounted),
@@ -297,13 +313,13 @@ const buildFolderDetailModelValue = typeof uiUtils.buildFolderDetailModel === 'f
             : { id: 'mount', label: 'Mount folder' },
         secondaryActions: [
             { id: 'reveal-protected', label: 'Reveal encrypted source' },
-            ...(isMounted ? [{ id: 'unmount', label: 'Unmount folder…', destructive: true }] : []),
+            ...(isMounted ? [{ id: 'unmount', label: isUnmounting ? 'Unmounting…' : 'Unmount folder…', destructive: true, disabled: isUnmounting }] : []),
         ],
         attention: {
             conflicts: 0,
             recoveryCopies: 0,
             pendingChanges: 0,
-            mountStatusLabel: isMounted ? 'Mounted' : 'Not mounted',
+            mountStatusLabel: isUnmounting ? 'Unmounting' : (isMounted ? 'Mounted' : 'Not mounted'),
             unmountSafetyLabel: isMounted ? 'Checking...' : null,
             safeToUnmount: null,
         },
@@ -358,12 +374,21 @@ const buildPersonalDevicesModelValue = typeof uiUtils.buildPersonalDevicesModel 
         reviewDevices: [],
         hasAttention: false,
     });
+const formatDeviceFingerprintInputValue = typeof uiUtils.formatDeviceFingerprintInput === 'function'
+    ? uiUtils.formatDeviceFingerprintInput
+    : value => String(value || '').replace(/\s/g, '').toUpperCase().match(/.{1,4}/g)?.join(' ') || '';
+const normalizeDeviceFingerprintValue = typeof uiUtils.normalizeDeviceFingerprint === 'function'
+    ? uiUtils.normalizeDeviceFingerprint
+    : value => {
+        const compact = String(value || '').replace(/\s/g, '').toUpperCase();
+        return /^[0-9A-F]{16}$/.test(compact) ? compact.match(/.{4}/g).join(' ') : null;
+    };
 const buildDeviceVerificationModelValue = typeof uiUtils.buildDeviceVerificationModel === 'function'
     ? uiUtils.buildDeviceVerificationModel
     : ({ device = null, fingerprint = '' } = {}) => {
         const userIdentifier = String(device?.user_id || device?.email || '').trim();
         const deviceId = String(device?.device_id || '').trim();
-        const normalizedFingerprint = String(fingerprint || '').trim();
+        const normalizedFingerprint = normalizeDeviceFingerprintValue(fingerprint);
         return {
             userIdentifier,
             deviceId,
@@ -416,7 +441,7 @@ const classifyEnrollmentFailureValue = typeof betaUxUtils.classifyEnrollmentFail
     : ({ folderPath = '' } = {}) => ({
         kind: 'generic',
         title: 'HybridCipher could not protect this folder',
-        detail: `Review the terminal output for the exact CLI error, then retry after correcting the path or permissions for "${folderPath}".`,
+        detail: `Review the error details, then retry after correcting the path or permissions for "${folderPath}".`,
         retryLabel: 'Try again',
     });
 const buildForceUnmountConfirmationValue = typeof betaUxUtils.buildForceUnmountConfirmation === 'function'
@@ -456,7 +481,7 @@ const buildMountTimeoutMessageValue = typeof betaUxUtils.buildMountTimeoutMessag
             ? `Mount for ${folderLabel} did not finish in the background.`
             : `Mount for ${folderLabel} did not finish.`,
         folderPath ? `Folder: ${folderPath}.` : '',
-        'Review the embedded terminal output for the mount command, then retry if needed.',
+        'Review the mount error details, then retry if needed.',
         'Before retrying, check whether the folder is already mounted.'
     ].filter(Boolean).join(' ');
 const autoMountUtils = window.HybridCipherAutoMountUtils || {};
@@ -506,12 +531,16 @@ class HybridCipherApp {
     constructor() {
         this.currentUser = null;
         this.currentDeviceId = null;
+        this.sessionPersistent = true;
         this.enrolledFolders = [];
         this.selectedFolder = null;
         this.currentMountPath = null;
         this.isLoggedIn = false;
         this.adminPanelVisible = false;
         this.appMode = 'individual';
+        this.teamLicenseStatus = null;
+        this.activeWorkspaceType = 'personal';
+        this.workspaceChoiceLoaded = false;
         this.folderSearchQuery = '';
         this.activeWorkspaceView = 'home';
         this.rememberMePreference = this.loadRememberPreference();
@@ -561,12 +590,6 @@ class HybridCipherApp {
         this.updateRestartCountdownTimer = null;
         this.updateRestartRemainingSecs = 15;
         this.terminalVisible = true; // Terminal visible by default
-        this.isRegisterOverlay = false;
-        this.registerOverlayPrevTerminalVisible = null;
-        this.registerOverlaySessionId = null;
-        this.registerOverlayCompletionHandled = false;
-        this.registerSentinelBuffers = {};
-        this.registerOverlayCommandEchoBySession = {};
         this.pendingRegistrationEmail = null;
         this.pendingRegistrationPassword = null;
         this.activeQueueDetails = null;
@@ -634,6 +657,7 @@ class HybridCipherApp {
         this.cachedCliPath = null;
         // Track PTY sessions for each mount by root_id
         this.mountSessions = {}; // root_id -> sessionId
+        this.unmountingRootIds = new Set();
         // Active mounts keyed by root_id -> mountpoint
         this.activeMountsByRootId = {};
         this.activeMountDetailsByRootId = {};
@@ -644,6 +668,7 @@ class HybridCipherApp {
             rootId: null,
             folder: null,
             records: [],
+            cloudFiles: false,
             selectedConflictId: null,
             reviewState: null
         };
@@ -658,6 +683,11 @@ class HybridCipherApp {
         this.mountStatusRefreshTimer = null;
         this.mountStatusPollTimer = null;
         this.mountStatusPollIntervalMs = 3000;
+        this.reconciliationStartedAtByRootId = {};
+        this.storeUpdateBannerShown = false;
+        this.storeUpdateBannerDismissed = false;
+        this.storeUpdateCheckInFlight = false;
+        this.storeUpdateStatusKnown = false;
         this.quitFlowInProgress = false;
         this.promptResponders = {};
         this.promptEchoSuppress = {};
@@ -709,6 +739,10 @@ class HybridCipherApp {
 
         // Check for updates after a short delay to avoid blocking startup
         setTimeout(() => this.checkForUpdates(), 5000);
+        if (this.platformInfo?.update_channel === 'microsoft_store') {
+            // A short local timer lets the persisted four-hour Store check resume after restarts.
+            setInterval(() => this.checkForUpdates(), 5 * 60 * 1000);
+        }
     }
 
     setupQueueRowState() {
@@ -722,6 +756,7 @@ class HybridCipherApp {
     // ========================================================================
 
     showWelcomeScreen() {
+        this.closeSettingsModal();
         document.getElementById('welcomeScreen').style.display = 'flex';
         const appContainer = document.getElementById('appContainer');
         if (appContainer) {
@@ -729,8 +764,6 @@ class HybridCipherApp {
             appContainer.classList.remove('register-overlay');
         }
         this.setAdminPanelVisible(false);
-        this.isRegisterOverlay = false;
-        this.registerOverlayPrevTerminalVisible = null;
         this.isLoggedIn = false;
         this.stopSessionHealthTimer();
         this.stopOperationsRefreshTimer();
@@ -752,6 +785,8 @@ class HybridCipherApp {
         this.stopMountStatusPolling();
         this.activeMountsByRootId = {};
         this.activeMountDetailsByRootId = {};
+        this.unmountingRootIds.clear();
+        this.reconciliationStartedAtByRootId = {};
         this.folderCoverageReviewsByRootId = {};
         this.recoveryPromptFingerprintByRootId = {};
         this.resetConflictWorkflowState();
@@ -786,8 +821,6 @@ class HybridCipherApp {
         }
         this.applyAppMode();
         this.setAdminPanelVisible(false);
-        this.isRegisterOverlay = false;
-        this.registerOverlayPrevTerminalVisible = null;
         this.isLoggedIn = true;
         this.updateMountButtons(false);
         this.updateSidebarMountSummary();
@@ -803,6 +836,7 @@ class HybridCipherApp {
         if (!sessionInfo || !this.isLoggedIn) {
             return;
         }
+        await this.refreshTeamLicenseStatus({ silent: true });
         this.startSessionHealthTimer({ runImmediately: false });
         this.startMountStatusPolling();
 
@@ -818,84 +852,8 @@ class HybridCipherApp {
             this.loadEnrolledFolders();
         }
 
-        // Keep terminal ready in the background, but land on Workspace Home.
-        this.updateTerminalCwdDisplay();
-        this.updateTerminalHeader();
-        this.updateTerminalPromptSymbol();
-        this.ensureTerminalWelcome();
-        this.startTerminalSessionForTab(this.welcomeTabId);
+        // The terminal starts only after explicit access through Advanced Settings.
         this.showWorkspaceHome();
-    }
-
-    setAdminPanelVisible(visible) {
-        if (this.appMode === 'individual') {
-            this.adminPanelVisible = false;
-            const workspace = document.getElementById('workspace');
-            const adminDashboard = document.getElementById('adminDashboard');
-            const adminPanelBtn = document.getElementById('adminPanelBtn');
-            if (workspace) {
-                workspace.classList.remove('admin-panel-visible');
-            }
-            if (adminDashboard) {
-                adminDashboard.style.display = 'none';
-                adminDashboard.setAttribute('aria-hidden', 'true');
-            }
-            if (adminPanelBtn) {
-                adminPanelBtn.classList.add('hidden');
-                adminPanelBtn.setAttribute('aria-hidden', 'true');
-                adminPanelBtn.tabIndex = -1;
-                adminPanelBtn.setAttribute('aria-pressed', 'false');
-            }
-            if (visible) {
-                this.showWorkspaceHome();
-            }
-            return;
-        }
-
-        this.adminPanelVisible = Boolean(visible);
-        const workspace = document.getElementById('workspace');
-        const adminDashboard = document.getElementById('adminDashboard');
-        const terminalContainer = document.getElementById('terminalContainer');
-        const fileBrowser = document.getElementById('fileBrowser');
-        if (workspace) {
-            workspace.classList.toggle('admin-panel-visible', this.adminPanelVisible);
-        }
-        if (this.adminPanelVisible) {
-            if (adminDashboard) adminDashboard.style.display = 'flex';
-            if (terminalContainer) terminalContainer.style.display = 'none';
-            if (fileBrowser) fileBrowser.style.display = 'none';
-        } else {
-            if (adminDashboard) adminDashboard.style.display = '';
-            if (terminalContainer) {
-                terminalContainer.style.display = this.terminalVisible ? 'flex' : 'none';
-            }
-            if (fileBrowser) {
-                fileBrowser.style.display = this.terminalVisible ? 'none' : 'flex';
-            }
-            if (this.terminalVisible && this.shouldUseXtermForTab(this.activeTabId)) {
-                this.ensureXtermForTab(this.activeTabId);
-                this.fitActiveXterm();
-            }
-        }
-        const adminPanelBtn = document.getElementById('adminPanelBtn');
-        if (adminPanelBtn) {
-            const label = adminPanelBtn.querySelector('.btn-label');
-            if (label) {
-                label.textContent = this.adminPanelVisible ? 'Hide panel' : 'Admin panel';
-            }
-            adminPanelBtn.setAttribute('aria-pressed', this.adminPanelVisible ? 'true' : 'false');
-        }
-        if (this.adminPanelVisible) {
-            this.refreshAdminDashboard();
-        }
-    }
-
-    toggleAdminPanel() {
-        if (this.appMode === 'individual') {
-            this.showWorkspaceHome();
-            return;
-        }
-        this.setAdminPanelVisible(!this.adminPanelVisible);
     }
 
     applyAppMode() {
@@ -905,6 +863,16 @@ class HybridCipherApp {
         const searchInput = document.getElementById('globalSearch');
         const protectionLabel = document.getElementById('sidebarCoverageCenterLabel');
         const uiModel = buildAppModeUiModelValue(this.appMode);
+        const teamAvailable = this.teamLicenseStatus?.workspace === 'team';
+        const selector = document.getElementById('workspaceSelector');
+        const badge = document.getElementById('workspaceLicenseBadge');
+        selector?.classList.toggle('hidden', !teamAvailable);
+        if (selector) selector.value = this.activeWorkspaceType;
+        if (badge) {
+            const readOnly = teamAvailable && !this.teamLicenseStatus.can_write;
+            badge.textContent = readOnly ? 'Team read-only' : '';
+            badge.classList.toggle('hidden', !readOnly);
+        }
 
         if (appContainer) {
             appContainer.setAttribute('data-app-mode', this.appMode);
@@ -927,6 +895,21 @@ class HybridCipherApp {
                 adminPanelBtn.tabIndex = -1;
             }
             sidebarSwitchGroupBtn?.classList.add('hidden');
+        } else {
+            adminPanelBtn?.classList.remove('hidden');
+            adminPanelBtn?.setAttribute('aria-hidden', 'false');
+            if (adminPanelBtn) adminPanelBtn.tabIndex = 0;
+            sidebarSwitchGroupBtn?.classList.remove('hidden');
+        }
+        appContainer?.setAttribute('data-team-can-write', String(Boolean(this.teamLicenseStatus?.can_write)));
+        if (this.appMode === 'team') {
+            const writable = Boolean(this.teamLicenseStatus?.can_write);
+            const online = Boolean(this.teamLicenseStatus?.online);
+            document.getElementById('adminCreateGroupBtn')?.toggleAttribute('disabled', !writable);
+            for (const id of ['adminAddMemberBtn', 'adminRemoveMemberBtn', 'adminRekeyStartBtn',
+                'adminRekeyMigrationBtn', 'adminRekeyCutoverBtn', 'adminRekeyFallbackBtn']) {
+                document.getElementById(id)?.toggleAttribute('disabled', !writable || !online);
+            }
         }
     }
 
@@ -1219,9 +1202,11 @@ class HybridCipherApp {
         suppressErrorNotification = false,
         retryAfterSessionRefresh = true,
     } = {}) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         if (!this.isLoggedIn) return;
         try {
             let result = await invoke('get_individual_home_status');
+            if (!isCurrentRead()) return;
             if (!result?.success || !result.data) {
                 throw new Error(result?.error || 'Workspace status unavailable');
             }
@@ -1243,11 +1228,13 @@ class HybridCipherApp {
                     forceRefresh: true,
                     staleMessage: 'Session expired. Please login again.',
                 });
+                if (!isCurrentRead()) return;
                 if (!sessionInfo || !this.isLoggedIn) {
                     return;
                 }
 
                 const retryResult = await invoke('get_individual_home_status');
+                if (!isCurrentRead()) return;
                 if (retryResult?.success && retryResult.data) {
                     result = retryResult;
                 }
@@ -1256,6 +1243,7 @@ class HybridCipherApp {
             this.homeStatusSnapshot = result.data;
             this.updateWorkspaceHomeSummary();
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to refresh workspace home status:', error);
             if (!suppressErrorNotification) {
                 this.showNotification('Failed to refresh workspace status.', 'warning');
@@ -1275,6 +1263,7 @@ class HybridCipherApp {
     }
 
     async refreshCoverageCenter({ suppressLoadingState = false } = {}) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         if (!this.isLoggedIn) return;
         if (!suppressLoadingState) {
             this.coverageCenterState.loading = true;
@@ -1284,6 +1273,7 @@ class HybridCipherApp {
 
         try {
             const result = await invoke('get_coverage_center_snapshot');
+            if (!isCurrentRead()) return;
             if (!result?.success || !result.data) {
                 throw new Error(result?.error || 'Coverage snapshot unavailable');
             }
@@ -1291,6 +1281,7 @@ class HybridCipherApp {
             this.coverageCenterState.loading = false;
             this.coverageCenterState.error = null;
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to refresh coverage center:', error);
             this.coverageCenterState.loading = false;
             this.coverageCenterState.error = error?.message || 'Coverage snapshot unavailable';
@@ -1438,7 +1429,7 @@ class HybridCipherApp {
                                     <article class="coverage-folder-row ${folder.needsAttention ? 'needs-attention' : 'is-safe'}">
                                         <div class="coverage-folder-row-main">
                                             <div class="coverage-folder-row-title">${this.escapeHtml(folder.name)}</div>
-                                            <div class="coverage-folder-row-path">${this.escapeHtml(folder.path)}</div>
+                                            <div class="coverage-folder-row-path">${this.escapeHtml(displayEnrolledPathValue(folder.path))}</div>
                                             <div class="coverage-folder-row-meta">
                                                 <span>${this.escapeHtml(folder.coverageLabel)}</span>
                                                 <span>${this.escapeHtml(folder.attentionLabel)}</span>
@@ -1467,10 +1458,10 @@ class HybridCipherApp {
                 <div class="workspace-home-panel coverage-center-advanced">
                     <div class="workspace-home-panel-header">
                         <h3>Advanced coverage tools</h3>
-                        <p>Proof audit, verify, and recovery commands still live in the embedded terminal for now.</p>
+                        <p>Audit protection proofs and review verification results here.</p>
                     </div>
                     <div class="coverage-center-actions">
-                        <button class="btn btn-secondary" type="button" data-coverage-action="open-terminal">Open terminal</button>
+                        <button class="btn btn-secondary" type="button" data-coverage-action="audit-proofs">Audit proofs</button>
                     </div>
                 </div>
             </div>
@@ -1493,8 +1484,8 @@ class HybridCipherApp {
                     case 'review-folder':
                         await this.handleCoverageFixAction(folderPath, 'review-folder-coverage');
                         break;
-                    case 'open-terminal':
-                        this.showTerminalView();
+                    case 'audit-proofs':
+                        await this.runSettingsCliCommand('hybridcipher coverage audit --verify-proofs', { closeSettingsModal: false, title: 'Audit protection proofs' });
                         break;
                     case 'add-folder':
                         await this.addEnrolledFolder();
@@ -1928,6 +1919,34 @@ class HybridCipherApp {
         `;
     }
 
+    renderLegacyFileNotice(compatibility) {
+        if (!compatibility) return '';
+        const legacyCount = Math.max(0, Number(compatibility.legacy_file_count) || 0);
+        const consentRequired = !compatibility.enabled && compatibility.last_read_error === 'legacy_consent_required';
+        if (legacyCount === 0 && !consentRequired) return '';
+
+        const countLabel = legacyCount === 1 ? '1 older encrypted file' : `${this.formatCount(legacyCount)} older encrypted files`;
+        const title = legacyCount > 0 ? countLabel : 'An older encrypted file needs access';
+        const summary = compatibility.enabled
+            ? 'Access enabled. Edits save in the current format.'
+            : 'Review the older file format before opening these files.';
+        return `
+            <section class="folder-legacy-notice" aria-label="Older encrypted files">
+                <div class="folder-legacy-notice-main">
+                    <div>
+                        <h4>${this.escapeHtml(title)}</h4>
+                        <p>${summary}</p>
+                    </div>
+                    ${!compatibility.enabled ? '<button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="enable-legacy-compatibility">Review access to older files</button>' : ''}
+                </div>
+                <details class="folder-legacy-notice-details">
+                    <summary>Details</summary>
+                    <p>Older files verify their key and available chunks, but their format cannot prove every original chunk is present. Opening a file leaves its encrypted original unchanged. Saving an edit keeps an encrypted original and writes the current format.</p>
+                    ${compatibility.encrypted_backup_directory ? `<p>Encrypted originals are kept in <code>${this.escapeHtml(compatibility.encrypted_backup_directory)}</code></p>` : ''}
+                </details>
+            </section>`;
+    }
+
     renderFolderDetailView(folder = this.selectedFolder) {
         const container = document.getElementById('folderDetailContent');
         if (!container) return;
@@ -1956,22 +1975,28 @@ class HybridCipherApp {
         }
 
         const isMounted = this.isFolderMounted(folder);
+        const isUnmounting = this.unmountingRootIds.has(String(folder.root_id || ''));
         const mountInfo = folder?.root_id ? this.getMountDetailsForRootId(folder.root_id) : null;
+        const mountDegraded = mountInfo?.availability === 'degraded';
         const coverageState = folder?.root_id ? this.getFolderCoverageReviewState(folder.root_id) : null;
         const model = buildFolderDetailModelValue({
             folder,
             mountInfo,
             isMounted,
+            isUnmounting,
             coverageReview: coverageState?.data || null,
         });
-        const healthLabel = model.healthTone === 'warning'
+        const routineReconciliation = this.isRoutineMountReconciliation(folder.root_id, mountInfo);
+        if (routineReconciliation) model.healthTone = 'safe';
+        const healthLabel = isUnmounting ? 'Unmounting…' : mountDegraded ? 'Cloud Files needs attention' : model.healthTone === 'warning'
             ? 'Needs attention'
             : (model.healthTone === 'safe' ? 'Ready to use.' : 'Protected — not mounted.');
         const coverage = model.coverage || buildFolderCoverageModelValue({ folder });
-        const mountStatusLabel = model.attention?.mountStatusLabel || 'Not mounted';
-        const mountSafetyReasons = isMounted
+        const mountStatusLabel = isUnmounting ? 'Unmounting' : mountDegraded ? 'Degraded' : (model.attention?.mountStatusLabel || 'Not mounted');
+        const mountSafetyReasons = isMounted && !routineReconciliation
             ? this.getMountUnsafeReasons(mountInfo?.syncStatus || mountInfo?.sync_status || null)
             : [];
+        const showMountAttention = model.attention.safeToUnmount === false && !routineReconciliation;
         const mountSafetyIssueCount = mountSafetyReasons.reduce(
             (total, reason) => total + Math.max(1, Number(reason?.count || 0)),
             0
@@ -1983,20 +2008,19 @@ class HybridCipherApp {
         const operationsStatus = mountInfo?.syncStatus || mountInfo?.sync_status || {};
 
         container.innerHTML = `
-            <div class="folder-detail-shell tone-${this.escapeHtmlAttr(model.healthTone || 'idle')}">
-                ${compatibility && (compatibility.legacy_file_count > 0 || compatibility.enabled) ? `
-                    <section class="folder-mount-safety-reason tone-${compatibility.enabled ? 'safe' : 'warning'}">
-                        <h4>${compatibility.enabled ? 'Access to older files enabled' : 'This folder contains older encrypted files'}</h4>
-                        <p>${compatibility.enabled ? 'You can open and edit older files. Saving an edit creates the current format and retains the encrypted original.' : 'Older files authenticate their key and available chunks, but cannot prove that every original chunk is present. Review this limitation to enable access for this folder on this device.'}</p>
-                        ${!compatibility.enabled ? '<button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="enable-legacy-compatibility">Review access to older files</button>' : ''}
-                        <p>Encrypted originals: <code>${this.escapeHtml(compatibility.encrypted_backup_directory || '')}</code></p>
+            <div class="folder-detail-shell tone-${this.escapeHtmlAttr(mountDegraded ? 'warning' : (model.healthTone || 'idle'))}">
+                ${mountDegraded ? `
+                    <section class="folder-mount-safety-reason tone-warning" role="alert">
+                        <h4>Cloud Files cannot serve this folder safely</h4>
+                        <p>The mount remains registered. Review the provider error before retrying or stopping it.</p>
+                        <details><summary>Provider diagnostics</summary><pre>${this.escapeHtml(JSON.stringify(mountInfo.operationalHealth || {}, null, 2))}</pre></details>
                     </section>` : ''}
                 ${compatibility?.last_read_error === 'integrity_failure' ? '<section class="folder-mount-safety-reason tone-warning" role="alert"><h4>A file failed integrity verification</h4><p>Its encrypted contents or layout could not be verified. Preserve the original and restore a verified recovery copy before retrying. Access to older files does not bypass integrity checks. Other files remain available.</p></section>' : ''}
                 <div class="folder-detail-header">
                     <div>
                         <span class="workspace-section-eyebrow">Protected folder</span>
                         <h2>${this.escapeHtml(model.displayName || this.basename(model.path || 'Protected folder'))}</h2>
-                        <p class="folder-detail-path">${this.escapeHtml(model.path || 'Path unavailable')}</p>
+                        <p class="folder-detail-path">${this.escapeHtml(displayEnrolledPathValue(model.path) || 'Path unavailable')}</p>
                     </div>
                     <div class="folder-detail-health">
                         <span class="folder-detail-health-label">${this.escapeHtml(healthLabel)}</span>
@@ -2019,7 +2043,7 @@ class HybridCipherApp {
                             ${model.secondaryActions.map(action => `
                                 ${action.destructive ? '<div class="folder-detail-menu-divider" role="separator"></div>' : ''}
                                 <button class="folder-detail-menu-item ${action.destructive ? 'destructive' : ''}" type="button"
-                                    role="menuitem" data-folder-detail-action="${this.escapeHtmlAttr(action.id)}">
+                                    role="menuitem" data-folder-detail-action="${this.escapeHtmlAttr(action.id)}" ${action.disabled ? 'disabled' : ''}>
                                     ${action.id === 'reveal-protected' ? `
                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                                             <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 7a2 2 0 012-2h5l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
@@ -2035,26 +2059,29 @@ class HybridCipherApp {
                         </div>
                     </div>
                 </div>
-                ${model.isMounted ? `
-                    <section class="folder-mount-session tone-${model.attention.safeToUnmount === false ? 'warning' : 'safe'}">
+                ${this.renderLegacyFileNotice(compatibility)}
+                ${model.isMounted || isUnmounting ? `
+                    <section class="folder-mount-session tone-${showMountAttention ? 'warning' : 'safe'}">
                         <div class="folder-mount-session-summary">
                             <div class="folder-mount-session-heading">
                                 <span class="folder-detail-attention-label">Mount session</span>
-                                <strong>${model.attention.safeToUnmount === null
-                                    ? 'Checking unmount safety…'
-                                    : (model.attention.safeToUnmount ? 'Safe to unmount' : 'Attention required before unmounting')}</strong>
+                                <strong aria-live="polite">${isUnmounting
+                                    ? '<span class="unmounting-status"><span class="spinner-small" aria-hidden="true"></span>Unmounting…</span>'
+                                    : model.attention.safeToUnmount === null
+                                    ? 'Checking mount status…'
+                                    : (showMountAttention ? 'Attention required before unmounting' : 'Mounted')}</strong>
                             </div>
                             <div class="folder-mount-session-details">
-                                <span>${model.attention.safeToUnmount === null
+                                <span>${isUnmounting ? 'Finishing pending work and stopping this mount…' : model.attention.safeToUnmount === null
                                     ? 'Checking pending changes…'
-                                    : (model.attention.safeToUnmount
-                                        ? 'No pending changes'
-                                        : (mountSafetyIssueCount > 0
+                                    : (showMountAttention
+                                        ? (mountSafetyIssueCount > 0
                                             ? this.escapeHtml(operationsStatus.pending_operation_count > 0 ? this.pendingOperationLabel(operationsStatus) : `${this.formatCount(mountSafetyIssueCount)} affected ${mountSafetyIssueCount === 1 ? 'item' : 'items'}`)
-                                            : 'Resolve the reported folder issues first'))}</span>
+                                            : 'Resolve the reported folder issues first')
+                                        : 'Unmount checks the current sync status')}</span>
                                 ${model.mountpoint ? `<span class="folder-mount-session-path">${this.escapeHtml(model.mountpoint)}</span>` : ''}
                                 ${model.backendLabel ? `<span class="folder-mount-session-backend">Connection: ${this.escapeHtml(model.backendLabel)}</span>` : ''}
-                                ${model.attention.safeToUnmount === false && mountSafetyReasons.length > 0 ? `
+                                ${showMountAttention && mountSafetyReasons.length > 0 ? `
                                     <button class="btn btn-secondary btn-small folder-mount-review-button" type="button"
                                         data-folder-detail-action="toggle-mount-safety-details"
                                         aria-expanded="${mountSafetyDetailsOpen ? 'true' : 'false'}"
@@ -2077,7 +2104,7 @@ class HybridCipherApp {
                                     </button>
                                 </div>
                                 <div class="folder-mount-safety-list">
-                                    ${mountSafetyReasons.map(reason => this.renderMountSafetyReasonCard(reason)).join('')}
+                                    ${mountSafetyReasons.map(reason => this.renderMountSafetyReasonCard(reason, mountInfo?.backend)).join('')}
                                 </div>
                                 <p class="folder-mount-safety-footnote">Avoid force unmount unless you have preserved any local changes you still need.</p>
                             </div>
@@ -2087,7 +2114,7 @@ class HybridCipherApp {
                 <div class="folder-detail-stats">
                     <div class="folder-detail-stat">
                         <span class="folder-detail-stat-label">Mount status</span>
-                        <span class="folder-detail-stat-value">${this.escapeHtml(mountStatusLabel)}</span>
+                        <span class="folder-detail-stat-value" aria-live="polite">${isUnmounting ? '<span class="unmounting-status"><span class="spinner-small" aria-hidden="true"></span>Unmounting</span>' : this.escapeHtml(mountStatusLabel)}</span>
                     </div>
                     <div class="folder-detail-stat">
                         <span class="folder-detail-stat-label">Last scan</span>
@@ -2220,11 +2247,14 @@ class HybridCipherApp {
                     break;
                 }
                 case 'retry-pending-rename':
-                case 'keep-original-name': {
-                    const response = await invoke('resolve_pending_operation', { rootId: folder.root_id, operationId: dataset.operationId, action: action === 'retry-pending-rename' ? 'retry_rename' : 'keep_original_name' });
+                case 'keep-original-name':
+                case 'keep-renamed-file': {
+                    if (action === 'keep-renamed-file' && !await this.showConfirmDialog('Keep the current renamed file?', 'Use this when the original was removed and the renamed file is the version you want to keep. The app will verify that it is encrypted and has no pending edits, then dismiss only this rename request. No file contents will be deleted or overwritten.')) return;
+                    const resolutions = { 'retry-pending-rename': 'retry_rename', 'keep-original-name': 'keep_original_name', 'keep-renamed-file': 'keep_renamed_file' };
+                    const response = await invoke('resolve_pending_operation', { rootId: folder.root_id, operationId: dataset.operationId, action: resolutions[action] });
                     if (!response?.success) throw new Error(response?.error || 'The operation could not be resolved');
                     await this.refreshActiveMounts({ renderFolderList: true, suppressRecoveryPrompt: true });
-                    this.showNotification(action === 'keep-original-name' ? 'Original name kept. File contents were preserved.' : 'Rename completed.', 'success');
+                    this.showNotification(action === 'keep-renamed-file' ? 'Renamed file kept. The stale rename request was cleared.' : action === 'keep-original-name' ? 'Original name kept. File contents were preserved.' : 'Rename completed.', 'success');
                     break;
                 }
                 case 'mount':
@@ -2292,7 +2322,7 @@ class HybridCipherApp {
             }
         } catch (error) {
             console.error('Folder detail action failed:', error);
-            this.showNotification(error?.message || 'Folder action failed.', 'error');
+            this.showNotification(uiUtils.actionErrorMessage(error), 'error');
         }
     }
 
@@ -2303,9 +2333,11 @@ class HybridCipherApp {
     }
 
     async refreshPersonalDevicesOverview({ suppressErrorNotification = false } = {}) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         if (!this.isLoggedIn) return;
         try {
             const result = await invoke('get_personal_devices_overview');
+            if (!isCurrentRead()) return;
             if (!result?.success || !result.data) {
                 throw new Error(result?.error || 'Devices overview unavailable');
             }
@@ -2313,15 +2345,45 @@ class HybridCipherApp {
             this.renderDevicesCenter();
             this.refreshWorkspaceHomeStatus({ suppressErrorNotification: true });
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to refresh personal devices overview:', error);
             if (!suppressErrorNotification) {
                 this.showNotification('Failed to load device status.', 'warning');
             }
             const container = document.getElementById('devicesCenterContent');
             if (container) {
-                container.innerHTML = '<div class="workspace-empty-state"><h3>Device status unavailable</h3><p>HybridCipher could not load trusted devices right now.</p></div>';
+                container.innerHTML = `
+                    <div class="workspace-empty-state"><h3>Device status unavailable</h3><p>HybridCipher could not load trusted devices right now.</p></div>
+                    <section class="devices-current-card">
+                        <span class="workspace-section-eyebrow">This device</span>
+                        ${this.renderCurrentDeviceFingerprintControls()}
+                    </section>
+                `;
+                this.bindCurrentDeviceFingerprintControls(container);
             }
         }
+    }
+
+    renderCurrentDeviceFingerprintControls() {
+        if (!this.currentDeviceId) return '';
+        return `
+            <div class="device-fingerprint-controls">
+                <button class="btn btn-secondary btn-small" type="button" id="showCurrentDeviceFingerprintBtn">Show fingerprint</button>
+                <div class="device-fingerprint-panel" id="currentDeviceFingerprintPanel" hidden>
+                    <span class="device-fingerprint-label">This device's fingerprint</span>
+                    <div class="device-fingerprint-value-row">
+                        <code id="currentDeviceFingerprintValue"></code>
+                        <button class="btn btn-secondary btn-small" type="button" id="copyCurrentDeviceFingerprintBtn">Copy</button>
+                    </div>
+                    <p>Read this value to someone verifying this device. Compare all 16 characters on their trusted device.</p>
+                </div>
+            </div>
+        `;
+    }
+
+    bindCurrentDeviceFingerprintControls(container) {
+        container.querySelector('#showCurrentDeviceFingerprintBtn')?.addEventListener('click', () => this.toggleCurrentDeviceFingerprint());
+        container.querySelector('#copyCurrentDeviceFingerprintBtn')?.addEventListener('click', () => this.copyCurrentDeviceFingerprint());
     }
 
     formatDeviceStatusLabel(status) {
@@ -2401,6 +2463,7 @@ class HybridCipherApp {
                             ${model.currentDevice.last_seen ? `<span>Last seen: ${this.escapeHtml(this.formatSettingsTimestamp(model.currentDevice.last_seen))}</span>` : ''}
                         </div>
                     ` : ''}
+                    ${this.renderCurrentDeviceFingerprintControls()}
                 </section>
 
                 <section class="devices-group">
@@ -2446,6 +2509,59 @@ class HybridCipherApp {
             const device = devices.find(entry => entry?.device_id === deviceId);
             button.addEventListener('click', () => this.handleDevicesAction(button.dataset.devicesAction, device));
         });
+        this.bindCurrentDeviceFingerprintControls(container);
+    }
+
+    async toggleCurrentDeviceFingerprint() {
+        const panel = document.getElementById('currentDeviceFingerprintPanel');
+        const button = document.getElementById('showCurrentDeviceFingerprintBtn');
+        const value = document.getElementById('currentDeviceFingerprintValue');
+        if (!panel || !button || !value) return;
+        if (!panel.hidden) {
+            panel.hidden = true;
+            value.textContent = '';
+            button.textContent = 'Show fingerprint';
+            return;
+        }
+
+        button.disabled = true;
+        try {
+            const result = await invoke('get_current_device_fingerprint');
+            if (!result?.success || !result.data) {
+                throw new Error(result?.error || 'Device fingerprint is unavailable.');
+            }
+            if (result.data.device_id !== this.currentDeviceId) {
+                throw new Error('The device identity changed. Refresh Devices and try again.');
+            }
+            const fingerprint = normalizeDeviceFingerprintValue(result.data.fingerprint);
+            if (!fingerprint) {
+                throw new Error('The device fingerprint has an invalid format.');
+            }
+            // The Devices view may have been redrawn while the command was running.
+            if (document.getElementById('currentDeviceFingerprintPanel') !== panel) return;
+            value.textContent = fingerprint;
+            panel.hidden = false;
+            button.textContent = 'Hide fingerprint';
+        } catch (error) {
+            console.error('Failed to show device fingerprint:', error);
+            this.showNotification(
+                (typeof error === 'string' ? error : error?.message) || 'Device fingerprint is unavailable.',
+                'error'
+            );
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async copyCurrentDeviceFingerprint() {
+        const fingerprint = document.getElementById('currentDeviceFingerprintValue')?.textContent || '';
+        if (!normalizeDeviceFingerprintValue(fingerprint)) return;
+        try {
+            await navigator.clipboard.writeText(fingerprint);
+            this.showNotification('Device fingerprint copied.', 'success');
+        } catch (error) {
+            this.showNotification('Could not copy the fingerprint. Select the displayed value instead.', 'error');
+        }
     }
 
     async handleDevicesAction(action, device) {
@@ -2794,8 +2910,7 @@ class HybridCipherApp {
             input.value = '';
         }
 
-        await this.createTerminalTab();
-        await this.executeCommandDirectly(`hybridcipher ${command} -h`);
+        await this.runSettingsCliCommand(`hybridcipher ${command} -h`, { closeSettingsModal: false });
     }
 
     getRecentCommandEntries() {
@@ -3433,7 +3548,7 @@ class HybridCipherApp {
 
     async declineLegalAgreement() {
         try {
-            await invoke('exit_application');
+            this.checkedCommandResult(await invoke('exit_application'), 'Quit');
         } catch (error) {
             console.error('Failed to exit after declining legal agreement:', error);
             this.showNotification('Unable to close the app automatically. Please quit the app manually.', 'error');
@@ -3502,12 +3617,8 @@ class HybridCipherApp {
         // Header actions
         const globalSearch = document.getElementById('globalSearch');
         globalSearch?.addEventListener('input', (e) => this.handleGlobalSearch(e));
-        globalSearch?.addEventListener('focus', () => {
-            if (this.appMode !== 'individual') this.renderCommandPalette(globalSearch.value);
-        });
         globalSearch?.addEventListener('click', (e) => {
             e.stopPropagation(); // Prevent document click handler from closing the palette
-            if (this.appMode !== 'individual') this.renderCommandPalette(globalSearch.value);
         });
         globalSearch?.addEventListener('keydown', (e) => this.handleCommandPaletteKeydown(e));
         document.getElementById('settingsBtn')?.addEventListener('click', () => this.openSettingsModal());
@@ -3535,12 +3646,9 @@ class HybridCipherApp {
         document.getElementById('sidebarHomeBtn')?.addEventListener('click', () => {
             this.showWorkspaceHome();
         });
-        document.getElementById('sidebarTerminalBtn')?.addEventListener('click', () => {
-            this.showTerminalView();
-        });
+        document.getElementById('sidebarFilesBtn')?.addEventListener('click', () => this.showFileBrowserView());
         document.getElementById('homeAddFolderBtn')?.addEventListener('click', () => this.addEnrolledFolder());
         document.getElementById('homeOpenDevicesBtn')?.addEventListener('click', () => this.showDevicesView());
-        document.getElementById('homeOpenTerminalBtn')?.addEventListener('click', () => this.showTerminalView());
         document.getElementById('homeRunCoverageScanBtn')?.addEventListener('click', () => {
             this.showCoverageView({ autoStartScan: true });
         });
@@ -3735,9 +3843,15 @@ class HybridCipherApp {
             button.addEventListener('click', () => this.setAdminPanelVisible(false));
         });
         document.getElementById('settingsLogoutBtn')?.addEventListener('click', async () => {
-            await this.runSettingsCliCommand('hybridcipher logout');
             await this.logout();
         });
+        document.getElementById('workspaceSelector')?.addEventListener('change', event => {
+            this.selectWorkspaceType(event.target.value);
+        });
+        document.getElementById('teamActivateBtn')?.addEventListener('click', () => this.activateTeamFromSettings());
+        document.getElementById('teamAcceptInvitationBtn')?.addEventListener('click', () => this.acceptTeamInvitationFromSettings());
+        document.getElementById('teamInviteBtn')?.addEventListener('click', () => this.inviteTeamMemberFromSettings());
+        document.getElementById('teamExportExistingBtn')?.addEventListener('click', () => this.exportExistingTeamFile());
         document.getElementById('settingsQuitAppBtn')?.addEventListener('click', async () => {
             this.closeSettingsModal();
             await this.handleQuitRequested();
@@ -3871,34 +3985,14 @@ class HybridCipherApp {
         document.getElementById('adminServerStatusRefreshBtn')?.addEventListener('click', () => {
             this.refreshAdminServerStatusSummary();
         });
-        document.getElementById('adminAddMemberBtn')?.addEventListener('click', async () => {
-            const member = await this.promptForText(
-                'Enter member email or user ID to invite.',
-                { title: 'Add member', placeholder: 'email or UUID', submitLabel: 'Invite' }
-            );
-            if (member === null) return;
-            const command = `hybridcipher add-member ${this.quoteCliArg(member)}`;
-            this.runDashboardCliCommand(command);
-        });
+        document.getElementById('adminAddMemberBtn')?.addEventListener('click', () => this.openAddGroupMemberDialog());
         document.getElementById('adminRemoveMemberBtn')?.addEventListener('click', async () => {
             this.openRemoveMemberModal();
         });
         document.getElementById('adminListMembersBtn')?.addEventListener('click', async () => {
             this.openListMembersModal();
         });
-        document.getElementById('adminVerifyMembershipBtn')?.addEventListener('click', async () => {
-            const userId = await this.promptForText(
-                'Optional: enter a user email or UUID to verify. Leave blank to verify your own membership.',
-                { allowEmpty: true, title: 'Verify membership', placeholder: 'email or UUID (optional)' }
-            );
-            if (userId === null) return;
-            const trimmedUser = userId.trim();
-            let command = 'hybridcipher verify-membership';
-            if (trimmedUser) {
-                command += ` --user ${this.quoteCliArg(trimmedUser)}`;
-            }
-            this.runDashboardCliCommand(command);
-        });
+        document.getElementById('adminVerifyMembershipBtn')?.addEventListener('click', () => this.verifyMembershipWithDialog());
         document.getElementById('adminProcessWelcomesBtn')?.addEventListener('click', () => {
             this.runDashboardCliCommand('hybridcipher process-welcome-messages');
         });
@@ -3911,28 +4005,14 @@ class HybridCipherApp {
         document.getElementById('adminCoverageFullAuditBtn')?.addEventListener('click', () => {
             this.runDashboardCliCommand('hybridcipher coverage audit --verify-proofs --verify-all-proofs');
         });
-        document.getElementById('adminCoverageVerifyBtn')?.addEventListener('click', async () => {
-            const fileId = await this.promptForText(
-                'Enter the file ID to verify coverage proof.',
-                { title: 'Coverage verify', placeholder: 'file ID', submitLabel: 'Verify' }
-            );
-            if (fileId === null) return;
-            const trimmed = fileId.trim();
-            if (!trimmed) {
-                this.showNotification('File ID is required for coverage verification.', 'warning');
-                return;
-            }
-            this.runDashboardCliCommand(`hybridcipher coverage verify ${this.quoteCliArg(trimmed)}`);
-        });
+        document.getElementById('adminCoverageVerifyBtn')?.addEventListener('click', () => this.verifyCoverageWithDialog());
         document.getElementById('adminCoverageEnrolledListBtn')?.addEventListener('click', () => {
             this.openAdminEnrolledListModal();
         });
         document.getElementById('adminEnrollFolderBtn')?.addEventListener('click', () => {
             this.addEnrolledFolder();
         });
-        document.getElementById('adminPendingDevicesBtn')?.addEventListener('click', () => {
-            this.runDashboardCliCommand('hybridcipher pending-devices');
-        });
+        document.getElementById('adminPendingDevicesBtn')?.addEventListener('click', () => this.showDevicesView());
         document.getElementById('adminIssueWelcomeQueue')?.addEventListener('click', () => {
             this.showIssueWelcomeQueue();
         });
@@ -3974,23 +4054,7 @@ class HybridCipherApp {
             );
             if (confirmed !== true) return;
 
-            try {
-                await this.getCliBinaryPath();
-            } catch (error) {
-                this.showNotification(
-                    'Failed to locate hybridcipher CLI. Please build it with "cargo build --release --bin hybridcipher"',
-                    'error'
-                );
-                return;
-            }
-
-            this.setAdminPanelVisible(false);
-            await this.createTerminalTab();
-            await this.executeCommandDirectly(
-                'hybridcipher coverage migrate --all --yes',
-                true,
-                { returnSessionId: true }
-            );
+            await this.runDashboardCliCommand('hybridcipher coverage migrate --all --yes', { title: 'Migrate protected files' });
         });
         document.getElementById('adminRekeyCutoverBtn')?.addEventListener('click', () => {
             this.runDashboardCliCommand(
@@ -4078,14 +4142,20 @@ class HybridCipherApp {
         document.getElementById('closeDeviceVerifyModalBtn')?.addEventListener('click', () => this.closeDeviceVerifyModal());
         document.getElementById('cancelDeviceVerifyBtn')?.addEventListener('click', () => this.closeDeviceVerifyModal());
         document.getElementById('deviceVerifyBackdrop')?.addEventListener('click', () => this.closeDeviceVerifyModal());
-        document.getElementById('deviceVerifyFingerprintInput')?.addEventListener('input', () => this.updateDeviceVerifySubmitState());
+        document.getElementById('deviceVerifyFingerprintInput')?.addEventListener('input', (event) => {
+            this.formatFingerprintField(event.target);
+            this.updateDeviceVerifySubmitState();
+        });
         document.getElementById('deviceVerifyForm')?.addEventListener('submit', (event) => this.handleDeviceVerifySubmit(event));
         document.getElementById('closeAdminPinVerifyModalBtn')?.addEventListener('click', () => this.closeAdminPinVerifyModal());
         document.getElementById('cancelAdminPinVerifyBtn')?.addEventListener('click', () => this.closeAdminPinVerifyModal());
         document.getElementById('adminPinVerifyBackdrop')?.addEventListener('click', () => this.closeAdminPinVerifyModal());
         document.getElementById('adminPinVerifyMemberSelect')?.addEventListener('change', () => this.handleAdminPinVerifyMemberChange());
         document.getElementById('adminPinVerifyDeviceSelect')?.addEventListener('change', () => this.updateAdminPinVerifySubmitState());
-        document.getElementById('adminPinVerifyFingerprintInput')?.addEventListener('input', () => this.updateAdminPinVerifySubmitState());
+        document.getElementById('adminPinVerifyFingerprintInput')?.addEventListener('input', (event) => {
+            this.formatFingerprintField(event.target);
+            this.updateAdminPinVerifySubmitState();
+        });
         document.getElementById('adminPinVerifyForm')?.addEventListener('submit', (event) => this.handleAdminPinVerifySubmit(event));
         document.getElementById('closeAdminEnrolledListModalBtn')?.addEventListener('click', () => this.closeAdminEnrolledListModal());
         document.getElementById('cancelAdminEnrolledListBtn')?.addEventListener('click', () => this.closeAdminEnrolledListModal());
@@ -4175,6 +4245,7 @@ class HybridCipherApp {
             if (sessionInfo) {
                 this.currentUser = sessionInfo.email;
                 this.currentDeviceId = sessionInfo.device_id || null;
+                this.sessionPersistent = sessionInfo.persistent !== false;
                 this.updateUserStatus(sessionInfo.email, true);
                 await this.showMainApp({ skipLoadEnrolledFolders: true });
                 this.showNotification(`Welcome back, ${sessionInfo.email}!`, 'success');
@@ -4185,11 +4256,11 @@ class HybridCipherApp {
                     console.error('Auto-mount on restored session failed:', error);
                 });
             } else {
-                this.showWelcomeScreen();
+                if (!this.isLoggedIn) this.showWelcomeScreen();
             }
         } catch (error) {
             console.error('Session check failed:', error);
-            this.showWelcomeScreen();
+            if (!this.isLoggedIn) this.showWelcomeScreen();
         }
     }
 
@@ -4239,6 +4310,9 @@ class HybridCipherApp {
                 return null;
             }
             this.lastHealthCheckTime = Date.now();
+            this.refreshTeamLicenseStatus({ silent: true }).catch(error => {
+                console.warn('Team license check failed:', error);
+            });
             if (sessionInfo.refreshed && refreshWorkspaceOnRenewal && this.isLoggedIn) {
                 await this.refreshWorkspaceHomeStatus({
                     suppressErrorNotification: true,
@@ -4290,6 +4364,13 @@ class HybridCipherApp {
             return null;
         }
 
+        if (sessionInfo?.status === 'offline') {
+            this.currentUser = sessionInfo.email || this.currentUser;
+            this.currentDeviceId = sessionInfo.device_id || this.currentDeviceId || null;
+            this.sessionPersistent = sessionInfo.persistent !== false;
+            return sessionInfo;
+        }
+
         if (!sessionInfo || sessionInfo.status !== 'active') {
             if (this.isLoggedIn) {
                 await this.handleStaleSession(staleMessage);
@@ -4297,7 +4378,7 @@ class HybridCipherApp {
             return null;
         }
 
-        if (verifyCli) {
+        if (verifyCli && sessionInfo.persistent !== false) {
             const cliSessionOk = await this.verifyCliSession();
             if (!cliSessionOk) {
                 // CLI session rejected (likely server-side idle timeout).
@@ -4309,6 +4390,7 @@ class HybridCipherApp {
                         if (retryOk) {
                             this.currentUser = retryInfo.email || this.currentUser;
                             this.currentDeviceId = retryInfo.device_id || this.currentDeviceId || null;
+                            this.sessionPersistent = retryInfo.persistent !== false;
                             return retryInfo;
                         }
                     }
@@ -4324,23 +4406,28 @@ class HybridCipherApp {
 
         this.currentUser = sessionInfo.email || this.currentUser;
         this.currentDeviceId = sessionInfo.device_id || this.currentDeviceId || null;
+        this.sessionPersistent = sessionInfo.persistent !== false;
         return sessionInfo;
     }
 
     async handleStaleSession(message) {
         try {
-            await invoke('logout_user');
+            this.checkedCommandResult(await invoke('logout_user'), 'Logout');
         } catch (error) {
             console.error('Logout error:', error);
+            this.showNotification(`Session expired, but mounted work prevents logout: ${error}`, 'error');
+            return false;
         }
         this.currentUser = null;
         this.currentDeviceId = null;
+        this.sessionPersistent = true;
         this.enrolledFolders = [];
         this.selectedFolder = null;
         this.showWelcomeScreen();
         if (message) {
             this.showNotification(message, 'warning');
         }
+        return true;
     }
 
     async submitLoginRequest({ email, password, mfaCode = null, backupCode = null }) {
@@ -4579,6 +4666,7 @@ class HybridCipherApp {
                 }
                 this.currentUser = email;
                 this.currentDeviceId = result?.data?.device_id || null;
+                this.sessionPersistent = this.rememberMePreference;
                 this.updateUserStatus(email, true);
                 this.closeLoginModal();
                 await this.showMainApp({ skipLoadEnrolledFolders: true });
@@ -5311,18 +5399,33 @@ class HybridCipherApp {
         }
     }
 
+    checkedCommandResult(result, action) {
+        if (result?.success !== true) {
+            throw new Error(result?.error || `${action} failed`);
+        }
+        return result.data;
+    }
+
     async logout() {
         try {
-            await invoke('logout_user');
+            this.checkedCommandResult(await invoke('logout_user'), 'Logout');
+            this.closeSettingsModal();
             this.currentUser = null;
             this.currentDeviceId = null;
+            this.sessionPersistent = true;
             this.enrolledFolders = [];
             this.selectedFolder = null;
+            this.teamLicenseStatus = null;
+            this.activeWorkspaceType = 'personal';
+            this.workspaceChoiceLoaded = false;
+            this.appMode = 'individual';
             this.showWelcomeScreen();
             this.showNotification('Logged out successfully', 'info');
+            return true;
         } catch (error) {
             console.error('Logout error:', error);
-            this.showNotification('Logout failed', 'error');
+            this.showNotification(`Logout failed: ${error}`, 'error');
+            return false;
         }
     }
 
@@ -5529,6 +5632,7 @@ class HybridCipherApp {
     }
 
     async openSettingsEnrollmentModal() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const modal = document.getElementById('settingsEnrollmentModal');
         const list = document.getElementById('settingsEnrollmentModalList');
         if (!modal || !list) return;
@@ -5538,6 +5642,7 @@ class HybridCipherApp {
         list.innerHTML = '<div class="member-list-empty">Loading protected folders...</div>';
 
         const loaded = await this.loadEnrolledFolders({ suppressErrorNotification: true });
+        if (!isCurrentRead()) return;
         if (!loaded) {
             list.innerHTML = '<div class="member-list-empty">Failed to load protected folders.</div>';
             this.showNotification('Failed to load protected folders', 'error');
@@ -5578,11 +5683,11 @@ class HybridCipherApp {
             const folderName = document.createElement('div');
             folderName.className = 'member-list-email';
             const fallbackName = folder.path ? folder.path.split(/[/\\\\]/).filter(Boolean).pop() : '';
-            folderName.textContent = folder.name || fallbackName || folder.path || 'Unknown folder';
+            folderName.textContent = folder.name || fallbackName || displayEnrolledPathValue(folder.path) || 'Unknown folder';
 
             const folderPath = document.createElement('div');
             folderPath.className = 'member-list-details';
-            folderPath.textContent = folder.path || 'Path unavailable';
+            folderPath.textContent = displayEnrolledPathValue(folder.path) || 'Path unavailable';
 
             meta.appendChild(folderName);
             meta.appendChild(folderPath);
@@ -5590,7 +5695,7 @@ class HybridCipherApp {
             const action = document.createElement('button');
             action.type = 'button';
             action.className = 'btn btn-secondary btn-small';
-            action.textContent = 'Remove';
+            action.textContent = 'Unenroll';
             action.addEventListener('click', async (event) => {
                 event.stopPropagation();
                 if (action.disabled) return;
@@ -5609,77 +5714,82 @@ class HybridCipherApp {
     }
 
     async handleSettingsUnenrollFolder(folder) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         if (!folder?.root_id) {
             this.showNotification('Protected folder id is missing.', 'error');
-            return;
+            return false;
         }
 
-        let isMounted = false;
-        let mountpoint = null;
-        if (folder?.root_id) {
-            try {
-                const mountStatus = await invoke('check_mount_status_by_root_id', {
-                    rootId: folder.root_id
-                });
-                isMounted = Boolean(mountStatus?.success && mountStatus?.data);
-                mountpoint = isMounted ? mountStatus.data.mountpoint : null;
-            } catch (error) {
-                console.warn('Failed to check mount status before removal:', error);
-            }
-        }
-
-        if (isMounted) {
-            const unmountFirst = await this.showConfirmDialog(
-                'Folder is mounted',
-                `This folder is currently mounted${mountpoint ? ` at:\n${mountpoint}\n` : '.\n'}\nUnmount first and continue?`
-            );
-            if (!unmountFirst) {
-                return;
-            }
-
-            const unmounted = await this.requestFolderUnmount(folder, {
-                confirm: false,
-                suppressSuccessNotification: true,
-                suppressFailureNotification: true
-            });
-            if (!unmounted) {
-                this.showNotification('Unmount failed. Cannot proceed with removal.', 'error');
-                return;
-            }
-
-            const proceedAfterUnmount = await this.showConfirmDialog(
-                'Unmount completed',
-                `Unmount succeeded for:\n"${folder.path}"\n\nProceed with removal and decryption?`
-            );
-            if (!proceedAfterUnmount) {
-                return;
-            }
-        }
-
-        if (!isMounted) {
-            const confirmed = await this.showConfirmDialog(
-                'Remove Protected Folder',
-                `This will decrypt all files in this folder and stop protecting it:\n\n"${folder.path}"\n\nDo you want to proceed?`
-            );
-            if (!confirmed) {
-                return;
-            }
-        }
-
-        this.showActionProgressModal(`Removing protection from ${folder.path}...`);
+        let progressShown = false;
         try {
-            const response = await invoke('unenroll_folder_and_decrypt', {
-                rootId: folder.root_id
+            const outcome = await uiUtils.runFolderUnenrollFlow({
+                rootId: folder.root_id,
+                path: folder.path,
+                choose: async () => {
+                    const modal = document.getElementById('actionPromptModal');
+                    modal?.classList.add('unenroll-choice');
+                    try {
+                        return await this.showThreeWayActionPrompt(
+                            'Remove protected folder',
+                            `Choose what to do with the files in:\n"${displayEnrolledPathValue(folder.path)}"`,
+                            {
+                                detail: 'Unenrolling stops this device from protecting new files in this folder.',
+                                primaryLabel: 'Unenroll, keep files encrypted',
+                                secondaryLabel: 'Unenroll and decrypt files',
+                                tertiaryLabel: 'Cancel'
+                            }
+                        );
+                    } finally {
+                        modal?.classList.remove('unenroll-choice');
+                    }
+                },
+                confirmCloudRisk: () => this.showActionPrompt(
+                    'Plaintext may reach your cloud storage',
+                    'Decryption writes plaintext into this folder. If it is synced to a cloud service, the plaintext may be uploaded and may remain in cloud file history even if another device encrypts it later.',
+                    {
+                        primaryLabel: 'Decrypt and unenroll',
+                        secondaryLabel: 'Cancel',
+                        focusSecondary: true
+                    }
+                ),
+                checkMount: async rootId => {
+                    const status = await invoke('check_mount_status_by_root_id', { rootId });
+                    if (!isCurrentRead()) throw new Error('Workspace changed.');
+                    return uiUtils.normalizeFolderMountStatus(status);
+                },
+                confirmUnmount: mount => this.showConfirmDialog(
+                    'Folder is mounted',
+                    `This folder is currently mounted${mount?.mountpoint ? ` at:\n${mount.mountpoint}\n` : '.\n'}\nUnmount first and continue?`
+                ),
+                unmount: () => {
+                    if (!isCurrentRead()) throw new Error('Workspace changed.');
+                    return this.requestFolderUnmount(folder, {
+                        confirm: false,
+                        suppressSuccessNotification: true,
+                        suppressFailureNotification: true
+                    });
+                },
+                invokeCommand: (command, args) => {
+                    if (!isCurrentRead()) throw new Error('Workspace changed.');
+                    this.showActionProgressModal(`Removing protection from ${displayEnrolledPathValue(folder.path)}...`);
+                    progressShown = true;
+                    return invoke(command, args);
+                }
             });
-            if (!response?.success) {
-                throw new Error(response?.error || 'Folder removal failed.');
-            }
+            if (!isCurrentRead()) return false;
+            if (!outcome) return false;
             this.hideActionProgressModal();
+            progressShown = false;
             await this.loadEnrolledFolders({ suppressErrorNotification: true });
+            if (!isCurrentRead()) return false;
             this.renderSettingsEnrollmentList();
-            this.showNotification('Protected folder removed and decrypted.', 'success');
+            this.showNotification(outcome.decrypt
+                ? 'Protected folder removed and decrypted.'
+                : 'Protected folder removed. Files remain encrypted.', 'success');
+            return true;
         } catch (error) {
-            this.hideActionProgressModal();
+            if (!isCurrentRead()) return false;
+            if (progressShown) this.hideActionProgressModal();
             console.error('Failed to remove protected folder:', error);
             await this.showActionPrompt(
                 'Remove protected folder failed',
@@ -5689,11 +5799,12 @@ class HybridCipherApp {
                     secondaryLabel: null
                 }
             );
-            return;
+            return false;
         }
     }
 
     async addEnrolledFolder() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         try {
             // Use Tauri dialog to pick a folder
             const tauriGlobal = window.__TAURI__;
@@ -5707,6 +5818,7 @@ class HybridCipherApp {
                 multiple: false,
                 title: 'Select folder to enroll'
             });
+            if (!isCurrentRead()) return;
 
             if (!selected) {
                 // User cancelled
@@ -5718,6 +5830,7 @@ class HybridCipherApp {
                 'Add Protected Folder',
                 `This will add "${selected}" to your protected folders for coverage tracking and automatic encryption.\n\nProceed?`
             );
+            if (!isCurrentRead()) return;
             if (!confirmed) {
                 return;
             }
@@ -5726,14 +5839,17 @@ class HybridCipherApp {
             const response = await invoke('enroll_folder_and_hydrate', {
                 folderPath: selected
             });
+            if (!isCurrentRead()) return;
             if (!response?.success) {
                 throw new Error(response?.error || 'Folder enrollment failed.');
             }
 
             this.hideActionProgressModal();
             await this.loadEnrolledFolders({ suppressErrorNotification: true });
+            if (!isCurrentRead()) return;
             this.showNotification('Folder protected now with post-quantum encryption.', 'success');
         } catch (error) {
+            if (!isCurrentRead()) return;
             this.hideActionProgressModal();
             console.error('Failed to add folder:', error);
             await this.showActionPrompt(
@@ -5747,9 +5863,22 @@ class HybridCipherApp {
         }
     }
 
+    captureWorkspaceReadContext() {
+        const account = this.currentUser;
+        const sequence = this.workspaceSwitchSequence;
+        const generation = this.desktopAccountGeneration;
+        const loggedIn = this.isLoggedIn;
+        return () => this.currentUser === account
+            && this.workspaceSwitchSequence === sequence
+            && this.desktopAccountGeneration === generation
+            && this.isLoggedIn === loggedIn;
+    }
+
     async loadEnrolledFolders({ suppressErrorNotification = false } = {}) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         try {
             const response = await invoke('list_enrolled_folders');
+            if (!isCurrentRead()) return false;
             if (!response.success) {
                 throw new Error(response.error || 'Failed to load folders');
             }
@@ -5758,6 +5887,7 @@ class HybridCipherApp {
                 renderFolderList: false,
                 suppressErrorNotification: true
             });
+            if (!isCurrentRead()) return false;
             this.renderFolderList();
             this.renderSettingsEnrollmentList();
             if (this.enrolledFolders.length > 0) {
@@ -5781,6 +5911,7 @@ class HybridCipherApp {
             this.updateSidebarMountSummary();
             return true;
         } catch (error) {
+            if (!isCurrentRead()) return false;
             console.error('Failed to load folders:', error);
             if (!suppressErrorNotification) {
                 this.showNotification('Failed to load folders', 'error');
@@ -5794,9 +5925,11 @@ class HybridCipherApp {
         suppressErrorNotification = true,
         suppressRecoveryPrompt = false
     } = {}) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         if (!this.isLoggedIn) {
             this.activeMountsByRootId = {};
             this.activeMountDetailsByRootId = {};
+            this.reconciliationStartedAtByRootId = {};
             this.syncSelectedFolderMountUi();
             if (renderFolderList) {
                 this.renderFolderList();
@@ -5810,6 +5943,7 @@ class HybridCipherApp {
 
         try {
             const response = await invoke('list_active_mounts');
+            if (!isCurrentRead()) return;
             if (!response?.success || !Array.isArray(response?.data)) {
                 throw new Error(response?.error || 'Active mounts unavailable');
             }
@@ -5824,10 +5958,32 @@ class HybridCipherApp {
                     mountDetailsByRoot[rootId] = {
                         mountpoint,
                         backend: String(entry?.backend || '').trim() || 'sync',
+                        availability: entry?.availability === 'degraded' ? 'degraded' : 'usable',
+                        operationalHealth: entry?.operational_health || null,
                         fallbackReason: entry?.fallback_reason || null,
                         syncStatus: entry?.sync_status || null
                     };
                 }
+            });
+            this.reconciliationStartedAtByRootId ||= {};
+            const observedAt = Date.now();
+            Object.entries(mountDetailsByRoot).forEach(([rootId, detail]) => {
+                const reasons = detail.syncStatus?.unsafe_reasons;
+                const reconciliationOnly = detail.backend === 'windows-cloud-files'
+                    && detail.availability === 'usable'
+                    && detail.syncStatus?.safe_to_unmount === false
+                    && !detail.syncStatus?.last_error
+                    && Array.isArray(reasons)
+                    && reasons.length === 1
+                    && reasons[0]?.kind === 'provider_reconciliation';
+                if (reconciliationOnly) {
+                    this.reconciliationStartedAtByRootId[rootId] ??= observedAt;
+                } else {
+                    delete this.reconciliationStartedAtByRootId[rootId];
+                }
+            });
+            Object.keys(this.reconciliationStartedAtByRootId).forEach(rootId => {
+                if (!mountDetailsByRoot[rootId]) delete this.reconciliationStartedAtByRootId[rootId];
             });
 
             this.activeMountsByRootId = mountsByRoot;
@@ -5835,12 +5991,15 @@ class HybridCipherApp {
                 if (!String(detail.backend).includes('cloud')) return;
                 try {
                     const response = await invoke('get_vault_compatibility', { rootId });
+                    if (!isCurrentRead()) return;
                     if (response?.success) detail.compatibility = response.data;
                 } catch (_) { /* Non-Windows mounts do not expose this preference. */ }
             }));
+            if (!isCurrentRead()) return;
             this.activeMountDetailsByRootId = mountDetailsByRoot;
             if (!suppressRecoveryPrompt) {
                 await this.maybeShowRecoveryPrompts(mountDetailsByRoot);
+                if (!isCurrentRead()) return;
             }
             this.syncSelectedFolderMountUi();
             if (renderFolderList) {
@@ -5852,6 +6011,7 @@ class HybridCipherApp {
             this.updateSidebarMountSummary();
             return this.activeMountsByRootId;
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.warn('Failed to refresh active mounts:', error);
             if (!suppressErrorNotification) {
                 this.showNotification('Failed to refresh mount status.', 'warning');
@@ -5866,6 +6026,7 @@ class HybridCipherApp {
     }
 
     async maybeShowRecoveryPrompts(mountDetailsByRoot = this.activeMountDetailsByRootId) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         if (!mountDetailsByRoot || typeof mountDetailsByRoot !== 'object') return;
 
         for (const [rootId, detail] of Object.entries(mountDetailsByRoot)) {
@@ -5903,6 +6064,7 @@ class HybridCipherApp {
                     secondaryLabel: 'Later'
                 }
             );
+            if (!isCurrentRead()) return;
             if (choice && folder) {
                 await this.openRecoveryCenterForFolder(folder);
             }
@@ -5979,6 +6141,12 @@ class HybridCipherApp {
 
     hasMountSafetyAlert(syncStatus) {
         return Boolean(syncStatus && !syncStatus.safe_to_unmount);
+    }
+
+    isRoutineMountReconciliation(rootId, detail) {
+        if (detail?.backend !== 'windows-cloud-files' || detail.availability !== 'usable') return false;
+        const startedAt = this.reconciliationStartedAtByRootId?.[String(rootId || '')];
+        return isRoutineProviderReconciliationValue(detail.syncStatus, Date.now() - startedAt);
     }
 
     hasPendingConflicts(syncStatus) {
@@ -6075,7 +6243,7 @@ class HybridCipherApp {
         return reasons;
     }
 
-    renderMountSafetyReasonCard(reason) {
+    renderMountSafetyReasonCard(reason, backend = null) {
         if (!reason || typeof reason !== 'object') return '';
 
         const rawCount = Math.max(0, Number(reason.count || 0));
@@ -6084,14 +6252,14 @@ class HybridCipherApp {
             (Array.isArray(reason.sample_paths) ? reason.sample_paths : []).filter(Boolean)
         )).slice(0, 5);
         let title = 'Mount condition needs attention';
-        let summary = this.formatMountSafetyReason(reason) || 'HybridCipher cannot safely interrupt this mount yet.';
+        let summary = this.formatMountSafetyReason(reason, backend) || 'HybridCipher cannot safely interrupt this mount yet.';
         let guidance = 'Keep the mount running, address the condition, then refresh its status.';
         let action = '';
 
         switch (reason.kind) {
             case 'pending_writeback': {
                 title = reason.operation_label || `${this.formatCount(count)} unresolved ${count === 1 ? 'operation' : 'operations'}`;
-                summary = reason.operations?.every(operation => operation.kind === 'rename') && reason.operations.length ? 'Choose whether to finish each rename or keep its original name.' : 'These operations must finish before the folder can be safely unmounted.';
+                summary = reason.operations?.every(operation => operation.kind === 'rename') && reason.operations.length ? 'Finish the rename, keep the original name, or verify and keep an already-encrypted renamed file after the original was removed.' : 'These operations must finish before the folder can be safely unmounted.';
                 const error = String(reason.last_error || '').toLowerCase();
                 if (error.includes('plaintext path is unavailable') || error.includes('cannot find the file')) {
                     guidance = 'A queued operation refers to a local path that no longer exists. Review any related conflict below, keep the mount running, and refresh the status. If it persists, preserve any local files you need before considering force unmount.';
@@ -6104,8 +6272,12 @@ class HybridCipherApp {
             }
             case 'conflict':
                 title = `${this.formatCount(count)} unresolved ${count === 1 ? 'conflict' : 'conflicts'}`;
-                summary = 'These conflict files remain local-only until you choose which changes to keep or merge.';
-                guidance = 'Open conflict review and resolve every listed file. HybridCipher can protect the result after it is merged back.';
+                summary = backend === 'windows-cloud-files'
+                    ? 'Windows Cloud Files recorded a content conflict for this path.'
+                    : 'These conflict files remain local-only until you choose which changes to keep or merge.';
+                guidance = backend === 'windows-cloud-files'
+                    ? 'Open conflict review to inspect the saved record and recheck synchronization. Keep the mount running while the conflict remains.'
+                    : 'Open conflict review and resolve every listed file. HybridCipher can protect the result after it is merged back.';
                 action = '<button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="resolve-conflicts">Open conflict review</button>';
                 break;
             case 'recovery_copies_present':
@@ -6118,6 +6290,11 @@ class HybridCipherApp {
                 title = `${this.formatCount(count)} pending plaintext ${count === 1 ? 'refresh' : 'refreshes'}`;
                 summary = 'HybridCipher is still rebuilding the local mounted view from protected data.';
                 guidance = 'Keep the mount running until the refresh completes, then refresh the status.';
+                break;
+            case 'provider_reconciliation':
+                title = 'Folder check is taking longer than expected';
+                summary = 'Windows Cloud Files is checking the mounted folder for changes.';
+                guidance = 'Keep the mount running and refresh its status. If this remains active, inspect provider diagnostics before unmounting.';
                 break;
             case 'deleted_open':
                 title = `${this.formatCount(count)} deleted but open ${count === 1 ? 'file' : 'files'}`;
@@ -6178,7 +6355,7 @@ class HybridCipherApp {
                         <p><strong>${this.escapeHtml(operation.source)}</strong>${operation.destination ? ` → <strong>${this.escapeHtml(operation.destination)}</strong>` : ''}</p>
                         <p>${this.escapeHtml(operation.last_error || 'Waiting to complete')}</p>
                         <details><summary>Retry history</summary><p>${Number(operation.attempts || 0)} attempts; ${Number(operation.merged_records || 0)} duplicate records combined.</p></details>
-                        ${operation.kind === 'rename' ? `<button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="retry-pending-rename" data-operation-id="${this.escapeHtmlAttr(operation.id)}">Retry rename</button> <button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="keep-original-name" data-operation-id="${this.escapeHtmlAttr(operation.id)}">Keep original name</button>` : ''}
+                        ${operation.kind === 'rename' ? `<button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="retry-pending-rename" data-operation-id="${this.escapeHtmlAttr(operation.id)}">Retry rename</button> <button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="keep-original-name" data-operation-id="${this.escapeHtmlAttr(operation.id)}">Keep original name</button> <button class="btn btn-secondary btn-small" type="button" data-folder-detail-action="keep-renamed-file" data-operation-id="${this.escapeHtmlAttr(operation.id)}">Keep renamed file</button>` : ''}
                     </div>`).join('')}
                 <div class="folder-mount-safety-next-step">
                     <div><span class="folder-mount-safety-field-label">What to do</span><p>${this.escapeHtml(guidance)}</p></div>
@@ -6193,7 +6370,7 @@ class HybridCipherApp {
             const error = String(reason.last_error || '').toLowerCase();
             return !error || error.includes('unstable file') || error.includes('changed during read') || error.includes('mid-write');
         }
-        return reason?.kind === 'pending_refresh';
+        return reason?.kind === 'pending_refresh' || reason?.kind === 'provider_reconciliation';
     }
 
     statusHasOnlyAutoDrainableReasons(syncStatus) {
@@ -6201,7 +6378,7 @@ class HybridCipherApp {
         return reasons.length > 0 && reasons.every(reason => this.isAutoDrainableMountReason(reason));
     }
 
-    formatMountSafetyReason(reason) {
+    formatMountSafetyReason(reason, backend = null) {
         if (!reason || typeof reason !== 'object') {
             return '';
         }
@@ -6221,13 +6398,17 @@ class HybridCipherApp {
                 }
             case 'pending_refresh':
                 return `${reason.count || 0} pending plaintext refresh(es) are still rebuilding the local mount state.`;
+            case 'provider_reconciliation':
+                return 'Windows Cloud Files is checking the mounted folder for changes.';
             case 'conflict': {
                 const examplePath = reason.sample_paths?.[0] || '';
-                let message = `${reason.count || 0} unresolved conflict file(s) remain local-only until they are resolved or merged back.`;
+                let message = backend === 'windows-cloud-files'
+                    ? `${reason.count || 0} Windows Cloud Files conflict record(s) still block safe unmount.`
+                    : `${reason.count || 0} unresolved conflict file(s) remain local-only until they are resolved or merged back.`;
                 if (examplePath) {
                     message += ` Example: ${examplePath}`;
                 }
-                if ((reason.edited_count || 0) > 0) {
+                if (backend !== 'windows-cloud-files' && (reason.edited_count || 0) > 0) {
                     message += ` ${reason.edited_count} conflict file(s) were edited locally and are still not protected by encrypted sync.`;
                 }
                 return message;
@@ -6280,10 +6461,10 @@ class HybridCipherApp {
         }
     }
 
-    buildMountSafetyReasons(syncStatus) {
+    buildMountSafetyReasons(syncStatus, backend = null) {
         if (!syncStatus) return [];
         const formattedReasons = this.getMountUnsafeReasons(syncStatus)
-            .map(reason => this.formatMountSafetyReason(reason))
+            .map(reason => this.formatMountSafetyReason(reason, backend))
             .filter(Boolean);
 
         const extraWarnings = Array.isArray(syncStatus.preflight_warnings)
@@ -6293,8 +6474,8 @@ class HybridCipherApp {
         return Array.from(new Set([...formattedReasons, ...extraWarnings.slice(0, 3)]));
     }
 
-    buildMountSafetyDetail(syncStatus, fallbackDetail = '') {
-        const reasons = this.buildMountSafetyReasons(syncStatus);
+    buildMountSafetyDetail(syncStatus, fallbackDetail = '', backend = null) {
+        const reasons = this.buildMountSafetyReasons(syncStatus, backend);
         const lines = [];
 
         if (reasons.length > 0) {
@@ -6321,10 +6502,8 @@ class HybridCipherApp {
     }
 
     async showMountSafetyAlert(folder, fallbackDetail = '') {
-        const syncStatus = folder?.root_id
-            ? this.getMountDetailsForRootId(folder.root_id)?.syncStatus
-            : null;
-        const detail = this.buildMountSafetyDetail(syncStatus, fallbackDetail);
+        const mountInfo = folder?.root_id ? this.getMountDetailsForRootId(folder.root_id) : null;
+        const detail = this.buildMountSafetyDetail(mountInfo?.syncStatus, fallbackDetail, mountInfo?.backend);
 
         const shouldReview = await this.showActionPrompt(
             'Unmount safety warning',
@@ -6351,6 +6530,7 @@ class HybridCipherApp {
             rootId: null,
             folder: null,
             records: [],
+            cloudFiles: false,
             selectedConflictId: null,
             reviewState: null
         };
@@ -6501,7 +6681,8 @@ class HybridCipherApp {
             return false;
         }
 
-        const response = await invoke('list_mount_conflicts', { rootId });
+        const cloudFiles = this.getMountDetailsForRootId(rootId)?.backend === 'windows-cloud-files';
+        const response = await invoke(cloudFiles ? 'list_windows_cloud_conflicts' : 'list_mount_conflicts', { rootId });
         if (!response?.success || !Array.isArray(response?.data)) {
             const message = response?.error || 'Failed to load mount conflicts.';
             if (!suppressNotification) {
@@ -6511,6 +6692,7 @@ class HybridCipherApp {
         }
 
         this.conflictCenterState.records = response.data;
+        this.conflictCenterState.cloudFiles = cloudFiles;
         if (!this.conflictCenterState.folder) {
             this.conflictCenterState.folder = this.findFolderByRootId(rootId);
         }
@@ -6554,7 +6736,7 @@ class HybridCipherApp {
         }
 
         const targetConflictId = this.conflictCenterState.selectedConflictId;
-        if (targetConflictId) {
+        if (targetConflictId && !cloudFiles) {
             await this.openConflictReview(targetConflictId, { suppressNotification: true });
         }
 
@@ -6572,13 +6754,16 @@ class HybridCipherApp {
 
         const folderLabel = this.getConflictCenterFolderLabel(this.conflictCenterState.folder);
         const records = Array.isArray(this.conflictCenterState.records) ? this.conflictCenterState.records : [];
+        const cloudFiles = Boolean(this.conflictCenterState.cloudFiles);
         const reviewState = this.conflictCenterState.reviewState
             || buildMountConflictReviewStateValue({ records, syncStatus: null });
-        titleEl.textContent = `Resolve conflicts: ${folderLabel}`;
+        titleEl.textContent = `${cloudFiles ? 'Review' : 'Resolve'} conflicts: ${folderLabel}`;
         summaryEl.textContent = reviewState.mismatch
             ? `Conflict status is updating: Mount session reports ${reviewState.reportedCount}, while Conflict Review currently lists ${reviewState.listedCount}.`
             : (records.length > 0
-                ? `${records.length} unresolved conflict file(s) remain LOCAL-ONLY and still block safe unmount until you resolve them.`
+                ? (cloudFiles
+                    ? `${records.length} Windows Cloud Files conflict record(s) block safe unmount. Recheck synchronization before taking further action.`
+                    : `${records.length} unresolved conflict file(s) remain LOCAL-ONLY and still block safe unmount until you resolve them.`)
                 : (reviewState.hasOtherBlockingWork
                     ? 'No unresolved conflicts remain, but other pending mount work still blocks safe unmount.'
                     : 'No unresolved conflicts remain for this mount.'));
@@ -6610,6 +6795,28 @@ class HybridCipherApp {
             return;
         }
 
+        if (cloudFiles) {
+            listEl.innerHTML = `
+                <p class="text-secondary">These are Windows Cloud Files records. This mount has no separate conflict copy to merge. Recheck after local writes finish; an unsynced file will remain blocked.</p>
+                ${records.map(record => `
+                    <div class="conflict-record-card">
+                        <div class="conflict-record-card-header"><span class="conflict-kind-pill warning">Cloud Files conflict</span></div>
+                        <div class="conflict-record-path">${this.escapeHtml(record.relative_path || '')}</div>
+                        <div class="conflict-record-meta">Recorded: ${this.escapeHtml(this.formatConflictTimestamp(record.created_at))}</div>
+                        <div class="conflict-record-meta">Mounted path: ${this.escapeHtml(record.local_plaintext_path || 'Unavailable')}</div>
+                    </div>
+                `).join('')}
+                <button class="btn btn-secondary btn-small" type="button" data-cloud-conflict-recheck>Recheck synchronization</button>
+            `;
+            listEl.querySelector('[data-cloud-conflict-recheck]')?.addEventListener('click', () => {
+                this.recheckWindowsCloudConflicts().catch(error => {
+                    console.error('Cloud Files conflict recheck failed:', error);
+                    this.showNotification(`Conflict recheck failed: ${error}`, 'error');
+                });
+            });
+            return;
+        }
+
         listEl.innerHTML = records.map(record => `
             <button type="button" class="conflict-record-card ${record.id === this.conflictCenterState.selectedConflictId ? 'selected' : ''}" data-conflict-review-id="${record.id}">
                 <div class="conflict-record-card-header">
@@ -6633,6 +6840,21 @@ class HybridCipherApp {
                 });
             });
         });
+    }
+
+    async recheckWindowsCloudConflicts() {
+        const rootId = String(this.conflictCenterState.rootId || '').trim();
+        if (!rootId) return false;
+        const response = await invoke('recheck_windows_cloud_conflicts', { rootId });
+        if (!response?.success) {
+            throw new Error(response?.error || 'Cloud Files conflict recheck failed');
+        }
+        await this.refreshConflictCenter({ suppressNotification: true });
+        const remaining = this.conflictCenterState.records.length;
+        this.showNotification(remaining
+            ? `${remaining} Cloud Files conflict(s) still require attention.`
+            : 'Cloud Files conflicts are clear.', remaining ? 'warning' : 'success');
+        return remaining === 0;
     }
 
     closeConflictCenter() {
@@ -7152,6 +7374,7 @@ class HybridCipherApp {
                     rootId,
                     mountpoint: detail.mountpoint,
                     syncStatus: detail.syncStatus || null,
+                    backend: detail.backend,
                     folder
                 };
             })
@@ -7169,7 +7392,7 @@ class HybridCipherApp {
                 const label = entry.folder?.name
                     || this.basename(entry.folder?.path || entry.mountpoint || entry.rootId || 'Mounted folder');
                 lines.push(`${label}:`);
-                const reasons = this.buildMountSafetyReasons(entry.syncStatus);
+                const reasons = this.buildMountSafetyReasons(entry.syncStatus, entry.backend);
                 reasons.forEach(reason => {
                     lines.push(`- ${reason}`);
                 });
@@ -7342,7 +7565,7 @@ class HybridCipherApp {
             : 'all mounted folders';
         const folderPath = singleEntry?.folder?.path || '';
         const unsafeReasons = entries
-            .flatMap(entry => this.buildMountSafetyReasons(entry?.syncStatus || null))
+            .flatMap(entry => this.buildMountSafetyReasons(entry?.syncStatus || null, entry?.backend))
             .filter(Boolean)
             .slice(0, 3);
         const confirmation = buildForceUnmountConfirmationValue({
@@ -7384,10 +7607,9 @@ class HybridCipherApp {
             return count;
         }, 0);
         const degradedCount = folders.reduce((count, folder) => {
-            const syncStatus = folder?.root_id
-                ? this.getMountDetailsForRootId(folder.root_id)?.syncStatus
-                : null;
-            if (syncStatus && syncStatus.low_space_mode && syncStatus.low_space_mode !== 'healthy') {
+            const detail = folder?.root_id ? this.getMountDetailsForRootId(folder.root_id) : null;
+            const syncStatus = detail?.syncStatus;
+            if (detail?.availability === 'degraded' || (syncStatus && syncStatus.low_space_mode && syncStatus.low_space_mode !== 'healthy')) {
                 return count + 1;
             }
             return count;
@@ -7431,9 +7653,7 @@ class HybridCipherApp {
             return;
         }
 
-        const visibleFolders = this.appMode === 'individual'
-            ? filterProtectedFoldersValue(this.enrolledFolders, this.folderSearchQuery)
-            : this.enrolledFolders;
+        const visibleFolders = filterProtectedFoldersValue(this.enrolledFolders, this.folderSearchQuery);
         if (visibleFolders.length === 0) {
             folderList.innerHTML = `
                 <div class="empty-state folder-search-empty">
@@ -7445,29 +7665,34 @@ class HybridCipherApp {
 
         folderList.innerHTML = visibleFolders.map(folder => {
             const isMounted = this.isFolderMounted(folder);
+            const isUnmounting = this.unmountingRootIds.has(String(folder.root_id || ''));
             const displayName = folder.name || this.basename(folder.path);
             const escapedDisplayName = this.escapeHtml(displayName);
             const escapedFolderPath = this.escapeHtmlAttr(folder.path || '');
             const escapedRootId = this.escapeHtmlAttr(folder.root_id || '');
-            const syncStatus = folder?.root_id
-                ? this.getMountDetailsForRootId(folder.root_id)?.syncStatus
-                : null;
-            const showSafetyAlert = isMounted && this.hasMountSafetyAlert(syncStatus);
+            const mountDetail = folder?.root_id ? this.getMountDetailsForRootId(folder.root_id) : null;
+            const syncStatus = mountDetail?.syncStatus || null;
+            const mountDegraded = mountDetail?.availability === 'degraded';
+            const showSafetyAlert = isMounted && (mountDegraded
+                || (this.hasMountSafetyAlert(syncStatus)
+                    && !this.isRoutineMountReconciliation(folder.root_id, mountDetail)));
             const hasConflicts = isMounted && this.hasPendingConflicts(syncStatus);
             const hasRecoveryCopies = isMounted && this.hasPendingRecoveryCopies(syncStatus);
-            const alertTitle = hasConflicts
+            const alertTitle = mountDegraded ? 'Cloud Files provider diagnostics' : hasConflicts
                 ? 'Resolve conflicts'
                 : (hasRecoveryCopies ? 'Resolve recovery copies' : 'Unmount safety warning');
-            const alertLabel = hasConflicts
+            const alertLabel = mountDegraded ? 'Review Cloud Files provider diagnostics' : hasConflicts
                 ? 'Resolve conflicts'
                 : (hasRecoveryCopies ? 'Resolve recovery copies' : 'Show mount safety warning');
             const rowStatus = this.getFolderRowStatusState({
                 isMounted,
+                isUnmounting,
                 syncStatus,
                 showSafetyAlert,
             });
+            if (mountDegraded && !isUnmounting) rowStatus.healthDotTone = 'red';
             return `
-                <div class="folder-item ${folder === this.selectedFolder ? 'active' : ''} ${isMounted ? 'mounted' : ''}" 
+                <div class="folder-item ${folder === this.selectedFolder ? 'active' : ''} ${isMounted ? 'mounted' : ''} ${isUnmounting ? 'unmounting' : ''}"
                      data-folder-path="${escapedFolderPath}"
                      data-folder-root-id="${escapedRootId}">
                     <div class="folder-item-main">
@@ -7475,6 +7700,7 @@ class HybridCipherApp {
                             <path stroke="currentColor" stroke-width="2" d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
                         </svg>
                         ${rowStatus.showMountedBadge ? '<span class="mount-indicator mounted compact">Mounted</span>' : ''}
+                        ${rowStatus.showUnmountingBadge ? '<span class="mount-indicator unmounting compact" role="status"><span class="spinner-small" aria-hidden="true"></span>Unmounting</span>' : ''}
                     </div>
                     <span class="folder-name">${escapedDisplayName}</span>
                     ${(rowStatus.showAlertButton || rowStatus.healthDotTone) ? `
@@ -7515,7 +7741,9 @@ class HybridCipherApp {
                 event.preventDefault();
                 event.stopPropagation();
                 if (folder) {
-                    if (this.folderHasPendingConflicts(folder)) {
+                    if (this.getMountDetailsForRootId(rootId)?.availability === 'degraded') {
+                        this.selectFolder(folder, { showDetail: true });
+                    } else if (this.folderHasPendingConflicts(folder)) {
                         await this.openConflictCenterForFolder(folder);
                     } else if (this.folderHasPendingRecoveryCopies(folder)) {
                         await this.openRecoveryCenterForFolder(folder);
@@ -7579,7 +7807,8 @@ class HybridCipherApp {
                 shell: 'bash',
                 username: 'user',
                 hostname: 'localhost',
-                home_dir: '~'
+                home_dir: '~',
+                update_channel: 'self'
             };
             document.body.setAttribute('data-platform', 'linux');
         }
@@ -8524,6 +8753,7 @@ class HybridCipherApp {
 
     async refreshSessionAfterTerminalAction() {
         if (!this.isLoggedIn) return;
+        if (this.sessionPersistent === false) return;
         const cliSessionOk = await this.verifyCliSession();
         if (!cliSessionOk) {
             await this.handleStaleSession('Session ended. Please login again.');
@@ -8625,8 +8855,16 @@ class HybridCipherApp {
             if (!payload.session_id || typeof payload.chunk !== 'string') return;
             this.appendChunkToSession(payload.session_id, payload.chunk);
         });
-        tauriEvent.listen('app_quit_requested', async () => {
-            await this.handleQuitRequested();
+        tauriEvent.listen('app_quit_requested', async (event) => {
+            const requestId = event?.payload?.request_id;
+            if (typeof requestId !== 'number') return;
+            try {
+                const acknowledged = await invoke('ack_quit_request', { requestId });
+                if (acknowledged?.success !== true || acknowledged.data !== true) return;
+                await this.handleQuitRequested();
+            } catch (error) {
+                console.error('Failed to acknowledge Quit request:', error);
+            }
         });
         tauriEvent.listen('open_settings_requested', (event) => {
             const sectionId = typeof event?.payload === 'string' ? event.payload : null;
@@ -8690,7 +8928,7 @@ class HybridCipherApp {
             return;
         }
 
-        let filteredChunk = this.filterRegisterOverlayChunk(sessionId, chunk);
+        let filteredChunk = chunk;
         if (!filteredChunk) {
             return;
         }
@@ -8804,67 +9042,6 @@ class HybridCipherApp {
             clearTimeout(queue.timer);
         }
         delete this.terminalRenderQueues[sessionId];
-    }
-
-    filterRegisterOverlayChunk(sessionId, chunk) {
-        if (!this.registerOverlaySessionId || sessionId !== this.registerOverlaySessionId) {
-            return chunk;
-        }
-
-        const echoFiltered = this.stripRegisterOverlayCommandEcho(sessionId, chunk);
-        if (!echoFiltered) {
-            return '';
-        }
-
-        const successToken = '__HC_REGISTER_SUCCESS__';
-        const failToken = '__HC_REGISTER_FAILED__';
-        const holdLen = Math.max(successToken.length, failToken.length) - 1;
-
-        const existing = this.registerSentinelBuffers[sessionId] || '';
-        let combined = existing + echoFiltered;
-        let success = false;
-        let fail = false;
-
-        if (combined.includes(successToken)) {
-            success = true;
-            combined = combined.split(successToken).join('');
-        }
-        if (combined.includes(failToken)) {
-            fail = true;
-            combined = combined.split(failToken).join('');
-        }
-
-        let output = combined;
-        let hold = '';
-        if (combined.length > holdLen) {
-            output = combined.slice(0, -holdLen);
-            hold = combined.slice(-holdLen);
-        } else {
-            output = '';
-            hold = combined;
-        }
-
-        if (success || fail) {
-            output += hold;
-            hold = '';
-            this.registerSentinelBuffers[sessionId] = '';
-            this.registerOverlaySessionId = null;
-            this.handleRegisterOverlayCompletion(success);
-        } else {
-            this.registerSentinelBuffers[sessionId] = hold;
-        }
-
-        return output;
-    }
-
-    stripRegisterOverlayCommandEcho(sessionId, chunk) {
-        // The 'clear' command in the bash script handles hiding the command echo,
-        // so we just return the chunk as-is and clean up the state
-        const echoState = this.registerOverlayCommandEchoBySession[sessionId];
-        if (echoState) {
-            delete this.registerOverlayCommandEchoBySession[sessionId];
-        }
-        return chunk;
     }
 
     /**
@@ -9811,23 +9988,6 @@ class HybridCipherApp {
         });
     }
 
-    toggleTerminal() {
-        if (this.activeWorkspaceView === 'home') {
-            this.showTerminalView();
-            return;
-        }
-
-        this.terminalVisible = !this.terminalVisible;
-        if (this.terminalVisible) {
-            this.showTerminalView();
-        } else {
-            this.showFileBrowserView();
-            if (this.isRegisterOverlay) {
-                this.closeRegisterTerminalOverlay();
-            }
-        }
-    }
-
     getTerminalWelcome() {
         if (!this.platformInfo) {
             return 'Terminal ready';
@@ -9956,79 +10116,6 @@ class HybridCipherApp {
         // PTY handles command submission directly through keystream; nothing to do here.
     }
 
-    // Execute command directly without populating input field or mounting
-    async executeCommandDirectly(command, skipMount = true, options = {}) {
-        // Show terminal if it is not the active workspace view
-        if (this.activeWorkspaceView !== 'terminal') {
-            this.showTerminalView();
-        }
-
-        if (await this.handleRestrictedIndividualCliCommand(command, { clearInput: false })) {
-            return null;
-        }
-
-        // Wait a bit for terminal to render
-        await new Promise(resolve => setTimeout(resolve, 100));
-
-        const cwd = this.getTerminalCwd();
-        this.updateTerminalCwdDisplay();
-
-        if (command === 'clear' || command === 'reset') {
-            this.clearTerminalOutput();
-            this.updateActiveTabTitle(command);
-            return;
-        }
-
-        if (this.shouldPreflightSessionForCommand(command)) {
-            const sessionInfo = await this.ensureSessionReady({
-                silent: false,
-                verifyCli: true,
-                staleMessage: 'Session expired. Please login again.'
-            });
-            if (!sessionInfo) {
-                return null;
-            }
-        }
-
-        // Update tab title with the command
-        this.updateActiveTabTitle(command);
-
-        // Ensure PTY session exists and send command to it
-        let targetTab = this.getActiveTab();
-        if (targetTab && this.isWelcomeTab(targetTab.id)) {
-            await this.createTerminalTab();
-            targetTab = this.getActiveTab();
-        }
-
-        if (!targetTab?.sessionId) {
-            await this.startTerminalSessionForTab(targetTab?.id);
-        }
-        const sessionId = targetTab?.sessionId;
-        if (sessionId) {
-            try {
-                // Settings/dashboard callers can pass an unresolved command.
-                // Apply the same trusted executable policy at the final send.
-                const resolvedCommand = /^hybridcipher\b/.test(command)
-                    ? this.resolveCliCommand(command, await this.getCliBinaryPath())
-                    : command;
-                await invoke('write_terminal_stdin', { sessionId, data: `${resolvedCommand}\r` });
-            } catch (error) {
-                console.error('Terminal PTY write error:', error);
-                this.appendTerminalLine(`Error: ${error}`, 'error');
-            }
-        } else {
-            this.appendTerminalLine('No terminal session available', 'error');
-        }
-
-        if (options.returnSessionId) {
-            return sessionId;
-        }
-    }
-
-    // ========================================================================
-    // Coverage CLI Command Integration
-    // ========================================================================
-
     async getCliBinaryPath() {
         if (this.cachedCliPath) {
             return this.cachedCliPath;
@@ -10057,62 +10144,42 @@ class HybridCipherApp {
         return confirmed === true;
     }
 
-    async executeCoverageCommand(action, folder, options = {}) {
-        const { skipPreConfirm = false } = options;
+    async executeCoverageCommand(action, folder) {
         // Handle both object with .path property and string path
         const folderPath = typeof folder === 'string' ? folder : (folder?.path || null);
         if (!folderPath) {
             this.showNotification('No folder selected', 'error');
             return false;
         }
+        if (action === 'unenroll') {
+            const selected = typeof folder === 'string'
+                ? this.enrolledFolders.find(item => item.path === folderPath)
+                : folder;
+            return this.handleSettingsUnenrollFolder(selected);
+        }
         try {
-            await this.getCliBinaryPath();
+            let result;
+            switch (action) {
+                case 'enroll':
+                    result = await invoke('enroll_folder_and_hydrate', { folderPath });
+                    break;
+                case 'coverage-scan':
+                    result = await invoke('run_coverage_scan', { rootPath: folderPath });
+                    break;
+                case 'coverage-status':
+                    result = await invoke('get_coverage_status');
+                    break;
+                default:
+                    throw new Error(`Unknown action: ${action}`);
+            }
+            this.checkedCommandResult(result, action);
+            await this.loadEnrolledFolders();
+            this.showNotification(`${action === 'coverage-scan' ? 'Coverage scan' : 'Folder action'} completed`, 'success');
+            return true;
         } catch (error) {
-            this.showNotification('Failed to locate hybridcipher CLI. Please build it with "cargo build --release --bin hybridcipher"', 'error');
+            this.showNotification(error?.message || String(error), 'error');
             return false;
         }
-
-        let command;
-        let needsConfirm = false;
-        switch (action) {
-            case 'enroll':
-                command = `hybridcipher coverage enroll ${this.quoteCliArg(folderPath)} --yes`;
-                break;
-            case 'unenroll':
-                // Show confirmation dialog first
-                if (!skipPreConfirm) {
-                    const confirmed = await this.showConfirmDialog(
-                        'Remove Protected Folder',
-                        `This will decrypt all files in this folder and stop protecting it:\n\n"${folderPath}"\n\nDo you want to proceed?`
-                    );
-                    if (!confirmed) {
-                        return false;
-                    }
-                }
-                command = `hybridcipher coverage unenroll ${this.quoteCliArg(folderPath)} --yes`;
-                break;
-            case 'coverage-scan':
-                command = `hybridcipher coverage scan --root ${this.quoteCliArg(folderPath)}`;
-                break;
-            case 'coverage-status':
-                command = `hybridcipher coverage status --root ${this.quoteCliArg(folderPath)}`;
-                break;
-            default:
-                this.showNotification(`Unknown action: ${action}`, 'error');
-                return false;
-        }
-
-        // Execute command directly (no input field population, no auto-mount)
-        const sessionId = await this.executeCommandDirectly(command, true, { returnSessionId: true });
-        if (action === 'enroll' || action === 'unenroll') {
-            this.startCoverageCommandTracking({
-                action,
-                path: folderPath,
-                sessionId
-            });
-        }
-
-        return true;
     }
 
     startCoverageCommandTracking({ action, path, sessionId }) {
@@ -10236,18 +10303,16 @@ class HybridCipherApp {
             }
 
             this.showNotification(`${failure.title}. ${failure.detail}`, 'error');
-            this.showTerminalView();
-            this.focusTerminalArea();
+            this.showActionPrompt(failure.title, failure.detail, { detail: lines.join('\n'), primaryLabel: 'Close', secondaryLabel: null });
             return;
         }
 
         if (tracker.action === 'unenroll') {
             this.showNotification(
-                'HybridCipher could not remove this protected folder. Review the terminal output and retry.',
+                'HybridCipher could not remove this protected folder. Review the error details and retry.',
                 'error'
             );
-            this.showTerminalView();
-            this.focusTerminalArea();
+            this.showActionPrompt('Could not remove protection', 'Review the error details and retry.', { detail: lines.join('\n'), primaryLabel: 'Close', secondaryLabel: null });
         }
     }
 
@@ -10432,6 +10497,9 @@ class HybridCipherApp {
             return false;
         }
 
+        const rootId = String(folder.root_id);
+        if (this.unmountingRootIds.has(rootId)) return false;
+
         const folderLabel = folder.name || this.basename(folder.path || 'this folder');
         const mountpoint = this.getMountpointForRootId(folder.root_id);
         if (confirm) {
@@ -10442,19 +10510,31 @@ class HybridCipherApp {
             if (!confirmed) return false;
         }
 
-        const decision = await this.promptUnsafeUnmountDecision({
-            rootIds: [folder.root_id],
-            title: 'Unmount folder',
-            message: 'HybridCipher will wait briefly for pending encrypted commits before unmounting this folder.',
-            forceLabel: 'Force unmount'
-        });
-        if (decision === 'cancel') return false;
+        this.setFolderUnmounting(rootId, true);
+        try {
+            const decision = await this.promptUnsafeUnmountDecision({
+                rootIds: [folder.root_id],
+                title: 'Unmount folder',
+                message: 'HybridCipher will wait briefly for pending encrypted commits before unmounting this folder.',
+                forceLabel: 'Force unmount'
+            });
+            if (decision === 'cancel') return false;
 
-        return this.executeUnmountCommand(folder, {
-            force: decision === 'force',
-            suppressSuccessNotification,
-            suppressFailureNotification,
-        });
+            return await this.executeUnmountCommand(folder, {
+                force: decision === 'force',
+                suppressSuccessNotification,
+                suppressFailureNotification,
+            });
+        } finally {
+            this.setFolderUnmounting(rootId, false);
+        }
+    }
+
+    setFolderUnmounting(rootId, isUnmounting) {
+        if (isUnmounting) this.unmountingRootIds.add(rootId);
+        else this.unmountingRootIds.delete(rootId);
+        this.renderFolderList();
+        this.syncSelectedFolderMountUi();
     }
 
     async requestAllUnmount(options = {}) {
@@ -10646,7 +10726,7 @@ class HybridCipherApp {
             });
             const rootIds = Object.keys(this.activeMountDetailsByRootId || {});
             if (rootIds.length === 0) {
-                await invoke('exit_application');
+                this.checkedCommandResult(await invoke('exit_application'), 'Quit');
                 return;
             }
 
@@ -10666,11 +10746,14 @@ class HybridCipherApp {
                 suppressSuccessNotification: true,
                 suppressFailureNotification: force
             });
-            if (!unmounted && !force) {
+            if (!unmounted) {
+                if (force) {
+                    this.showNotification('Quit cancelled because mounted work could not be stopped.', 'error');
+                }
                 return;
             }
 
-            await invoke('exit_application');
+            this.checkedCommandResult(await invoke('exit_application'), 'Quit');
         } catch (error) {
             console.error('Quit flow failed:', error);
             this.showNotification('Quit failed: ' + error, 'error');
@@ -10907,11 +10990,23 @@ class HybridCipherApp {
             });
 
             if (checkResult.success && checkResult.data) {
+                if (checkResult.data.availability === 'degraded') {
+                    const health = checkResult.data.operational_health || {};
+                    const detail = health.error || health.operational?.error || health.last_error;
+                    this.showNotification(
+                        `This folder is mounted, but Cloud Files cannot serve it safely${detail ? `: ${detail}` : '. Check its sync status and retry.'}`,
+                        'error'
+                    );
+                    return false;
+                }
                 // Already mounted, just open it
                 if (!autoMountRestore) {
                     await this.openMountInExplorer(checkResult.data.mountpoint);
                 }
                 return true;
+            } else if (checkResult.error_code === 'MOUNT_DEGRADED' || checkResult.error_code === 'MOUNT_SOURCE_UNAVAILABLE') {
+                this.showNotification(checkResult.error || 'This Cloud Files mount is unhealthy. Check its sync status before retrying.', 'error');
+                return false;
             } else {
                 // Not mounted - clean up any stale session entry
                 if (this.mountSessions[folder.root_id]) {
@@ -11128,6 +11223,12 @@ class HybridCipherApp {
                     'Mount status check timed out'
                 );
 
+                if (result.success && result.data?.availability === 'degraded') {
+                    return {
+                        status: 'failed',
+                        error: 'Cloud Files mount is present but unhealthy. Check its sync status before retrying.'
+                    };
+                }
                 if (result.success && result.data) {
                     return {
                         status: 'mounted',
@@ -11335,7 +11436,13 @@ class HybridCipherApp {
         const showResolveRecovery = Boolean(isMounted && this.selectedFolder && this.folderHasPendingRecoveryCopies(this.selectedFolder));
 
         if (unmountBtn) {
-            if (isMounted) {
+            const isUnmounting = this.unmountingRootIds.has(String(this.selectedFolder?.root_id || ''));
+            unmountBtn.dataset.defaultHtml ||= unmountBtn.innerHTML;
+            unmountBtn.disabled = isUnmounting;
+            unmountBtn.innerHTML = isUnmounting
+                ? '<span class="spinner-small" aria-hidden="true"></span> Unmounting…'
+                : unmountBtn.dataset.defaultHtml;
+            if (isMounted || isUnmounting) {
                 unmountBtn.style.display = 'flex';
             } else {
                 unmountBtn.style.display = 'none';
@@ -11984,7 +12091,7 @@ class HybridCipherApp {
     updateBreadcrumb(path) {
         const breadcrumb = document.getElementById('breadcrumb');
         if (breadcrumb) {
-            const parts = path.split('/').filter(p => p);
+            const parts = displayEnrolledPathValue(path).split('/').filter(p => p);
             breadcrumb.innerHTML = parts.map((part, index) =>
                 `<span class="breadcrumb-item">${this.escapeHtml(part)}</span>`
             ).join(' <span class="breadcrumb-separator">/</span> ');
@@ -12172,132 +12279,274 @@ class HybridCipherApp {
         this.resetRegisterModalState();
     }
 
-    async openRegisterTerminalOverlay() {
-        const appContainer = document.getElementById('appContainer');
-        const mainContent = document.getElementById('mainContent');
-        const fileBrowser = document.getElementById('fileBrowser');
-        const terminalContainer = document.getElementById('terminalContainer');
-        if (!appContainer || !terminalContainer) {
-            return;
-        }
-
-        if (this.isRegisterOverlay) {
-            this.focusTerminalArea();
-            return;
-        }
-
-        this.registerOverlayPrevTerminalVisible = this.terminalVisible;
-        this.isRegisterOverlay = true;
-        appContainer.style.display = 'flex';
-        appContainer.classList.add('register-overlay');
-
-        // Force terminal visibility for the overlay
-        this.terminalVisible = true;
-        terminalContainer.style.display = 'flex';
-        if (fileBrowser) fileBrowser.style.display = 'none';
-        mainContent?.classList.add('terminal-visible');
-        this.updateTerminalCwdDisplay();
-        this.updateTerminalHeader();
-        this.ensureTerminalWelcome();
-        this.updateTerminalPromptSymbol();
-        this.focusTerminalArea();
-        await this.startTerminalSessionForTab(this.activeTabId);
-        this.applyCursorToActiveTab();
-
-        await this.createTerminalTab();
-        const activeTab = this.getActiveTab();
-        if (activeTab?.sessionId) {
-            this.registerOverlaySessionId = activeTab.sessionId;
-            this.registerOverlayCompletionHandled = false;
-            this.registerSentinelBuffers[activeTab.sessionId] = '';
-        }
-        await this.executeRegisterCommand();
-    }
-
-    closeRegisterTerminalOverlay() {
-        const appContainer = document.getElementById('appContainer');
-        const mainContent = document.getElementById('mainContent');
-        const fileBrowser = document.getElementById('fileBrowser');
-        const terminalContainer = document.getElementById('terminalContainer');
-        if (appContainer) {
-            appContainer.style.display = 'none';
-            appContainer.classList.remove('register-overlay');
-        }
-
-        this.isRegisterOverlay = false;
-
-        if (this.registerOverlayPrevTerminalVisible === false) {
-            this.terminalVisible = false;
-            if (terminalContainer) terminalContainer.style.display = 'none';
-            if (fileBrowser) fileBrowser.style.display = 'flex';
-            mainContent?.classList.remove('terminal-visible');
-        } else {
-            this.terminalVisible = true;
-            if (terminalContainer) terminalContainer.style.display = 'flex';
-            if (fileBrowser) fileBrowser.style.display = 'none';
-            mainContent?.classList.add('terminal-visible');
-        }
-
-        this.registerOverlayPrevTerminalVisible = null;
-    }
-
-    buildRegisterCommand(cliPath) {
-        const osType = this.platformInfo?.os_type;
-        if (osType === 'windows') {
-            const escapedCliPath = cliPath.replace(/'/g, "''");
-            return `powershell -NoProfile -Command "$email = Read-Host 'Please enter your email address'; & '${escapedCliPath}' register $email; if ($LASTEXITCODE -eq 0) { echo __HC_REGISTER_SUCCESS__ } else { echo __HC_REGISTER_FAILED__ }"`;
-        }
-
-        const escapedCliPath = cliPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-        return `bash -lc 'clear; read -r -p "Please enter your email address: " email; echo; "${escapedCliPath}" register "$email"; status=$?; if [ $status -eq 0 ]; then printf "__HC_REGISTER_SUCCESS__\\n"; else printf "__HC_REGISTER_FAILED__\\n"; fi'`;
-    }
-
-    async executeRegisterCommand() {
-        let cliPath;
+    async refreshTeamLicenseStatus({ silent = false } = {}) {
+        if (!this.isLoggedIn) return null;
         try {
-            cliPath = await this.getCliBinaryPath();
+            const status = await invoke('get_team_license_status');
+            this.teamLicenseStatus = status;
+            if (status?.workspace !== 'team') {
+                this.activeWorkspaceType = 'personal';
+            } else if (!this.workspaceChoiceLoaded) {
+                this.activeWorkspaceType = localStorage.getItem(this.workspacePreferenceKey()) === 'team'
+                    ? 'team' : 'personal';
+                this.workspaceChoiceLoaded = true;
+            }
+            const nextMode = this.activeWorkspaceType === 'team' ? 'team' : 'individual';
+            if (nextMode !== this.appMode) {
+                this.appMode = nextMode;
+                this.setAdminPanelVisible(false);
+                this.updateWorkspaceHomeSummary();
+            }
+            this.applyAppMode();
+            this.renderTeamLicenseSettings();
+            await this.refreshPendingTeamRequests(status?.workspace === 'team' && status.online && status.can_write);
+            await this.refreshTeamDirectory();
+            return status;
         } catch (error) {
-            this.showNotification('Failed to locate hybridcipher CLI. Please build it with "cargo build --release --bin hybridcipher"', 'error');
-            return;
+            console.warn('Team license status unavailable:', error);
+            if (!silent) this.showNotification(`Team license check failed: ${error}`, 'warning');
+            const note = document.getElementById('teamLicenseNote');
+            if (note) note.textContent = String(error);
+            return null;
         }
-
-        const command = this.buildRegisterCommand(cliPath);
-        if (this.registerOverlaySessionId) {
-            this.registerOverlayCommandEchoBySession[this.registerOverlaySessionId] = {
-                remaining: `${command}\r\n`
-            };
-        }
-        await this.executeCommandDirectly(command, true);
-        this.updateActiveTabTitle('Register');
     }
 
-    async handleRegisterOverlayCompletion(success) {
-        if (this.registerOverlayCompletionHandled) {
-            return;
-        }
-        this.registerOverlayCompletionHandled = true;
+    workspacePreferenceKey() {
+        return `hybridcipher_workspace_${encodeURIComponent(this.currentUser || '')}`;
+    }
 
-        if (!success) {
-            this.showNotification('Registration failed. Please try again.', 'error');
-            return;
-        }
-
+    async selectWorkspaceType(type) {
+        if (type === 'team' && this.teamLicenseStatus?.workspace !== 'team') return;
+        this.activeWorkspaceType = type === 'team' ? 'team' : 'personal';
+        this.appMode = this.activeWorkspaceType === 'team' ? 'team' : 'individual';
+        localStorage.setItem(this.workspacePreferenceKey(), this.activeWorkspaceType);
+        this.setAdminPanelVisible(false);
+        this.applyAppMode();
+        this.showWorkspaceHome();
+        if (!this.teamLicenseStatus?.online || this.sessionPersistent === false) return;
         try {
-            const sessionInfo = await invoke('get_session_info');
-            if (sessionInfo && sessionInfo.status === 'active') {
-                this.currentUser = sessionInfo.email || null;
-                await this.showMainApp();
-                this.showNotification('Registration complete. You are now logged in.', 'success');
-            } else {
-                this.showNotification('Registration complete. Please log in.', 'info');
+            const groups = await this.fetchGroupList();
+            if (!groups.length) {
+                if (this.activeWorkspaceType === 'team') {
+                    this.showNotification('Create a Team group before using Team files.', 'info');
+                }
+                return;
+            }
+            const context = await this.getActiveGroupContext();
+            if (!groups.some(group => group.id === context.groupId)) {
+                await this.runBundledCliArgs(['switch-group', groups[0].id, '--no-color']);
+                this.refreshAdminGroupStatus();
             }
         } catch (error) {
-            console.error('Post-register session check failed:', error);
-            this.showNotification('Registration complete. Please log in.', 'info');
+            this.showNotification(`Could not select a group for this workspace: ${error}`, 'warning');
+        }
+    }
+
+    renderTeamLicenseSettings() {
+        const status = this.teamLicenseStatus;
+        const team = status?.workspace === 'team';
+        const setText = (id, value) => {
+            const element = document.getElementById(id);
+            if (element) element.textContent = value;
+        };
+        setText('teamLicenseWorkspace', team
+            ? `${status.organization?.name || 'Team'} workspace`
+            : 'Personal workspace');
+        setText('teamLicenseState', team
+            ? (status.revoked ? 'Revoked' : status.can_write ? 'Active' : 'Read-only')
+            : 'Personal');
+        setText('teamLicenseSeats', status?.organization
+            ? `${status.organization.seats_used} of ${status.organization.seat_limit} used`
+            : 'Available after reconnecting');
+        setText('teamLicenseExpiry', status?.entitlement_expires_at
+            ? new Date(status.entitlement_expires_at * 1000).toLocaleString()
+            : '—');
+        setText('teamLicenseNote', status?.message || (team && !status.online
+            ? 'Offline administration requests are saved and checked after reconnecting.'
+            : ''));
+        document.getElementById('teamLicenseSeatsRow')?.classList.toggle('hidden', !team);
+        document.getElementById('teamLicenseExpiryRow')?.classList.toggle('hidden', !team);
+        document.getElementById('teamExportExistingBtn')?.classList.toggle('hidden', !team);
+        document.getElementById('teamActivationForm')?.classList.toggle('hidden', team);
+        document.getElementById('teamInvitationAcceptance')?.classList.toggle('hidden', team);
+        const mayInvite = team && status.can_write
+            && ['owner', 'admin'].includes(status.organization?.role || this.teamDirectoryRole);
+        document.getElementById('teamInviteForm')?.classList.toggle('hidden', !mayInvite);
+        document.getElementById('teamPendingRequestsPanel')?.classList.toggle('hidden', !team);
+        document.getElementById('teamDirectoryPanel')?.classList.toggle('hidden', !team);
+        if (team && !status.can_write) {
+            setText('teamLicenseNote', status.message || 'Team is read-only. Existing files can be read and exported; pending edits are preserved until access is restored.');
+        }
+    }
+
+    async refreshTeamDirectory() {
+        if (this.teamLicenseStatus?.workspace !== 'team') return;
+        try {
+            const directory = await invoke('get_team_directory');
+            const list = document.getElementById('teamDirectoryList');
+            if (!list) return;
+            const canAdminister = this.teamLicenseStatus.can_write && ['owner', 'admin'].includes(directory.role);
+            const note = document.getElementById('teamDirectoryNote');
+            if (note) note.textContent = directory.online ? 'Owner and pending invitations count toward seats.' : 'Saved member list. Requests will be checked after reconnecting.';
+            const row = (label, kind, id, action) => `<div class="team-request-row"><span>${this.escapeHtml(label)}</span>`
+                + (canAdminister && kind ? `<button type="button" class="btn btn-secondary btn-small" data-team-directory-kind="${kind}" data-team-directory-id="${this.escapeHtmlAttr(id)}">${action}</button>` : '') + '</div>';
+            list.innerHTML = (directory.members || []).map(member => row(`${member.email} (${member.role})`, member.role === 'owner' ? null : 'remove_member', member.user_id, 'Remove member')).join('')
+                + (directory.invitations || []).filter(invitation => invitation.status === 'pending' && Date.parse(invitation.expires_at) > Date.now())
+                    .map(invitation => row(`${invitation.email} (invitation pending)`, 'cancel_invitation', invitation.id, 'Cancel invitation')).join('');
+            if (!list.innerHTML) list.textContent = 'Member list is available after connecting.';
+            list.querySelectorAll('[data-team-directory-kind]').forEach(button => button.addEventListener('click', async () => {
+                button.disabled = true;
+                try {
+                    await invoke('queue_team_admin_request', { kind: button.dataset.teamDirectoryKind, targetId: button.dataset.teamDirectoryId, email: null, groupName: null, description: null });
+                    await this.refreshPendingTeamRequests(Boolean(this.teamLicenseStatus?.online));
+                    await this.refreshTeamLicenseStatus({ silent: true });
+                } catch (error) { this.showNotification(`Team request could not be saved: ${error}`, 'error'); }
+                finally { button.disabled = false; }
+            }));
+        } catch (error) { console.warn('Team directory unavailable:', error); }
+    }
+
+    async refreshPendingTeamRequests(replay = false) {
+        if (this.teamLicenseStatus?.workspace !== 'team') return;
+        try {
+            const requests = await invoke(replay ? 'sync_team_admin_requests' : 'list_team_admin_requests');
+            const list = document.getElementById('teamPendingRequestsList');
+            if (!list) return;
+            if (!requests?.length) {
+                list.textContent = 'No administration requests.';
+                return;
+            }
+            list.innerHTML = requests.map(item => {
+                const request = item.request || {};
+                const target = request.email || request.group_name || request.target_id || '';
+                const detail = item.status === 'accepted' && request.kind === 'invite_member'
+                    ? `Invitation code: ${request.invitation_code || ''}`
+                    : item.status === 'accepted' && request.kind === 'create_group'
+                        ? `Group ready: ${item.result_id || ''}`
+                        : item.last_error || '';
+                return `<div class="team-request-row"><strong>${this.escapeHtml(request.kind.replaceAll('_', ' '))}: ${this.escapeHtml(target)}</strong>`
+                    + `<span>${this.escapeHtml(item.status)}</span><small>${this.escapeHtml(detail)}</small>`
+                    + (!['accepted', 'rejected'].includes(item.status) ? '' : `<button type="button" class="btn btn-secondary btn-small" data-dismiss-team-request="${this.escapeHtmlAttr(request.id)}">Clear</button>`)
+                    + '</div>';
+            }).join('');
+            list.querySelectorAll('[data-dismiss-team-request]').forEach(button => {
+                button.addEventListener('click', async () => {
+                    try {
+                        await invoke('dismiss_team_admin_request', { requestId: button.dataset.dismissTeamRequest });
+                        await this.refreshPendingTeamRequests();
+                    } catch (error) {
+                        this.showNotification(`Could not clear request: ${error}`, 'error');
+                    }
+                });
+            });
+        } catch (error) {
+            console.warn('Team request review unavailable:', error);
+        }
+    }
+
+    async activateTeamFromSettings() {
+        const nameInput = document.getElementById('teamOrganizationName');
+        const codeInput = document.getElementById('teamUnlockCode');
+        const organizationName = nameInput?.value.trim() || '';
+        const code = codeInput?.value.trim() || '';
+        if (!organizationName || !code) {
+            this.showNotification('Enter an organization name and Team code.', 'warning');
+            return;
+        }
+        try {
+            const status = await invoke('redeem_team_code', { code, organizationName });
+            if (codeInput) codeInput.value = '';
+            this.teamLicenseStatus = status;
+            await this.selectWorkspaceType('team');
+            this.renderTeamLicenseSettings();
+            this.showWorkspaceHome();
+            this.showNotification('Team workspace activated.', 'success');
+        } catch (error) {
+            this.showNotification(`Team activation failed: ${error}`, 'error');
+        }
+    }
+
+    async acceptTeamInvitationFromSettings() {
+        const codeInput = document.getElementById('teamInvitationCode');
+        const code = codeInput?.value.trim() || '';
+        if (!code) {
+            this.showNotification('Enter the invitation code.', 'warning');
+            return;
+        }
+        try {
+            await invoke('accept_team_invitation', { code });
+            if (codeInput) codeInput.value = '';
+            await this.refreshTeamLicenseStatus();
+            await this.selectWorkspaceType('team');
+            this.showWorkspaceHome();
+            this.showNotification('Joined the Team organization.', 'success');
+        } catch (error) {
+            this.showNotification(`Could not join Team: ${error}`, 'error');
+        }
+    }
+
+    async inviteTeamMemberFromSettings() {
+        const emailInput = document.getElementById('teamInviteEmail');
+        const email = emailInput?.value.trim() || '';
+        if (!this.isValidEmail(email)) {
+            this.showNotification('Enter a valid email address.', 'warning');
+            return;
+        }
+        try {
+            if (this.teamLicenseStatus?.online === false) {
+                await invoke('queue_team_admin_request', { kind: 'invite_member', email });
+                if (emailInput) emailInput.value = '';
+                await this.refreshPendingTeamRequests();
+                this.showNotification('Invitation request saved. The server will check it after reconnecting.', 'info');
+                return;
+            }
+            const code = await invoke('invite_team_member', { email });
+            const output = document.getElementById('teamGeneratedInvitation');
+            const label = document.getElementById('teamGeneratedInvitationLabel');
+            if (output) {
+                output.value = code;
+                output.classList.remove('hidden');
+                output.select();
+            }
+            label?.classList.remove('hidden');
+            if (emailInput) emailInput.value = '';
+            await this.refreshTeamLicenseStatus({ silent: true });
+            this.showNotification('Seat reserved. Copy the invitation code and share it securely.', 'success');
+        } catch (error) {
+            this.showNotification(`Invitation failed: ${error}`, 'error');
+        }
+    }
+
+    async exportExistingTeamFile() {
+        const dialog = window.__TAURI__?.dialog;
+        if (!dialog?.open || !dialog?.save) {
+            this.showNotification('File picker is unavailable.', 'error');
+            return;
+        }
+        const encryptedPath = await dialog.open({
+            multiple: false,
+            title: 'Select an existing encrypted file',
+            filters: [{ name: 'Encrypted files', extensions: ['encrypted'] }]
+        });
+        if (!encryptedPath) return;
+        const outputPath = await dialog.save({
+            title: 'Export decrypted copy',
+            defaultPath: String(encryptedPath).replace(/\.encrypted$/i, '')
+        });
+        if (!outputPath) return;
+        try {
+            this.checkedCommandResult(await invoke('export_existing_team_file', {
+                encryptedPath, outputPath
+            }), 'Export');
+            this.showNotification('Decrypted copy exported. The encrypted original was retained.', 'success');
+        } catch (error) {
+            this.showNotification(`Export failed: ${error}`, 'error');
         }
     }
 
     openSettingsModal(sectionId = null) {
+        this.renderTeamLicenseSettings();
+        this.refreshTeamLicenseStatus({ silent: true });
         this.refreshSettingsStatus();
         this.refreshLegalStatusUi();
         this.updateMfaSettingsButton();
@@ -12388,7 +12637,7 @@ class HybridCipherApp {
         }
     }
 
-    handleCreateGroupSubmit(e) {
+    async handleCreateGroupSubmit(e) {
         e.preventDefault();
         const nameInput = document.getElementById('createGroupName');
         const descriptionInput = document.getElementById('createGroupDescription');
@@ -12400,6 +12649,16 @@ class HybridCipherApp {
         }
 
         this.closeCreateGroupModal();
+        if (this.teamLicenseStatus?.online === false) {
+            try {
+                await invoke('queue_team_admin_request', { kind: 'create_group', groupName: name, description });
+                await this.refreshPendingTeamRequests();
+                this.showNotification('Group request saved. The server will check it after reconnecting.', 'info');
+            } catch (error) {
+                this.showNotification(`Could not save group request: ${error}`, 'error');
+            }
+            return;
+        }
         const descriptionArg = description ? ` --description ${this.quoteCliArg(description)}` : '';
         const command = `hybridcipher create-group ${this.quoteCliArg(name)}${descriptionArg} && hybridcipher initialize-group`;
         this.runDashboardCliCommand(command);
@@ -12432,6 +12691,7 @@ class HybridCipherApp {
     }
 
     async loadSwitchGroupList() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const list = document.getElementById('switchGroupList');
         if (!list) return;
         try {
@@ -12439,45 +12699,29 @@ class HybridCipherApp {
                 this.fetchGroupList(),
                 this.getActiveGroupContext()
             ]);
+            if (!isCurrentRead()) return;
             this.switchGroupCurrentId = context.groupId;
             this.renderSwitchGroupList(groups, this.switchGroupCurrentId);
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to load group list:', error);
             list.innerHTML = '<div class="group-list-empty">Failed to load groups.</div>';
         }
     }
 
     async fetchGroupListFromCli() {
-        let cliPath;
-        try {
-            cliPath = await this.getCliBinaryPath();
-        } catch (error) {
-            throw new Error('CLI binary not available');
-        }
-
-        const rawCommand = 'hybridcipher list-groups --format json --no-color';
-        const command = this.resolveCliCommand(rawCommand, cliPath);
-        const result = await invoke('run_shell_command', { command, cwd: null });
-        if (!result?.success || !result?.data) {
-            throw new Error(result?.error || 'Group list command failed');
-        }
-
-        const stdout = result.data.stdout || '';
-        const stderr = result.data.stderr || '';
-        let groups = this.parseGroupListOutput(stdout);
-        if (!groups.length && stderr) {
-            groups = this.parseGroupListOutput(stderr);
-        }
+        const result = await this.runBundledCliArgs(['list-groups', '--format', 'json', '--no-color']);
+        let groups = this.parseGroupListOutput(result.stdout || '');
+        if (!groups.length && result.stderr) groups = this.parseGroupListOutput(result.stderr);
         return groups;
     }
-
     async fetchGroupList() {
         try {
             const result = await invoke('get_group_summaries');
             if (result?.success && Array.isArray(result.data)) {
                 return result.data
                     .map(group => this.normalizeGroupListEntry(group))
-                    .filter(Boolean);
+                    .filter(group => group && Boolean(group.organization_id) === (this.appMode === 'team'));
             }
             if (result?.error) {
                 console.warn('Group summary command failed, falling back to CLI:', result.error);
@@ -12485,7 +12729,8 @@ class HybridCipherApp {
         } catch (error) {
             console.warn('Failed to fetch group summaries from desktop backend:', error);
         }
-        return this.fetchGroupListFromCli();
+        return (await this.fetchGroupListFromCli())
+            .filter(group => group && Boolean(group.organization_id) === (this.appMode === 'team'));
     }
 
     parseGroupListOutput(output) {
@@ -12560,6 +12805,7 @@ class HybridCipherApp {
 
         return {
             id,
+            organization_id: group?.organization_id || null,
             name: group?.name || 'Untitled group',
             description: descriptionValue,
             created_at: createdAtValue,
@@ -12826,6 +13072,7 @@ class HybridCipherApp {
     }
 
     async loadListGroups() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const list = document.getElementById('listGroupsList');
         if (!list) return;
         try {
@@ -12833,8 +13080,10 @@ class HybridCipherApp {
                 this.fetchGroupList(),
                 this.getActiveGroupContext()
             ]);
+            if (!isCurrentRead()) return;
             this.renderListGroups(groups, context.groupId);
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to load groups list modal:', error);
             list.innerHTML = '<div class="group-list-empty">Failed to load groups.</div>';
         }
@@ -12990,6 +13239,7 @@ class HybridCipherApp {
         }
         if (fingerprintInput) {
             fingerprintInput.value = '';
+            fingerprintInput.setAttribute('aria-invalid', 'false');
         }
         if (submitBtn) {
             submitBtn.disabled = true;
@@ -13026,11 +13276,13 @@ class HybridCipherApp {
     }
 
     async loadAdminPinVerifyMembers() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const memberSelect = document.getElementById('adminPinVerifyMemberSelect');
         if (!memberSelect) return;
 
         try {
             const result = await invoke('get_group_member_details');
+            if (!isCurrentRead()) return;
             if (!result?.success) {
                 throw new Error(result?.error || 'Member list unavailable');
             }
@@ -13040,6 +13292,7 @@ class HybridCipherApp {
             this.renderAdminPinVerifyMemberOptions();
             this.handleAdminPinVerifyMemberChange();
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to load members for trust verification:', error);
             this.adminPinVerifyMembers = [];
             memberSelect.innerHTML = '<option value="">Failed to load members</option>';
@@ -13135,8 +13388,12 @@ class HybridCipherApp {
         const hasMember = Boolean(memberSelect?.value);
         const hasDevice = Boolean(deviceSelect?.value);
         const fingerprint = String(fingerprintInput?.value || '').trim();
-        const hasFingerprint = fingerprint.length > 0;
-        submitBtn.disabled = !(hasMember && hasDevice && hasFingerprint);
+        const validFingerprint = normalizeDeviceFingerprintValue(fingerprint);
+        fingerprintInput?.setAttribute('aria-invalid', fingerprint && !validFingerprint ? 'true' : 'false');
+        this.setAdminPinVerifyError(fingerprint && !validFingerprint
+            ? 'Enter 16 hexadecimal characters (0-9, A-F).'
+            : '');
+        submitBtn.disabled = !(hasMember && hasDevice && validFingerprint);
     }
 
     async handleAdminPinVerifySubmit(event) {
@@ -13160,6 +13417,11 @@ class HybridCipherApp {
         }
         if (!fingerprint) {
             this.setAdminPinVerifyError('Fingerprint is required.');
+            return;
+        }
+        const normalizedFingerprint = normalizeDeviceFingerprintValue(fingerprint);
+        if (!normalizedFingerprint) {
+            this.setAdminPinVerifyError('Enter 16 hexadecimal characters (0-9, A-F).');
             return;
         }
 
@@ -13187,7 +13449,7 @@ class HybridCipherApp {
         }
 
         const command =
-            `hybridcipher pin verify ${this.quoteCliArg(userIdOrEmail)} ${this.quoteCliArg(deviceId)} --fingerprint ${this.quoteCliArg(fingerprint)}`;
+            `hybridcipher pin verify ${this.quoteCliArg(userIdOrEmail)} ${this.quoteCliArg(deviceId)} --fingerprint ${this.quoteCliArg(normalizedFingerprint)}`;
         this.closeAdminPinVerifyModal();
         this.runDashboardCliCommand(command);
     }
@@ -13277,11 +13539,11 @@ class HybridCipherApp {
             const folderName = document.createElement('div');
             folderName.className = 'member-list-email';
             const fallbackName = folder.path ? folder.path.split(/[/\\\\]/).filter(Boolean).pop() : '';
-            folderName.textContent = folder.name || fallbackName || folder.path || 'Unknown folder';
+            folderName.textContent = folder.name || fallbackName || displayEnrolledPathValue(folder.path) || 'Unknown folder';
 
             const folderPath = document.createElement('div');
             folderPath.className = 'member-list-details admin-enrolled-list-path';
-            folderPath.textContent = folder.path || 'Path unavailable';
+            folderPath.textContent = displayEnrolledPathValue(folder.path) || 'Path unavailable';
 
             const enrolledAt = this.formatSettingsTimestamp(folder.enrolled_at);
             const trackedBytes = Number(folder.tracked_bytes);
@@ -13316,16 +13578,19 @@ class HybridCipherApp {
     }
 
     async loadListMembers() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const list = document.getElementById('listMembersList');
         if (!list) return;
         try {
             const result = await invoke('get_group_member_details');
+            if (!isCurrentRead()) return;
             if (!result?.success) {
                 throw new Error(result?.error || 'Member list unavailable');
             }
             const members = Array.isArray(result.data) ? result.data : [];
             this.renderListMembers(members);
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to load members list:', error);
             list.innerHTML = '<div class="member-list-empty">Failed to load members.</div>';
         }
@@ -13391,16 +13656,19 @@ class HybridCipherApp {
     }
 
     async loadRemoveMemberList() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const list = document.getElementById('removeMemberList');
         if (!list) return;
         try {
             const result = await invoke('get_group_members');
+            if (!isCurrentRead()) return;
             if (!result?.success) {
                 throw new Error(result?.error || 'Members unavailable');
             }
             const members = Array.isArray(result.data) ? result.data : [];
             this.renderRemoveMemberList(members);
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to load group members:', error);
             list.innerHTML = '<div class="member-list-empty">Failed to load members.</div>';
         }
@@ -13526,36 +13794,6 @@ class HybridCipherApp {
         }
     }
 
-    async beginRekeyFlow({ title, message, progressMessage = 'Preparing rekey...' }) {
-        const startRekey = await this.showActionPrompt(
-            title,
-            message,
-            {
-                primaryLabel: 'Start rekey',
-                secondaryLabel: 'Not now'
-            }
-        );
-        if (startRekey !== true) {
-            return;
-        }
-
-        this.setAdminPanelVisible(false);
-        await this.createTerminalTab();
-        const command = 'hybridcipher rekey start --activation-delay immediate --local-migration defer';
-        await this.executeCommandDirectly(command, true, { returnSessionId: true });
-        const progressMessages = Array.isArray(progressMessage)
-            ? progressMessage
-            : [
-                'Preparing rekey...',
-                'Verifying device security...',
-                'Auditing active devices...',
-                'Scanning coverage state...',
-                'Generating Welcome payloads...',
-                'Publishing new epoch descriptor...'
-            ];
-        this.showActionProgressModal(progressMessages);
-    }
-
     async promptRekeyMigrationChoice(sessionId) {
         const startMigration = await this.showActionPrompt(
             'Start migration now?',
@@ -13574,17 +13812,6 @@ class HybridCipherApp {
         if (!shouldMigrate) {
             await this.showMigrationDeferredPrompt();
         }
-    }
-
-    async showMigrationDeferredPrompt() {
-        await this.showActionPrompt(
-            'Migration deferred',
-            'When ready, run: hybridcipher coverage migration',
-            {
-                primaryLabel: 'OK',
-                secondaryLabel: null
-            }
-        );
     }
 
     async handleRekeyStartPrompt() {
@@ -13887,11 +14114,13 @@ class HybridCipherApp {
     }
 
     async refreshAdminPendingActionsSummary() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const valueEl = document.getElementById('adminPendingActionsValue');
         const metaEl = document.getElementById('adminPendingActionsMeta');
         if (valueEl) valueEl.textContent = 'Loading pending actions...';
         if (metaEl) metaEl.textContent = '—';
         await this.refreshOperationsQueues();
+        if (!isCurrentRead()) return;
         this.updateAdminPendingActionsCard();
     }
 
@@ -13934,6 +14163,7 @@ class HybridCipherApp {
     }
 
     async refreshAdminTeamMembersSummary() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const valueEl = document.getElementById('adminTeamMembersValue');
         const metaEl = document.getElementById('adminTeamMembersMeta');
         if (!valueEl || !metaEl) return;
@@ -13946,6 +14176,7 @@ class HybridCipherApp {
                 invoke('get_group_member_details'),
                 invoke('get_stale_devices')
             ]);
+            if (!isCurrentRead()) return;
 
             if (!membersResp?.success) {
                 throw new Error(membersResp?.error || 'Members unavailable');
@@ -13986,6 +14217,7 @@ class HybridCipherApp {
             valueEl.textContent = `${this.formatCount(activeUsers)} ${userLabel}`;
             metaEl.textContent = `${this.formatCount(nonStaleDevices)} ${deviceLabel} (non-stale)`;
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.warn('Failed to load team members summary:', error);
             valueEl.textContent = 'Members unavailable';
             metaEl.textContent = '—';
@@ -14016,6 +14248,7 @@ class HybridCipherApp {
     }
 
     async refreshAdminServerStatusSummary() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const valueEl = document.getElementById('adminServerStatusValue');
         const metaEl = document.getElementById('adminServerStatusMeta');
         if (!valueEl || !metaEl) return;
@@ -14025,6 +14258,7 @@ class HybridCipherApp {
 
         try {
             const output = await this.runCliStatusCommand('hybridcipher server-trust show --no-color');
+            if (!isCurrentRead()) return;
             const status = this.parseServerTrustStatus(output);
             const summary = this.summarizeServerTrustStatus(status) || 'Status unavailable';
             if (summary === 'Verified') {
@@ -14037,6 +14271,7 @@ class HybridCipherApp {
             this.adminServerStatusLastUpdatedAt = Date.now();
             metaEl.textContent = 'Last: just now';
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.warn('Failed to load server status:', error);
             const message = error?.message || '';
             if (/not authenticated|login/i.test(message)) {
@@ -14052,10 +14287,12 @@ class HybridCipherApp {
     }
 
     async refreshAdminGroupStatus() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const groupStatusEl = document.getElementById('adminCurrentGroupStatus');
         if (!groupStatusEl) return;
 
         const context = await this.getActiveGroupContext();
+        if (!isCurrentRead()) return;
         if (context.groupName || context.groupId) {
             groupStatusEl.textContent = context.groupName || context.groupId;
             return;
@@ -14063,9 +14300,11 @@ class HybridCipherApp {
 
         try {
             const output = await this.runCliStatusCommand('hybridcipher current-group --no-color');
+            if (!isCurrentRead()) return;
             const status = this.parseCurrentGroupStatus(output);
             groupStatusEl.textContent = status || 'Active group unavailable';
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.warn('Failed to load current group status:', error);
             groupStatusEl.textContent = 'Active group unavailable';
         }
@@ -14076,12 +14315,14 @@ class HybridCipherApp {
     }
 
     async refreshAdminCoverageSummary() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const statusEl = document.getElementById('adminCoverageStatus');
         const metaEl = document.getElementById('adminCoverageMeta');
         if (!statusEl || !metaEl) return;
 
         try {
             const response = await invoke('list_enrolled_folders');
+            if (!isCurrentRead()) return;
             if (!response?.success) {
                 throw new Error(response?.error || 'Coverage data unavailable');
             }
@@ -14105,73 +14346,70 @@ class HybridCipherApp {
             statusEl.textContent = `${percentTracked}% covered`;
             metaEl.textContent = `${this.formatCount(folderCount)} enrolled folders • ${this.formatCount(totalKnown)} files`;
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.warn('Failed to load coverage summary:', error);
             statusEl.textContent = 'Coverage unavailable';
             metaEl.textContent = '—';
         }
     }
 
+    parseGeneratedCliArgs(rawCommand) {
+        const tokens = [];
+        let token = '';
+        let started = false;
+        let quoted = false;
+        const command = String(rawCommand || '');
+        if (/[\r\n]/.test(command)) throw new Error('Invalid generated CLI command');
+        for (let index = 0; index < command.length; index += 1) {
+            const character = command[index];
+            if (character === '"') {
+                started = true;
+                if (quoted && command[index + 1] === '"') {
+                    token += '"';
+                    index += 1;
+                } else {
+                    quoted = !quoted;
+                }
+            } else if (/\s/.test(character) && !quoted) {
+                if (started) {
+                    tokens.push(token);
+                    token = '';
+                    started = false;
+                }
+            } else {
+                token += character;
+                started = true;
+            }
+        }
+        if (quoted) throw new Error('Unclosed quote in generated CLI command');
+        if (started) tokens.push(token);
+        if (tokens.shift() !== 'hybridcipher') throw new Error('Expected a HybridCipher CLI command');
+        return tokens;
+    }
+
+    async runBundledCliArgs(args, { input = null, checkStatus = true } = {}) {
+        if (this.sessionPersistent === false) {
+            throw new Error('This action requires a persistent login. Turn on Remember me and sign in again.');
+        }
+        const result = await invoke('run_bundled_cli', { args, input });
+        this.checkedCommandResult(result, 'CLI action');
+        const data = result.data || {};
+        if (checkStatus && data.status !== 0) {
+            throw new Error((data.stderr || data.stdout || '').trim() || `CLI exited with status ${data.status}`);
+        }
+        return data;
+    }
+
     async runCliStatusCommand(rawCommand) {
-        let cliPath;
-        try {
-            cliPath = await this.getCliBinaryPath();
-        } catch (error) {
-            throw new Error('CLI binary not available');
-        }
-
-        const command = this.resolveCliCommand(rawCommand, cliPath);
-        const result = await invoke('run_shell_command', { command, cwd: null });
-        if (!result?.success || !result?.data) {
-            throw new Error(result?.error || 'CLI command failed');
-        }
-
-        const stdout = result.data.stdout || '';
-        const stderr = result.data.stderr || '';
-        return `${stdout}\n${stderr}`.trim();
+        const result = await this.runBundledCliArgs(this.parseGeneratedCliArgs(rawCommand));
+        return `${result.stdout || ''}\n${result.stderr || ''}`.trim();
     }
 
     async runCliCommandRaw(rawCommand) {
-        let cliPath;
-        try {
-            cliPath = await this.getCliBinaryPath();
-        } catch (error) {
-            throw new Error('CLI binary not available');
-        }
-
-        const command = this.resolveCliCommand(rawCommand, cliPath);
-        const result = await invoke('run_shell_command', { command, cwd: null });
-        if (!result?.success || !result.data) {
-            throw new Error(result?.error || 'CLI command failed');
-        }
-        return result.data;
+        const operations = window.HybridCipherTeamMethods?.create({});
+        if (!operations) throw new Error('Desktop operation dialogs are unavailable. Restart the app.');
+        return operations.runCliCommandRaw.call(this, rawCommand);
     }
-
-    escapeShellInput(value) {
-        if (!value) return '';
-        return value
-            .replace(/\\/g, '\\\\')
-            .replace(/"/g, '\\"')
-            .replace(/\$/g, '\\$')
-            .replace(/`/g, '\\`');
-    }
-
-    async runCliCommandWithInput(rawCommand, inputLines = []) {
-        let cliPath;
-        try {
-            cliPath = await this.getCliBinaryPath();
-        } catch (error) {
-            throw new Error('CLI binary not available');
-        }
-
-        const command = this.resolveCliCommand(rawCommand, cliPath);
-        const joined = Array.isArray(inputLines) ? inputLines.join('\n') + '\n' : `${inputLines}\n`;
-        const result = await invoke('run_shell_command', { command, cwd: null, input: joined });
-        if (!result?.success || !result.data) {
-            throw new Error(result?.error || 'CLI command failed');
-        }
-        return result.data;
-    }
-
     showIssueWelcomeQueue() {
         this.setQueueDetailsHeader(
             'Issue welcome',
@@ -14245,6 +14483,7 @@ class HybridCipherApp {
     }
 
     async loadPendingDevicesQueue(options = {}) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const { suppressDetails = false } = options;
         const queue = document.getElementById('adminIssueWelcomeQueue');
         if (!suppressDetails) {
@@ -14252,6 +14491,7 @@ class HybridCipherApp {
         }
         try {
             const result = await invoke('get_pending_devices');
+            if (!isCurrentRead()) return;
             if (!result?.success || !result.data) {
                 throw new Error(result?.error || 'Pending devices unavailable');
             }
@@ -14264,6 +14504,7 @@ class HybridCipherApp {
                 this.renderPendingDevicesPage();
             }
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Pending devices load failed:', error);
             if (!suppressDetails) {
                 this.setQueueDetailsMessage('queue-details-error', 'Failed to load pending devices.');
@@ -14273,6 +14514,7 @@ class HybridCipherApp {
     }
 
     async loadStaleDevicesQueue(options = {}) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const { suppressDetails = false } = options;
         const queue = document.getElementById('adminStaleDevicesQueue');
         if (!suppressDetails) {
@@ -14280,6 +14522,7 @@ class HybridCipherApp {
         }
         try {
             const result = await invoke('get_stale_devices');
+            if (!isCurrentRead()) return;
             if (!result?.success || !result.data) {
                 throw new Error(result?.error || 'Stale devices unavailable');
             }
@@ -14292,6 +14535,7 @@ class HybridCipherApp {
                 this.renderStaleDevicesPage();
             }
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Stale devices load failed:', error);
             if (!suppressDetails) {
                 this.setQueueDetailsMessage('queue-details-error', 'Failed to load stale devices.');
@@ -14301,6 +14545,7 @@ class HybridCipherApp {
     }
 
     async loadUnverifiedDevicesQueue(options = {}) {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const { suppressDetails = false } = options;
         const queue = document.getElementById('adminUnverifiedDevicesQueue');
         if (!suppressDetails) {
@@ -14308,6 +14553,7 @@ class HybridCipherApp {
         }
         try {
             const result = await invoke('get_unverified_devices');
+            if (!isCurrentRead()) return;
             if (!result?.success || !result.data) {
                 throw new Error(result?.error || 'Unverified devices unavailable');
             }
@@ -14320,6 +14566,7 @@ class HybridCipherApp {
                 this.renderUnverifiedDevicesPage();
             }
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Unverified devices load failed:', error);
             if (!suppressDetails) {
                 this.setQueueDetailsMessage('queue-details-error', 'Failed to load unverified devices.');
@@ -14631,14 +14878,29 @@ class HybridCipherApp {
         this.updateDeviceVerifySubmitState();
     }
 
+    formatFingerprintField(input) {
+        if (!input) return;
+        const cursor = input.selectionStart ?? input.value.length;
+        const formatted = formatDeviceFingerprintInputValue(input.value);
+        const formattedBeforeCursor = formatDeviceFingerprintInputValue(input.value.slice(0, cursor));
+        input.value = formatted;
+        input.setSelectionRange(formattedBeforeCursor.length, formattedBeforeCursor.length);
+    }
+
     updateDeviceVerifySubmitState() {
         const submitBtn = document.getElementById('submitDeviceVerifyBtn');
         if (!submitBtn) return;
-        const fingerprint = String(document.getElementById('deviceVerifyFingerprintInput')?.value || '').trim();
-        submitBtn.disabled = !buildDeviceVerificationModelValue({
+        const input = document.getElementById('deviceVerifyFingerprintInput');
+        const fingerprint = String(input?.value || '').trim();
+        const model = buildDeviceVerificationModelValue({
             device: this.deviceVerifyDevice,
             fingerprint
-        }).canSubmit;
+        });
+        input?.setAttribute('aria-invalid', fingerprint && !model.fingerprint ? 'true' : 'false');
+        this.setDeviceVerifyError(fingerprint && !model.fingerprint
+            ? 'Enter 16 hexadecimal characters (0-9, A-F).'
+            : '');
+        submitBtn.disabled = !model.canSubmit;
     }
 
     async handleDeviceVerifySubmit(event) {
@@ -14659,7 +14921,9 @@ class HybridCipherApp {
             return;
         }
         if (!verificationModel.fingerprint) {
-            this.setDeviceVerifyError('Fingerprint is required.');
+            this.setDeviceVerifyError(fingerprint
+                ? 'Enter 16 hexadecimal characters (0-9, A-F).'
+                : 'Fingerprint is required.');
             return;
         }
 
@@ -14792,12 +15056,14 @@ class HybridCipherApp {
     }
 
     async refreshSettingsStatus() {
+        const isCurrentRead = this.captureWorkspaceReadContext();
         const coverageScanEl = document.getElementById('settingsCoverageLastScan');
         const ipcStatusEl = document.getElementById('settingsCoverageIpcStatus');
         const registryUploadEl = document.getElementById('settingsRegistryLastUpload');
 
         try {
             const result = await invoke('get_settings_status');
+            if (!isCurrentRead()) return;
             if (!result.success || !result.data) {
                 throw new Error(result.error || 'Settings status unavailable');
             }
@@ -14826,6 +15092,7 @@ class HybridCipherApp {
                 registryUploadEl.textContent = this.formatSettingsTimestamp(status.registry_last_upload);
             }
         } catch (error) {
+            if (!isCurrentRead()) return;
             console.error('Failed to refresh settings status:', error);
             if (coverageScanEl) coverageScanEl.textContent = '—';
             if (ipcStatusEl) {
@@ -14944,32 +15211,10 @@ class HybridCipherApp {
     }
 
     async runSettingsCliCommand(command, options = {}) {
-        const { confirmTitle, confirmMessage, closeSettingsModal = true } = options;
-        if (this.adminPanelVisible) {
-            this.setAdminPanelVisible(false);
-        }
-        if (confirmTitle && confirmMessage) {
-            const confirmed = await this.showConfirmDialog(confirmTitle, confirmMessage);
-            if (!confirmed) return;
-        }
-
-        try {
-            await this.getCliBinaryPath();
-        } catch (error) {
-            this.showNotification(
-                'Failed to locate hybridcipher CLI. Please build it with "cargo build --release --bin hybridcipher"',
-                'error'
-            );
-            return;
-        }
-
-        await this.createTerminalTab();
-        await this.executeCommandDirectly(command, true);
-        if (closeSettingsModal) {
-            this.closeSettingsModal();
-        }
+        const operations = window.HybridCipherTeamMethods?.create({});
+        if (!operations) throw new Error('Desktop operation dialogs are unavailable. Restart the app.');
+        return operations.runSettingsCliCommand.call(this, command, options);
     }
-
     runDashboardCliCommand(command, options = {}) {
         this.setAdminPanelVisible(false);
         return this.runSettingsCliCommand(command, { ...options, closeSettingsModal: false });
@@ -15093,7 +15338,8 @@ class HybridCipherApp {
             detail = '',
             primaryLabel = 'Continue',
             secondaryLabel = 'Cancel',
-            keepOpen = false
+            keepOpen = false,
+            focusSecondary = false
         } = {}
     ) {
         const modal = document.getElementById('actionPromptModal');
@@ -15141,7 +15387,7 @@ class HybridCipherApp {
         }
 
         modal.style.display = 'flex';
-        setTimeout(() => primaryBtn.focus(), 0);
+        setTimeout(() => (focusSecondary && secondaryLabel ? secondaryBtn : primaryBtn).focus(), 0);
 
         return new Promise(resolve => {
             const cleanup = () => {
@@ -15317,6 +15563,7 @@ class HybridCipherApp {
 }
 
 Object.assign(HybridCipherApp.prototype, window.HybridCipherAppUpdateMethods || {});
+Object.assign(HybridCipherApp.prototype, window.HybridCipherTeamMethods?.create(HybridCipherApp.prototype) || {});
 
 // Initialize app
 const app = new HybridCipherApp();

@@ -676,6 +676,11 @@ body {
     background: rgba(46, 230, 214, 0.06);
 }
 
+.folder-item.unmounting {
+    border-color: rgba(96, 165, 250, 0.35);
+    background: rgba(96, 165, 250, 0.08);
+}
+
 .folder-item.active {
     background: var(--gradient-primary);
     color: white;
@@ -1645,6 +1650,28 @@ body {
     color: #93c5fd;
 }
 
+.mount-indicator.unmounting {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    background: rgba(96, 165, 250, 0.2);
+    color: #93c5fd;
+}
+
+.unmounting-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+}
+
+.unmounting-status .spinner-small,
+.mount-indicator.unmounting .spinner-small {
+    width: 12px;
+    height: 12px;
+    border-color: rgba(147, 197, 253, 0.3);
+    border-top-color: currentColor;
+}
+
 .mount-indicator.ready {
     background: rgba(134, 239, 172, 0.2);
     color: #86efac;
@@ -2229,6 +2256,14 @@ body {
     white-space: pre-line;
 }
 
+.unenroll-choice .action-prompt-actions {
+    flex-direction: column;
+}
+
+.unenroll-choice #actionPromptPrimaryBtn { order: 0; }
+.unenroll-choice #actionPromptSecondaryBtn { order: 1; }
+.unenroll-choice #actionPromptTertiaryBtn { order: 2; }
+
 .recovery-code-modal {
     max-width: 520px;
 }
@@ -2427,6 +2462,66 @@ body {
 
 .settings-actions .btn {
     width: 100%;
+}
+
+.team-license-form {
+    display: grid;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.team-license-form.hidden,
+.team-license-form .hidden {
+    display: none;
+}
+
+.team-license-form label {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+}
+
+.team-license-form input {
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 10px 12px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.team-license-note {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    margin: 10px 0 0;
+}
+
+.team-request-row {
+    display: grid;
+    gap: 4px;
+    padding: 10px;
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow-wrap: anywhere;
+}
+
+.team-request-row span,
+.team-request-row small {
+    color: var(--text-secondary);
+}
+
+.workspace-selector {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 6px 9px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.workspace-license-badge {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    white-space: nowrap;
 }
 
 .settings-action-rich {
@@ -3315,6 +3410,7 @@ body {
 .settings-update-status .update-status-available {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
     color: #6366f1;
     font-weight: 500;
@@ -3334,6 +3430,31 @@ body {
 
 .settings-update-status .update-status-error {
     color: #ef4444;
+}
+
+.store-update-banner {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: 9999;
+    max-width: min(340px, calc(100vw - 40px));
+    padding: 16px 20px;
+    border: 1px solid var(--color-primary, #6366f1);
+    border-radius: 12px;
+    background: var(--color-surface, #1e293b);
+    color: var(--color-text, #f1f5f9);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    font-size: 14px;
+}
+
+.store-update-banner p {
+    margin: 6px 0 12px;
+}
+
+.store-update-banner-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
 }
 
 .settings-select {
@@ -3985,6 +4106,17 @@ body {
     color: #fecaca;
 }
 
+.workspace-context-label { color: var(--text-secondary); margin: 0.5rem 0; }
+.workspace-setup-notice { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; padding: 1rem; border: 1px solid var(--border-color); border-radius: 8px; }
+.operation-progress { width: 100%; margin: 0.75rem 0; }
+.operation-output { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; padding: 1rem 0; }
+#desktopOperationDetails { margin: 1rem 0; }
+
+.folder-detail-menu-item:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
 .folder-detail-menu-divider {
     height: 1px;
     margin: 0.35rem 0.5rem;
@@ -4105,6 +4237,93 @@ body {
     gap: var(--spacing-sm);
 }
 
+.folder-legacy-notice {
+    padding: 0.75rem var(--spacing-md);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+}
+
+.folder-legacy-notice-main {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--spacing-md);
+}
+
+.folder-legacy-notice h4,
+.folder-legacy-notice p {
+    margin: 0;
+}
+
+.folder-legacy-notice h4 {
+    font-size: 0.9rem;
+}
+
+.folder-legacy-notice p,
+.folder-legacy-notice-details {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+
+.folder-legacy-notice-main > .btn {
+    flex-shrink: 0;
+}
+
+.folder-legacy-notice-details {
+    margin-top: var(--spacing-xs);
+}
+
+.folder-legacy-notice-details summary {
+    width: fit-content;
+    cursor: pointer;
+}
+
+.folder-legacy-notice-details p {
+    margin-top: var(--spacing-sm);
+}
+
+.folder-legacy-notice-details code {
+    overflow-wrap: anywhere;
+}
+
+.device-fingerprint-controls {
+    margin-top: var(--spacing-md);
+}
+
+.device-fingerprint-panel {
+    display: grid;
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-sm);
+    padding: var(--spacing-md);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+}
+
+.device-fingerprint-panel[hidden] {
+    display: none;
+}
+
+.device-fingerprint-label {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+}
+
+.device-fingerprint-value-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--spacing-sm);
+}
+
+.device-fingerprint-value-row code {
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    overflow-wrap: anywhere;
+}
+
 .folder-mount-safety-reason {
     display: flex;
     flex-direction: column;
@@ -4117,6 +4336,14 @@ body {
 
 .folder-mount-safety-reason.tone-error {
     border-color: rgba(248, 113, 113, 0.34);
+}
+
+.folder-mount-safety-reason details pre {
+    max-height: 18rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-size: 0.75rem;
 }
 
 .folder-mount-safety-kind,
@@ -4185,6 +4412,11 @@ body {
 }
 
 @media (max-width: 760px) {
+    .folder-legacy-notice-main {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
     .folder-mount-session-summary,
     .folder-mount-safety-panel-header,
     .folder-mount-safety-reason-header,

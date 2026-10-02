@@ -1,6 +1,6 @@
 [package]
 name = "hybridcipher-desktop"
-version = "0.1.6" # this will be syncd to the version in tauri.conf.json during build
+version = "0.1.1" # Crate metadata; app versions live in tauri.{windows,macos}.conf.json.
 edition = "2021"
 authors = ["HybridCipher Team"]
 description = "Cross-platform desktop application for HybridCipher encrypted file sharing"
@@ -12,6 +12,7 @@ categories = ["cryptography", "gui"]
 
 [build-dependencies]
 cc = "1.2.33"
+serde_json = "1.0"
 tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
@@ -85,6 +86,7 @@ hybridcipher-macos-file-provider = { path = "../../../crates/macos-file-provider
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6", features = ["windows-native"] }
 hybridcipher-windows-cloud-provider = { path = "../../../crates/windows-cloud-provider" }
+windows = { version = "0.61", features = ["ApplicationModel", "Foundation", "Services_Store", "Win32_Foundation", "Win32_UI_Shell"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", features = ["linux-native"] }
@@ -95,6 +97,7 @@ hybridcipher-windows-cloud-provider = { path = "../../../crates/windows-cloud-pr
 
 [features]
 native-verification = ["hybridcipher-windows-cloud-provider/native-verification"]
+store-msix = []
 # Enable additional macOS-specific features
 custom-protocol = ["tauri/custom-protocol"]
 individual-edition = []

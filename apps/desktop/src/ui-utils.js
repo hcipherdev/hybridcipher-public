@@ -456,7 +456,7 @@
         };
     }
 
-    function buildFolderDetailModel({ folder = {}, mountInfo = null, isMounted = false, coverageReview = null } = {}) {
+    function buildFolderDetailModel({ folder = {}, mountInfo = null, isMounted = false, isUnmounting = false, coverageReview = null } = {}) {
         const syncStatus = mountInfo?.syncStatus || mountInfo?.sync_status || {};
         const backend = mountInfo?.backend || null;
         const conflicts = toCount(syncStatus.pending_conflict_count);
@@ -476,7 +476,7 @@
         ];
         if (isMounted) {
             secondaryActions.push(
-                { id: 'unmount', label: 'Unmount folder…', destructive: true },
+                { id: 'unmount', label: isUnmounting ? 'Unmounting…' : 'Unmount folder…', destructive: true, disabled: isUnmounting },
             );
         }
 
@@ -502,7 +502,7 @@
                 conflicts,
                 recoveryCopies,
                 pendingChanges,
-                mountStatusLabel: isMounted ? 'Mounted' : 'Not mounted',
+                mountStatusLabel: isUnmounting ? 'Unmounting' : (isMounted ? 'Mounted' : 'Not mounted'),
                 unmountSafetyLabel: !isMounted
                     ? null
                     : (safeToUnmount === null
@@ -667,11 +667,23 @@
         };
     }
 
+    function formatDeviceFingerprintInput(value) {
+        const compact = String(value || '').replace(/\s/g, '').toUpperCase();
+        return compact.match(/.{1,4}/g)?.join(' ') || '';
+    }
+
+    function normalizeDeviceFingerprint(value) {
+        const compact = String(value || '').replace(/\s/g, '').toUpperCase();
+        return /^[0-9A-F]{16}$/.test(compact)
+            ? compact.match(/.{4}/g).join(' ')
+            : null;
+    }
+
     function buildDeviceVerificationModel({ device = null, fingerprint = '' } = {}) {
         const userId = String(device?.user_id || '').trim();
         const email = String(device?.email || '').trim();
         const deviceId = String(device?.device_id || '').trim();
-        const normalizedFingerprint = String(fingerprint || '').trim();
+        const normalizedFingerprint = normalizeDeviceFingerprint(fingerprint);
         const userIdentifier = userId || email;
 
         return {
@@ -704,19 +716,42 @@
 
         return safeFolders.filter(folder => {
             const path = String(folder?.path || '');
-            const basename = path.split(/[\\/]/).filter(Boolean).pop() || '';
-            return [folder?.name, basename, path].some(value =>
+            const displayPath = displayEnrolledPath(path);
+            const basename = displayPath.split(/[\\/]/).filter(Boolean).pop() || '';
+            return [folder?.name, basename, displayPath].some(value =>
                 String(value || '').toLocaleLowerCase().includes(normalizedQuery)
             );
         });
     }
 
+    function displayEnrolledPath(value) {
+        const path = String(value || '');
+        if (path.startsWith('\\\\?\\UNC\\')) {
+            return `\\\\${path.slice(8)}`;
+        }
+        if (path.startsWith('\\\\?\\') && /^[A-Za-z]:[\\/]/.test(path.slice(4))) {
+            return path.slice(4);
+        }
+        return path;
+    }
+
+    function isRoutineProviderReconciliation(syncStatus, observedDurationMs) {
+        if (!syncStatus || syncStatus.safe_to_unmount !== false || syncStatus.last_error) return false;
+        const reasons = syncStatus.unsafe_reasons;
+        return Array.isArray(reasons)
+            && reasons.length === 1
+            && reasons[0]?.kind === 'provider_reconciliation'
+            && Number.isFinite(observedDurationMs)
+            && observedDurationMs >= 0
+            && observedDurationMs < 30_000;
+    }
+
     function buildAppModeUiModel(appMode) {
         const isIndividual = appMode === 'individual';
         return {
-            searchMode: isIndividual ? 'folders' : 'commands',
-            searchPlaceholder: isIndividual ? 'Search protected folders…' : 'Search CLI commands…',
-            showTechnicalNavigation: !isIndividual,
+            searchMode: 'folders',
+            searchPlaceholder: 'Search protected folders…',
+            showTechnicalNavigation: false,
             protectionNavigationLabel: isIndividual ? 'Protection status' : 'Coverage Center',
         };
     }
@@ -734,10 +769,19 @@
         return ADVANCED_SETTINGS_SECTION_IDS.has(String(sectionId || ''));
     }
 
-    function getFolderRowStatusState({ isMounted = false, syncStatus = null, showSafetyAlert = false } = {}) {
+    function getFolderRowStatusState({ isMounted = false, isUnmounting = false, syncStatus = null, showSafetyAlert = false } = {}) {
+        if (isUnmounting) {
+            return {
+                showMountedBadge: false,
+                showUnmountingBadge: true,
+                showAlertButton: false,
+                healthDotTone: null,
+            };
+        }
         if (!isMounted) {
             return {
                 showMountedBadge: false,
+                showUnmountingBadge: false,
                 showAlertButton: false,
                 healthDotTone: null,
             };
@@ -749,6 +793,7 @@
 
         return {
             showMountedBadge: true,
+            showUnmountingBadge: false,
             showAlertButton: Boolean(showSafetyAlert),
             healthDotTone: hasConflicts || hasRecoveryCopies ? 'red' : 'green',
         };
@@ -786,11 +831,55 @@
         return `${count} unresolved ${pluralize(count, kind, `${kind}s`)} affecting ${files} ${pluralize(files, 'file', 'files')}`;
     }
 
+    function actionErrorMessage(error, fallback = 'Folder action failed.') {
+        if (typeof error === 'string' && error.trim()) return error;
+        if (typeof error?.message === 'string' && error.message.trim()) return error.message;
+        return fallback;
+    }
+
+    function normalizeFolderMountStatus(status) {
+        return status?.error === 'Mount not found'
+            ? { success: true, data: null }
+            : status;
+    }
+
+    async function runFolderUnenrollFlow({ rootId, path, choose, confirmCloudRisk,
+        checkMount, confirmUnmount, unmount, invokeCommand }) {
+        const choice = await choose(path);
+        if (choice !== 'primary' && choice !== 'secondary') return null;
+
+        const decrypt = choice === 'secondary';
+        if (decrypt && !await confirmCloudRisk(path)) return null;
+
+        const mountStatus = await checkMount(rootId);
+        if (!mountStatus || mountStatus.success !== true) {
+            throw new Error(mountStatus?.error || 'Could not check whether the folder is mounted.');
+        }
+        if (mountStatus.data) {
+            if (!await confirmUnmount(mountStatus.data)) return null;
+            if (!await unmount()) throw new Error('Unmount failed. Cannot proceed with removal.');
+            const afterUnmount = await checkMount(rootId);
+            if (!afterUnmount || afterUnmount.success !== true || afterUnmount.data) {
+                throw new Error('Could not confirm that the folder is unmounted.');
+            }
+        }
+
+        const command = decrypt ? 'unenroll_folder_and_decrypt' : 'unenroll_folder_keep_encrypted';
+        const response = await invokeCommand(command, { rootId });
+        if (!response?.success) throw new Error(response?.error || 'Folder removal failed.');
+        return { decrypt, response };
+    }
+
     const api = {
+        actionErrorMessage,
+        normalizeFolderMountStatus,
+        runFolderUnenrollFlow,
         pendingOperationLabel,
         captureKeyedScrollPositions,
         restoreKeyedScrollPositions,
         filterProtectedFolders,
+        displayEnrolledPath,
+        isRoutineProviderReconciliation,
         buildAppModeUiModel,
         shouldExpandAdvancedSettings,
         getEmbeddedTerminalHeaderTitle,
@@ -803,6 +892,8 @@
         buildFolderDetailModel,
         buildCoverageCenterModel,
         buildPersonalDevicesModel,
+        formatDeviceFingerprintInput,
+        normalizeDeviceFingerprint,
         buildDeviceVerificationModel,
         buildDeviceVerificationCommand,
     };

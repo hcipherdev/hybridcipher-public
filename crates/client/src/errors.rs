@@ -70,6 +70,9 @@ pub enum ErrorCode {
     GroupMigrationFailed = 4008,
     GroupPermissionDenied = 4009,
     GroupSizeLimitExceeded = 4010,
+    GroupNotInitialized = 4011,
+    GroupDeviceApprovalRequired = 4012,
+    GroupGenesisConflict = 4013,
 
     // File Operation Errors (5000-5999)
     FileNotFound = 5001,

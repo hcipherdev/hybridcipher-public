@@ -14,23 +14,30 @@ set -euo pipefail
 #   (aarch64-apple-darwin x86_64-apple-darwin)
 # - MODE=custom: builds targets listed in DESKTOP_TARGETS
 #
-# use INDIVIDUAL_EDITION=1 ./scripts/macos/desktop_release_pkg.sh
-# to build with individual-edition feature enabled (for testing only; not for public releases)
 # Overrides:
 # - DESKTOP_TARGETS is used only when MODE=custom
-# - ENV_FILE can override env file path (default: scripts/macos/.env.local)
+# - ENV_FILE can override env file path (default: secrets/macos-release.env)
 #
 # Usage:
 #   ./scripts/macos/desktop_release_pkg.sh
 #   MODE=full ./scripts/macos/desktop_release_pkg.sh
 #   MODE=custom DESKTOP_TARGETS="aarch64-apple-darwin" ./scripts/macos/desktop_release_pkg.sh
 #   PUBLISH_PUBLIC_RELEASE=1 ./scripts/macos/desktop_release_pkg.sh
+#   ./scripts/macos/desktop_release_pkg.sh --public-verify
+#   ./scripts/macos/desktop_release_pkg.sh --build-file-provider [OUTPUT_DIR]
+#   ./scripts/macos/desktop_release_pkg.sh --validate-file-provider [APP_BUNDLE]
+#
+# Build/validation subcommands do not load the release env file or publish.
+# File Provider builds accept APPLE_APPLICATION_IDENTITY (default: ad-hoc "-")
+# and APPLE_TEAM_ID; VERSION_OVERRIDE may only forward the canonical version.
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env.local}"
-FILE_PROVIDER_BUILD_SCRIPT="$SCRIPT_DIR/build_file_provider_extension.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/app_version.sh"
+ENV_FILE="${ENV_FILE:-$ROOT_DIR/secrets/macos-release.env}"
 APP_ENTITLEMENTS_TEMPLATE="$ROOT_DIR/apps/desktop/src-tauri/entitlements.plist"
+RELEASE_NOTES_PATH="$ROOT_DIR/apps/desktop/release-notes/releases.macos.json"
+MACOS_TAURI_RELEASE_CONFIG="src-tauri/tauri.macos.release.conf.json"
 DEFAULT_APPLE_TEAM_ID="G2L88C9692"
 
 ARTIFACTS=()
@@ -195,7 +202,7 @@ create_signed_updater_app_archive() {
 load_env_file() {
   if [[ ! -f "$ENV_FILE" ]]; then
     echo "Missing env file: $ENV_FILE" >&2
-    echo "Create it from .env.local template first." >&2
+    echo "Create the release environment file under secrets/ first." >&2
     exit 1
   fi
 
@@ -244,75 +251,44 @@ extract_version_from_release_tag() {
 }
 
 desktop_app_version() {
-  awk -F '"' '/^version = / { print $2; exit }' "$ROOT_DIR/apps/desktop/src-tauri/Cargo.toml"
+  macos_app_version
 }
 
-desktop_tauri_config_version() {
-  awk -F '"' '/"version"[[:space:]]*:/ { print $4; exit }' "$ROOT_DIR/apps/desktop/src-tauri/tauri.conf.json"
-}
+warn_if_release_notes_missing() {
+  local version="$1"
+  local path="$2"
 
-sync_desktop_tauri_config_version() {
-  local cargo_version
-  local tauri_version
-  cargo_version="$(desktop_app_version)"
-  tauri_version="$(desktop_tauri_config_version)"
+  python3 - "$version" "$path" <<'PY'
+import json
+import sys
 
-  if [[ -z "$cargo_version" ]]; then
-    echo "Failed to detect desktop version from apps/desktop/src-tauri/Cargo.toml" >&2
-    exit 1
-  fi
-
-  if [[ -z "$tauri_version" ]]; then
-    echo "Failed to detect desktop version from apps/desktop/src-tauri/tauri.conf.json" >&2
-    exit 1
-  fi
-
-  if [[ "$cargo_version" != "$tauri_version" ]]; then
-    log "Syncing tauri.conf.json version to Cargo.toml version ($cargo_version)"
-    python3 - "$ROOT_DIR/apps/desktop/src-tauri/tauri.conf.json" "$cargo_version" <<'PY'
-import json, sys
-
-path = sys.argv[1]
-version = sys.argv[2]
-
-with open(path, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-data["version"] = version
-
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=True)
-    f.write("\n")
+version, path = sys.argv[1:]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        document = json.load(fh)
+    releases = document.get("releases")
+    if not isinstance(releases, list):
+        raise ValueError("the document must contain a releases array")
+    if not any(isinstance(entry, dict) and entry.get("version") == version for entry in releases):
+        print(
+            f"WARNING: No release notes were found for version {version} in '{path}'. "
+            "Add a matching macOS release entry; the build will continue.",
+            file=sys.stderr,
+        )
+except Exception as error:
+    print(
+        f"WARNING: Could not check macOS release notes for version {version} in '{path}': "
+        f"{error}. Add or repair the matching release entry; the build will continue.",
+        file=sys.stderr,
+    )
 PY
-  fi
-}
-
-validate_desktop_version_consistency() {
-  local cargo_version
-  local tauri_version
-  cargo_version="$(desktop_app_version)"
-  tauri_version="$(desktop_tauri_config_version)"
-
-  if [[ -z "$cargo_version" ]]; then
-    echo "Failed to detect desktop version from apps/desktop/src-tauri/Cargo.toml" >&2
-    exit 1
-  fi
-  if [[ -z "$tauri_version" ]]; then
-    echo "Failed to detect desktop version from apps/desktop/src-tauri/tauri.conf.json" >&2
-    exit 1
-  fi
-  if [[ "$cargo_version" != "$tauri_version" ]]; then
-    echo "Desktop version mismatch: Cargo.toml=$cargo_version tauri.conf.json=$tauri_version" >&2
-    echo "Failed to keep versions in sync; check tauri.conf.json write permissions." >&2
-    exit 1
-  fi
 }
 
 set_default_release_tag_from_version() {
   local version
   version="$(desktop_app_version)"
   if [[ -z "$version" ]]; then
-    echo "Failed to detect desktop version from apps/desktop/src-tauri/Cargo.toml" >&2
+    echo "Failed to read macOS version from tauri.macos.conf.json" >&2
     exit 1
   fi
 
@@ -328,7 +304,7 @@ validate_release_tag_version_alignment() {
   local tag_version
   version="$(desktop_app_version)"
   if [[ -z "$version" ]]; then
-    echo "Failed to detect desktop version from apps/desktop/src-tauri/Cargo.toml" >&2
+    echo "Failed to read macOS version from tauri.macos.conf.json" >&2
     exit 1
   fi
 
@@ -398,6 +374,11 @@ cleanup_signing_keychain() {
 
 cleanup_stale_temp_files() {
   log "Cleaning up stale temp files from previous runs"
+  rm -f /tmp/hybridcipher-public-tauri.*.json 2>/dev/null || true
+  rm -f "$ROOT_DIR/apps/desktop/src-tauri"/tauri.macos-public.*.json 2>/dev/null || true
+  if [[ "${1:-signed}" == "unsigned" ]]; then
+    return
+  fi
   rm -f /tmp/hybridcipher-*.json 2>/dev/null || true
   rm -f /tmp/hybridcipher-*.p8 2>/dev/null || true
   rm -f /tmp/hybridcipher-*.zip 2>/dev/null || true
@@ -407,7 +388,6 @@ cleanup_stale_temp_files() {
   rm -f /tmp/hybridcipher-signing.*.keychain-db 2>/dev/null || true
   rm -f /tmp/AuthKey_*.p8 2>/dev/null || true
   rm -rf /tmp/hybridcipher-pkg-*.* 2>/dev/null || true
-  rm -f /tmp/hybridcipher-public-tauri.*.json 2>/dev/null || true
 }
 
 find_component_index() {
@@ -450,6 +430,344 @@ upsert_component_key() {
   fi
 }
 
+# Shared by signed releases, public verification, and local package builds.
+codesign_file_provider_artifact() {
+  local target="$1"
+  local identity="$2"
+  local entitlements="$3"
+  local -a args=(--force --sign "$identity" --entitlements "$entitlements")
+  if [[ "$identity" != "-" ]]; then
+    args+=(--timestamp --options runtime)
+  fi
+  codesign "${args[@]}" "$target"
+}
+
+build_file_provider_runtime() {
+  local PROVIDER_ROOT="$ROOT_DIR/apps/desktop/macos-fileprovider"
+  local EXTENSION_ROOT="$PROVIDER_ROOT/HybridCipherFileProvider"
+  local OUTPUT_DIR="${1:-$ROOT_DIR/dist/macos/fileprovider-build}"
+  local APPEX="$OUTPUT_DIR/HybridCipherFileProvider.appex"
+  local APPEX_CONTENTS="$APPEX/Contents"
+  local APPEX_MACOS="$APPEX_CONTENTS/MacOS"
+  local MODULE_NAME="HybridCipherFileProvider"
+  local EXECUTABLE_NAME="HybridCipherFileProvider"
+  local PROVIDERCTL="$OUTPUT_DIR/providerctl-native"
+  local INFO_PLIST="$APPEX_CONTENTS/Info.plist"
+  local ENTITLEMENTS="$OUTPUT_DIR/HybridCipherFileProvider.entitlements"
+  local PROVIDERCTL_ENTITLEMENTS="$OUTPUT_DIR/ProviderCtl.entitlements"
+  local MODULE_CACHE="$OUTPUT_DIR/module-cache"
+
+  require_cmd xcrun
+  require_cmd plutil
+  require_cmd codesign
+  require_cmd /usr/libexec/PlistBuddy
+  require_cmd python3
+
+  local version
+  version="$(macos_app_version)" || return 1
+  if [[ -z "$version" ]]; then
+    echo "Failed to detect desktop app version." >&2
+    exit 1
+  fi
+
+  validate_file_provider_source
+
+  rm -rf "$OUTPUT_DIR"
+  mkdir -p "$APPEX_MACOS" "$MODULE_CACHE"
+
+  local team_prefix=""
+  if [[ -n "${APPLE_TEAM_ID:-}" ]]; then
+    team_prefix="${APPLE_TEAM_ID}."
+  fi
+
+  sed "s/\$(TeamIdentifierPrefix)/$team_prefix/g" \
+    "$EXTENSION_ROOT/Info.plist" >"$INFO_PLIST"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDevelopmentRegion en" "$INFO_PLIST"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $EXECUTABLE_NAME" "$INFO_PLIST"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$INFO_PLIST"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$INFO_PLIST"
+  /usr/libexec/PlistBuddy -c "Set :NSExtension:NSExtensionPrincipalClass $MODULE_NAME.HybridCipherFileProviderExtension" "$INFO_PLIST"
+  plutil -lint "$INFO_PLIST" >/dev/null
+
+  sed "s/\$(TeamIdentifierPrefix)/$team_prefix/g" \
+    "$EXTENSION_ROOT/HybridCipherFileProvider.entitlements" >"$ENTITLEMENTS"
+  plutil -lint "$ENTITLEMENTS" >/dev/null
+  sed "s/\$(TeamIdentifierPrefix)/$team_prefix/g" \
+    "$PROVIDER_ROOT/ProviderCtl/ProviderCtl.entitlements" >"$PROVIDERCTL_ENTITLEMENTS"
+  plutil -lint "$PROVIDERCTL_ENTITLEMENTS" >/dev/null
+
+  local -a swift_sources=("$EXTENSION_ROOT"/Sources/*.swift)
+  local extension_main_obj="$OUTPUT_DIR/ExtensionMain.o"
+  xcrun clang \
+    -fobjc-arc \
+    -fmodules \
+    -fmodules-cache-path="$MODULE_CACHE/clang" \
+    -c "$EXTENSION_ROOT/Sources/ExtensionMain.m" \
+    -o "$extension_main_obj"
+
+  xcrun swiftc \
+    -O \
+    -application-extension \
+    -module-name "$MODULE_NAME" \
+    "${swift_sources[@]}" \
+    "$extension_main_obj" \
+    -module-cache-path "$MODULE_CACHE" \
+    -Xcc -fmodules-cache-path="$MODULE_CACHE/clang" \
+    -o "$APPEX_MACOS/$EXECUTABLE_NAME"
+
+  xcrun swiftc \
+    -O \
+    "$PROVIDER_ROOT/ProviderCtl/main.swift" \
+    -module-cache-path "$MODULE_CACHE" \
+    -Xcc -fmodules-cache-path="$MODULE_CACHE/clang" \
+    -o "$PROVIDERCTL"
+
+  codesign_file_provider_artifact "$APPEX" "${APPLE_APPLICATION_IDENTITY:--}" "$ENTITLEMENTS"
+  codesign_file_provider_artifact "$PROVIDERCTL" "${APPLE_APPLICATION_IDENTITY:--}" "$PROVIDERCTL_ENTITLEMENTS"
+
+  echo "Built File Provider extension: $APPEX"
+  echo "Built provider control helper: $PROVIDERCTL"
+}
+
+file_provider_require_file() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "Missing required file: $file" >&2
+    exit 1
+  fi
+}
+
+file_provider_require_executable() {
+  local file="$1"
+  if [[ ! -x "$file" ]]; then
+    echo "Missing required executable: $file" >&2
+    exit 1
+  fi
+}
+
+file_provider_require_text() {
+  local file="$1"
+  local text="$2"
+  if ! grep -Fq "$text" "$file"; then
+    echo "Expected '$text' in $file" >&2
+    exit 1
+  fi
+}
+
+file_provider_require_plist_bool_true() {
+  local file="$1"
+  local key="$2"
+  local value
+  if ! value="$(/usr/libexec/PlistBuddy -c "Print $key" "$file" 2>/dev/null)"; then
+    echo "Expected plist key $key in $file" >&2
+    exit 1
+  fi
+  if [[ "$value" != "true" ]]; then
+    echo "Expected plist key $key to be true in $file; got $value" >&2
+    exit 1
+  fi
+}
+
+file_provider_require_no_unexpanded_placeholders() {
+  local label="$1"
+  local content="$2"
+  if grep -Fq "\$(" <<<"$content"; then
+    echo "$label contains unexpanded entitlement placeholders." >&2
+    exit 1
+  fi
+}
+
+file_provider_validate_providerctl_command_support() {
+  local providerctl="$1"
+  local status_output
+  status_output="$("$providerctl" status 2>&1)"
+  python3 - "$status_output" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("ok") is not True:
+    raise SystemExit("providerctl-native status returned ok=false")
+PY
+
+  local command
+  for command in register unregister signal; do
+    local output
+    if output="$("$providerctl" "$command" 2>&1)"; then
+      echo "providerctl-native $command without required options unexpectedly succeeded." >&2
+      exit 1
+    fi
+    if grep -Fq "registration must run inside HybridCipher.app" <<<"$output"; then
+      echo "providerctl-native $command is still the packaging-only stub: $output" >&2
+      exit 1
+    fi
+    if ! grep -Fq "missing required option: --domain-id" <<<"$output"; then
+      echo "providerctl-native $command did not expose command-specific argument validation: $output" >&2
+      exit 1
+    fi
+  done
+}
+
+file_provider_validate_plist() {
+  local file="$1"
+  plutil -lint "$file" >/dev/null
+}
+
+validate_file_provider_source() {
+  local PROVIDER_DIR="$ROOT_DIR/apps/desktop/macos-fileprovider/HybridCipherFileProvider"
+  local PROVIDERCTL_ENTITLEMENTS="$ROOT_DIR/apps/desktop/macos-fileprovider/ProviderCtl/ProviderCtl.entitlements"
+  local APP_ENTITLEMENTS="$ROOT_DIR/apps/desktop/src-tauri/entitlements.plist"
+  local EXTENSION_ENTITLEMENTS="$PROVIDER_DIR/HybridCipherFileProvider.entitlements"
+  local EXTENSION_INFO="$PROVIDER_DIR/Info.plist"
+  local EXTENSION_BUNDLE_ID="com.hybridcipher.app.HybridCipherFileProvider"
+  local APP_GROUP="group.com.hybridcipher.macOS"
+  local TEAM_PREFIX_PLACEHOLDER="\$(TeamIdentifierPrefix)"
+
+  file_provider_require_file "$APP_ENTITLEMENTS"
+  file_provider_require_file "$EXTENSION_ENTITLEMENTS"
+  file_provider_require_file "$PROVIDERCTL_ENTITLEMENTS"
+  file_provider_require_file "$EXTENSION_INFO"
+  file_provider_require_file "$PROVIDER_DIR/Sources/HybridCipherFileProviderExtension.swift"
+  file_provider_require_file "$PROVIDER_DIR/Sources/ProviderAppGroup.swift"
+  file_provider_require_file "$PROVIDER_DIR/Sources/ProviderBridgeClient.swift"
+  file_provider_require_file "$PROVIDER_DIR/Sources/ProviderErrorMapping.swift"
+  file_provider_require_file "$PROVIDER_DIR/Sources/ProviderModels.swift"
+  file_provider_require_file "$PROVIDER_DIR/Sources/ProviderWritebackStager.swift"
+  file_provider_require_file "$PROVIDER_DIR/Sources/FileProviderEnumerator.swift"
+  file_provider_require_file "$PROVIDER_DIR/Sources/FileProviderItem.swift"
+
+  file_provider_validate_plist "$APP_ENTITLEMENTS"
+  file_provider_validate_plist "$EXTENSION_ENTITLEMENTS"
+  file_provider_validate_plist "$PROVIDERCTL_ENTITLEMENTS"
+  file_provider_validate_plist "$EXTENSION_INFO"
+
+  file_provider_require_text "$APP_ENTITLEMENTS" "$APP_GROUP"
+  file_provider_require_text "$EXTENSION_ENTITLEMENTS" "$APP_GROUP"
+  file_provider_require_text "$PROVIDERCTL_ENTITLEMENTS" "$APP_GROUP"
+  file_provider_require_text "$EXTENSION_ENTITLEMENTS" "com.apple.security.network.client"
+  file_provider_require_text "$EXTENSION_INFO" "$EXTENSION_BUNDLE_ID"
+  file_provider_require_text "$EXTENSION_INFO" "com.apple.fileprovider-nonui"
+  file_provider_require_text "$EXTENSION_INFO" "${TEAM_PREFIX_PLACEHOLDER}${APP_GROUP}"
+  file_provider_require_plist_bool_true "$EXTENSION_INFO" ":NSExtension:NSExtensionFileProviderSupportsEnumeration"
+  file_provider_require_text "$PROVIDER_DIR/Sources/FileProviderItem.swift" "FileProviderRootItem"
+  file_provider_require_text "$PROVIDER_DIR/Sources/HybridCipherFileProviderExtension.swift" \
+    "completionHandler(FileProviderRootItem(displayName: domain.displayName), nil)"
+  file_provider_require_text "$PROVIDER_DIR/Sources/ProviderBridgeClient.swift" \
+    "containerURL(forSecurityApplicationGroupIdentifier:"
+  file_provider_require_text "$PROVIDER_DIR/Sources/ProviderBridgeClient.swift" \
+    "ProviderAppGroup.identifier()"
+  file_provider_require_text "$PROVIDER_DIR/Sources/ProviderErrorMapping.swift" \
+    "NSFileProviderError(.serverUnreachable)"
+  file_provider_require_text "$PROVIDER_DIR/Sources/ProviderAppGroup.swift" \
+    "fallbackIdentifier"
+  file_provider_require_text "$PROVIDER_DIR/Sources/ProviderAppGroup.swift" \
+    "containerURL(forSecurityApplicationGroupIdentifier:"
+  file_provider_require_text "$PROVIDER_DIR/Sources/ProviderWritebackStager.swift" \
+    "copyItem(at: contentsURL"
+  file_provider_require_text "$PROVIDER_DIR/Sources/HybridCipherFileProviderExtension.swift" \
+    "ProviderWritebackStager.stage"
+
+  if grep -Fq "com.apple.developer.fileprovider.testing-mode" "$EXTENSION_ENTITLEMENTS"; then
+    echo "Release extension entitlements must not include File Provider testing-mode." >&2
+    exit 1
+  fi
+}
+
+validate_file_provider_built_app() {
+  local EXTENSION_BUNDLE_ID="com.hybridcipher.app.HybridCipherFileProvider"
+  local APP_GROUP="group.com.hybridcipher.macOS"
+  local app="$1"
+  local appex="$app/Contents/PlugIns/HybridCipherFileProvider.appex"
+  local appex_info="$appex/Contents/Info.plist"
+  local providerctl="$app/Contents/Resources/bin/providerctl-native"
+  local app_info="$app/Contents/Info.plist"
+
+  if [[ ! -d "$app" ]]; then
+    echo "App bundle not found: $app" >&2
+    exit 1
+  fi
+  if [[ ! -d "$appex" ]]; then
+    echo "File Provider extension bundle not found: $appex" >&2
+    exit 1
+  fi
+  file_provider_require_file "$app_info"
+  file_provider_require_file "$appex_info"
+  file_provider_require_executable "$providerctl"
+  file_provider_validate_plist "$app_info"
+  file_provider_validate_plist "$appex_info"
+
+  local app_bundle_id
+  app_bundle_id="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app_info")"
+  local bundle_id
+  bundle_id="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$appex_info")"
+  if [[ "$bundle_id" != "$EXTENSION_BUNDLE_ID" ]]; then
+    echo "Unexpected extension bundle id: $bundle_id" >&2
+    exit 1
+  fi
+  if [[ "$bundle_id" != "$app_bundle_id".* ]]; then
+    echo "Extension bundle id $bundle_id is not namespaced under containing app $app_bundle_id." >&2
+    exit 1
+  fi
+
+  codesign --verify --deep --strict --verbose=2 "$app" >/dev/null
+  codesign --verify --strict --verbose=2 "$app" >/dev/null
+  codesign --verify --strict --verbose=2 "$appex" >/dev/null
+  local app_entitlements
+  app_entitlements="$(codesign -d --entitlements :- "$app" 2>/dev/null)"
+  file_provider_require_no_unexpanded_placeholders "Signed app entitlements" "$app_entitlements"
+  local document_group
+  document_group="$(/usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionFileProviderDocumentGroup" "$appex_info")"
+  if [[ "$document_group" == *"\$("* ]]; then
+    echo "File Provider document group contains an unexpanded placeholder: $document_group" >&2
+    exit 1
+  fi
+  file_provider_require_plist_bool_true "$appex_info" ":NSExtension:NSExtensionFileProviderSupportsEnumeration"
+  if ! grep -Fq "<string>${document_group}</string>" <<<"$app_entitlements"; then
+    echo "Signed app is missing File Provider document group entitlement $document_group." >&2
+    exit 1
+  fi
+  local appex_entitlements
+  appex_entitlements="$(codesign -d --entitlements :- "$appex" 2>/dev/null)"
+  file_provider_require_no_unexpanded_placeholders "Signed extension entitlements" "$appex_entitlements"
+  if ! grep -Fq "<string>${document_group}</string>" <<<"$appex_entitlements"; then
+    echo "Signed extension is missing File Provider document group entitlement $document_group." >&2
+    exit 1
+  fi
+  if ! grep -Fq "<key>com.apple.security.network.client</key>" <<<"$appex_entitlements"; then
+    echo "Signed extension is missing network client entitlement for provider bridge IPC." >&2
+    exit 1
+  fi
+  if codesign -d --entitlements :- "$appex" 2>/dev/null | grep -Fq "com.apple.developer.fileprovider.testing-mode"; then
+    echo "Signed extension contains File Provider testing-mode entitlement." >&2
+    exit 1
+  fi
+  if ! codesign -d --entitlements :- "$appex" 2>/dev/null | grep -Fq "$APP_GROUP"; then
+    echo "Signed extension is missing app-group entitlement $APP_GROUP." >&2
+    exit 1
+  fi
+  codesign --verify --strict --verbose=2 "$providerctl" >/dev/null
+  local providerctl_entitlements
+  providerctl_entitlements="$(codesign -d --entitlements :- "$providerctl" 2>/dev/null)"
+  file_provider_require_no_unexpanded_placeholders "Signed providerctl entitlements" "$providerctl_entitlements"
+  if ! grep -Fq "<string>${document_group}</string>" <<<"$providerctl_entitlements"; then
+    echo "Signed providerctl-native is missing File Provider document group entitlement $document_group." >&2
+    exit 1
+  fi
+  file_provider_validate_providerctl_command_support "$providerctl"
+}
+
+validate_file_provider_runtime() {
+  require_cmd plutil
+  require_cmd /usr/libexec/PlistBuddy
+  validate_file_provider_source
+  if [[ -n "${1:-}" ]]; then
+    require_cmd codesign
+    require_cmd python3
+    validate_file_provider_built_app "$1"
+  fi
+  echo "macOS File Provider runtime validation passed."
+}
+
 require_file_provider_extension_in_app() {
   local app_path="$1"
   local appex="$app_path/Contents/PlugIns/HybridCipherFileProvider.appex"
@@ -489,7 +807,7 @@ generate_desktop_app_entitlements() {
   plutil -lint "$output_path" >/dev/null
 }
 
-stage_file_provider_runtime_in_app() {
+stage_file_provider_runtime_in_app() (
   local app_path="$1"
   local signing_identity="$2"
   local team_id="$3"
@@ -499,32 +817,36 @@ stage_file_provider_runtime_in_app() {
   local bundled_providerctl="$app_path/Contents/Resources/bin/providerctl-native"
 
   file_provider_build_dir="$(mktemp -d /tmp/hybridcipher-fileprovider.XXXXXX)"
+  trap 'rm -rf "$file_provider_build_dir"' EXIT
   log "Building and staging macOS File Provider runtime"
   VERSION_OVERRIDE="$version" \
     APPLE_APPLICATION_IDENTITY="$signing_identity" \
     APPLE_TEAM_ID="$team_id" \
-    "$FILE_PROVIDER_BUILD_SCRIPT" "$file_provider_build_dir"
+    build_file_provider_runtime "$file_provider_build_dir"
 
   rm -rf "$staged_appex"
   mkdir -p "$app_path/Contents/PlugIns" "$app_path/Contents/Resources/bin"
   cp -R "$file_provider_build_dir/HybridCipherFileProvider.appex" "$staged_appex"
   install -m 0755 "$file_provider_build_dir/providerctl-native" "$bundled_providerctl"
 
-  if [[ "$signing_identity" != "-" ]]; then
-    local app_entitlements="$file_provider_build_dir/HybridCipherApp.entitlements"
-    generate_desktop_app_entitlements "$app_entitlements" "$team_id"
-    log "Re-signing app bundle after staging File Provider runtime"
-    codesign --force \
-      --sign "$signing_identity" \
-      --entitlements "$app_entitlements" \
-      --timestamp \
-      --options runtime \
-      "$app_path"
+  local app_entitlements="$file_provider_build_dir/HybridCipherApp.entitlements"
+  generate_desktop_app_entitlements "$app_entitlements" "$team_id"
+  if [[ "$signing_identity" == "-" ]]; then
+    # Tauri's unsigned CLI resource may have no signature on Intel. Give each
+    # bundled executable an ad-hoc signature before validating the containing app.
+    local bundled_cli
+    for bundled_cli in \
+      "$app_path/Contents/Resources/bin/hybridcipher" \
+      "$app_path/Contents/Resources/resources/bin/hybridcipher"; do
+      if [[ -f "$bundled_cli" ]]; then
+        codesign --force --sign "-" "$bundled_cli"
+      fi
+    done
   fi
-
-  require_file_provider_extension_in_app "$app_path"
-  rm -rf "$file_provider_build_dir"
-}
+  log "Re-signing app bundle after staging File Provider runtime"
+  codesign_file_provider_artifact "$app_path" "$signing_identity" "$app_entitlements"
+  validate_file_provider_built_app "$app_path"
+)
 
 should_notarize() {
   [[ -n "${APPLE_API_KEY:-}" ]] && [[ -n "${APPLE_API_KEY_ID:-}" ]] && [[ -n "${APPLE_API_ISSUER:-}" ]]
@@ -532,9 +854,9 @@ should_notarize() {
 
 create_public_verify_tauri_config() {
   local config_path
-  config_path="$(mktemp /tmp/hybridcipher-public-tauri.XXXXXX.json)"
+  config_path="$(mktemp "$ROOT_DIR/apps/desktop/src-tauri/tauri.macos-public.XXXXXX.json")"
 
-  python3 - "$ROOT_DIR/apps/desktop/src-tauri/tauri.conf.json" "$config_path" <<'PY'
+  python3 - "$ROOT_DIR/apps/desktop/src-tauri/tauri.conf.json" "$config_path" "$(macos_app_version)" <<'PY'
 import json
 import sys
 
@@ -544,6 +866,7 @@ output_path = sys.argv[2]
 with open(source_path, "r", encoding="utf-8") as fh:
     data = json.load(fh)
 
+data["version"] = sys.argv[3]
 data.setdefault("bundle", {})
 data["bundle"]["createUpdaterArtifacts"] = False
 
@@ -558,10 +881,7 @@ PY
 build_cli_for_target() {
   local target="$1"
   local -a cargo_build_cmd=(cargo build --release --bin hybridcipher --target "$target")
-
-  if [[ "${INDIVIDUAL_EDITION:-0}" == "1" ]]; then
-    cargo_build_cmd+=(--features individual-edition)
-  fi
+  : "${HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS:?Set the published Team verification key list before building}"
 
   log "Building CLI for $target" >&2
   (cd "$ROOT_DIR" && "${cargo_build_cmd[@]}")
@@ -604,9 +924,7 @@ build_tauri_bundle_for_target() {
   local -a tauri_build_cmd=(npx tauri build --target "$target")
   local -a tauri_env=()
 
-  if [[ "${INDIVIDUAL_EDITION:-0}" == "1" ]]; then
-    tauri_build_cmd+=(--features individual-edition)
-  fi
+  : "${HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS:?Set the published Team verification key list before building}"
 
   if [[ -n "$config_path" ]]; then
     tauri_build_cmd+=(--config "$config_path")
@@ -633,7 +951,9 @@ build_tauri_bundle_for_target() {
   log "Building unsigned Tauri bundle for $target"
   (
     cd "$ROOT_DIR/apps/desktop"
-    env "${tauri_env[@]}" "${tauri_build_cmd[@]}"
+    env -u APPLE_SIGNING_IDENTITY -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD \
+      -u TAURI_SIGNING_PRIVATE_KEY -u TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+      "${tauri_env[@]}" "${tauri_build_cmd[@]}"
   )
 }
 
@@ -1063,7 +1383,7 @@ build_target() {
   cli_bin="$(build_cli_for_target "$target")"
   bundled_cli="$(stage_bundled_cli_resource "$cli_bin")"
   sign_staged_bundled_cli "$bundled_cli"
-  build_tauri_bundle_for_target "$target" "signed" "" "$bundled_cli"
+  build_tauri_bundle_for_target "$target" "signed" "$MACOS_TAURI_RELEASE_CONFIG" "$bundled_cli"
 
   app_path="$(find_app_bundle_path "$target")"
   version="$(desktop_app_version)"
@@ -1106,7 +1426,10 @@ build_public_verify_target() {
   bundled_cli="$(stage_bundled_cli_resource "$cli_bin")"
 
   config_path="$(create_public_verify_tauri_config)"
-  build_tauri_bundle_for_target "$target" "unsigned" "$config_path" "$bundled_cli"
+  if ! build_tauri_bundle_for_target "$target" "unsigned" "$config_path" "$bundled_cli"; then
+    rm -f "$config_path"
+    return 1
+  fi
   rm -f "$config_path"
 
   app_path="$(find_app_bundle_path "$target")"
@@ -1127,6 +1450,10 @@ main() {
   require_cmd npm
   require_cmd npx
   require_cmd xcrun
+  require_cmd plutil
+  require_cmd codesign
+  require_cmd /usr/libexec/PlistBuddy
+  require_cmd python3
   require_cmd pkgbuild
   require_cmd hdiutil
   require_cmd productsign
@@ -1146,8 +1473,9 @@ main() {
     PUBLIC_RELEASE_REPO="HybridCipher/desktop-releases"
   fi
 
-  sync_desktop_tauri_config_version
-  validate_desktop_version_consistency
+  macos_app_version >/dev/null
+  validate_file_provider_source
+  warn_if_release_notes_missing "$(desktop_app_version)" "$RELEASE_NOTES_PATH"
 
   if [[ "${PUBLISH_PUBLIC_RELEASE:-0}" == "1" ]]; then
     set_default_release_tag_from_version
@@ -1174,14 +1502,20 @@ main() {
 }
 
 public_verify_main() {
-  cleanup_stale_temp_files
+  cleanup_stale_temp_files unsigned
 
   require_cmd cargo
   require_cmd npm
   require_cmd npx
   require_cmd xcrun
+  require_cmd plutil
+  require_cmd codesign
+  require_cmd /usr/libexec/PlistBuddy
+  require_cmd python3
 
-  validate_desktop_version_consistency
+  macos_app_version >/dev/null
+  validate_file_provider_source
+  warn_if_release_notes_missing "$(desktop_app_version)" "$RELEASE_NOTES_PATH"
   install_desktop_frontend_dependencies
 
   determine_build_targets
@@ -1195,10 +1529,43 @@ public_verify_main() {
   printf '%s\n' "${ARTIFACTS[@]}"
 }
 
+desktop_release_main() {
+  local command="${1:-}"
+  case "$command" in
+    --build-file-provider|--validate-file-provider)
+      shift
+      if [[ "$#" -gt 1 ]]; then
+        echo "$command accepts at most one path argument." >&2
+        return 1
+      fi
+      if [[ "$command" == "--build-file-provider" ]]; then
+        build_file_provider_runtime "$@"
+      else
+        validate_file_provider_runtime "$@"
+      fi
+      ;;
+    --public-verify)
+      shift
+      if [[ "$#" -ne 0 ]]; then
+        echo "--public-verify does not accept arguments; use MODE and DESKTOP_TARGETS." >&2
+        return 1
+      fi
+      public_verify_main
+      ;;
+    --help|-h)
+      printf '%s\n' \
+        'Usage: desktop_release_pkg.sh [--public-verify | --build-file-provider [OUTPUT_DIR] | --validate-file-provider [APP_BUNDLE]]' \
+        'The default command builds a signed release. MODE selects silicon, full, or custom targets.'
+      ;;
+    "") main ;;
+    *) echo "Unknown argument: $command (use --help)." >&2; return 1 ;;
+  esac
+}
+
 if [[ "${HYBRIDCIPHER_DESKTOP_RELEASE_SOURCE_ONLY:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  main "$@"
+  desktop_release_main "$@"
 fi

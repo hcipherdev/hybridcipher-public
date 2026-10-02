@@ -51,7 +51,21 @@ pub fn embedded_client_server_url() -> Option<String> {
 }
 
 pub fn default_server_url() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(url) = option_env!("HYBRIDCIPHER_STAGING_SERVER_URL") {
+        return url.to_string();
+    }
     embedded_client_server_url().unwrap_or_else(|| "https://api.hybridcipher.com".to_string())
+}
+
+/// Account storage component, with an isolated absolute path for staging debug builds.
+/// Release builds always use the normal account directory.
+pub fn account_data_location() -> &'static str {
+    #[cfg(debug_assertions)]
+    if let Some(path) = option_env!("HYBRIDCIPHER_STAGING_HOME") {
+        return path;
+    }
+    ".hybridcipher"
 }
 
 fn merge_overrides(
