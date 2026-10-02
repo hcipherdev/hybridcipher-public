@@ -5,7 +5,7 @@
       "published_at": "2026-10-03",
       "highlights": [
         "Fixed the \"Legal documents unavailable\" startup error affecting the macOS 0.1.6 release. The bundled Terms of Service and Privacy Notice now load from the correct location, so affected users can accept them and continue into the app.",
-        "Team workspaces are now available in the macOS desktop app with activation-code setup, workspace switching, member and invitation management, and clearer access status.",
+        "Builds configured with the service's Team verification key support activation-code setup, workspace switching, member and invitation management, and clearer access status. Temporary builds without this key support Personal folders; Team activation and writes are unavailable.",
         "Removing a protected folder now lets you choose to keep its files encrypted or decrypt them, with a warning before plaintext could reach cloud storage."
       ],
       "important_changes": [

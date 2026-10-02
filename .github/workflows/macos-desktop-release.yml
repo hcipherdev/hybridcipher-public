@@ -41,6 +41,11 @@ on:
           - macos-15
           - macos-15-intel
           - macos-latest
+      allow_missing_team_key:
+        description: "Temporarily build without Team verification keys. Personal folders remain available; Team activation and writes are unavailable."
+        required: true
+        default: false
+        type: boolean
       publish_public_release:
         description: "Create or update the release in the destination release repo."
         required: true
@@ -64,6 +69,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS: ${{ vars.HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS }}
+      ALLOW_MISSING_TEAM_KEY: ${{ inputs.allow_missing_team_key }}
 
     steps:
       - name: Checkout public source

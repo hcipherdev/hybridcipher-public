@@ -17,12 +17,15 @@ set -euo pipefail
 # Overrides:
 # - DESKTOP_TARGETS is used only when MODE=custom
 # - ENV_FILE can override env file path (default: secrets/macos-release.env)
+# - ALLOW_MISSING_TEAM_KEY=1 permits temporary builds without Team verification
+#   keys; Personal folders remain available, while Team activation and writes fail.
 #
 # Usage:
 #   ./scripts/macos/desktop_release_pkg.sh
 #   MODE=full ./scripts/macos/desktop_release_pkg.sh
 #   MODE=custom DESKTOP_TARGETS="aarch64-apple-darwin" ./scripts/macos/desktop_release_pkg.sh
 #   PUBLISH_PUBLIC_RELEASE=1 ./scripts/macos/desktop_release_pkg.sh
+#   ALLOW_MISSING_TEAM_KEY=1 ./scripts/macos/desktop_release_pkg.sh
 #   ./scripts/macos/desktop_release_pkg.sh --public-verify
 #   ./scripts/macos/desktop_release_pkg.sh --build-file-provider [OUTPUT_DIR]
 #   ./scripts/macos/desktop_release_pkg.sh --validate-file-provider [APP_BUNDLE]
@@ -55,6 +58,22 @@ require_cmd() {
     echo "Missing required command: $1" >&2
     exit 1
   fi
+}
+
+check_team_verification_keys() {
+  if [[ -n "${HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS:-}" ]]; then
+    return 0
+  fi
+
+  case "${ALLOW_MISSING_TEAM_KEY:-0}" in
+    1|true)
+      echo "WARNING: Building without Team verification keys. Personal folders remain available; Team activation and writes are unavailable." >&2
+      ;;
+    *)
+      echo "Set HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS to the published Team verification key list before building, or explicitly set ALLOW_MISSING_TEAM_KEY=1 for a temporary build without Team access." >&2
+      return 1
+      ;;
+  esac
 }
 
 base64_decode_to_file() {
@@ -881,7 +900,7 @@ PY
 build_cli_for_target() {
   local target="$1"
   local -a cargo_build_cmd=(cargo build --release --bin hybridcipher --target "$target")
-  : "${HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS:?Set the published Team verification key list before building}"
+  check_team_verification_keys || return 1
 
   log "Building CLI for $target" >&2
   (cd "$ROOT_DIR" && "${cargo_build_cmd[@]}")
@@ -924,7 +943,7 @@ build_tauri_bundle_for_target() {
   local -a tauri_build_cmd=(npx tauri build --target "$target")
   local -a tauri_env=()
 
-  : "${HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS:?Set the published Team verification key list before building}"
+  check_team_verification_keys || return 1
 
   if [[ -n "$config_path" ]]; then
     tauri_build_cmd+=(--config "$config_path")
