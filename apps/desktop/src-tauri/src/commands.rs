@@ -8764,6 +8764,7 @@ pub async fn list_mount_conflicts(
     }
 }
 
+#[cfg(target_os = "windows")]
 #[tauri::command]
 pub async fn list_windows_cloud_conflicts(
     root_id: String,

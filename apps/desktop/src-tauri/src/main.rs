@@ -547,6 +547,7 @@ fn main() {
             check_mount_status_by_root_id,
             list_active_mounts,
             list_mount_conflicts,
+            #[cfg(target_os = "windows")]
             list_windows_cloud_conflicts,
             recheck_windows_cloud_conflicts,
             get_mount_conflict_preview,
