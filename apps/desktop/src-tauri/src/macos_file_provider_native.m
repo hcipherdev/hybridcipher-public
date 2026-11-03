@@ -140,8 +140,12 @@ char *HCFileProviderRegisterDomain(const char *domain_id,
   }
 }
 
-char *HCFileProviderUnregisterDomain(const char *domain_id) {
+char *HCFileProviderUnregisterDomain(const char *domain_id,
+                                     char **preserved_path_out) {
   @autoreleasepool {
+    if (preserved_path_out != NULL) {
+      *preserved_path_out = NULL;
+    }
     if (domain_id == NULL || domain_id[0] == '\0') {
       return HCFileProviderCopyCString(@"missing File Provider domain id");
     }
@@ -158,16 +162,34 @@ char *HCFileProviderUnregisterDomain(const char *domain_id) {
 
     dispatch_semaphore_t removeSemaphore = dispatch_semaphore_create(0);
     __block NSError *removeError = nil;
-    [NSFileProviderManager removeDomain:matchingDomain
-                      completionHandler:^(NSError *error) {
-                        removeError = error;
-                        dispatch_semaphore_signal(removeSemaphore);
-                      }];
+    __block NSURL *preservedLocation = nil;
+    if (@available(macOS 12.0, *)) {
+      // Plain removal deletes edits the system has not handed to the extension
+      // yet. This mode moves them aside and reports where they were kept.
+      [NSFileProviderManager
+               removeDomain:matchingDomain
+                       mode:NSFileProviderDomainRemovalModePreserveDirtyUserData
+          completionHandler:^(NSURL *location, NSError *error) {
+            preservedLocation = location;
+            removeError = error;
+            dispatch_semaphore_signal(removeSemaphore);
+          }];
+    } else {
+      [NSFileProviderManager removeDomain:matchingDomain
+                        completionHandler:^(NSError *error) {
+                          removeError = error;
+                          dispatch_semaphore_signal(removeSemaphore);
+                        }];
+    }
 
     if (dispatch_semaphore_wait(removeSemaphore,
                                 dispatch_time(DISPATCH_TIME_NOW,
                                               30 * NSEC_PER_SEC)) != 0) {
       return HCFileProviderCopyTimeout(@"unregister File Provider domain");
+    }
+    if (removeError == nil && preservedLocation != nil &&
+        preserved_path_out != NULL) {
+      *preserved_path_out = HCFileProviderCopyCString(preservedLocation.path);
     }
     return HCFileProviderCopyError(@"unregister File Provider domain",
                                    removeError);
@@ -240,6 +262,155 @@ char *HCFileProviderSignalDomain(const char *domain_id,
       }
     }
 
+    return NULL;
+  }
+}
+
+// Waits until macOS has handed every edit made in the domain to the extension,
+// so removing the domain afterwards does not set unsynced edits aside.
+char *HCFileProviderWaitForPendingChanges(const char *domain_id,
+                                          unsigned int timeout_secs) {
+  @autoreleasepool {
+    if (domain_id == NULL || domain_id[0] == '\0') {
+      return HCFileProviderCopyCString(@"missing File Provider domain id");
+    }
+
+    NSString *identifierString = [NSString stringWithUTF8String:domain_id];
+    __block NSFileProviderDomain *matchingDomain = nil;
+    char *lookupError = HCFileProviderFindDomain(identifierString, &matchingDomain);
+    if (lookupError != NULL) {
+      return lookupError;
+    }
+    if (matchingDomain == nil) {
+      return NULL;
+    }
+
+    NSFileProviderManager *manager =
+        [NSFileProviderManager managerForDomain:matchingDomain];
+    if (manager == nil) {
+      return HCFileProviderCopyCString(@"File Provider manager unavailable");
+    }
+
+    dispatch_semaphore_t waitSemaphore = dispatch_semaphore_create(0);
+    __block NSError *waitError = nil;
+    [manager waitForChangesOnItemsBelowItemWithIdentifier:
+                 NSFileProviderRootContainerItemIdentifier
+                                       completionHandler:^(NSError *error) {
+                                         waitError = error;
+                                         dispatch_semaphore_signal(waitSemaphore);
+                                       }];
+
+    if (dispatch_semaphore_wait(waitSemaphore,
+                                dispatch_time(DISPATCH_TIME_NOW,
+                                              (int64_t)timeout_secs *
+                                                  NSEC_PER_SEC)) != 0) {
+      return HCFileProviderCopyTimeout(@"wait for pending File Provider changes");
+    }
+    return HCFileProviderCopyError(@"wait for pending File Provider changes",
+                                   waitError);
+  }
+}
+
+// Tells macOS the bridge is reachable again. After the extension reported
+// "server unreachable" (the app was not running yet), macOS throttles the
+// domain with a growing backoff, up to hours; a signal alone does not lift it.
+char *HCFileProviderResolveServerUnreachable(const char *domain_id) {
+  @autoreleasepool {
+    if (domain_id == NULL || domain_id[0] == '\0') {
+      return HCFileProviderCopyCString(@"missing File Provider domain id");
+    }
+
+    NSString *identifierString = [NSString stringWithUTF8String:domain_id];
+    __block NSFileProviderDomain *matchingDomain = nil;
+    char *lookupError = HCFileProviderFindDomain(identifierString, &matchingDomain);
+    if (lookupError != NULL) {
+      return lookupError;
+    }
+    if (matchingDomain == nil) {
+      return HCFileProviderCopyCString(@"File Provider domain not found");
+    }
+
+    NSFileProviderManager *manager =
+        [NSFileProviderManager managerForDomain:matchingDomain];
+    if (manager == nil) {
+      return HCFileProviderCopyCString(@"File Provider manager unavailable");
+    }
+
+    if (@available(macOS 11.3, *)) {
+      NSError *resolved = [NSError errorWithDomain:NSFileProviderErrorDomain
+                                              code:NSFileProviderErrorServerUnreachable
+                                          userInfo:nil];
+      dispatch_semaphore_t resolveSemaphore = dispatch_semaphore_create(0);
+      __block NSError *resolveError = nil;
+      [manager signalErrorResolved:resolved
+                 completionHandler:^(NSError *error) {
+                   resolveError = error;
+                   dispatch_semaphore_signal(resolveSemaphore);
+                 }];
+      if (dispatch_semaphore_wait(resolveSemaphore,
+                                  dispatch_time(DISPATCH_TIME_NOW,
+                                                30 * NSEC_PER_SEC)) != 0) {
+        return HCFileProviderCopyTimeout(@"resolve File Provider unreachable state");
+      }
+      return HCFileProviderCopyError(@"resolve File Provider unreachable state",
+                                     resolveError);
+    }
+    return NULL;
+  }
+}
+
+char *HCFileProviderUserVisibleURL(const char *domain_id, char **path_out) {
+  @autoreleasepool {
+    if (path_out != NULL) {
+      *path_out = NULL;
+    }
+    if (domain_id == NULL || domain_id[0] == '\0') {
+      return HCFileProviderCopyCString(@"missing File Provider domain id");
+    }
+
+    NSString *identifierString = [NSString stringWithUTF8String:domain_id];
+    __block NSFileProviderDomain *matchingDomain = nil;
+    char *lookupError = HCFileProviderFindDomain(identifierString, &matchingDomain);
+    if (lookupError != NULL) {
+      return lookupError;
+    }
+    if (matchingDomain == nil) {
+      return HCFileProviderCopyCString(@"File Provider domain not found");
+    }
+
+    NSFileProviderManager *manager =
+        [NSFileProviderManager managerForDomain:matchingDomain];
+    if (manager == nil) {
+      return HCFileProviderCopyCString(@"File Provider manager unavailable");
+    }
+
+    dispatch_semaphore_t urlSemaphore = dispatch_semaphore_create(0);
+    __block NSError *urlError = nil;
+    __block NSURL *userVisibleURL = nil;
+    [manager getUserVisibleURLForItemIdentifier:
+                 NSFileProviderRootContainerItemIdentifier
+                              completionHandler:^(NSURL *url, NSError *error) {
+                                userVisibleURL = url;
+                                urlError = error;
+                                dispatch_semaphore_signal(urlSemaphore);
+                              }];
+
+    if (dispatch_semaphore_wait(urlSemaphore,
+                                dispatch_time(DISPATCH_TIME_NOW,
+                                              30 * NSEC_PER_SEC)) != 0) {
+      return HCFileProviderCopyTimeout(@"read File Provider domain location");
+    }
+    if (urlError != nil) {
+      return HCFileProviderCopyError(@"read File Provider domain location",
+                                     urlError);
+    }
+    if (userVisibleURL == nil || userVisibleURL.path.length == 0) {
+      return HCFileProviderCopyCString(
+          @"File Provider returned no location for the domain");
+    }
+    if (path_out != NULL) {
+      *path_out = HCFileProviderCopyCString(userVisibleURL.path);
+    }
     return NULL;
   }
 }

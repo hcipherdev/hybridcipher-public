@@ -279,32 +279,6 @@ impl CliSchemaManager {
                             "hybridcipher rekey status --group group123".to_string(),
                         ],
                     },
-                    CliCommand {
-                        name: "cutover".to_string(),
-                        description: "Complete rekey cutover after migration threshold".to_string(),
-                        subcommands: vec![],
-                        arguments: vec![
-                            CliArgument {
-                                name: "group".to_string(),
-                                description: "Group ID".to_string(),
-                                required: true,
-                                arg_type: "string".to_string(),
-                                default_value: None,
-                                possible_values: None,
-                            },
-                            CliArgument {
-                                name: "force".to_string(),
-                                description: "Force cutover even if threshold not met".to_string(),
-                                required: false,
-                                arg_type: "bool".to_string(),
-                                default_value: Some("false".to_string()),
-                                possible_values: None,
-                            },
-                        ],
-                        examples: vec![
-                            "hybridcipher rekey cutover --group group123".to_string(),
-                        ],
-                    },
                 ],
                 arguments: vec![],
                 examples: vec![],

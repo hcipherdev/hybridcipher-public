@@ -8,8 +8,13 @@ pub enum EpochKeySource {
     Welcome,
     /// Key was authenticated via a roster/group update.
     GroupUpdate,
+    /// Key authenticated by decrypting a saved-code recovery artifact.
+    Recovery,
     /// Key was generated locally before Welcome distribution.
     LocalInit,
+    /// Key belongs to an accountless vault held only on this device. It never
+    /// satisfies account readiness; adoption replaces it with a Welcome key.
+    LocalVault,
     /// Placeholder or zeroed key material.
     Placeholder,
     /// Unknown origin (legacy or missing metadata).
@@ -24,6 +29,14 @@ impl Default for EpochKeySource {
 
 impl EpochKeySource {
     pub fn is_verified(self) -> bool {
-        matches!(self, EpochKeySource::Welcome | EpochKeySource::GroupUpdate)
+        matches!(
+            self,
+            EpochKeySource::Welcome | EpochKeySource::GroupUpdate | EpochKeySource::Recovery
+        )
+    }
+
+    /// Usable for an accountless vault's own files; never for account readiness.
+    pub fn is_locally_usable(self) -> bool {
+        self.is_verified() || self == EpochKeySource::LocalVault
     }
 }

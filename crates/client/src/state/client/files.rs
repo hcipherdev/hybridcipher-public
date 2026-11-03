@@ -1,25 +1,21 @@
 use super::*;
 use crate::file::content_manifest;
+use crate::file::durability::OutputDurability;
+
+/// What a file without a `.encrypted` name turned out to hold.
+#[derive(Debug)]
+pub(crate) enum PlainNamedContents {
+    /// No HybridCipher header: encrypt it.
+    Plaintext,
+    /// The active group's ciphertext, now renamed to this `.encrypted` path.
+    Adopted(PathBuf),
+    /// The active group's ciphertext, left as it is because this path is taken.
+    NameTaken(PathBuf),
+    /// A header this device cannot check, for this reason: encrypt it anyway.
+    Unverified(String),
+}
 
 impl<S: Storage, N: Network> Client<S, N> {
-    pub(super) fn path_has_encrypted_suffix(path: &Path) -> bool {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("encrypted"))
-            .unwrap_or(false)
-    }
-
-    pub(super) fn is_directory_metadata_sidecar(path: &Path) -> bool {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name == DIRECTORY_METADATA_FILE_NAME)
-            .unwrap_or(false)
-    }
-
-    pub(super) fn is_directory_metadata_sidecar_relative(relative_path: &str) -> bool {
-        Self::is_directory_metadata_sidecar(Path::new(relative_path))
-    }
-
     pub(super) fn default_encrypted_output_path(path: &Path) -> PathBuf {
         match path.extension().and_then(|s| s.to_str()) {
             Some(ext) if !ext.is_empty() => path.with_extension(format!("{ext}.encrypted")),
@@ -100,7 +96,8 @@ impl<S: Storage, N: Network> Client<S, N> {
             }
         };
 
-        if !metadata.is_file() || Self::path_has_encrypted_suffix(source_path) {
+        let kind = ciphertext::classify(source_path);
+        if !metadata.is_file() || kind == CiphertextKind::FolderRecord {
             return Ok(None);
         }
 
@@ -109,6 +106,30 @@ impl<S: Storage, N: Network> Client<S, N> {
         }
         if self.path_is_under_enrollment_lock(source_path).await {
             return Ok(None);
+        }
+
+        // A `.encrypted` name is left alone only when a header backs it up; even a
+        // damaged one stays, so it can still be reported and recovered. Its header
+        // is read first so this client's own new ciphertext is never read in full.
+        if kind == CiphertextKind::File {
+            match ciphertext::inspect_path(source_path) {
+                Ok(ContentKind::NotCiphertext) => {}
+                Ok(_) => return Ok(None),
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(ClientError::file_error(
+                        ErrorCode::FileAccessDenied,
+                        format!(
+                            "Failed to inspect '{}' for auto-encryption: {}",
+                            source_path.display(),
+                            err
+                        ),
+                        "coverage_auto_encrypt_inspect".to_string(),
+                        source_path.display().to_string(),
+                        None,
+                    ))
+                }
+            }
         }
 
         let parent_dir = source_path.parent().map(|p| p.to_path_buf());
@@ -134,6 +155,39 @@ impl<S: Storage, N: Network> Client<S, N> {
                 ))
             }
         };
+
+        if kind == CiphertextKind::NotEncrypted {
+            match self
+                .check_plain_named_contents(source_path, &plaintext)
+                .await?
+            {
+                PlainNamedContents::Plaintext => {}
+                PlainNamedContents::Adopted(path) => return Ok(Some(path)),
+                PlainNamedContents::NameTaken(target) => {
+                    self.logger.log(
+                        crate::logging::LogLevel::Warn,
+                        &format!(
+                            "{} is already HybridCipher ciphertext, but {} exists; left it unchanged",
+                            source_path.display(),
+                            target.display()
+                        ),
+                        Some("coverage_adopt_ciphertext"),
+                    );
+                    return Ok(None);
+                }
+                PlainNamedContents::Unverified(reason) => {
+                    self.logger.log(
+                        crate::logging::LogLevel::Warn,
+                        &format!(
+                            "{} has a HybridCipher header that cannot be checked ({}); encrypting it",
+                            source_path.display(),
+                            reason
+                        ),
+                        Some("coverage_auto_encrypt_unverified"),
+                    );
+                }
+            }
+        }
 
         let path_label = source_path.to_string_lossy().to_string();
         let original_name = source_path
@@ -294,6 +348,75 @@ impl<S: Storage, N: Network> Client<S, N> {
         Ok(Some(canonical_output))
     }
 
+    /// Decide what a file without a `.encrypted` name holds, from `contents` (its bytes).
+    ///
+    /// The name proves nothing: ciphertext whose suffix was removed is renamed back
+    /// to `<name>.encrypted` instead of being encrypted a second time. That needs
+    /// the active group's key to unwrap it, since a header alone can be faked;
+    /// anything this device cannot check is reported as `Unverified`, and callers
+    /// encrypt it like plaintext.
+    pub(crate) async fn check_plain_named_contents(
+        &self,
+        path: &Path,
+        contents: &[u8],
+    ) -> Result<PlainNamedContents, ClientError> {
+        let header = match ciphertext::inspect_bytes(contents) {
+            ContentKind::NotCiphertext => return Ok(PlainNamedContents::Plaintext),
+            ContentKind::Damaged(_) => {
+                return Ok(PlainNamedContents::Unverified(
+                    "its HybridCipher header is damaged".to_string(),
+                ))
+            }
+            ContentKind::Ciphertext(header) => header,
+        };
+        if let Err(reason) = self.verify_ciphertext_header(&header).await {
+            return Ok(PlainNamedContents::Unverified(reason));
+        }
+
+        let target = Self::default_encrypted_output_path(path);
+        let parent_dir_mtime = path.parent().and_then(Self::capture_directory_mtime);
+        // A hard link cannot replace an existing file, unlike a rename on Unix.
+        let renamed = match fs::hard_link(path, &target).await {
+            Ok(()) => fs::remove_file(path).await,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                return Ok(PlainNamedContents::NameTaken(target))
+            }
+            // Some volumes (FAT, many network shares) have no hard links.
+            Err(_) if fs::symlink_metadata(&target).await.is_ok() => {
+                return Ok(PlainNamedContents::NameTaken(target))
+            }
+            Err(_) => fs::rename(path, &target).await,
+        };
+        renamed.map_err(|err| {
+            ClientError::file_error(
+                ErrorCode::FileAccessDenied,
+                format!(
+                    "Failed to rename ciphertext '{}' to '{}': {}",
+                    path.display(),
+                    target.display(),
+                    err
+                ),
+                "coverage_adopt_ciphertext_rename".to_string(),
+                path.display().to_string(),
+                None,
+            )
+        })?;
+        if let Some(dir) = path.parent() {
+            Self::restore_directory_mtime(dir, parent_dir_mtime);
+        }
+        let adopted = fs::canonicalize(&target).await.unwrap_or(target);
+        self.logger.log(
+            crate::logging::LogLevel::Info,
+            &format!(
+                "{} was already HybridCipher ciphertext; renamed it to {}",
+                path.display(),
+                adopted.display()
+            ),
+            Some("coverage_adopt_ciphertext"),
+        );
+        Ok(PlainNamedContents::Adopted(adopted))
+    }
+
     #[cfg(feature = "mount-fs")]
     pub(super) fn candidate_file_paths(parent_id: &str, name: &str) -> Vec<String> {
         let mut paths = Vec::new();
@@ -369,7 +492,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         if !normalized_path.is_empty() && normalized_path != "/" {
             candidates.push(raw_path.clone());
-            if !Self::path_has_encrypted_suffix(&raw_path) {
+            if ciphertext::classify(&raw_path) == CiphertextKind::NotEncrypted {
                 candidates.push(Self::default_encrypted_output_path(&raw_path));
             }
         }
@@ -384,7 +507,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                     }
                     CoverageRootKind::Folder => {
                         candidates.push(root.path.join(rel));
-                        if !rel.to_ascii_lowercase().ends_with(".encrypted") {
+                        if ciphertext::strip_encrypted_suffix(rel).is_none() {
                             candidates.push(root.path.join(format!("{rel}.encrypted")));
                         }
                     }
@@ -1378,6 +1501,114 @@ impl<S: Storage, N: Network> Client<S, N> {
         )
     }
 
+    /// Key version a file was wrapped under. A device that missed a rotation is never sent
+    /// older versions by approval, so their absence is reported as `EpochKeyUnavailable`.
+    async fn file_epoch_key(&self, group_id: Uuid, epoch_id: u64) -> Result<[u8; 32], ClientError> {
+        let missing = {
+            let state = self.state.read().await;
+            Self::get_epoch_state(&state, group_id, epoch_id).is_none()
+        };
+        if missing {
+            // Whatever stopped the fetch, the device lacks this key; only an expired
+            // sign-in keeps its own error so the user is asked to sign in again.
+            match self.ensure_epoch_key_available(group_id, epoch_id).await {
+                Ok(()) => {}
+                Err(error @ ClientError::Unauthorized(_)) => return Err(error),
+                Err(_) => return Err(ClientError::EpochKeyUnavailable { epoch_id }),
+            }
+        }
+        let state = self.state.read().await;
+        Self::get_epoch_state(&state, group_id, epoch_id)
+            .map(|epoch| epoch.encryption_key)
+            .ok_or(ClientError::EpochKeyUnavailable { epoch_id })
+    }
+
+    /// Unwrap a file's key with its group's epoch key and check the authenticated
+    /// content manifest. Success proves the header was written by this group.
+    async fn unwrap_verified_file_key(
+        &self,
+        encrypted_file: &EncryptedFileMetadata,
+        file_group_id: Uuid,
+        allow_legacy: bool,
+    ) -> Result<hybridcipher_crypto::AeadKey, ClientError> {
+        use hybridcipher_crypto::aead::AeadContext;
+        use hybridcipher_crypto::{open, AeadKey, AeadNonce};
+
+        let file_epoch_id = encrypted_file.epoch_id;
+        let epoch_key_bytes = self.file_epoch_key(file_group_id, file_epoch_id).await?;
+
+        let wrapped_key = encrypted_file.wrapped_file_key.as_ref().ok_or_else(|| {
+            ClientError::DecryptionError(
+                "Encrypted file missing wrapped_file_key (legacy format unsupported)".to_string(),
+            )
+        })?;
+        let wrap_nonce_bytes = encrypted_file.key_wrap_nonce.as_deref().ok_or_else(|| {
+            ClientError::DecryptionError("Missing key wrap nonce in encrypted metadata".to_string())
+        })?;
+        let wrap_nonce = AeadNonce::from_bytes(wrap_nonce_bytes).map_err(|e| {
+            ClientError::DecryptionError(format!("Invalid key wrap nonce: {:?}", e))
+        })?;
+
+        let header_version = encrypted_file.header_version.unwrap_or(1);
+        let wrap_aad = self.build_wrap_aad(
+            &encrypted_file.file_id,
+            &encrypted_file.file_path,
+            file_group_id,
+            file_epoch_id,
+            header_version,
+        );
+        if let Some(expected_hash) = encrypted_file.key_wrap_aad_hash.as_ref() {
+            let actual = hash_wrap_aad(&wrap_aad);
+            if &actual != expected_hash {
+                return Err(ClientError::DecryptionError(
+                    "Key wrap AAD hash mismatch".to_string(),
+                ));
+            }
+        }
+
+        let kek_bytes =
+            hkdf_expand(&epoch_key_bytes, HkdfContext::KeyWrapping, 32).map_err(|e| {
+                ClientError::DecryptionError(format!("HKDF(KeyWrapping) failed: {:?}", e))
+            })?;
+        let kek = AeadKey::from_bytes(&kek_bytes)
+            .map_err(|e| ClientError::DecryptionError(format!("Invalid KEK: {:?}", e)))?;
+
+        let file_key_bytes = open(
+            &kek,
+            &wrap_nonce,
+            AeadContext::FileData,
+            &wrap_aad,
+            wrapped_key,
+        )
+        .map_err(|e| ClientError::FileIntegrity(format!("Key unwrap failed: {:?}", e)))?;
+        content_manifest::verify(encrypted_file, &file_key_bytes, allow_legacy)
+    }
+
+    /// Whether a file whose header parsed was really written by the active group.
+    /// Nothing is decrypted beyond the wrapped key; the reason says why it is not.
+    pub(super) async fn verify_ciphertext_header(
+        &self,
+        header: &EncryptedFileMetadata,
+    ) -> Result<(), String> {
+        let active_group = {
+            let state = self.state.read().await;
+            self.local_group_id.or(state.active_group_id)
+        };
+        let Some(active_group) = active_group else {
+            return Err("no active group".to_string());
+        };
+        match header.group_id {
+            Some(group) if group == active_group => {}
+            Some(group) => return Err(format!("it belongs to group {group}")),
+            None => return Err("its header names no group".to_string()),
+        }
+        // Older headers have no content manifest; their key unwrapping is the proof.
+        self.unwrap_verified_file_key(header, active_group, true)
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
     /// Decrypt a file using the appropriate epoch key
     ///
     /// This integrates:
@@ -1394,7 +1625,7 @@ impl<S: Storage, N: Network> Client<S, N> {
     /// Decrypted file content
     ///
     /// # Errors
-    /// - `InvalidState` if epoch key not available
+    /// - `EpochKeyUnavailable` if this device lacks the file's key version
     /// - `DecryptionError` if decryption fails
     /// - `StorageError` if coverage log cannot be accessed
     pub async fn decrypt_file(
@@ -1432,8 +1663,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         allow_large_single_record: bool,
     ) -> Result<Vec<u8>, ClientError> {
         use hybridcipher_crypto::aead::AeadContext;
-        use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
-        use hybridcipher_crypto::{open, AeadKey, AeadNonce};
+        use hybridcipher_crypto::{open, AeadNonce};
 
         let packed_content_size = match encrypted_file.sparse_metadata.as_ref() {
             Some(layout) => layout
@@ -1559,83 +1789,9 @@ impl<S: Storage, N: Network> Client<S, N> {
         // This avoids relying on local coverage state during cross-device access
         let file_epoch_id = encrypted_file.epoch_id;
 
-        // Ensure we have at least the requested epoch; if missing, try to fetch
-        {
-            let state = self.state.read().await;
-            if Self::get_epoch_state(&state, file_group_id, file_epoch_id).is_none() {
-                drop(state);
-                self.ensure_epoch_key_available(file_group_id, file_epoch_id)
-                    .await?;
-            } else {
-                self.logger.log(
-                    crate::logging::LogLevel::Info,
-                    &format!(
-                        "DEBUG: Found epoch {} locally for group {}",
-                        file_epoch_id, file_group_id
-                    ),
-                    None,
-                );
-            }
-        }
-
-        // Wrapped-DEK header format only
-        let wrapped_key = encrypted_file.wrapped_file_key.as_ref().ok_or_else(|| {
-            ClientError::DecryptionError(
-                "Encrypted file missing wrapped_file_key (legacy format unsupported)".to_string(),
-            )
-        })?;
-        let wrap_nonce_bytes = encrypted_file.key_wrap_nonce.as_deref().ok_or_else(|| {
-            ClientError::DecryptionError("Missing key wrap nonce in encrypted metadata".to_string())
-        })?;
-        let wrap_nonce = AeadNonce::from_bytes(wrap_nonce_bytes).map_err(|e| {
-            ClientError::DecryptionError(format!("Invalid key wrap nonce: {:?}", e))
-        })?;
-
-        let header_version = encrypted_file.header_version.unwrap_or(1);
-        let wrap_aad = self.build_wrap_aad(
-            &encrypted_file.file_id,
-            &encrypted_file.file_path,
-            file_group_id,
-            file_epoch_id,
-            header_version,
-        );
-        if let Some(expected_hash) = encrypted_file.key_wrap_aad_hash.as_ref() {
-            let actual = hash_wrap_aad(&wrap_aad);
-            if &actual != expected_hash {
-                return Err(ClientError::DecryptionError(
-                    "Key wrap AAD hash mismatch".to_string(),
-                ));
-            }
-        }
-
-        let epoch_key_bytes = {
-            let state = self.state.read().await;
-            Self::get_epoch_state(&state, file_group_id, file_epoch_id)
-                .map(|e| e.encryption_key)
-                .ok_or_else(|| {
-                    ClientError::InvalidState(format!(
-                        "Epoch {} not available for key unwrap",
-                        file_epoch_id
-                    ))
-                })?
-        };
-
-        let kek_bytes =
-            hkdf_expand(&epoch_key_bytes, HkdfContext::KeyWrapping, 32).map_err(|e| {
-                ClientError::DecryptionError(format!("HKDF(KeyWrapping) failed: {:?}", e))
-            })?;
-        let kek = AeadKey::from_bytes(&kek_bytes)
-            .map_err(|e| ClientError::DecryptionError(format!("Invalid KEK: {:?}", e)))?;
-
-        let file_key_bytes = open(
-            &kek,
-            &wrap_nonce,
-            AeadContext::FileData,
-            &wrap_aad,
-            wrapped_key,
-        )
-        .map_err(|e| ClientError::FileIntegrity(format!("Key unwrap failed: {:?}", e)))?;
-        let file_key = content_manifest::verify(encrypted_file, &file_key_bytes, allow_legacy)?;
+        let file_key = self
+            .unwrap_verified_file_key(encrypted_file, file_group_id, allow_legacy)
+            .await?;
 
         let header_version = encrypted_file.header_version.unwrap_or(1);
         let packed_plaintext = if header_version == CHUNKED_HEADER_VERSION
@@ -1724,9 +1880,28 @@ impl<S: Storage, N: Network> Client<S, N> {
         output_path: &Path,
         policy: content_manifest::LegacyReadPolicy,
     ) -> Result<(), ClientError> {
+        self.decrypt_file_streaming_to_path_with_options(
+            encrypted_path,
+            encrypted_file,
+            output_path,
+            policy,
+            OutputDurability::Full,
+        )
+        .await
+    }
+
+    /// As [`Self::decrypt_file_streaming_to_path_with_policy`], with the caller
+    /// choosing how the output is synced; see [`OutputDurability`].
+    pub async fn decrypt_file_streaming_to_path_with_options(
+        &self,
+        encrypted_path: &Path,
+        encrypted_file: &EncryptedFileMetadata,
+        output_path: &Path,
+        policy: content_manifest::LegacyReadPolicy,
+        durability: OutputDurability,
+    ) -> Result<(), ClientError> {
         use hybridcipher_crypto::aead::AeadContext;
-        use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
-        use hybridcipher_crypto::{open, AeadKey, AeadNonce};
+        use hybridcipher_crypto::{open, AeadNonce};
         use std::io::{BufReader, Read, Seek, SeekFrom};
 
         policy.check(encrypted_file)?;
@@ -1741,7 +1916,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                 )
                 .await?,
             );
-            return Self::write_plaintext_atomic(output_path, &plaintext);
+            return Self::write_plaintext_atomic(output_path, &plaintext, durability);
         }
 
         // Ensure client state is loaded
@@ -1810,75 +1985,13 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let file_epoch_id = encrypted_file.epoch_id;
 
-        {
-            let state = self.state.read().await;
-            if Self::get_epoch_state(&state, file_group_id, file_epoch_id).is_none() {
-                drop(state);
-                self.ensure_epoch_key_available(file_group_id, file_epoch_id)
-                    .await?;
-            }
-        }
-
-        let wrapped_key = encrypted_file.wrapped_file_key.as_ref().ok_or_else(|| {
-            ClientError::DecryptionError(
-                "Encrypted file missing wrapped_file_key (legacy format unsupported)".to_string(),
+        let file_key = self
+            .unwrap_verified_file_key(
+                encrypted_file,
+                file_group_id,
+                policy == content_manifest::LegacyReadPolicy::AllowLegacyUnverified,
             )
-        })?;
-        let wrap_nonce_bytes = encrypted_file.key_wrap_nonce.as_deref().ok_or_else(|| {
-            ClientError::DecryptionError("Missing key wrap nonce in encrypted metadata".to_string())
-        })?;
-        let wrap_nonce = AeadNonce::from_bytes(wrap_nonce_bytes).map_err(|e| {
-            ClientError::DecryptionError(format!("Invalid key wrap nonce: {:?}", e))
-        })?;
-
-        let wrap_aad = self.build_wrap_aad(
-            &encrypted_file.file_id,
-            &encrypted_file.file_path,
-            file_group_id,
-            file_epoch_id,
-            header_version,
-        );
-        if let Some(expected_hash) = encrypted_file.key_wrap_aad_hash.as_ref() {
-            let actual = hash_wrap_aad(&wrap_aad);
-            if &actual != expected_hash {
-                return Err(ClientError::DecryptionError(
-                    "Key wrap AAD hash mismatch".to_string(),
-                ));
-            }
-        }
-
-        let epoch_key_bytes = {
-            let state = self.state.read().await;
-            Self::get_epoch_state(&state, file_group_id, file_epoch_id)
-                .map(|e| e.encryption_key)
-                .ok_or_else(|| {
-                    ClientError::InvalidState(format!(
-                        "Epoch {} not available for key unwrap",
-                        file_epoch_id
-                    ))
-                })?
-        };
-
-        let kek_bytes =
-            hkdf_expand(&epoch_key_bytes, HkdfContext::KeyWrapping, 32).map_err(|e| {
-                ClientError::DecryptionError(format!("HKDF(KeyWrapping) failed: {:?}", e))
-            })?;
-        let kek = AeadKey::from_bytes(&kek_bytes)
-            .map_err(|e| ClientError::DecryptionError(format!("Invalid KEK: {:?}", e)))?;
-
-        let file_key_bytes = open(
-            &kek,
-            &wrap_nonce,
-            AeadContext::FileData,
-            &wrap_aad,
-            wrapped_key,
-        )
-        .map_err(|e| ClientError::FileIntegrity(format!("Key unwrap failed: {:?}", e)))?;
-        let file_key = content_manifest::verify(
-            encrypted_file,
-            &file_key_bytes,
-            policy == content_manifest::LegacyReadPolicy::AllowLegacyUnverified,
-        )?;
+            .await?;
 
         let content_nonce = encrypted_file.content_nonce.as_ref().ok_or_else(|| {
             ClientError::DecryptionError("Missing content nonce in metadata".to_string())
@@ -2071,7 +2184,7 @@ impl<S: Storage, N: Network> Client<S, N> {
             chunk_index += 1;
         }
 
-        output.finish()?;
+        output.finish(durability)?;
 
         if !content_manifest::requires_legacy_compatibility(encrypted_file) {
             self.maybe_schedule_rewrap(&encrypted_file.file_path, file_epoch_id)
@@ -2093,8 +2206,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         length: usize,
     ) -> Result<zeroize::Zeroizing<Vec<u8>>, ClientError> {
         use hybridcipher_crypto::aead::AeadContext;
-        use hybridcipher_crypto::kdf::{hkdf_expand, HkdfContext};
-        use hybridcipher_crypto::{open, AeadKey, AeadNonce};
+        use hybridcipher_crypto::{open, AeadNonce};
         use std::io::{BufReader, Read, Seek, SeekFrom};
         use zeroize::Zeroizing;
 
@@ -2185,66 +2297,9 @@ impl<S: Storage, N: Network> Client<S, N> {
         }
 
         let file_epoch_id = encrypted_file.epoch_id;
-        {
-            let state = self.state.read().await;
-            if Self::get_epoch_state(&state, file_group_id, file_epoch_id).is_none() {
-                drop(state);
-                self.ensure_epoch_key_available(file_group_id, file_epoch_id)
-                    .await?;
-            }
-        }
-
-        let wrapped_key = encrypted_file.wrapped_file_key.as_ref().ok_or_else(|| {
-            ClientError::DecryptionError(
-                "Encrypted file missing wrapped_file_key (legacy format unsupported)".to_string(),
-            )
-        })?;
-        let wrap_nonce_bytes = encrypted_file.key_wrap_nonce.as_deref().ok_or_else(|| {
-            ClientError::DecryptionError("Missing key wrap nonce in encrypted metadata".to_string())
-        })?;
-        let wrap_nonce = AeadNonce::from_bytes(wrap_nonce_bytes).map_err(|err| {
-            ClientError::DecryptionError(format!("Invalid key wrap nonce: {err:?}"))
-        })?;
-        let wrap_aad = self.build_wrap_aad(
-            &encrypted_file.file_id,
-            &encrypted_file.file_path,
-            file_group_id,
-            file_epoch_id,
-            header_version,
-        );
-        if let Some(expected_hash) = encrypted_file.key_wrap_aad_hash.as_ref() {
-            if &hash_wrap_aad(&wrap_aad) != expected_hash {
-                return Err(ClientError::DecryptionError(
-                    "Key wrap AAD hash mismatch".to_string(),
-                ));
-            }
-        }
-        let epoch_key_bytes = {
-            let state = self.state.read().await;
-            Self::get_epoch_state(&state, file_group_id, file_epoch_id)
-                .map(|epoch| epoch.encryption_key)
-                .ok_or_else(|| {
-                    ClientError::InvalidState(format!(
-                        "Epoch {} not available for key unwrap",
-                        file_epoch_id
-                    ))
-                })?
-        };
-        let kek_bytes =
-            hkdf_expand(&epoch_key_bytes, HkdfContext::KeyWrapping, 32).map_err(|err| {
-                ClientError::DecryptionError(format!("HKDF(KeyWrapping) failed: {err:?}"))
-            })?;
-        let kek = AeadKey::from_bytes(&kek_bytes)
-            .map_err(|err| ClientError::DecryptionError(format!("Invalid KEK: {err:?}")))?;
-        let file_key_bytes = open(
-            &kek,
-            &wrap_nonce,
-            AeadContext::FileData,
-            &wrap_aad,
-            wrapped_key,
-        )
-        .map_err(|err| ClientError::FileIntegrity(format!("Key unwrap failed: {err:?}")))?;
-        let file_key = content_manifest::verify(encrypted_file, &file_key_bytes, false)?;
+        let file_key = self
+            .unwrap_verified_file_key(encrypted_file, file_group_id, false)
+            .await?;
 
         let content_nonce = encrypted_file.content_nonce.as_ref().ok_or_else(|| {
             ClientError::DecryptionError("Missing content nonce in metadata".to_string())
@@ -2671,7 +2726,11 @@ impl<S: Storage, N: Network> Client<S, N> {
         Ok(())
     }
 
-    pub(super) fn write_plaintext_atomic(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
+    pub(super) fn write_plaintext_atomic(
+        path: &Path,
+        bytes: &[u8],
+        durability: OutputDurability,
+    ) -> Result<(), ClientError> {
         use std::io::Write;
 
         let parent = path.parent().ok_or_else(|| {
@@ -2705,7 +2764,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                 e
             ))
         })?;
-        if let Err(err) = file.sync_all() {
+        if let Err(err) = durability.apply(&file) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(ClientError::DecryptionError(format!(
                 "Failed to fsync {}: {}",
@@ -2737,8 +2796,10 @@ impl<S: Storage, N: Network> Client<S, N> {
             )));
         }
 
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+        if durability == OutputDurability::Full {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
         }
 
         Ok(())

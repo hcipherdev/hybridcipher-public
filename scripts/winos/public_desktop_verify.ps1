@@ -6,6 +6,10 @@ Purpose:
 How to run from the repository root:
   powershell -ExecutionPolicy Bypass -File .\scripts\winos\public_desktop_verify.ps1
 
+The build embeds the published Team verification keys from
+apps\desktop\team-verification-keys.txt unless HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS
+is set; a different value cannot reproduce the published hash.
+
 Output:
   target\x86_64-pc-windows-msvc\release\bundle\nsis\HybridCipher_<version>_x64-setup.exe
   target\x86_64-pc-windows-msvc\release\bundle\nsis\HybridCipher_<version>_x64-setup.exe.sha256
@@ -17,8 +21,16 @@ param(
     [string]$TargetTriple = "x86_64-pc-windows-msvc"
 )
 
+. (Join-Path $PSScriptRoot "team-verification-keys.ps1")
+$PublishedTeamKeys = Get-PublishedTeamVerificationKeys -Repo (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if ([string]::IsNullOrWhiteSpace($env:HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS)) {
-    throw "Set HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS to the published Team verification key list before building."
+    if ([string]::IsNullOrWhiteSpace($PublishedTeamKeys)) {
+        throw "Set HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS or restore apps\desktop\team-verification-keys.txt before building."
+    }
+    $env:HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS = $PublishedTeamKeys
+    Write-Host "Using published Team verification keys from apps\desktop\team-verification-keys.txt" -ForegroundColor Cyan
+} elseif ($PublishedTeamKeys -and $env:HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS -cne $PublishedTeamKeys) {
+    Write-Warning "HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS differs from apps\desktop\team-verification-keys.txt; this build will not match the published verification hashes."
 }
 
 $ErrorActionPreference = "Stop"

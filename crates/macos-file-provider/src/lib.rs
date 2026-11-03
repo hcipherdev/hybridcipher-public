@@ -3,9 +3,9 @@ use chrono::{DateTime, Utc};
 use hybridcipher_mount_sync::{
     encrypted_path_for, load_mount_conflict_registry, load_mount_recovery_registry,
     parse_encrypted_header_only, ConflictKind, ConflictResolutionRequest, ConflictResolutionResult,
-    MountConflictRecord, MountCrypto, MountRecoveryCopyRecord, MountSafetyReason,
-    MountSyncRuntimeStatus, RecoveryCopyResolutionRequest, RecoveryCopyResolutionResult,
-    SyncTracker,
+    DeleteInference, FileCountProgress, MountConflictRecord, MountCrypto, MountRecoveryCopyRecord,
+    MountSafetyReason, MountSyncRuntimeStatus, ProviderFileErrorCode,
+    RecoveryCopyResolutionRequest, RecoveryCopyResolutionResult, SyncTracker,
 };
 use hybridcipher_provider_core::{
     normalize_relative_path, FileIdentityV1, ProviderBridge, ProviderCoreError, ProviderEntry,
@@ -17,20 +17,27 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex,
+    },
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 mod provider_state;
+#[cfg(unix)]
+mod long_socket;
 
 pub const DEFAULT_PROVIDER_IDENTIFIER: &str = "com.hybridcipher.app.HybridCipherFileProvider";
 
 const DEFAULT_APPLE_TEAM_ID: &str = "G2L88C9692";
 const FILE_PROVIDER_APP_GROUP_SUFFIX: &str = "group.com.hybridcipher.macOS";
-const MACOS_UNIX_SOCKET_PATH_LIMIT: usize = 104;
+/// How long after the bridge starts the extension may take to connect before the
+/// mount is reported as not reachable from Finder.
+pub const EXTENSION_CONNECT_GRACE: Duration = Duration::from_secs(20);
 const FILE_PROVIDER_CACHE_TMP_PREFIX: &str = ".hybridcipher-fp-tmp-";
 const ENCRYPTED_TMP_DIR_NAME: &str = ".hybridcipher-tmp";
 const PROVIDER_CHANGE_RETENTION: usize = 4_096;
@@ -40,7 +47,9 @@ const FILE_ID_XATTR: &str = "com.hybridcipher.file_id";
 const FILE_ID_XATTR: &str = "user.hybridcipher.file_id";
 
 pub use hybridcipher_provider_core::{
-    local_provider_bridge, ClientMountCrypto, LocalProviderBridge, LocalProviderClient,
+    local_provider_bridge, ClientMountCrypto, EncryptedInventory, LegacyFileSummary,
+    LegacyReadPolicy, LegacyUpgradeReport, LocalProviderBridge, LocalProviderClient,
+    VaultCompatibility, VaultCompatibilityStatus,
 };
 use provider_state::{
     record_state_changes, resolve_snapshot_for_identifier, ProviderChangeEnumeration,
@@ -112,8 +121,15 @@ pub struct MacFileProviderStatus {
 pub struct MacFileProviderRuntimeHealth {
     pub root_id: Uuid,
     pub registration_present: bool,
-    pub domain_visible: bool,
+    /// The host's own listener answers. It says nothing about the extension, which
+    /// runs sandboxed and may still be unable to reach it.
     pub socket_reachable: bool,
+    /// The File Provider extension has connected since the bridge started.
+    #[serde(default)]
+    pub extension_connected: bool,
+    /// While the extension hasn't connected: seconds since the bridge started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_waiting_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,9 +258,48 @@ struct MacFileProviderCacheBridge {
     encrypted_root: PathBuf,
     runtime_paths: ProviderRuntimePaths,
     crypto: Arc<dyn MountCrypto>,
+    compatibility: Option<Arc<VaultCompatibility>>,
     tracker: AsyncMutex<SyncTracker>,
     operation_lock: AsyncMutex<()>,
     pending_directory_migrations: AsyncMutex<Vec<(String, String)>>,
+    /// The encrypted files, scanned once and kept until a change is possible:
+    /// every change to the encrypted tree holds `operation_lock`, and taking or
+    /// releasing it clears this (see `lock_operation`).
+    inventory: std::sync::Mutex<Option<Arc<InventoryIndex>>>,
+    /// The parsed provider state; this bridge is the only writer of its file.
+    provider_state: std::sync::Mutex<Option<Arc<ProviderPersistentState>>>,
+    /// Set once a full sync has succeeded. Until then the cache may be missing
+    /// files or hold an earlier session's copies, so reads decrypt straight from
+    /// the ciphertext and changes are asked to wait.
+    warm: AtomicBool,
+}
+
+fn missing_header(entry: &ProviderEntry) -> ProviderCoreError {
+    ProviderCoreError::InvalidIdentity(format!(
+        "{} has no readable encrypted header",
+        entry.relative_path
+    ))
+}
+
+/// How often a first sync records its progress in the runtime status.
+const PREPARING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+
+struct InventoryIndex {
+    entries: Vec<ProviderEntry>,
+    by_path: HashMap<String, usize>,
+}
+
+/// Holds `operation_lock`; the inventory is rescanned after it is taken and
+/// again after it is released, so no lookup sees a tree that was changing.
+struct OperationGuard<'a> {
+    _lock: tokio::sync::MutexGuard<'a, ()>,
+    bridge: &'a MacFileProviderCacheBridge,
+}
+
+impl Drop for OperationGuard<'_> {
+    fn drop(&mut self) {
+        self.bridge.forget_inventory();
+    }
 }
 
 impl MacFileProviderCacheBridge {
@@ -256,26 +311,11 @@ impl MacFileProviderCacheBridge {
         user_config_dir: PathBuf,
         excluded_patterns: Vec<String>,
         crypto: Arc<dyn MountCrypto>,
+        compatibility: Option<Arc<VaultCompatibility>>,
     ) -> hybridcipher_provider_core::Result<Self> {
         fs::create_dir_all(&runtime_paths.cache_dir)?;
         fs::create_dir_all(&encrypted_root)?;
-        match prune_redundant_decrypt_collision_conflicts(root_id, &runtime_paths) {
-            Ok(pruned_conflicts) if pruned_conflicts > 0 => {
-                tracing::info!(
-                    "pruned {} redundant macOS File Provider conflict copies for root {}",
-                    pruned_conflicts,
-                    root_id
-                );
-            }
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(
-                    "failed to prune redundant macOS File Provider conflict copies for root {}: {}",
-                    root_id,
-                    err
-                );
-            }
-        }
+        prune_redundant_decrypt_collision_conflicts_logged(root_id, &runtime_paths);
         let mut tracker = configured_cache_sync_tracker(
             root_id,
             &runtime_paths,
@@ -288,32 +328,130 @@ impl MacFileProviderCacheBridge {
                 root_id
             );
         }
+        if !cache_contains_user_visible_entries(&runtime_paths.cache_dir)? {
+            // Whatever the saved state says was decrypted, an empty cache holds
+            // none of it: rebuild it from the ciphertext without reading any
+            // absence as a delete.
+            tracker.enter_startup_rehydrate_mode();
+        }
         Ok(Self {
             root_id,
             domain_identifier,
             encrypted_root,
             runtime_paths,
             crypto,
+            compatibility,
             tracker: AsyncMutex::new(tracker),
             operation_lock: AsyncMutex::new(()),
+            inventory: std::sync::Mutex::new(None),
+            provider_state: std::sync::Mutex::new(None),
             pending_directory_migrations: AsyncMutex::new(Vec::new()),
+            warm: AtomicBool::new(false),
         })
     }
 
+    fn is_warm(&self) -> bool {
+        self.warm.load(Ordering::Acquire)
+    }
+
+    /// The first full sync of a root that is already open in Finder, reporting
+    /// its progress in the runtime status until it is done.
+    async fn first_sync(&self) -> hybridcipher_provider_core::Result<MountSyncRuntimeStatus> {
+        let status_path = &self.runtime_paths.status_path;
+        let last_written = std::sync::Mutex::new(None::<Instant>);
+        let report = |processed: usize, total: usize| {
+            let Ok(mut last) = last_written.lock() else {
+                return;
+            };
+            if processed != 0
+                && processed != total
+                && last.is_some_and(|at| at.elapsed() < PREPARING_STATUS_INTERVAL)
+            {
+                return;
+            }
+            *last = Some(Instant::now());
+            let mut status = read_mount_sync_runtime_status(status_path).unwrap_or_default();
+            status.preparing_files = Some(FileCountProgress { processed, total });
+            status.updated_at = Utc::now();
+            if let Err(err) = write_mount_sync_runtime_status(status_path, &status) {
+                tracing::debug!("could not record first sync progress: {err}");
+            }
+        };
+        let result = self.sync_once_with_progress(Some(&report)).await;
+        if result.is_err() {
+            // The failed sync wrote its error; only the count is cleared.
+            let mut status = read_mount_sync_runtime_status(status_path).unwrap_or_default();
+            status.preparing_files = None;
+            let _ = write_mount_sync_runtime_status(status_path, &status);
+        }
+        let status = result?;
+        // Edits Finder was asked to hold back can be sent now.
+        if let Err(err) = signal_provider_domain(&self.domain_identifier, Vec::new()) {
+            tracing::warn!(
+                "failed to signal macOS File Provider domain {}: {}",
+                self.domain_identifier,
+                err
+            );
+        }
+        Ok(status)
+    }
+
+    /// Decrypt one file straight from its ciphertext, bypassing the cache.
+    async fn decrypt_entry_to_path(
+        &self,
+        entry: &ProviderEntry,
+        output_path: &Path,
+    ) -> hybridcipher_provider_core::Result<()> {
+        let metadata = entry
+            .metadata
+            .as_ref()
+            .ok_or_else(|| missing_header(entry))?;
+        if metadata.content_chunk_size.is_some() {
+            self.crypto
+                .decrypt_file_streaming_deferred(&entry.encrypted_path, output_path, metadata)
+                .await?;
+        } else {
+            let plaintext = self
+                .crypto
+                .decrypt_file(&entry.encrypted_path, metadata)
+                .await?;
+            fs::write(output_path, plaintext)?;
+        }
+        Ok(())
+    }
+
     async fn sync_once(&self) -> hybridcipher_provider_core::Result<MountSyncRuntimeStatus> {
-        let _operation = self.operation_lock.lock().await;
-        self.sync_once_locked().await
+        self.sync_once_with_progress(None).await
+    }
+
+    async fn sync_once_with_progress(
+        &self,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> hybridcipher_provider_core::Result<MountSyncRuntimeStatus> {
+        let _operation = self.lock_operation().await;
+        self.sync_once_locked_with_progress(progress).await
     }
 
     async fn sync_once_locked(&self) -> hybridcipher_provider_core::Result<MountSyncRuntimeStatus> {
+        self.sync_once_locked_with_progress(None).await
+    }
+
+    async fn sync_once_locked_with_progress(
+        &self,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> hybridcipher_provider_core::Result<MountSyncRuntimeStatus> {
         fs::create_dir_all(&self.runtime_paths.cache_dir)?;
         fs::create_dir_all(&self.encrypted_root)?;
+        // A failed sync does not save its conflict records, so identical copies
+        // can only be recognized once a later sync has registered them.
+        prune_redundant_decrypt_collision_conflicts_logged(self.root_id, &self.runtime_paths);
         let mut tracker = self.tracker.lock().await;
         let sync_result = tracker
-            .sync(
+            .sync_with_progress(
                 self.crypto.as_ref(),
                 &self.encrypted_root,
                 &self.runtime_paths.cache_dir,
+                progress,
             )
             .await;
         let mut status = tracker.runtime_status();
@@ -323,11 +461,28 @@ impl MacFileProviderCacheBridge {
             write_mount_sync_runtime_status(&self.runtime_paths.status_path, &status)?;
             return Err(ProviderCoreError::Crypto(err));
         }
+        tracker.exit_startup_rehydrate_mode();
         tracker.persist_sync_baseline()?;
         drop(tracker);
         let _ = self.reconcile_provider_state().await?;
         write_mount_sync_runtime_status(&self.runtime_paths.status_path, &status)?;
+        self.warm.store(true, Ordering::Release);
         Ok(status)
+    }
+
+    async fn lock_operation(&self) -> OperationGuard<'_> {
+        let lock = self.operation_lock.lock().await;
+        self.forget_inventory();
+        OperationGuard {
+            _lock: lock,
+            bridge: self,
+        }
+    }
+
+    fn forget_inventory(&self) {
+        if let Ok(mut inventory) = self.inventory.lock() {
+            *inventory = None;
+        }
     }
 
     async fn has_fast_drain_work(&self) -> bool {
@@ -359,6 +514,11 @@ impl MacFileProviderCacheBridge {
         &self,
         relative_path: &str,
     ) -> hybridcipher_provider_core::Result<Option<ProviderEntry>> {
+        let normalized = normalize_relative_path(relative_path);
+        let inventory = self.inventory_index()?;
+        if let Some(&index) = inventory.by_path.get(&normalized) {
+            return Ok(Some(inventory.entries[index].clone()));
+        }
         let cache_path = cache_path_for_relative(&self.runtime_paths.cache_dir, relative_path)?;
         if !cache_path.exists() {
             return Ok(None);
@@ -369,6 +529,89 @@ impl MacFileProviderCacheBridge {
             &self.runtime_paths.cache_dir,
             &cache_path,
         )
+    }
+
+    fn path_or_ancestor_is_excluded(&self, relative_path: &Path) -> bool {
+        let mut candidate = Some(relative_path);
+        while let Some(path) = candidate {
+            if path.as_os_str().is_empty() {
+                break;
+            }
+            if self.crypto.is_path_excluded(path)
+                || self
+                    .crypto
+                    .is_path_excluded(&self.encrypted_root.join(path))
+            {
+                return true;
+            }
+            candidate = path.parent();
+        }
+        false
+    }
+
+    fn encrypted_inventory(&self) -> hybridcipher_provider_core::Result<Vec<ProviderEntry>> {
+        Ok(self.inventory_index()?.entries.clone())
+    }
+
+    fn inventory_index(&self) -> hybridcipher_provider_core::Result<Arc<InventoryIndex>> {
+        if let Some(index) = self.inventory.lock().ok().and_then(|cached| cached.clone()) {
+            return Ok(index);
+        }
+        let entries = EncryptedInventory::new(self.root_id, &self.encrypted_root)
+            .scan_filtered(&|relative_path| self.path_or_ancestor_is_excluded(relative_path))?;
+        if let Some(compatibility) = &self.compatibility {
+            compatibility.observe(&entries);
+        }
+        let by_path = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.relative_path.clone(), index))
+            .collect();
+        let index = Arc::new(InventoryIndex { entries, by_path });
+        if let Ok(mut cached) = self.inventory.lock() {
+            *cached = Some(index.clone());
+        }
+        Ok(index)
+    }
+
+    fn ensure_legacy_read_allowed(
+        &self,
+        entry: &ProviderEntry,
+    ) -> hybridcipher_provider_core::Result<()> {
+        if entry.requires_legacy_compatibility()
+            && self
+                .compatibility
+                .as_ref()
+                .map_or(true, |policy| policy.policy() == LegacyReadPolicy::Strict)
+        {
+            if let Some(policy) = &self.compatibility {
+                let result: std::result::Result<(), hybridcipher_mount_sync::MountSyncError> =
+                    Err(hybridcipher_mount_sync::MountSyncError::LegacyCompatibilityRequired);
+                policy.record_read_result(&result);
+            }
+            return Err(ProviderCoreError::Crypto(
+                hybridcipher_mount_sync::MountSyncError::LegacyCompatibilityRequired,
+            ));
+        }
+        Ok(())
+    }
+
+    fn preserve_legacy_subtree(
+        &self,
+        relative_path: &str,
+    ) -> hybridcipher_provider_core::Result<()> {
+        let Some(compatibility) = &self.compatibility else {
+            return Ok(());
+        };
+        let prefix = normalize_relative_path(relative_path);
+        for entry in self.encrypted_inventory()? {
+            let is_descendant = entry.relative_path == prefix
+                || entry.relative_path.starts_with(&(prefix.clone() + "/"));
+            if entry.kind == ProviderEntryKind::File && is_descendant {
+                compatibility.preserve_before_change(&entry.encrypted_path)?;
+            }
+        }
+        Ok(())
     }
 
     async fn queue_directory_migration(
@@ -382,12 +625,28 @@ impl MacFileProviderCacheBridge {
             .push((old_prefix.into(), new_prefix.into()));
     }
 
-    fn load_provider_state(&self) -> hybridcipher_provider_core::Result<ProviderPersistentState> {
-        if !self.runtime_paths.provider_state_path.exists() {
-            return Ok(ProviderPersistentState::new(self.root_id));
+    fn load_provider_state(
+        &self,
+    ) -> hybridcipher_provider_core::Result<Arc<ProviderPersistentState>> {
+        if let Some(state) = self
+            .provider_state
+            .lock()
+            .ok()
+            .and_then(|cached| cached.clone())
+        {
+            return Ok(state);
         }
-        let data = fs::read(&self.runtime_paths.provider_state_path)?;
-        Ok(serde_json::from_slice(&data)?)
+        let state = if self.runtime_paths.provider_state_path.exists() {
+            let data = fs::read(&self.runtime_paths.provider_state_path)?;
+            serde_json::from_slice(&data)?
+        } else {
+            ProviderPersistentState::new(self.root_id)
+        };
+        let state = Arc::new(state);
+        if let Ok(mut cached) = self.provider_state.lock() {
+            *cached = Some(state.clone());
+        }
+        Ok(state)
     }
 
     fn write_provider_state(
@@ -401,6 +660,9 @@ impl MacFileProviderCacheBridge {
             &self.runtime_paths.provider_state_path,
             serde_json::to_vec_pretty(state)?,
         )?;
+        if let Ok(mut cached) = self.provider_state.lock() {
+            *cached = Some(Arc::new(state.clone()));
+        }
         Ok(())
     }
 
@@ -432,18 +694,14 @@ impl MacFileProviderCacheBridge {
         &self,
     ) -> hybridcipher_provider_core::Result<(ProviderPersistentState, ProviderChangeJournal)> {
         let previous_state = self.load_provider_state()?;
-        let mut next_state = previous_state.clone();
+        let mut next_state = (*previous_state).clone();
         let mut pending_directory_migrations = self.pending_directory_migrations.lock().await;
         for (old_prefix, new_prefix) in pending_directory_migrations.drain(..) {
             next_state.apply_directory_migration(&old_prefix, &new_prefix);
         }
         drop(pending_directory_migrations);
 
-        let entries = scan_cache_inventory(
-            self.root_id,
-            &self.encrypted_root,
-            &self.runtime_paths.cache_dir,
-        )?;
+        let entries = self.encrypted_inventory()?;
         next_state.rebuild_items(
             self.root_id,
             &self.encrypted_root,
@@ -496,7 +754,7 @@ impl MacFileProviderCacheBridge {
         identifier: &str,
     ) -> hybridcipher_provider_core::Result<Option<ProviderItemSnapshot>> {
         Ok(resolve_snapshot_for_identifier(
-            &self.load_provider_state()?,
+            &*self.load_provider_state()?,
             identifier,
         ))
     }
@@ -510,21 +768,58 @@ impl ProviderBridge for MacFileProviderCacheBridge {
             .await
             .map_err(ProviderCoreError::from)
     }
+
+    async fn upgrade_legacy_files(
+        &self,
+        root_id: Uuid,
+        encrypted_root: &Path,
+        relative_paths: Option<&[String]>,
+        plaintext_staging_dir: &Path,
+    ) -> hybridcipher_provider_core::Result<LegacyUpgradeReport> {
+        self.check_write_access().await?;
+        self.ensure_root(root_id, encrypted_root)?;
+        let compatibility = self
+            .compatibility
+            .as_deref()
+            .ok_or_else(|| ProviderCoreError::MutationUnsupported("vault compatibility".into()))?;
+        let _operation = self.lock_operation().await;
+        // Publish local edits first so an upgrade never races an unsynced save.
+        let status = self.sync_once_locked().await?;
+        if status.pending_writeback_count > 0 || status.pending_refresh_count > 0 {
+            return Err(ProviderCoreError::MutationUnsupported(
+                "older files can be upgraded after pending changes in this folder finish syncing"
+                    .into(),
+            ));
+        }
+        let entries = self.encrypted_inventory()?;
+        let context = hybridcipher_provider_core::LegacyUpgradeContext {
+            crypto: self.crypto.as_ref(),
+            compatibility,
+            root_id,
+            encrypted_root,
+            plaintext_staging_dir,
+        };
+        let report = hybridcipher_provider_core::upgrade_legacy_entries(
+            &context,
+            &entries,
+            relative_paths,
+            &std::collections::HashSet::new(),
+        )
+        .await?;
+        if !report.upgraded.is_empty() {
+            // The cache already holds this plaintext; syncing records the new ciphertext.
+            self.sync_once_locked().await?;
+        }
+        self.encrypted_inventory()?;
+        Ok(report)
+    }
     async fn inventory(
         &self,
         root_id: Uuid,
         encrypted_root: &Path,
     ) -> hybridcipher_provider_core::Result<Vec<ProviderEntry>> {
         self.ensure_root(root_id, encrypted_root)?;
-        // Do NOT sync here.  The background cache-sync task already keeps the
-        // cache directory fresh (every 350ms / 5s).  A blocking sync on every
-        // inventory call causes the File Provider extension to time out because
-        // full sync takes O(seconds) per encrypted file via the crypto server.
-        scan_cache_inventory(
-            self.root_id,
-            &self.encrypted_root,
-            &self.runtime_paths.cache_dir,
-        )
+        self.encrypted_inventory()
     }
 
     async fn hydrate_file(
@@ -537,12 +832,26 @@ impl ProviderBridge for MacFileProviderCacheBridge {
                 entry.relative_path
             )));
         }
+        self.ensure_legacy_read_allowed(entry)?;
+        if !self.is_warm() {
+            let metadata = entry
+                .metadata
+                .as_ref()
+                .ok_or_else(|| missing_header(entry))?;
+            return Ok(self
+                .crypto
+                .decrypt_file(&entry.encrypted_path, metadata)
+                .await?);
+        }
         let cache_path =
             cache_path_for_relative(&self.runtime_paths.cache_dir, &entry.relative_path)?;
         if !cache_path.exists() {
             // Only sync when the file is genuinely absent from cache — this is
             // a cache miss, so we must decrypt it from the encrypted store.
             self.sync_once().await?;
+        }
+        if !cache_path.exists() {
+            self.ensure_legacy_read_allowed(entry)?;
         }
         Ok(fs::read(cache_path)?)
     }
@@ -558,11 +867,18 @@ impl ProviderBridge for MacFileProviderCacheBridge {
                 entry.relative_path
             )));
         }
+        self.ensure_legacy_read_allowed(entry)?;
+        if !self.is_warm() {
+            return self.decrypt_entry_to_path(entry, output_path).await;
+        }
         let cache_path =
             cache_path_for_relative(&self.runtime_paths.cache_dir, &entry.relative_path)?;
         if !cache_path.exists() {
             // Only sync when the file is genuinely absent from cache.
             self.sync_once().await?;
+        }
+        if !cache_path.exists() {
+            self.ensure_legacy_read_allowed(entry)?;
         }
         copy_file_atomically(&cache_path, output_path)?;
         Ok(())
@@ -576,6 +892,9 @@ impl ProviderBridge for MacFileProviderCacheBridge {
     ) -> hybridcipher_provider_core::Result<Option<FileIdentityV1>> {
         self.ensure_root(root_id, encrypted_root)?;
         let normalized = identifier.trim_start_matches('/');
+        if let Some(entry) = self.entry_for_relative_path(normalized)? {
+            return Ok(Some(entry.identity));
+        }
         let cache_path = cache_path_for_relative(&self.runtime_paths.cache_dir, normalized)?;
         if !cache_path.exists() {
             return Ok(None);
@@ -599,8 +918,15 @@ impl ProviderBridge for MacFileProviderCacheBridge {
     ) -> hybridcipher_provider_core::Result<ProviderEntry> {
         self.check_write_access().await?;
         self.ensure_root(root_id, encrypted_root)?;
-        let _operation = self.operation_lock.lock().await;
+        let _operation = self.lock_operation().await;
         let cache_path = cache_path_for_relative(&self.runtime_paths.cache_dir, relative_path)?;
+        if let Some(entry) = self.entry_for_relative_path(relative_path)? {
+            if entry.kind == ProviderEntryKind::File {
+                if let Some(compatibility) = &self.compatibility {
+                    compatibility.preserve_before_change(&entry.encrypted_path)?;
+                }
+            }
+        }
         copy_file_atomically(plaintext_path, &cache_path)?;
         if let Some(file_id) = existing_identity.and_then(|identity| identity.file_id.as_deref()) {
             let _ = write_file_id_xattr(&cache_path, file_id);
@@ -626,7 +952,7 @@ impl ProviderBridge for MacFileProviderCacheBridge {
     ) -> hybridcipher_provider_core::Result<ProviderEntry> {
         self.check_write_access().await?;
         self.ensure_root(root_id, encrypted_root)?;
-        let _operation = self.operation_lock.lock().await;
+        let _operation = self.lock_operation().await;
         let cache_path = cache_path_for_relative(&self.runtime_paths.cache_dir, relative_path)?;
         fs::create_dir_all(&cache_path)?;
         self.sync_once_locked().await?;
@@ -645,9 +971,25 @@ impl ProviderBridge for MacFileProviderCacheBridge {
     ) -> hybridcipher_provider_core::Result<()> {
         self.check_write_access().await?;
         self.ensure_root(identity.root_id, encrypted_root)?;
-        let _operation = self.operation_lock.lock().await;
+        let _operation = self.lock_operation().await;
         let cache_path =
             cache_path_for_relative(&self.runtime_paths.cache_dir, &identity.relative_path)?;
+        match identity.kind {
+            ProviderEntryKind::File => {
+                if let Some(entry) = self.entry_for_relative_path(&identity.relative_path)? {
+                    if let Some(compatibility) = &self.compatibility {
+                        compatibility.preserve_before_change(&entry.encrypted_path)?;
+                    }
+                }
+            }
+            ProviderEntryKind::Directory => {
+                self.preserve_legacy_subtree(&identity.relative_path)?;
+            }
+        }
+        self.tracker
+            .lock()
+            .await
+            .authorize_mount_deletion(&cache_path);
         match identity.kind {
             ProviderEntryKind::Directory => {
                 if cache_path.exists() {
@@ -674,11 +1016,48 @@ impl ProviderBridge for MacFileProviderCacheBridge {
     ) -> hybridcipher_provider_core::Result<Option<ProviderEntry>> {
         self.check_write_access().await?;
         self.ensure_root(root_id, encrypted_root)?;
-        let _operation = self.operation_lock.lock().await;
+        let _operation = self.lock_operation().await;
         let source_path = cache_path_for_relative(
             &self.runtime_paths.cache_dir,
             &source_identity.relative_path,
         )?;
+        match source_identity.kind {
+            ProviderEntryKind::File => {
+                if let Some(entry) = self.entry_for_relative_path(&source_identity.relative_path)? {
+                    self.ensure_legacy_read_allowed(&entry)?;
+                    if let Some(compatibility) = &self.compatibility {
+                        compatibility.preserve_before_change(&entry.encrypted_path)?;
+                    }
+                }
+                if let Some(target) = self.entry_for_relative_path(target_relative_path)? {
+                    if target.kind == ProviderEntryKind::File
+                        && target.relative_path != source_identity.relative_path
+                    {
+                        if let Some(compatibility) = &self.compatibility {
+                            compatibility.preserve_before_change(&target.encrypted_path)?;
+                        }
+                    }
+                }
+            }
+            ProviderEntryKind::Directory => {
+                let prefix = normalize_relative_path(&source_identity.relative_path);
+                for entry in self.encrypted_inventory()? {
+                    if entry.kind == ProviderEntryKind::File
+                        && (entry.relative_path == prefix
+                            || entry.relative_path.starts_with(&(prefix.clone() + "/")))
+                    {
+                        self.ensure_legacy_read_allowed(&entry)?;
+                    }
+                }
+                self.preserve_legacy_subtree(&source_identity.relative_path)?;
+            }
+        }
+        // The source leaves the cache; the sync pairs it with the target by file id
+        // and only then retires its old ciphertext.
+        self.tracker
+            .lock()
+            .await
+            .authorize_mount_deletion(&source_path);
         if !source_path.exists() {
             self.sync_once_locked().await?;
         }
@@ -726,6 +1105,11 @@ impl ProviderBridge for MacFileProviderCacheBridge {
 
 #[async_trait]
 trait ProviderSocketBridge: Send + Sync {
+    /// Whether Finder's changes can be applied now; see `busy_preparing`.
+    fn accepts_changes(&self) -> bool {
+        true
+    }
+
     async fn list_directory(
         &self,
         root_id: Uuid,
@@ -817,6 +1201,10 @@ trait ProviderSocketBridge: Send + Sync {
 
 #[async_trait]
 impl ProviderSocketBridge for MacFileProviderCacheBridge {
+    fn accepts_changes(&self) -> bool {
+        self.is_warm()
+    }
+
     async fn list_directory(
         &self,
         root_id: Uuid,
@@ -929,7 +1317,7 @@ impl ProviderSocketBridge for MacFileProviderCacheBridge {
             resolved_identity.as_ref(),
         )
         .await?;
-        let provider_identifier = entry_provider_identifier(&entry, &self.load_provider_state()?);
+        let provider_identifier = entry_provider_identifier(&entry, &*self.load_provider_state()?);
         self.provider_snapshot_for_identifier(&provider_identifier)
             .await?
             .ok_or_else(|| {
@@ -1046,7 +1434,7 @@ impl ProviderSocketBridge for MacFileProviderCacheBridge {
         request: ConflictResolutionRequest,
     ) -> hybridcipher_provider_core::Result<ConflictResolutionResult> {
         self.ensure_root(root_id, encrypted_root)?;
-        let _operation = self.operation_lock.lock().await;
+        let _operation = self.lock_operation().await;
         let mut tracker = self.tracker.lock().await;
         let result = tracker
             .resolve_conflict_action(&self.runtime_paths.cache_dir, &request)
@@ -1064,7 +1452,7 @@ impl ProviderSocketBridge for MacFileProviderCacheBridge {
         request: RecoveryCopyResolutionRequest,
     ) -> hybridcipher_provider_core::Result<RecoveryCopyResolutionResult> {
         self.ensure_root(root_id, encrypted_root)?;
-        let _operation = self.operation_lock.lock().await;
+        let _operation = self.lock_operation().await;
         let mut tracker = self.tracker.lock().await;
         let result = tracker
             .resolve_recovery_copy_action(&self.runtime_paths.cache_dir, &request)
@@ -1254,6 +1642,7 @@ pub struct MacFileProviderHost {
     running_roots: Arc<Mutex<HashMap<Uuid, FileProviderDomainRegistration>>>,
     socket_tasks: Arc<Mutex<HashMap<Uuid, Vec<tokio::task::JoinHandle<()>>>>>,
     sync_tasks: Arc<Mutex<HashMap<Uuid, tokio::task::JoinHandle<()>>>>,
+    cache_bridges: Arc<Mutex<HashMap<Uuid, Arc<MacFileProviderCacheBridge>>>>,
 }
 
 impl MacFileProviderHost {
@@ -1263,6 +1652,7 @@ impl MacFileProviderHost {
             running_roots: Arc::new(Mutex::new(HashMap::new())),
             socket_tasks: Arc::new(Mutex::new(HashMap::new())),
             sync_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cache_bridges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1286,33 +1676,21 @@ impl MacFileProviderHost {
         let mut socket_reachable = false;
 
         if registration.is_some() {
-            let runtime_paths = self.runtime_paths(root_id)?;
-            for candidate in runtime_socket_paths(root_id, &runtime_paths.socket_path) {
-                match check_provider_socket(&candidate) {
-                    Ok(()) => {
-                        socket_path = Some(candidate);
-                        socket_reachable = true;
-                        latest_error = None;
-                        break;
-                    }
-                    Err(err) => {
-                        socket_path = Some(candidate);
-                        latest_error = Some(err.to_string());
-                    }
-                }
+            let candidate = self.runtime_paths(root_id)?.socket_path;
+            match check_provider_socket(&candidate) {
+                Ok(()) => socket_reachable = true,
+                Err(err) => latest_error = Some(err.to_string()),
             }
+            socket_path = Some(candidate);
         }
-
-        let domain_visible = registration
-            .as_ref()
-            .map(|registration| platform_domain_visible(&registration.domain_identifier))
-            .unwrap_or(false);
+        let (extension_connected, extension_waiting_secs) = extension_contact(root_id);
 
         Ok(MacFileProviderRuntimeHealth {
             root_id,
             registration_present: registration.is_some(),
-            domain_visible,
             socket_reachable,
+            extension_connected,
+            extension_waiting_secs,
             socket_path,
             latest_error: latest_error.clone(),
             last_error: latest_error,
@@ -1405,6 +1783,28 @@ impl MacFileProviderHost {
         crypto: Arc<dyn MountCrypto>,
         excluded_patterns: Vec<String>,
     ) -> Result<()> {
+        self.start_root_inner(root_id, crypto, excluded_patterns, None)
+            .await
+    }
+
+    pub async fn start_root_with_compatibility(
+        &self,
+        root_id: Uuid,
+        crypto: Arc<dyn MountCrypto>,
+        excluded_patterns: Vec<String>,
+        compatibility: Arc<VaultCompatibility>,
+    ) -> Result<()> {
+        self.start_root_inner(root_id, crypto, excluded_patterns, Some(compatibility))
+            .await
+    }
+
+    async fn start_root_inner(
+        &self,
+        root_id: Uuid,
+        crypto: Arc<dyn MountCrypto>,
+        excluded_patterns: Vec<String>,
+        compatibility: Option<Arc<VaultCompatibility>>,
+    ) -> Result<()> {
         if self.is_root_running(root_id) {
             return Ok(());
         }
@@ -1422,20 +1822,107 @@ impl MacFileProviderHost {
             self.config.user_config_dir.clone(),
             excluded_patterns,
             crypto,
+            compatibility,
         )?);
         let replay_bridge: Arc<dyn ProviderBridge> = cache_bridge.clone();
         self.replay_pending_mutations(&registration, replay_bridge, &runtime_paths)
             .await?;
-        cache_bridge.sync_once().await?;
+        // Finder's items come from the ciphertext headers alone, so the folder can
+        // open now; files are decrypted on demand until the first full sync, which
+        // the sync task runs first, has filled the cache.
+        {
+            let _operation = cache_bridge.lock_operation().await;
+            cache_bridge.reconcile_provider_state().await?;
+        }
         let socket_bridge: Arc<dyn ProviderSocketBridge> = cache_bridge.clone();
         self.start_socket_server(registration.clone(), socket_bridge, runtime_paths.clone())
             .await?;
-        self.start_cache_sync_task(root_id, cache_bridge)?;
+        self.start_cache_sync_task(root_id, cache_bridge.clone())?;
+        self.cache_bridges
+            .lock()
+            .map_err(|_| MacFileProviderError::Operation("cache bridge lock poisoned".into()))?
+            .insert(root_id, cache_bridge);
         self.running_roots
             .lock()
             .map_err(|_| MacFileProviderError::Operation("running root lock poisoned".into()))?
             .insert(root_id, registration);
         Ok(())
+    }
+
+    pub async fn refresh_root(&self, root_id: Uuid) -> Result<()> {
+        let bridge = self.active_cache_bridge(root_id)?;
+        bridge.sync_once().await?;
+        ProviderSocketBridge::signal_enumerator(&*bridge, root_id, &bridge.encrypted_root).await?;
+        Ok(())
+    }
+
+    pub fn legacy_files(&self, root_id: Uuid) -> Result<Vec<LegacyFileSummary>> {
+        let bridge = self.active_cache_bridge(root_id)?;
+        Ok(hybridcipher_provider_core::legacy_file_summaries(
+            &bridge.encrypted_inventory()?,
+        ))
+    }
+
+    /// Rewrites older-format files in the current format and signals Finder.
+    pub async fn upgrade_legacy_files(
+        &self,
+        root_id: Uuid,
+        relative_paths: Option<Vec<String>>,
+    ) -> Result<LegacyUpgradeReport> {
+        let bridge = self.active_cache_bridge(root_id)?;
+        // Transient plaintext stays beside the private cache, outside the synced encrypted root.
+        let staging_dir = self
+            .runtime_paths(root_id)?
+            .cache_dir
+            .with_file_name(format!("macos_provider_legacy_upgrade_{root_id}"));
+        let report = ProviderBridge::upgrade_legacy_files(
+            &*bridge,
+            root_id,
+            &bridge.encrypted_root,
+            relative_paths.as_deref(),
+            &staging_dir,
+        )
+        .await?;
+        if !report.upgraded.is_empty() {
+            ProviderSocketBridge::signal_enumerator(&*bridge, root_id, &bridge.encrypted_root)
+                .await?;
+        }
+        Ok(report)
+    }
+
+    /// Conflict registry written by the cache sync. Its relative paths resolve
+    /// against `runtime_paths(root_id).cache_dir`, not the Finder location.
+    pub fn conflict_registry_path(&self, root_id: Uuid) -> Result<PathBuf> {
+        let paths = self.runtime_paths(root_id)?;
+        Ok(macos_file_provider_sync_journal_paths(&paths, root_id).conflicts)
+    }
+
+    pub async fn resolve_conflict(
+        &self,
+        root_id: Uuid,
+        request: ConflictResolutionRequest,
+    ) -> Result<ConflictResolutionResult> {
+        let bridge = self.active_cache_bridge(root_id)?;
+        Ok(ProviderSocketBridge::resolve_conflict(
+            &*bridge,
+            root_id,
+            &bridge.encrypted_root,
+            request,
+        )
+        .await?)
+    }
+
+    fn active_cache_bridge(&self, root_id: Uuid) -> Result<Arc<MacFileProviderCacheBridge>> {
+        self.cache_bridges
+            .lock()
+            .map_err(|_| MacFileProviderError::Operation("cache bridge lock poisoned".into()))?
+            .get(&root_id)
+            .cloned()
+            .ok_or_else(|| {
+                MacFileProviderError::Operation(format!(
+                    "macOS File Provider root {root_id} has no active cache bridge"
+                ))
+            })
     }
 
     pub fn stop_root(&self, root_id: Uuid) -> Result<()> {
@@ -1445,6 +1932,10 @@ impl MacFileProviderHost {
             .map_err(|_| MacFileProviderError::Operation("running root lock poisoned".into()))?
             .remove(&root_id);
         if removed.is_some() {
+            self.cache_bridges
+                .lock()
+                .map_err(|_| MacFileProviderError::Operation("cache bridge lock poisoned".into()))?
+                .remove(&root_id);
             if let Some(tasks) = self
                 .socket_tasks
                 .lock()
@@ -1464,10 +1955,10 @@ impl MacFileProviderHost {
                 task.abort();
             }
             if let Ok(paths) = self.runtime_paths(root_id) {
-                for socket_path in runtime_socket_paths(root_id, &paths.socket_path) {
-                    let _ = fs::remove_file(socket_path);
-                }
+                let _ = fs::remove_file(paths.socket_path);
             }
+            let _ = fs::remove_file(legacy_tmp_socket_path(root_id));
+            forget_extension_contact(root_id);
             self.cleanup_safe_runtime_artifacts(root_id)?;
             Ok(())
         } else {
@@ -1483,6 +1974,9 @@ impl MacFileProviderHost {
         cache_bridge: Arc<MacFileProviderCacheBridge>,
     ) -> Result<()> {
         let task = tokio::spawn(async move {
+            if let Err(err) = cache_bridge.first_sync().await {
+                tracing::warn!("macOS File Provider first sync failed for {root_id}: {err}");
+            }
             let mut regular = tokio::time::interval(Duration::from_secs(5));
             let mut fast = tokio::time::interval(Duration::from_millis(350));
             regular.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1521,9 +2015,11 @@ impl MacFileProviderHost {
     ) -> Result<()> {
         use tokio::net::UnixListener;
 
-        let socket_paths = runtime_socket_paths(registration.root_id, &runtime_paths.socket_path);
+        // Older builds also listened in /tmp, which the sandboxed extension can't reach.
+        let _ = fs::remove_file(legacy_tmp_socket_path(registration.root_id));
         let mut tasks = Vec::new();
-        for socket_path in socket_paths {
+        {
+            let socket_path = runtime_paths.socket_path.clone();
             if let Some(parent) = socket_path.parent() {
                 fs::create_dir_all(parent)?;
                 #[cfg(unix)]
@@ -1535,7 +2031,10 @@ impl MacFileProviderHost {
             if socket_path.exists() {
                 fs::remove_file(&socket_path)?;
             }
-            let listener = UnixListener::bind(&socket_path)?;
+            let listener = long_socket::bind(&socket_path)?;
+            listener.set_nonblocking(true)?;
+            let listener = UnixListener::from_std(listener)?;
+            begin_extension_wait(registration.root_id);
             let host = self.clone();
             let registration = registration.clone();
             let bridge = bridge.clone();
@@ -1545,7 +2044,15 @@ impl MacFileProviderHost {
             let task = tokio::spawn(async move {
                 loop {
                     let stream = match listener.accept().await {
-                        Ok((stream, _addr)) => stream,
+                        Ok((stream, _addr)) => {
+                            // The host checks its own socket too; only another process
+                            // (the extension) proves Finder can reach the bridge.
+                            let peer = stream.peer_cred().ok().and_then(|cred| cred.pid());
+                            if peer.is_some_and(|pid| pid as u32 != std::process::id()) {
+                                record_extension_contact(root_id);
+                            }
+                            stream
+                        }
                         Err(err) => {
                             tracing::warn!(
                                 "macOS File Provider socket accept failed for {}: {}",
@@ -1623,11 +2130,15 @@ impl MacFileProviderHost {
         }
         let state_dir = self.config.user_config_dir.join("mount_states");
         fs::create_dir_all(&state_dir)?;
-        let socket_path = self
-            .config
-            .socket_path
-            .clone()
-            .unwrap_or_else(|| default_socket_path(root_id));
+        let socket_path = match self.config.socket_path.clone() {
+            Some(path) => path,
+            None => app_group_socket_path(root_id).ok_or_else(|| {
+                MacFileProviderError::InvalidPath(
+                    "HOME is not set, so the File Provider app group container can't be found"
+                        .to_string(),
+                )
+            })?,
+        };
         Ok(ProviderRuntimePaths {
             status_path: state_dir.join(format!("mount_sync_status_{root_id}.json")),
             journal_path: state_dir.join(format!("macos_provider_mutations_{root_id}.json")),
@@ -1956,6 +2467,9 @@ fn configured_cache_sync_tracker(
     excluded_patterns: Vec<String>,
 ) -> SyncTracker {
     let mut tracker = SyncTracker::new();
+    // Only this app writes the cache, so a file missing from it was lost, not
+    // deleted; Finder's deletes and renames are authorized one by one.
+    tracker.set_delete_inference(DeleteInference::ExplicitOnly);
     let mount_config = SyncTracker::load_mount_config_from_file(None);
     tracker.set_deletion_config(mount_config.deletion);
     tracker.set_sparse_skip_size_bytes(mount_config.sparse_skip_size_bytes);
@@ -2019,6 +2533,29 @@ fn cache_contains_user_visible_entries(cache_dir: &Path) -> io::Result<bool> {
     }
 
     Ok(false)
+}
+
+fn prune_redundant_decrypt_collision_conflicts_logged(
+    root_id: Uuid,
+    runtime_paths: &ProviderRuntimePaths,
+) {
+    match prune_redundant_decrypt_collision_conflicts(root_id, runtime_paths) {
+        Ok(pruned_conflicts) if pruned_conflicts > 0 => {
+            tracing::info!(
+                "pruned {} redundant macOS File Provider conflict copies for root {}",
+                pruned_conflicts,
+                root_id
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                "failed to prune redundant macOS File Provider conflict copies for root {}: {}",
+                root_id,
+                err
+            );
+        }
+    }
 }
 
 fn prune_redundant_decrypt_collision_conflicts(
@@ -2104,6 +2641,7 @@ fn macos_file_provider_sync_journal_paths(
     }
 }
 
+#[cfg(test)]
 fn scan_cache_inventory(
     root_id: Uuid,
     encrypted_root: &Path,
@@ -2124,6 +2662,7 @@ fn scan_cache_inventory(
     Ok(entries)
 }
 
+#[cfg(test)]
 fn scan_cache_dir(
     root_id: Uuid,
     encrypted_root: &Path,
@@ -2261,45 +2800,28 @@ fn list_directory_snapshots(
     state: &ProviderPersistentState,
     container_identifier: Option<&str>,
 ) -> hybridcipher_provider_core::Result<Vec<ProviderItemSnapshot>> {
-    let relative_path = match container_identifier {
-        None => String::new(),
-        Some(identifier) => {
-            let snapshot = state.snapshot(identifier).ok_or_else(|| {
-                ProviderCoreError::InvalidIdentity(format!(
-                    "no provider snapshot found for identifier {identifier}"
-                ))
-            })?;
-            if snapshot.kind != ProviderEntryKind::Directory {
-                return Err(ProviderCoreError::InvalidIdentity(format!(
-                    "identifier {identifier} is not a directory"
-                )));
-            }
-            snapshot.relative_path.clone()
-        }
-    };
-
-    let directory_path = if relative_path.is_empty() {
-        cache_root.to_path_buf()
-    } else {
-        cache_path_for_relative(cache_root, &relative_path)?
-    };
-    if !directory_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut snapshots = Vec::new();
-    for child in fs::read_dir(&directory_path)? {
-        let child = child?;
-        let path = child.path();
-        if should_skip_cache_path(&path) {
-            continue;
-        }
-        if let Some(entry) = cache_entry_for_path(root_id, encrypted_root, cache_root, &path)? {
-            if let Some(snapshot) = state.snapshot_for_relative_path(root_id, entry) {
-                snapshots.push(snapshot);
-            }
+    let _ = (encrypted_root, cache_root);
+    if let Some(identifier) = container_identifier {
+        let snapshot = state.snapshot(identifier).ok_or_else(|| {
+            ProviderCoreError::InvalidIdentity(format!(
+                "no provider snapshot found for identifier {identifier}"
+            ))
+        })?;
+        if snapshot.kind != ProviderEntryKind::Directory {
+            return Err(ProviderCoreError::InvalidIdentity(format!(
+                "identifier {identifier} is not a directory"
+            )));
         }
     }
+    let parent_provider_id = container_identifier.map(str::to_string);
+    let mut snapshots = state
+        .items
+        .values()
+        .filter(|snapshot| {
+            snapshot.root_id == root_id && snapshot.parent_provider_id == parent_provider_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     snapshots.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(snapshots)
 }
@@ -2360,6 +2882,12 @@ fn copy_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
     copy_result
 }
 
+fn read_mount_sync_runtime_status(
+    status_path: &Path,
+) -> hybridcipher_provider_core::Result<MountSyncRuntimeStatus> {
+    Ok(serde_json::from_slice(&fs::read(status_path)?)?)
+}
+
 fn write_mount_sync_runtime_status(
     status_path: &Path,
     status: &MountSyncRuntimeStatus,
@@ -2401,63 +2929,109 @@ fn short_socket_filename(root_id: Uuid) -> String {
     format!("{}.sock", &root_hex[..16])
 }
 
+/// The only place the sandboxed extension can reach. Its length doesn't matter:
+/// `long_socket` addresses paths past the 104-byte `sun_path` field.
 fn app_group_socket_path(root_id: Uuid) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let path = home
-        .join("Library")
-        .join("Group Containers")
-        .join(file_provider_app_group_identifier())
-        .join(short_socket_filename(root_id));
-
-    if path.as_os_str().len() < MACOS_UNIX_SOCKET_PATH_LIMIT {
-        Some(path)
-    } else {
-        None
-    }
+    Some(
+        home.join("Library")
+            .join("Group Containers")
+            .join(file_provider_app_group_identifier())
+            .join(short_socket_filename(root_id)),
+    )
 }
 
-fn tmp_socket_path(root_id: Uuid) -> PathBuf {
+/// Where builds before the folder-relative socket listened when the container path
+/// was too long; removed so nothing connects to a stale listener.
+fn legacy_tmp_socket_path(root_id: Uuid) -> PathBuf {
     PathBuf::from("/tmp")
         .join("hc-fp")
         .join(short_socket_filename(root_id))
 }
 
-fn default_socket_path(root_id: Uuid) -> PathBuf {
-    app_group_socket_path(root_id).unwrap_or_else(|| tmp_socket_path(root_id))
+/// When each root's bridge started listening and whether the extension has
+/// connected since. Process-wide, because health checks build their own host.
+struct ExtensionContact {
+    listening_since: std::time::Instant,
+    connected: bool,
 }
 
-fn runtime_socket_paths(root_id: Uuid, primary_socket_path: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![primary_socket_path.to_path_buf()];
-    let fallback = tmp_socket_path(root_id);
-    if !paths.iter().any(|path| path == &fallback) {
-        paths.push(fallback);
+static EXTENSION_CONTACTS: LazyLock<Mutex<HashMap<Uuid, ExtensionContact>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn begin_extension_wait(root_id: Uuid) {
+    if let Ok(mut contacts) = EXTENSION_CONTACTS.lock() {
+        contacts.insert(
+            root_id,
+            ExtensionContact {
+                listening_since: std::time::Instant::now(),
+                connected: false,
+            },
+        );
     }
-    paths
 }
+
+fn record_extension_contact(root_id: Uuid) {
+    if let Ok(mut contacts) = EXTENSION_CONTACTS.lock() {
+        if let Some(contact) = contacts.get_mut(&root_id) {
+            contact.connected = true;
+        }
+    }
+}
+
+fn forget_extension_contact(root_id: Uuid) {
+    if let Ok(mut contacts) = EXTENSION_CONTACTS.lock() {
+        contacts.remove(&root_id);
+    }
+}
+
+/// Whether the extension connected, or else how long the bridge has waited for
+/// it. A bridge this process didn't start reports neither.
+fn extension_contact(root_id: Uuid) -> (bool, Option<u64>) {
+    let Ok(contacts) = EXTENSION_CONTACTS.lock() else {
+        return (false, None);
+    };
+    match contacts.get(&root_id) {
+        Some(contact) if contact.connected => (true, None),
+        Some(contact) => (false, Some(contact.listening_since.elapsed().as_secs())),
+        None => (false, None),
+    }
+}
+
+/// How long a health check waits for a bridge to answer its status request.
+#[cfg(unix)]
+const PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 fn check_provider_socket(socket_path: &Path) -> Result<()> {
-    use std::os::unix::net::UnixStream;
-
     if !socket_path.exists() {
         return Err(MacFileProviderError::Operation(format!(
             "provider socket does not exist: {}",
             socket_path.display()
         )));
     }
-    let mut stream = UnixStream::connect(socket_path).map_err(|err| {
+    let mut stream = long_socket::connect(socket_path).map_err(|err| {
         MacFileProviderError::Operation(format!(
             "provider socket connection failed for {}: {err}",
             socket_path.display()
         ))
     })?;
+    // A bridge that accepts but never answers must not hold the caller forever.
+    stream.set_read_timeout(Some(PROVIDER_STATUS_TIMEOUT))?;
+    stream.set_write_timeout(Some(PROVIDER_STATUS_TIMEOUT))?;
     let mut request = serde_json::to_vec(&ProviderSocketRequest::Status)?;
     request.push(b'\n');
     stream.write_all(&request)?;
     let _ = stream.shutdown(std::net::Shutdown::Write);
 
     let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    stream.read_to_string(&mut response).map_err(|err| {
+        MacFileProviderError::Operation(format!(
+            "provider socket {} did not answer within {} s: {err}",
+            socket_path.display(),
+            PROVIDER_STATUS_TIMEOUT.as_secs()
+        ))
+    })?;
     let response: ProviderSocketResponse = serde_json::from_str(response.trim())?;
     if response.ok {
         Ok(())
@@ -2559,25 +3133,6 @@ fn platform_unregister_system_domain(registration: &FileProviderDomainRegistrati
 #[cfg(not(target_os = "macos"))]
 fn platform_unregister_system_domain(_registration: &FileProviderDomainRegistration) -> Result<()> {
     Err(MacFileProviderError::UnsupportedPlatform)
-}
-
-#[cfg(target_os = "macos")]
-fn platform_domain_visible(domain_identifier: &str) -> bool {
-    std::process::Command::new("fileproviderctl")
-        .arg("dump")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout).contains(domain_identifier)
-                || String::from_utf8_lossy(&output.stderr).contains(domain_identifier)
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_domain_visible(_domain_identifier: &str) -> bool {
-    false
 }
 
 #[cfg(target_os = "macos")]
@@ -2745,6 +3300,8 @@ pub(crate) enum ProviderSocketRequest {
 pub(crate) struct ProviderSocketResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<ProviderFileErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<MacFileProviderStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<MountSyncRuntimeStatus>,
@@ -2772,12 +3329,16 @@ pub(crate) struct ProviderSocketResponse {
     pub recovery_resolution: Option<RecoveryCopyResolutionResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The request was refused for now and can be sent again later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_later: Option<bool>,
 }
 
 impl ProviderSocketResponse {
     pub fn ok() -> Self {
         Self {
             ok: true,
+            error_code: None,
             status: None,
             runtime_status: None,
             entries: None,
@@ -2792,12 +3353,14 @@ impl ProviderSocketResponse {
             conflict_resolution: None,
             recovery_resolution: None,
             message: None,
+            retry_later: None,
         }
     }
 
     pub fn error(err: impl ToString) -> Self {
         Self {
             ok: false,
+            error_code: None,
             status: None,
             runtime_status: None,
             entries: None,
@@ -2812,7 +3375,21 @@ impl ProviderSocketResponse {
             conflict_resolution: None,
             recovery_resolution: None,
             message: Some(err.to_string()),
+            retry_later: None,
         }
+    }
+
+    pub fn legacy_consent_required(err: impl ToString) -> Self {
+        let mut response = Self::error(err);
+        response.error_code = Some(ProviderFileErrorCode::LegacyConsentRequired);
+        response
+    }
+
+    /// Changes wait until the mount's first full sync has finished.
+    pub fn busy_preparing() -> Self {
+        let mut response = Self::error("HybridCipher is still preparing this folder");
+        response.retry_later = Some(true);
+        response
     }
 }
 
@@ -2850,7 +3427,7 @@ mod ipc {
         Ok(())
     }
 
-    async fn handle_request(
+    pub(super) async fn handle_request(
         host: &MacFileProviderHost,
         registration: &FileProviderDomainRegistration,
         bridge: Arc<dyn ProviderSocketBridge>,
@@ -3001,6 +3578,9 @@ mod ipc {
                     Ok(None) => ProviderSocketResponse::error(format!(
                         "no provider snapshot found for identifier {identifier}"
                     )),
+                    Err(err) if err.is_legacy_consent_required() => {
+                        ProviderSocketResponse::legacy_consent_required(err)
+                    }
                     Err(err) => ProviderSocketResponse::error(err),
                 }
             }
@@ -3013,6 +3593,9 @@ mod ipc {
             } => {
                 if let Err(err) = ensure_root(root_id, registration.root_id) {
                     return ProviderSocketResponse::error(err);
+                }
+                if !bridge.accepts_changes() {
+                    return ProviderSocketResponse::busy_preparing();
                 }
                 match bridge
                     .writeback(
@@ -3040,6 +3623,9 @@ mod ipc {
                 if let Err(err) = ensure_root(root_id, registration.root_id) {
                     return ProviderSocketResponse::error(err);
                 }
+                if !bridge.accepts_changes() {
+                    return ProviderSocketResponse::busy_preparing();
+                }
                 match bridge
                     .create_directory(root_id, &registration.encrypted_root, &relative_path)
                     .await
@@ -3059,6 +3645,9 @@ mod ipc {
                 if let Err(err) = ensure_root(root_id, registration.root_id) {
                     return ProviderSocketResponse::error(err);
                 }
+                if !bridge.accepts_changes() {
+                    return ProviderSocketResponse::busy_preparing();
+                }
                 match bridge
                     .delete(root_id, &registration.encrypted_root, &identifier)
                     .await
@@ -3075,6 +3664,9 @@ mod ipc {
             } => {
                 if let Err(err) = ensure_root(root_id, registration.root_id) {
                     return ProviderSocketResponse::error(err);
+                }
+                if !bridge.accepts_changes() {
+                    return ProviderSocketResponse::busy_preparing();
                 }
                 match bridge
                     .rename(
@@ -3113,6 +3705,9 @@ mod ipc {
                 if let Err(err) = ensure_root(root_id, registration.root_id) {
                     return ProviderSocketResponse::error(err);
                 }
+                if !bridge.accepts_changes() {
+                    return ProviderSocketResponse::busy_preparing();
+                }
                 let request = match serde_json::from_value(request) {
                     Ok(request) => request,
                     Err(err) => return ProviderSocketResponse::error(err),
@@ -3147,6 +3742,9 @@ mod ipc {
             ProviderSocketRequest::ResolveRecovery { root_id, request } => {
                 if let Err(err) = ensure_root(root_id, registration.root_id) {
                     return ProviderSocketResponse::error(err);
+                }
+                if !bridge.accepts_changes() {
+                    return ProviderSocketResponse::busy_preparing();
                 }
                 let request = match serde_json::from_value(request) {
                     Ok(request) => request,
@@ -3447,55 +4045,87 @@ mod tests {
     }
 
     #[test]
-    fn default_socket_path_stays_under_macos_sun_len_for_long_user_dirs() {
+    fn the_socket_lives_only_in_the_app_group_container() {
+        let root_id = Uuid::parse_str("00741c18-f05f-45f2-8f54-4c1c84a7bc14").unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let root_id = Uuid::new_v4();
-        let long_user_config_dir = temp
-            .path()
-            .join("a-very-long-home-directory-name")
-            .join("users")
-            .join("0123456789abcdef")
-            .join("mount-state-parent-that-would-overflow-sockaddr-un");
         let host = MacFileProviderHost::new(ProviderHostConfig {
-            user_config_dir: long_user_config_dir,
+            user_config_dir: temp.path().to_path_buf(),
             socket_path: None,
             provider_identifier: None,
         });
 
-        let paths = host.runtime_paths(root_id).unwrap();
-        assert!(
-            paths.socket_path.as_os_str().len() < 104,
-            "socket path is too long for macOS SUN_LEN: {}",
-            paths.socket_path.display()
-        );
-    }
-
-    #[test]
-    fn default_socket_path_prefers_file_provider_app_group_container() {
-        let root_id = Uuid::parse_str("00741c18-f05f-45f2-8f54-4c1c84a7bc14").unwrap();
-        let path = default_socket_path(root_id);
+        let path = host.runtime_paths(root_id).unwrap().socket_path;
 
         assert!(path.components().any(|component| {
             component.as_os_str() == std::ffi::OsStr::new("Group Containers")
         }));
         assert!(path.ends_with("00741c18f05f45f2.sock"));
         assert!(
-            path.as_os_str().len() < 104,
-            "socket path is too long for macOS SUN_LEN: {}",
-            path.display()
+            !path.starts_with("/tmp"),
+            "the sandboxed extension can't reach /tmp, whatever the path length"
         );
     }
 
     #[test]
-    fn runtime_socket_paths_include_tmp_fallback_for_local_packages() {
-        let root_id = Uuid::parse_str("00741c18-f05f-45f2-8f54-4c1c84a7bc14").unwrap();
-        let primary = default_socket_path(root_id);
+    fn runtime_health_reaches_a_socket_in_a_folder_longer_than_the_address_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_id = Uuid::new_v4();
+        let container = temp
+            .path()
+            .join("Users")
+            .join("a-person-with-a-really-long-account-name")
+            .join("Library")
+            .join("Group Containers")
+            .join("G2L88C9692.group.com.hybridcipher.macOS");
+        fs::create_dir_all(&container).unwrap();
+        let socket_path = container.join(short_socket_filename(root_id));
+        assert!(socket_path.as_os_str().len() > 104);
+        let host = MacFileProviderHost::new(ProviderHostConfig {
+            user_config_dir: temp.path().to_path_buf(),
+            socket_path: Some(socket_path.clone()),
+            provider_identifier: None,
+        });
+        host.register_domain(&FileProviderDomainRegistration {
+            root_id,
+            domain_identifier: format!("com.hybridcipher.root.{root_id}"),
+            display_name: "HybridCipher Test".to_string(),
+            encrypted_root: temp.path().join("encrypted"),
+            user_visible_url: Some(temp.path().join("visible")),
+        })
+        .unwrap();
 
-        let paths = runtime_socket_paths(root_id, &primary);
+        let listener = long_socket::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            stream.write_all(b"{\"ok\":true}\n").unwrap();
+        });
 
-        assert!(paths.contains(&primary));
-        assert!(paths.contains(&tmp_socket_path(root_id)));
-        assert_eq!(paths.len(), 2);
+        let health = host.check_runtime_health(root_id).unwrap();
+
+        handle.join().unwrap();
+        assert!(health.socket_reachable, "{:?}", health.last_error);
+    }
+
+    #[test]
+    fn extension_contact_is_tracked_from_bridge_start() {
+        let root_id = Uuid::new_v4();
+        assert_eq!(
+            extension_contact(root_id),
+            (false, None),
+            "a bridge this process didn't start reports nothing"
+        );
+        begin_extension_wait(root_id);
+        let (connected, waiting) = extension_contact(root_id);
+        assert!(!connected);
+        assert!(waiting.is_some(), "waiting for the extension");
+        record_extension_contact(root_id);
+        assert_eq!(extension_contact(root_id), (true, None));
+        begin_extension_wait(root_id);
+        assert!(!extension_contact(root_id).0, "a restarted bridge waits again");
+        forget_extension_contact(root_id);
+        assert_eq!(extension_contact(root_id), (false, None));
     }
 
     #[test]
@@ -3533,6 +4163,10 @@ mod tests {
         assert!(health.registration_present);
         assert!(health.socket_reachable);
         assert!(health.last_error.is_none(), "{:?}", health.last_error);
+        assert!(
+            !health.extension_connected,
+            "the host checking its own socket isn't the extension"
+        );
     }
 
     #[test]
@@ -4056,6 +4690,93 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_inventory_keeps_legacy_and_current_files_visible_without_cache_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_id = Uuid::new_v4();
+        let encrypted_root = temp.path().join("encrypted");
+        let cache_root = temp.path().join("cache");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        let legacy_metadata = serde_json::from_value(serde_json::json!({
+            "file_id": "legacy-file-id",
+            "file_path": "legacy.txt",
+            "header_version": 1,
+            "epoch_id": 1,
+            "wrapped_file_key": vec![1u8; 32],
+            "key_wrap_nonce": vec![2u8; 24],
+            "key_wrap_aad_hash": vec![3u8; 32],
+            "content_nonce": vec![4u8; 24],
+            "content_chunk_size": 4,
+            "content_size": 12,
+            "encrypted_size": 60,
+            "created_at": Utc::now(),
+            "encrypted_content": Vec::<u8>::new(),
+        }))
+        .unwrap();
+        let current_metadata = serde_json::from_value(serde_json::json!({
+            "file_id": "current-file-id",
+            "file_path": "current.txt",
+            "header_version": 3,
+            "epoch_id": 1,
+            "wrapped_file_key": vec![5u8; 32],
+            "key_wrap_nonce": vec![6u8; 24],
+            "key_wrap_aad_hash": vec![7u8; 32],
+            "content_nonce": vec![8u8; 24],
+            "content_chunk_size": 4,
+            "content_size": 12,
+            "encrypted_size": 48,
+            "created_at": Utc::now(),
+            "encrypted_content": Vec::<u8>::new(),
+        }))
+        .unwrap();
+        let entries = vec![
+            ProviderEntry::cache_file(
+                root_id,
+                "legacy.txt",
+                encrypted_root.join("legacy.txt.encrypted"),
+                12,
+                60,
+                Utc::now(),
+                Some(legacy_metadata),
+            ),
+            ProviderEntry::cache_file(
+                root_id,
+                "current.txt",
+                encrypted_root.join("current.txt.encrypted"),
+                12,
+                48,
+                Utc::now(),
+                Some(current_metadata),
+            ),
+        ];
+        let mut state = ProviderPersistentState::new(root_id);
+        state.rebuild_items(root_id, &encrypted_root, &cache_root, &entries);
+        let compatibility = VaultCompatibility::load(temp.path(), root_id).unwrap();
+        compatibility.observe(&entries);
+
+        let listed =
+            list_directory_snapshots(root_id, &encrypted_root, &cache_root, &state, None).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current.txt", "legacy.txt"]
+        );
+        assert_eq!(compatibility.status().legacy_file_count, 1);
+        assert!(!cache_root.exists());
+    }
+
+    #[test]
+    fn socket_response_marks_legacy_consent_as_a_typed_file_error() {
+        let response = ProviderSocketResponse::legacy_consent_required(
+            "Enable compatibility to open this legacy file",
+        );
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error_code"], "legacy_consent_required");
+    }
+
+    #[test]
     fn file_rename_emits_single_upsert_without_delete() {
         let root_id = Uuid::new_v4();
         let encrypted_root = PathBuf::from("/tmp/encrypted");
@@ -4268,5 +4989,93 @@ mod tests {
         );
 
         clear_domain_signal_handler_for_tests();
+    }
+
+    #[tokio::test]
+    async fn legacy_upgrade_keeps_cache_plaintext_and_leaves_no_pending_work() {
+        use hybridcipher_provider_core::compatibility_fixtures::{client, fixture};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_id = Uuid::new_v4();
+        let group = Uuid::new_v4();
+        let account = temp.path().join("account");
+        let encrypted_root = temp.path().join("encrypted");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        let runtime_paths = ProviderRuntimePaths {
+            status_path: state.join("status.json"),
+            journal_path: state.join("journal.json"),
+            provider_state_path: state.join("provider_state.json"),
+            provider_changes_path: state.join("provider_changes.json"),
+            socket_path: state.join("provider.sock"),
+            cache_dir: state.join("cache"),
+        };
+        let client = client(&account, group).await;
+        let compatibility = Arc::new(VaultCompatibility::load(&account, root_id).unwrap());
+        compatibility.set_enabled(true).unwrap();
+        let crypto = Arc::new(
+            ClientMountCrypto::for_root_with_compatibility(client, root_id, compatibility.clone())
+                .await
+                .unwrap(),
+        );
+        let legacy = fixture(&encrypted_root, "legacy.md", 300, 2, false, group);
+        let bridge = MacFileProviderCacheBridge::new(
+            root_id,
+            "test-domain".into(),
+            encrypted_root.clone(),
+            runtime_paths.clone(),
+            account.clone(),
+            Vec::new(),
+            crypto,
+            Some(compatibility.clone()),
+        )
+        .unwrap();
+        bridge.sync_once().await.unwrap();
+        let cached = runtime_paths.cache_dir.join("legacy.md");
+        assert_eq!(fs::read(&cached).unwrap(), vec![42u8; 300]);
+        assert_eq!(
+            legacy_file_summaries_for_test(&bridge),
+            vec!["legacy.md".to_string()]
+        );
+
+        let report = ProviderBridge::upgrade_legacy_files(
+            &bridge,
+            root_id,
+            &encrypted_root,
+            None,
+            &state.join("upgrade"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.upgraded, vec!["legacy.md".to_string()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(
+            hybridcipher_mount_sync::parse_encrypted_file(&legacy)
+                .unwrap()
+                .metadata
+                .header_version,
+            Some(3)
+        );
+        assert_eq!(fs::read(&cached).unwrap(), vec![42u8; 300]);
+        assert!(legacy_file_summaries_for_test(&bridge).is_empty());
+        assert_eq!(compatibility.status().legacy_file_count, 0);
+        let status = bridge.sync_once().await.unwrap();
+        assert_eq!(status.pending_writeback_count, 0);
+        assert_eq!(status.pending_refresh_count, 0);
+        assert_eq!(status.pending_conflict_count, 0);
+        assert!(status.last_error.is_none());
+    }
+
+    include!("../tests/cache/test_cached_lookups.rs");
+    include!("../tests/cache/test_first_sync_warm.rs");
+    include!("../tests/cache/test_cache_loss_keeps_ciphertext.rs");
+    include!("../tests/bench/test_first_sync_throughput.rs");
+
+    fn legacy_file_summaries_for_test(bridge: &MacFileProviderCacheBridge) -> Vec<String> {
+        hybridcipher_provider_core::legacy_file_summaries(&bridge.encrypted_inventory().unwrap())
+            .into_iter()
+            .map(|file| file.relative_path)
+            .collect()
     }
 }

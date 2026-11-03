@@ -125,6 +125,7 @@ async fn test_signed_welcome_with_wrong_decrypted_epoch_is_rejected() {
         epoch_id: 1,
         group_members: Vec::new(),
         active_at: Utc::now(),
+        signer_introductions: Vec::new(),
     })
     .unwrap();
     let response = signed_welcome_response(&client, group, 2, &plaintext).await;
@@ -197,8 +198,8 @@ async fn test_concurrent_genesis_preparation_reuses_one_signed_payload() {
     let user = Uuid::new_v4();
     let group = Uuid::new_v4();
     let (left, right) = tokio::join!(
-        first.load_or_create_pending_genesis(group, user, "https://one.test", &invitation),
-        second.load_or_create_pending_genesis(group, user, "https://one.test", &invitation),
+        first.load_or_create_pending_genesis(group, user, "https://one.test", &invitation, None),
+        second.load_or_create_pending_genesis(group, user, "https://one.test", &invitation, None),
     );
     let left = left.unwrap();
     let right = right.unwrap();
@@ -233,7 +234,7 @@ async fn test_protected_pending_payload_survives_restart_and_never_overwrites() 
         Arc::new(MockNetwork::new()),
     );
     let pending = first
-        .load_or_create_pending_genesis(group, user, "https://one.test", &invitation)
+        .load_or_create_pending_genesis(group, user, "https://one.test", &invitation, None)
         .await
         .unwrap();
     let stored = std::fs::read_to_string(temporary.path().join(format!("{key}.json"))).unwrap();
@@ -253,7 +254,7 @@ async fn test_protected_pending_payload_survives_restart_and_never_overwrites() 
         Arc::new(MockNetwork::new()),
     );
     let restored = restarted
-        .load_or_create_pending_genesis(group, user, "https://one.test", &invitation)
+        .load_or_create_pending_genesis(group, user, "https://one.test", &invitation, None)
         .await
         .unwrap();
     assert_eq!(restored.epoch_key, pending.epoch_key);
@@ -319,7 +320,7 @@ async fn test_lost_response_retry_sends_identical_genesis_body() {
     let user = Uuid::new_v4();
     let first = client(storage.clone());
     let pending = first
-        .load_or_create_pending_genesis(group, user, &server_url, &invitation)
+        .load_or_create_pending_genesis(group, user, &server_url, &invitation, None)
         .await
         .unwrap();
     assert!(Client::<MockStorage, MockNetwork>::submit_pending_genesis(
@@ -332,7 +333,7 @@ async fn test_lost_response_retry_sends_identical_genesis_body() {
     drop(first);
     let restarted = client(storage.clone());
     let restored = restarted
-        .load_or_create_pending_genesis(group, user, &server_url, &invitation)
+        .load_or_create_pending_genesis(group, user, &server_url, &invitation, None)
         .await
         .unwrap();
     Client::<MockStorage, MockNetwork>::submit_pending_genesis(
@@ -375,7 +376,7 @@ async fn test_setup_timeout_preserves_pending_keys() {
     let user = Uuid::new_v4();
     let group = Uuid::new_v4();
     let pending = client
-        .load_or_create_pending_genesis(group, user, &server_url, &invitation)
+        .load_or_create_pending_genesis(group, user, &server_url, &invitation, None)
         .await
         .unwrap();
     let error = Client::<MockStorage, MockNetwork>::submit_pending_genesis(
@@ -387,7 +388,7 @@ async fn test_setup_timeout_preserves_pending_keys() {
     .unwrap_err();
     assert_eq!(error.error_code(), Some(ErrorCode::NetworkTimeout));
     let restored = client
-        .load_or_create_pending_genesis(group, user, &server_url, &invitation)
+        .load_or_create_pending_genesis(group, user, &server_url, &invitation, None)
         .await
         .unwrap();
     assert_eq!(restored.epoch_key, pending.epoch_key);
@@ -496,7 +497,7 @@ async fn test_genesis_conflict_preserves_existing_canonical_key() {
     let invitation = InvitationKeyPair::generate("losing-device".into()).unwrap();
     let group = Uuid::new_v4();
     let pending = client
-        .load_or_create_pending_genesis(group, Uuid::new_v4(), &server_url, &invitation)
+        .load_or_create_pending_genesis(group, Uuid::new_v4(), &server_url, &invitation, None)
         .await
         .unwrap();
     {
@@ -543,4 +544,69 @@ async fn test_genesis_conflict_preserves_existing_canonical_key() {
         .await
         .unwrap()
         .is_some());
+}
+
+#[tokio::test]
+async fn test_supplied_genesis_key_is_used_for_pending_setup() {
+    let client = client(Arc::new(MockStorage::new()));
+    let invitation = client.ensure_invitation_keypair().await.unwrap();
+    let group = Uuid::new_v4();
+    let pending = client
+        .load_or_create_pending_genesis(
+            group,
+            Uuid::new_v4(),
+            "https://one.test",
+            &invitation,
+            Some(&[41; 32]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.epoch_key, [41; 32]);
+    assert_eq!(pending.request.welcome_messages.len(), 1);
+}
+
+#[tokio::test]
+async fn test_matching_welcome_promotes_a_local_vault_key() {
+    let client = client(Arc::new(MockStorage::new()));
+    client.set_local_only(true);
+    let vault = client.create_local_vault().await.unwrap();
+    let key = client
+        .local_vault_genesis_key(vault.group_id)
+        .await
+        .unwrap();
+    // After upgrade the same storage is opened by an account client.
+    client.set_local_only(false);
+    let canonical = signed_welcome_response(&client, vault.group_id, 1, key.as_ref()).await;
+    client
+        .process_welcome_messages_inner(canonical, vault.group_id)
+        .await
+        .unwrap();
+    let state = client.state.read().await;
+    let epoch =
+        Client::<MockStorage, MockNetwork>::get_epoch_state(&state, vault.group_id, 1).unwrap();
+    assert_eq!(epoch.key_source, EpochKeySource::Welcome);
+    assert_eq!(epoch.encryption_key, *key);
+}
+
+#[tokio::test]
+async fn test_welcome_cannot_replace_a_local_vault_key() {
+    let client = client(Arc::new(MockStorage::new()));
+    client.set_local_only(true);
+    let vault = client.create_local_vault().await.unwrap();
+    let key = client
+        .local_vault_genesis_key(vault.group_id)
+        .await
+        .unwrap();
+    client.set_local_only(false);
+    let conflicting = signed_welcome_response(&client, vault.group_id, 1, &[18; 32]).await;
+    let error = client
+        .process_welcome_messages_inner(conflicting, vault.group_id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.error_code(), Some(ErrorCode::SecurityTampering));
+    let state = client.state.read().await;
+    let epoch =
+        Client::<MockStorage, MockNetwork>::get_epoch_state(&state, vault.group_id, 1).unwrap();
+    assert_eq!(epoch.key_source, EpochKeySource::LocalVault);
+    assert_eq!(epoch.encryption_key, *key);
 }

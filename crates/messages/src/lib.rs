@@ -8,10 +8,13 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod cutover;
+pub mod device_actions;
 pub mod error;
 pub mod file_metadata;
 pub mod group_update;
 pub mod join_card;
+pub mod pin_attestation;
+pub mod recovery_credentials;
 pub mod recovery_handoff;
 pub mod transparency;
 pub mod welcome;

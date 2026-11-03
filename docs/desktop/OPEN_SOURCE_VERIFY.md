@@ -38,22 +38,59 @@ revisions remain separate from the Windows app version.
 - macOS with Xcode command line tools for macOS verification
 - Windows with Visual Studio Build Tools and the Windows SDK for Windows
   verification
-- Rust stable toolchain with the target you want to verify
+- `rustup`, set up as described in [Set up Rust](#set-up-rust)
 - Node.js with `npm`
 - `python3`
 
-Example target setup:
+## Set up Rust
+
+The published hashes were built with the Rust version pinned in
+`rust-toolchain.toml`. A different compiler version produces different binaries,
+so it must match. `rustup` reads that file and selects the pinned version
+automatically. Other installations, such as Homebrew's `rust` or a Linux
+distribution package, ignore it.
+
+Find out what you have:
 
 ```bash
-rustup target add aarch64-apple-darwin
-rustup target add x86_64-apple-darwin
+rustup --version
 ```
 
-Windows target setup:
+**If that command is not found** (no Rust yet, or Rust from Homebrew or a
+package manager), install `rustup`.
 
-```powershell
-rustup target add x86_64-pc-windows-msvc
+On macOS:
+
+```bash
+brew uninstall rust   # only if Rust was installed with Homebrew
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
 ```
+
+On Windows, download and run `rustup-init.exe` from <https://rustup.rs>, accept
+the default `x86_64-pc-windows-msvc` host, then open a new PowerShell window.
+
+**If you already use `rustup`**, keep your setup. Your default toolchain does not
+change; `rustup` switches to the pinned version only inside this repository. Run
+`rustup self update` if your `rustup` is older than 1.28.
+
+Then, from the repository root, install the pinned toolchain with its targets and
+confirm that it is the one in use:
+
+```bash
+rustup toolchain install
+rustc --version
+```
+
+`rustc --version` must print the version from `rust-toolchain.toml`, with no
+"(Homebrew)" suffix. If it prints something else, another Rust installation
+comes first in your `PATH`. Check with `which cargo` on macOS or
+`Get-Command cargo` on Windows; the `rustup` copy is in `~/.cargo/bin` (on
+Windows, `%USERPROFILE%\.cargo\bin`). Either remove the other installation or
+put the `rustup` directory first in `PATH`, then open a new terminal.
+
+The macOS verification script also warns when the active compiler does not match
+the pinned version.
 
 ## Canonical verification build
 
@@ -65,16 +102,16 @@ MODE=full ./scripts/macos/public_desktop_verify.sh
 ```
 
 The macOS verifier uses the shared build and File Provider validation functions
-in `scripts/macos/desktop_release_pkg.sh`. It does not load the release env file
+in `scripts/macos/desktop_build_common.sh`. It does not load the release env file
 or require Developer ID, notarization, or updater-signing credentials. Local
 verification bundles use ad-hoc signatures so their assembled runtime can be
 checked before archiving.
 
-The same package script also supports standalone source or bundle checks:
+The same shared script also supports standalone source or bundle checks:
 
 ```bash
-bash scripts/macos/desktop_release_pkg.sh --validate-file-provider
-bash scripts/macos/desktop_release_pkg.sh --validate-file-provider /path/to/HybridCipher.app
+bash scripts/macos/desktop_build_common.sh --validate-file-provider
+bash scripts/macos/desktop_build_common.sh --validate-file-provider /path/to/HybridCipher.app
 ```
 
 On Windows:
@@ -90,6 +127,17 @@ desktop bundle output directory:
 - `target/x86_64-apple-darwin/release/bundle/macos/HybridCipher_x86_64.unsigned.app.tar.gz`
 - `target/x86_64-pc-windows-msvc/release/bundle/nsis/HybridCipher_<version>_x64-setup.exe`
 - matching `.sha256` files beside each archive
+
+## Team verification keys
+
+Desktop and CLI builds embed the public keys that verify Team licenses. The
+published list is in `apps/desktop/team-verification-keys.txt`, and the
+verification scripts use it automatically, so no extra setup is needed.
+
+These are public keys only. Setting `HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS` to a
+different value changes the compiled binaries, so the result will not match
+the published hashes; the scripts print a warning when that happens. Release
+builds are required to embed exactly the published list.
 
 ## Hash comparison
 

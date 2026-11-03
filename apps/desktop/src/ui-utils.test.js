@@ -14,6 +14,7 @@ const {
     shouldRetryWorkspaceStatusAfterSessionRefresh,
     buildWorkspaceHomeModel,
     buildFolderDetailModel,
+    buildFolderContextMenuActions,
     buildFolderCoverageModel,
     buildCoverageCenterModel,
     buildPersonalDevicesModel,
@@ -117,6 +118,45 @@ test('folder status stays unmounting while the mount is still reported active', 
     });
 });
 
+test('folder context menu offers mount and removal for an unmounted folder', () => {
+    const actions = buildFolderContextMenuActions({ isMounted: false });
+    assert.deepEqual(actions.map(action => action.id), [
+        'mount', 'reveal-protected', 'run-coverage-scan', 'remove-protection',
+    ]);
+    assert.deepEqual(actions.at(-1), {
+        id: 'remove-protection', label: 'Remove protection…', destructive: true, disabled: false,
+    });
+});
+
+test('folder context menu keeps destructive actions last for a mounted folder', () => {
+    const actions = buildFolderContextMenuActions({
+        isMounted: true,
+        hasConflicts: true,
+        hasRecoveryCopies: true,
+    });
+    assert.deepEqual(actions.map(action => action.id), [
+        'open-mounted', 'resolve-conflicts', 'resolve-recovery',
+        'reveal-protected', 'run-coverage-scan', 'unmount', 'remove-protection',
+    ]);
+    const firstDestructive = actions.findIndex(action => action.destructive);
+    assert.equal(actions.slice(firstDestructive).every(action => action.destructive), true);
+});
+
+test('folder context menu disables actions while the mount is changing', () => {
+    const mounting = buildFolderContextMenuActions({ isMounted: false, isMounting: true });
+    assert.deepEqual(mounting[0], { id: 'mount', label: 'Mounting…', disabled: true });
+
+    const unmounting = buildFolderContextMenuActions({ isMounted: true, isUnmounting: true });
+    assert.equal(unmounting.find(action => action.id === 'unmount').disabled, true);
+    assert.equal(unmounting.find(action => action.id === 'remove-protection').disabled, true);
+});
+
+test('folder detail menu shares secondary actions with the context menu', () => {
+    const detail = buildFolderDetailModel({ folder: { root_id: 'root-1', path: '/protected' }, isMounted: true });
+    const menu = buildFolderContextMenuActions({ isMounted: true });
+    assert.deepEqual(menu.slice(-detail.secondaryActions.length), detail.secondaryActions);
+});
+
 test('unmounting status remains visible while mount disappearance is being confirmed', () => {
     const row = getFolderRowStatusState({ isMounted: false, isUnmounting: true });
     assert.equal(row.showUnmountingBadge, true);
@@ -183,16 +223,14 @@ test('brief Cloud Files reconciliation is routine but sustained or blocked work 
     ] }, 1000), false);
 });
 
-test('individual mode uses folder search and hides technical navigation', () => {
+test('both modes use the folder filter and hides technical navigation', () => {
     assert.deepEqual(buildAppModeUiModel('individual'), {
-        searchMode: 'folders',
-        searchPlaceholder: 'Search protected folders…',
+        searchPlaceholder: 'Filter folders…',
         showTechnicalNavigation: false,
         protectionNavigationLabel: 'Protection status',
     });
     assert.deepEqual(buildAppModeUiModel('team'), {
-        searchMode: 'folders',
-        searchPlaceholder: 'Search protected folders…',
+        searchPlaceholder: 'Filter folders…',
         showTechnicalNavigation: false,
         protectionNavigationLabel: 'Coverage Center',
     });
@@ -302,6 +340,7 @@ test('getFolderRowStatusState keeps mounted rows green when no issues exist', ()
         }),
         {
             showMountedBadge: true,
+            showMountingBadge: false,
             showUnmountingBadge: false,
             showAlertButton: false,
             healthDotTone: 'green',

@@ -52,16 +52,16 @@ impl Default for CacheConfig {
 struct CacheEntry<T> {
     value: T,
     created_at: SystemTime,
-    last_accessed: SystemTime,
+    /// Position in the cache's access order; clock times can tie, so LRU uses this.
+    last_accessed: u64,
 }
 
 impl<T> CacheEntry<T> {
-    fn new(value: T) -> Self {
-        let now = SystemTime::now();
+    fn new(value: T, tick: u64) -> Self {
         Self {
             value,
-            created_at: now,
-            last_accessed: now,
+            created_at: SystemTime::now(),
+            last_accessed: tick,
         }
     }
 
@@ -69,8 +69,8 @@ impl<T> CacheEntry<T> {
         self.created_at.elapsed().unwrap_or(Duration::MAX) > ttl
     }
 
-    fn access(&mut self) -> &T {
-        self.last_accessed = SystemTime::now();
+    fn access(&mut self, tick: u64) -> &T {
+        self.last_accessed = tick;
         &self.value
     }
 }
@@ -80,6 +80,7 @@ impl<T> CacheEntry<T> {
 struct LruCache<K, V> {
     entries: HashMap<K, CacheEntry<V>>,
     config: CacheConfig,
+    access_ticks: u64,
 }
 
 impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
@@ -87,7 +88,13 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
         Self {
             entries: HashMap::new(),
             config,
+            access_ticks: 0,
         }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.access_ticks += 1;
+        self.access_ticks
     }
 
     fn get(&mut self, key: &K) -> Option<V> {
@@ -96,13 +103,14 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
         }
 
         let ttl = Duration::from_secs(self.config.ttl_seconds);
+        let tick = self.next_tick();
 
         if let Some(entry) = self.entries.get_mut(key) {
             if entry.is_expired(ttl) {
                 self.entries.remove(key);
                 return None;
             }
-            return Some(entry.access().clone());
+            return Some(entry.access(tick).clone());
         }
 
         None
@@ -121,7 +129,8 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
             self.evict_lru();
         }
 
-        self.entries.insert(key, CacheEntry::new(value));
+        let tick = self.next_tick();
+        self.entries.insert(key, CacheEntry::new(value, tick));
         Ok(())
     }
 

@@ -44,7 +44,7 @@ pub async fn handle_create_group(
         .map_err(|e| CliError::network(format!("Failed to contact server: {}", e)))?;
 
     if response.status() == StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("create_group")?;
+        session_manager.invalidate_session("create_group").await?;
         return Err(CliError::authentication(
             "Authentication token rejected. Please run 'hybridcipher login' again.",
         ));
@@ -266,7 +266,7 @@ pub async fn handle_delete_group(
             Ok(())
         }
         StatusCode::UNAUTHORIZED => {
-            session_manager.invalidate_session("delete_group")?;
+            session_manager.invalidate_session("delete_group").await?;
             Err(CliError::authentication(
                 "Authentication token rejected. Please run 'hybridcipher login' again.",
             ))

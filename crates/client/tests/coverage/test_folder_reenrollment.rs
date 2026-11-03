@@ -10,7 +10,16 @@ async fn fixture() -> (tempfile::TempDir, TestClient, Uuid, Uuid, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let personal = Uuid::new_v4();
     let team = Uuid::new_v4();
-    let storage = Arc::new(LocalFsStorage::new(dir.path().join("account")));
+    let client = client_at(dir.path().join("account"), personal, team).await;
+    let folder = dir.path().join("protected");
+    fs::create_dir(&folder).await.unwrap();
+    (dir, client, personal, team, folder)
+}
+
+/// A client whose storage lives at `storage_dir`. Clients in sibling directories
+/// share one coverage root registry, as the account and vault storages do.
+async fn client_at(storage_dir: PathBuf, personal: Uuid, team: Uuid) -> TestClient {
+    let storage = Arc::new(LocalFsStorage::new(storage_dir));
     let epochs: Vec<_> = [(personal, [42; 32]), (team, [73; 32])]
         .into_iter()
         .map(|(group, key)| EpochState {
@@ -49,9 +58,7 @@ async fn fixture() -> (tempfile::TempDir, TestClient, Uuid, Uuid, PathBuf) {
         },
     );
     client.ensure_state_loaded().await.unwrap();
-    let folder = dir.path().join("protected");
-    fs::create_dir(&folder).await.unwrap();
-    (dir, client, personal, team, folder)
+    client
 }
 
 async fn root_by_id(client: &TestClient, root_id: Uuid) -> CoverageRoot {
@@ -266,4 +273,43 @@ async fn concurrent_team_reenrollments_cannot_create_duplicate_active_roots() {
         root_by_id(&client, old.root_id).await.state,
         CoverageRootState::Unenrolled
     );
+}
+
+#[tokio::test]
+async fn registry_change_by_another_storage_is_seen_before_enrolling() {
+    let (dir, account, personal, team, folder) = fixture().await;
+    let vault = client_at(dir.path().join("vault"), personal, team)
+        .await
+        .for_local_group(team);
+    vault.coverage_enroll_root(&folder).await.unwrap();
+    // The account reads the registry while the vault still holds the folder.
+    assert_eq!(account.coverage_root_registry_entries().await.unwrap().len(), 1);
+    vault.coverage_unenroll_root(&folder).await.unwrap();
+
+    let root = account.coverage_enroll_root(&folder).await.unwrap();
+    assert_eq!(root.group_id, Some(personal));
+}
+
+#[tokio::test]
+async fn registry_write_does_not_resurrect_entry_removed_by_another_storage() {
+    let (dir, account, personal, team, folder) = fixture().await;
+    let vault = client_at(dir.path().join("vault"), personal, team)
+        .await
+        .for_local_group(team);
+    let other = dir.path().join("other");
+    fs::create_dir(&other).await.unwrap();
+    vault.coverage_enroll_root(&folder).await.unwrap();
+    assert_eq!(account.coverage_root_registry_entries().await.unwrap().len(), 1);
+    vault.coverage_unenroll_root(&folder).await.unwrap();
+
+    account.coverage_enroll_root(&other).await.unwrap();
+    let paths: Vec<_> = vault
+        .coverage_root_registry_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| PathBuf::from(entry.path))
+        .collect();
+    let other = fs::canonicalize(&other).await.unwrap();
+    assert_eq!(paths, vec![other]);
 }

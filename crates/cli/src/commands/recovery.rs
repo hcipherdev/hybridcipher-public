@@ -1,6 +1,5 @@
 use crate::commands::file_ops::LocalClient;
 use crate::{
-    commands::welcome::{SubmitWelcomeRequest, SubmitWelcomeResponse},
     error::CliError,
     recovery_artifact::{BackupArtifact, BackupEntryPlain},
     session::{JoinCardPublishState, Session, SessionManager},
@@ -13,18 +12,29 @@ use dirs;
 use hkdf::Hkdf;
 use hybridcipher_client::state::client::GroupRole;
 use hybridcipher_client::{
-    state::client::CoverageRegistryEntry, RecoveryCapsulePlain, RecoveryEpochSecret,
+    auth::opaque::DeviceLoginMetadata,
+    device_actions::DeviceActionContext,
+    saved_code_recovery::RecoveryGroupScope,
+    saved_code_transport::{
+        authorize_saved_code_recovery, enroll_recovery_credential, fetch_recovery_credential,
+        protected_upload_recovery_artifact,
+    },
+    state::client::CoverageRegistryEntry,
 };
 use hybridcipher_crypto::account_protection::{decrypt_with_ad, encrypt_with_ad, ProtectedData};
+use hybridcipher_messages::recovery_credentials::{
+    recovery_envelope_sha256, RecoveryCredentialStatus,
+};
 use rand::{rngs::OsRng, RngCore};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const RECOVERY_CODE_BYTES: usize = 32;
 const REGISTRY_ENCRYPTION_LABEL: &[u8] = b"hybridcipher/coverage-registry";
@@ -70,11 +80,6 @@ pub enum AutoProvisionMode {
     PromptOnLogin,
 }
 
-#[derive(Debug, Deserialize)]
-struct RecoveryCompletionResponse {
-    cleared_pending: bool,
-}
-
 pub async fn handle_recovery_command(
     command: RecoveryCommands,
     session_manager: &SessionManager,
@@ -82,19 +87,27 @@ pub async fn handle_recovery_command(
     // A desktop action is scoped to the workspace selected when it started.
     // Keep ordinary CLI account-wide recovery behavior for invocations without this protocol.
     let desktop_group = if ui::desktop::enabled() {
-        Some(std::env::var("HYBRIDCIPHER_DESKTOP_GROUP")
-            .map_err(|_| CliError::invalid_input("Select a group before opening recovery"))?)
-    } else { None };
+        Some(
+            std::env::var("HYBRIDCIPHER_DESKTOP_GROUP")
+                .map_err(|_| CliError::invalid_input("Select a group before opening recovery"))?,
+        )
+    } else {
+        None
+    };
     let scoped_group = |provided: Option<String>| -> Result<Option<String>, CliError> {
         if let (Some(expected), Some(provided)) = (&desktop_group, &provided) {
             if expected != provided {
-                return Err(CliError::permission("Recovery group does not match the selected workspace"));
+                return Err(CliError::permission(
+                    "Recovery group does not match the selected workspace",
+                ));
             }
         }
         Ok(provided.or_else(|| desktop_group.clone()))
     };
     match command {
-        RecoveryCommands::Upload { group_id } => handle_upload(scoped_group(group_id)?, session_manager).await,
+        RecoveryCommands::Upload { group_id } => {
+            handle_upload(scoped_group(group_id)?, session_manager).await
+        }
         RecoveryCommands::Fetch {
             group_id,
             output,
@@ -120,9 +133,11 @@ async fn handle_upload(
         vec![group_uuid]
     } else {
         // Fetch group memberships from server to get current role information
-        let all_groups = session_manager.list_groups_http().await.map_err(|err| {
-            CliError::operation(format!("Unable to fetch group memberships: {}", err))
-        })?;
+        let all_groups = list_all_recovery_groups(session_manager)
+            .await
+            .map_err(|err| {
+                CliError::operation(format!("Unable to fetch group memberships: {}", err))
+            })?;
 
         all_groups
             .into_iter()
@@ -188,9 +203,7 @@ async fn handle_upload(
         match existing.append_entries_with_epoch_key(&entries, &writer.epoch_key) {
             Ok(_) => {
                 existing.save_to_path(&path)?;
-                upload_backup_artifact(&existing, &session, session_manager)
-                    .await
-                    .ok();
+                upload_backup_artifact(&existing, &session, session_manager).await?;
                 ui::dim("Recovery backup updated using stored writer key.");
                 artifact = Some(existing);
                 updated = true;
@@ -386,9 +399,7 @@ pub async fn auto_provision_recovery_capsule(
                 match existing.append_entries_with_epoch_key(&entries, &writer.epoch_key) {
                     Ok(_) => {
                         existing.save_to_path(&path)?;
-                        upload_backup_artifact(&existing, &session, session_manager)
-                            .await
-                            .ok();
+                        upload_backup_artifact(&existing, &session, session_manager).await?;
                         ui::dim("Recovery backup updated silently using stored writer key.");
 
                         ui::success(&format!(
@@ -459,8 +470,9 @@ async fn handle_fetch(
 ) -> Result<(), CliError> {
     let session = session_manager.require_auth()?;
 
-    let password =
-        ui::prompts::password("Enter account password (required to unwrap recovery backup)")?;
+    let password = Zeroizing::new(ui::prompts::password(
+        "Enter account password (required to unwrap recovery backup)",
+    )?);
     if password.trim().is_empty() {
         return Err(CliError::invalid_input(
             "Password cannot be empty for recovery".to_string(),
@@ -479,108 +491,156 @@ async fn handle_fetch(
     };
 
     let artifact_path = session_manager.recovery_artifact_path()?;
-    let local_artifact = BackupArtifact::load_from_path(&artifact_path).ok();
-    let server_artifact =
-        match download_backup_artifact_with_version(session_manager, &session).await {
-            Ok(artifact) => Some(artifact),
-            Err(err) => {
-                if local_artifact.is_none() {
-                    return Err(CliError::not_found(format!(
-                        "Unable to load recovery backup artifact: {}",
-                        err
-                    )));
-                }
-                ui::dim(&format!(
-                    "Using local recovery backup (server fetch failed: {})",
-                    err
-                ));
-                None
-            }
-        };
+    // A restore that grants trust must use the latest online authenticated
+    // backup; local ciphertext cannot extend the server-authorized snapshot.
+    let downloaded = download_backup_artifact_with_version(session_manager, &session).await?;
+    let fetched_server_version = Some(downloaded.server_version);
+    let artifact = downloaded.artifact;
 
-    let mut fetched_server_version = None;
-    let artifact = match (local_artifact, server_artifact) {
-        (Some(local), Some(remote)) => {
-            fetched_server_version = Some(remote.server_version);
-            let merged = merge_artifacts(remote.artifact, local);
-            if let Err(err) = merged.save_to_path(&artifact_path) {
-                ui::warning(&format!(
-                    "Merged recovery backup could not be saved to {}: {}",
-                    artifact_path.display(),
-                    err
-                ));
-            }
-            merged
-        }
-        (Some(local), None) => local,
-        (None, Some(remote)) => {
-            fetched_server_version = Some(remote.server_version);
-            remote.artifact.save_to_path(&artifact_path)?;
-            ui::dim(&format!(
-                "Downloaded recovery backup to {}",
-                artifact_path.display()
-            ));
-            remote.artifact
-        }
-        (None, None) => {
-            return Err(CliError::not_found(
-                "No recovery backup artifact is available locally or on the server".to_string(),
-            ))
-        }
-    };
-    if let Some(version) = fetched_server_version {
-        if let Err(err) = save_artifact_meta(session_manager, version) {
-            ui::warning(&format!(
-                "Failed to persist recovery artifact metadata version {}: {}",
-                version, err
-            ));
-        }
-    }
-
-    if let Some(path) = output {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                CliError::io(format!("Unable to create output directory: {}", err))
-            })?;
-        }
-        let artifact_bytes = general_purpose::STANDARD
-            .decode(artifact.to_base64()?.as_bytes())
-            .map_err(|err| CliError::format(format!("Invalid artifact encoding: {}", err)))?;
-        fs::write(&path, &artifact_bytes).map_err(|err| {
-            CliError::io(format!(
-                "Failed to write sealed artifact to {}: {}",
-                path.display(),
-                err
-            ))
-        })?;
-        ui::info(&format!(
-            "Sealed artifact saved to {} ({} bytes)",
-            path.display(),
-            artifact_bytes.len()
-        ));
-    }
-
-    let recovery_code_input = Zeroizing::new(ui::prompts::password("Enter recovery code to decrypt backup")?);
+    let recovery_code_input = Zeroizing::new(ui::prompts::password(
+        "Enter recovery code to decrypt backup",
+    )?);
     let recovery_secret = parse_recovery_code(&recovery_code_input)?;
 
-    let entries = artifact.decrypt_entries(&password, recovery_secret.as_ref())?;
-    if entries.is_empty() {
-        return Err(CliError::not_found(
-            "Recovery backup contains no epoch entries".to_string(),
-        ));
-    }
-
-    let k_file = artifact.unwrap_file_key(&password, recovery_secret.as_ref())?;
-    let epoch_key = artifact.derive_epoch_key(k_file.as_ref())?;
-    persist_writer_material(
-        session_manager,
-        &session.device_id,
-        slice_to_key(k_file.as_ref())?,
-        &epoch_key,
-    )?;
+    let unlocked = artifact.unlock(&password, recovery_secret.as_ref())?;
 
     let mut client = session_manager.create_client().await?;
 
+    // Fetch group memberships from server to get current role information
+    let all_groups = list_all_recovery_groups(session_manager)
+        .await
+        .map_err(|err| {
+            CliError::operation(format!("Unable to fetch group memberships: {}", err))
+        })?;
+
+    let scopes = recovery_scopes(&all_groups, group_filter)?;
+    let mut restore = unlocked
+        .validate_for_groups(&scopes, group_filter)
+        .map_err(CliError::format)?;
+    client
+        .validate_authenticated_recovery(&restore)
+        .await
+        .map_err(|e| CliError::operation(e.to_string()))?;
+    let identity = session_manager.get_or_create_device_keypair().await?;
+    let context = recovery_context(&session);
+    let status = ensure_cli_recovery_credential(
+        session_manager,
+        &session,
+        &artifact,
+        recovery_secret.as_ref(),
+        fetched_server_version,
+    )
+    .await?;
+    let credential = status
+        .credential
+        .as_ref()
+        .ok_or_else(|| CliError::authentication("Recovery credential has not been enrolled"))?;
+    let version = status
+        .artifact_version
+        .ok_or_else(|| CliError::not_found("Recovery backup revision is unavailable"))?;
+    // Enrollment may have changed the backup revision: always bind the proof to
+    // the exact current sealed bytes and validate every entry in that snapshot.
+    let current_remote = download_backup_artifact_with_version(session_manager, &session).await?;
+    if current_remote.server_version != version
+        || !artifact.has_same_envelope(&current_remote.artifact)
+    {
+        return Err(CliError::operation(
+            "Recovery backup changed during setup. Fetch it again.",
+        ));
+    }
+    let exact_hash = hex::encode(Sha256::digest(
+        general_purpose::STANDARD
+            .decode(&current_remote.artifact_blob)
+            .map_err(|e| CliError::format(e.to_string()))?,
+    ));
+    let unlocked = current_remote
+        .artifact
+        .unlock(&password, recovery_secret.as_ref())?;
+    let current_groups = list_all_recovery_groups(session_manager).await?;
+    restore = unlocked
+        .validate_for_groups(
+            &recovery_scopes(&current_groups, group_filter)?,
+            group_filter,
+        )
+        .map_err(CliError::format)?;
+    client
+        .validate_authenticated_recovery(&restore)
+        .await
+        .map_err(|e| CliError::operation(e.to_string()))?;
+    let metadata = recovery_device_metadata(session_manager, &session, &identity).await?;
+    authorize_saved_code_recovery(
+        &identity,
+        &context,
+        &session.username,
+        &password,
+        metadata,
+        unlocked.recovery_secret(),
+        credential,
+        version,
+        &exact_hash,
+    )
+    .await
+    .map_err(CliError::authentication)?;
+    session_manager.mark_device_recovered()?;
+    // Check current epochs again after the proof so a concurrent rekey cannot
+    // turn a stale backup entry into the writable current group.
+    let fresh_groups = list_all_recovery_groups(session_manager).await?;
+    restore = unlocked
+        .validate_for_groups(&recovery_scopes(&fresh_groups, group_filter)?, group_filter)
+        .map_err(CliError::format)?;
+    if !no_import {
+        let installed = client
+            .install_authenticated_recovery(&restore)
+            .await
+            .map_err(|e| CliError::operation(e.to_string()))?;
+        ui::info(&format!(
+            "Restored {} authenticated epoch(s) across {} group(s).",
+            installed.imported_epochs,
+            restore.group_ids().len()
+        ));
+        if !installed.missing_current_groups.is_empty() {
+            ui::warning("Historical keys were restored, but the current encryption key is missing. Obtain a newer backup or a Welcome message before enrolling folders.");
+        }
+        // Register recovered keys server-side so the next login keeps this device approved.
+        match client
+            .publish_recovered_self_welcomes(&installed.ready_groups)
+            .await
+        {
+            Ok(failed) if failed.is_empty() => {}
+            _ => ui::warning("Group key access could not be registered with the server yet; it will retry on the next Welcome sync."),
+        }
+    } else {
+        ui::info("Saved code verified; epoch import skipped (--no-import).");
+    }
+    current_remote.artifact.save_to_path(&artifact_path)?;
+    save_artifact_meta(session_manager, version)?;
+    if let Some(path) = output {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| CliError::io(format!("Unable to create output directory: {err}")))?;
+        }
+        let bytes = general_purpose::STANDARD
+            .decode(&current_remote.artifact_blob)
+            .map_err(|err| CliError::format(err.to_string()))?;
+        fs::write(&path, &bytes)
+            .map_err(|err| CliError::io(format!("Failed to save sealed backup: {err}")))?;
+        ui::info(&format!(
+            "Sealed artifact saved to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    if let Err(error) = persist_writer_material(
+        session_manager,
+        &session.device_id,
+        unlocked.file_key(),
+        unlocked.entry_key(),
+    ) {
+        ui::warning(&format!(
+            "Keys and device trust recovered; automatic backup needs secure storage: {}",
+            error
+        ));
+    }
     // Fetch coverage registry via the OPAQUE export-key channel.
     match session_manager.opaque_export_key().await {
         Ok(export_key) => match download_coverage_registry(session_manager, &session, &*export_key)
@@ -616,177 +676,214 @@ async fn handle_fetch(
         )),
     }
 
-    // Fetch group memberships from server to get current role information
-    let all_groups = session_manager.list_groups_http().await.map_err(|err| {
-        CliError::operation(format!("Unable to fetch group memberships: {}", err))
-    })?;
-
-    let mut group_labels_by_id = HashMap::new();
-    for group in &all_groups {
-        group_labels_by_id.insert(
-            group.id.to_ascii_lowercase(),
-            format!("{} ({})", group.name.trim(), group.id),
-        );
-    }
-    let group_label_for = |group_id: &Uuid| {
-        let key = group_id.to_string().to_ascii_lowercase();
-        group_labels_by_id
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| group_id.to_string())
-    };
-
-    let admin_groups: HashSet<Uuid> = all_groups
-        .iter()
-        .filter(|g| g.role.eq_ignore_ascii_case("admin"))
-        .filter_map(|g| Uuid::parse_str(&g.id).ok())
-        .collect();
-
-    if admin_groups.is_empty() {
-        return Err(CliError::permission(SessionManager::admin_only_message(
-            "hybridcipher recovery fetch",
-            None,
-        )));
-    }
-
-    let target_groups: HashSet<Uuid> = match group_filter {
-        Some(group_id) => {
-            if !admin_groups.contains(&group_id) {
-                return Err(CliError::permission(SessionManager::admin_only_message(
-                    "hybridcipher recovery fetch",
-                    None,
-                )));
-            }
-            HashSet::from([group_id])
+    if !no_import {
+        if let Some(group) = group_filter.or_else(|| restore.group_ids().first().copied()) {
+            client
+                .use_group(group)
+                .await
+                .map_err(|e| CliError::operation(e.to_string()))?;
         }
-        None => admin_groups,
-    };
-
-    let mut grouped: HashMap<Uuid, Vec<BackupEntryPlain>> = HashMap::new();
-    for entry in entries {
-        if target_groups.contains(&entry.group_id) {
-            grouped.entry(entry.group_id).or_default().push(entry);
+        if let Err(error) = auto_recover_coverage_after_restore(&client).await {
+            ui::warning(&format!("Coverage recovery post-fetch skipped: {}", error));
         }
     }
+    if let Err(error) = ensure_join_card_published(session_manager).await {
+        ui::warning(&format!("Join card publication check failed: {}", error));
+    }
+    ui::success("Saved-code recovery completed; this device is trusted.");
+    Ok(())
+}
 
-    if grouped.is_empty() {
-        return Err(CliError::not_found(
-            "No recoverable epoch entries found for the selected admin groups".to_string(),
+fn recovery_scopes(
+    groups: &[crate::session::GroupInfo],
+    _filter: Option<Uuid>,
+) -> Result<Vec<RecoveryGroupScope>, CliError> {
+    if groups.is_empty() {
+        return Err(CliError::permission(
+            "This account has no recovery group memberships",
         ));
     }
+    groups
+        .iter()
+        .map(|group| {
+            let id = Uuid::parse_str(&group.id)
+                .map_err(|_| CliError::format("Recovery group ID is invalid"))?;
+            Ok(RecoveryGroupScope {
+                group_id: id,
+                group_name: group.name.clone(),
+                user_role: if group.role.eq_ignore_ascii_case("admin")
+                    || group.role.eq_ignore_ascii_case("owner")
+                {
+                    GroupRole::Admin
+                } else {
+                    GroupRole::Member
+                },
+                current_epoch_uuid: group
+                    .current_epoch
+                    .as_deref()
+                    .map(Uuid::parse_str)
+                    .transpose()
+                    .map_err(|_| CliError::format("Current recovery group epoch is invalid"))?,
+            })
+        })
+        .collect()
+}
 
-    let mut processed = false;
-    let mut imported_groups = Vec::new();
-    for (group_id, group_entries) in grouped {
-        let group_label = group_label_for(&group_id);
-        let Some(latest) = latest_active_entry(&group_entries) else {
-            ui::warning(&format!(
-                "No active epoch found in backup for group {}; skipping import.",
-                group_label
-            ));
-            continue;
-        };
-        processed = true;
+#[derive(Deserialize)]
+struct RecoveryMembershipPage {
+    groups: Vec<RecoveryMembership>,
+    has_more: bool,
+    next_cursor: Option<String>,
+}
 
-        let capsule = RecoveryCapsulePlain {
-            group_id,
-            generated_at: latest.created_at,
-            epochs: vec![RecoveryEpochSecret {
-                epoch_number: latest.epoch_number,
-                epoch_uuid: latest.epoch_uuid,
-                created_at: latest.created_at,
-                is_active: true,
-                file_count: 0,
-                encryption_key_b64: latest.encryption_key_b64.clone(),
-            }],
-        };
+#[derive(Deserialize)]
+struct RecoveryMembership {
+    id: String,
+    organization_id: Option<String>,
+    name: String,
+    description: Option<String>,
+    user_role: String,
+    current_epoch: Option<String>,
+    member_count: usize,
+    created_at: String,
+}
 
-        if !no_import {
-            client
-                .import_recovery_capsule(&capsule)
-                .await
-                .map_err(|err| {
-                    CliError::operation(format!(
-                        "Failed to import recovered epoch for group {}: {}",
-                        group_label, err
-                    ))
-                })?;
-            imported_groups.push(group_id);
-            ui::info(&format!(
-                "Imported active epoch {} for group {}",
-                latest.epoch_number, group_label
-            ));
-        } else {
-            ui::info(&format!(
-                "Recovered active epoch {} for group {} (import skipped)",
-                latest.epoch_number, group_label
+async fn list_all_recovery_groups(
+    session_manager: &SessionManager,
+) -> Result<Vec<crate::session::GroupInfo>, CliError> {
+    let session = session_manager.require_auth()?;
+    let client = recovery_http_client()?;
+    let endpoint = format!("{}/api/v1/groups", session.server_url.trim_end_matches('/'));
+    let mut cursor: Option<String> = None;
+    let mut cursors = HashSet::new();
+    let mut groups = Vec::new();
+    let mut ids = HashSet::new();
+    for _ in 0..1000 {
+        let mut request = client
+            .get(&endpoint)
+            .bearer_auth(&session.token)
+            .query(&[("limit", "100")]);
+        if let Some(cursor) = &cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| CliError::network_from(&e))?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            session_manager.invalidate_session("recovery_memberships").await?;
+            return Err(CliError::authentication(
+                "Login again to fetch recovery memberships",
             ));
         }
-
-        match notify_recovery_completion(session_manager, &session, group_id).await {
-            Ok(completion) => {
-                if completion.cleared_pending {
-                    ui::info(&format!(
-                        "Server acknowledged recovery for group {}; device marked active.",
-                        group_label
-                    ));
-                } else {
-                    ui::info(&format!(
-                        "Server acknowledged recovery for group {}; device was already active.",
-                        group_label
-                    ));
-                }
-
-                if !no_import {
-                    if let Err(err) =
-                        self_issue_recovery_welcome(session_manager, &session, &client, group_id)
-                            .await
-                    {
-                        ui::warning(&format!(
-                            "Recovery succeeded but Welcome submission failed for group {}: {}",
-                            group_label, err
-                        ));
-                    }
-                } else {
-                    ui::info(
-                        "Automated Welcome submission skipped (no local epoch import performed).",
-                    );
-                }
-            }
-            Err(err) => {
-                ui::warning(&format!(
-                    "Recovery completed locally but server could not finalize device activation for group {}: {}",
-                    group_label, err
+        if !response.status().is_success() {
+            return Err(CliError::network(format!(
+                "Cannot fetch recovery memberships: {}",
+                response.status()
+            )));
+        }
+        let page: RecoveryMembershipPage = response
+            .json()
+            .await
+            .map_err(|e| CliError::format(format!("Invalid recovery membership page: {e}")))?;
+        for group in page.groups {
+            if !ids.insert(group.id.clone()) {
+                return Err(CliError::format(
+                    "Duplicate recovery membership; fetch again",
                 ));
             }
+            groups.push(crate::session::GroupInfo {
+                id: group.id,
+                organization_id: group.organization_id,
+                name: group.name,
+                description: group.description,
+                role: group.user_role,
+                current_epoch: group.current_epoch,
+                member_count: group.member_count,
+                created_at: group.created_at,
+            });
         }
-    }
-
-    if !processed {
-        return Err(CliError::not_found(
-            "No active epochs were found in the recovery backup for the selected groups"
-                .to_string(),
-        ));
-    }
-
-    if !imported_groups.is_empty() || no_import {
-        if let Err(err) = auto_recover_coverage_after_restore(&client).await {
-            ui::warning(&format!("Coverage recovery post-fetch skipped: {}", err));
-        } else {
-            ui::dim("Coverage recovery tasks triggered (marker discovery + scan + guard).");
+        if !page.has_more {
+            return Ok(groups);
         }
-
-        // Ensure join card is published after successful recovery
-        if let Err(err) = ensure_join_card_published(session_manager).await {
-            ui::warning(&format!("Join card publication check failed: {}", err));
+        let next = page
+            .next_cursor
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::format("Recovery membership pagination is incomplete"))?;
+        if !cursors.insert(next.clone()) {
+            return Err(CliError::format(
+                "Recovery membership pagination repeated a cursor",
+            ));
         }
-
-        return Ok(());
+        cursor = Some(next);
     }
-
-    Err(CliError::not_found(
-        "No active epochs were imported from the recovery backup".to_string(),
+    Err(CliError::format(
+        "Recovery membership list exceeded the page limit",
     ))
+}
+
+fn recovery_context(session: &Session) -> DeviceActionContext<'_> {
+    DeviceActionContext {
+        server_url: &session.server_url,
+        token: &session.token,
+        user_id: &session.user_id,
+        device_id: &session.device_id,
+    }
+}
+
+async fn recovery_device_metadata(
+    session_manager: &SessionManager,
+    _session: &Session,
+    identity: &hybridcipher_crypto::signatures::Ed25519KeyPair,
+) -> Result<DeviceLoginMetadata, CliError> {
+    let invitation = session_manager.get_or_create_invitation_keypair().await?;
+    let public = invitation
+        .invitation_public_key()
+        .map_err(|e| CliError::session(e.to_string()))?
+        .to_bytes();
+    Ok(DeviceLoginMetadata {
+        identity_public_key_hex: hex::encode(identity.public_key_bytes()),
+        invitation_public_key_hex: hex::encode(public),
+        device_display_name: None,
+        mfa_code: None,
+        backup_code: None,
+    })
+}
+
+async fn ensure_cli_recovery_credential(
+    session_manager: &SessionManager,
+    session: &Session,
+    artifact: &BackupArtifact,
+    raw_code: &[u8],
+    expected_version: Option<u32>,
+) -> Result<RecoveryCredentialStatus, CliError> {
+    let context = recovery_context(session);
+    let status = fetch_recovery_credential(&context)
+        .await
+        .map_err(CliError::authentication)?;
+    if let Some(credential) = &status.credential {
+        let hash = recovery_envelope_sha256(
+            &serde_json::to_value(artifact).map_err(|e| CliError::format(e.to_string()))?,
+        )
+        .map_err(CliError::format)?;
+        if hash != credential.recovery_envelope_sha256 {
+            return Err(CliError::operation("This backup uses another encryption envelope. Fetch the current recovery backup before updating it."));
+        }
+        return Ok(status);
+    }
+    // Legacy enrollment uses the established OTP/MFA trust-confirmation flow
+    // once; later saved-code recovery needs no additional verification.
+    super::auth::ensure_device_management_trust(session_manager).await?;
+    let identity = session_manager.get_or_create_device_keypair().await?;
+    let version = expected_version.or(status.artifact_version);
+    let enrolled =
+        enroll_recovery_credential(&identity, &context, raw_code, artifact, version, None, None)
+            .await
+            .map_err(CliError::authentication)?;
+    if let Some(version) = enrolled.artifact_version {
+        save_artifact_meta(session_manager, version)?;
+    }
+    Ok(enrolled)
 }
 
 fn format_recovery_code(code: &[u8]) -> String {
@@ -802,10 +899,12 @@ fn format_recovery_code(code: &[u8]) -> String {
 }
 
 pub fn parse_recovery_code(input: &str) -> Result<Zeroizing<Vec<u8>>, CliError> {
-    let normalized: String = input
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
-        .collect();
+    let normalized = Zeroizing::new(
+        input
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect::<String>(),
+    );
 
     if normalized.len() != RECOVERY_CODE_BYTES * 2 {
         return Err(CliError::invalid_input(format!(
@@ -827,17 +926,14 @@ pub fn parse_recovery_code(input: &str) -> Result<Zeroizing<Vec<u8>>, CliError> 
     Ok(Zeroizing::new(bytes))
 }
 
-/// Select the latest active entry for a group (highest epoch_number with is_active=true).
-fn latest_active_entry(entries: &[BackupEntryPlain]) -> Option<BackupEntryPlain> {
-    entries
-        .iter()
-        .filter(|e| e.is_active)
-        .max_by_key(|e| e.epoch_number)
-        .cloned()
-}
-
 struct WriterMaterial {
     epoch_key: [u8; 32],
+}
+
+impl Drop for WriterMaterial {
+    fn drop(&mut self) {
+        self.epoch_key.zeroize();
+    }
 }
 
 const WRITER_BLOB_FILE: &str = "recovery_writer_blob.json";
@@ -885,7 +981,7 @@ async fn append_with_prompts(
 ) -> Result<(), CliError> {
     artifact.append_entries(entries, password, recovery_secret)?;
     let k_file = artifact.unwrap_file_key(password, recovery_secret)?;
-    let epoch_key = artifact.derive_epoch_key(k_file.as_ref())?;
+    let epoch_key = Zeroizing::new(artifact.derive_epoch_key(k_file.as_ref())?);
     persist_writer_material(
         session_manager,
         &session.device_id,
@@ -894,9 +990,15 @@ async fn append_with_prompts(
     )?;
     let path = session_manager.recovery_artifact_path()?;
     artifact.save_to_path(&path)?;
-    upload_backup_artifact(artifact, session, session_manager)
-        .await
-        .ok();
+    ensure_cli_recovery_credential(
+        session_manager,
+        session,
+        artifact,
+        recovery_secret,
+        load_artifact_meta(session_manager),
+    )
+    .await?;
+    upload_backup_artifact(artifact, session, session_manager).await?;
     Ok(())
 }
 
@@ -1111,12 +1213,12 @@ fn load_writer_material(
             None => return Ok(None),
         },
     };
-    let epoch_key_bytes = decrypt_with_ad(&blob, key, WRITER_AAD).map_err(|e| {
+    let epoch_key_bytes = Zeroizing::new(decrypt_with_ad(&blob, key, WRITER_AAD).map_err(|e| {
         CliError::decryption(format!(
             "Failed to decrypt writer blob; recovery prompts will be required: {}",
             e
         ))
-    })?;
+    })?);
     if epoch_key_bytes.len() != 32 {
         return Ok(None);
     }
@@ -1132,13 +1234,9 @@ struct RecoveryArtifactEnvelope {
     expected_version: Option<u32>,
 }
 
-#[derive(Deserialize)]
-struct RecoveryArtifactResponse {
-    version: u32,
-}
-
 struct DownloadedBackupArtifact {
     artifact: BackupArtifact,
+    artifact_blob: String,
     server_version: u32,
 }
 
@@ -1169,161 +1267,57 @@ async fn upload_backup_artifact(
     session: &Session,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
-    let endpoint = recovery_artifact_endpoint(&session.server_url)?;
-    let expected_version = load_artifact_meta(session_manager);
-
-    // Merge with server copy if present
-    let server_artifact =
-        match download_backup_artifact_with_version(session_manager, session).await {
-            Ok(a) => Some(a.artifact),
-            Err(_) => None,
-        };
-    let merged = match server_artifact {
-        Some(server) => merge_artifacts(server, artifact.clone()),
-        None => artifact.clone(),
-    };
-
-    let payload = RecoveryArtifactEnvelope {
-        artifact_blob: merged.to_base64()?,
-        version: merged.version,
-        expected_version,
-    };
-
-    let client = recovery_http_client()?;
-    let retry_delays_secs = [2u64, 5, 10, 20];
-    for (idx, delay_sec) in retry_delays_secs.iter().enumerate() {
-        let attempt = idx + 1;
-        let total_attempts = retry_delays_secs.len();
-        let response = client
-            .put(&endpoint)
-            .bearer_auth(&session.token)
-            .json(&payload)
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(r) => r,
-            Err(err) => {
-                if idx == retry_delays_secs.len() - 1 {
-                    ui::warning("Automatic backup upload failed repeatedly. Ensure network is available and your OS keychain/keyring is unlocked. Until fixed, automatic epoch backups are disabled and data is at risk if devices are lost.");
-                    return Err(CliError::network(format!(
-                        "Failed to upload recovery backup after retries: {}",
-                        err
-                    )));
-                }
-                ui::warning(&format!(
-                    "Recovery backup upload attempt {}/{} failed: {}. Retrying in {} seconds...",
-                    attempt, total_attempts, err, delay_sec
-                ));
-                tokio::time::sleep(std::time::Duration::from_secs(*delay_sec)).await;
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if status == StatusCode::UNAUTHORIZED {
-            session_manager.invalidate_session("recovery_upload")?;
-            return Err(CliError::authentication(
-                "Authentication token rejected. Please login again.".to_string(),
+    let identity = session_manager.get_or_create_device_keypair().await?;
+    let context = recovery_context(session);
+    let mut pending = artifact.clone();
+    for _ in 0..3 {
+        let status = fetch_recovery_credential(&context)
+            .await
+            .map_err(CliError::authentication)?;
+        let credential = status.credential.ok_or_else(|| CliError::authentication(
+            "This legacy backup needs recovery-code enrollment. Run recovery fetch with your saved code first."))?;
+        let envelope_hash = recovery_envelope_sha256(
+            &serde_json::to_value(&pending).map_err(|e| CliError::format(e.to_string()))?,
+        )
+        .map_err(CliError::format)?;
+        if envelope_hash != credential.recovery_envelope_sha256 {
+            return Err(CliError::operation(
+                "Recovery backup envelope changed. Fetch the current backup before uploading.",
             ));
         }
-        if status.is_success() {
-            let resp: RecoveryArtifactResponse = response.json().await.map_err(|e| {
-                CliError::format(format!(
-                    "Failed to parse recovery backup upload response: {}",
-                    e
-                ))
-            })?;
-            save_artifact_meta(session_manager, resp.version)?;
-            merged.save_to_path(&session_manager.recovery_artifact_path()?)?;
-            return Ok(());
+        if status.artifact_version.is_some() {
+            let remote = download_backup_artifact_with_version(session_manager, session).await?;
+            pending = merge_artifacts(remote.artifact, pending);
         }
-
-        if status == StatusCode::CONFLICT {
-            let fresh_server =
-                download_backup_artifact_with_version(session_manager, session).await?;
-            let merged_retry = merge_artifacts(fresh_server.artifact, merged.clone());
-            let retry_payload = RecoveryArtifactEnvelope {
-                artifact_blob: merged_retry.to_base64()?,
-                version: merged_retry.version,
-                expected_version: Some(fresh_server.server_version),
-            };
-            let retry = client
-                .put(&endpoint)
-                .bearer_auth(&session.token)
-                .json(&retry_payload)
-                .send()
-                .await;
-            match retry {
-                Ok(resp) if resp.status() == StatusCode::UNAUTHORIZED => {
-                    session_manager.invalidate_session("recovery_upload_retry")?;
-                    return Err(CliError::authentication(
-                        "Authentication token rejected. Please login again.".to_string(),
-                    ));
-                }
-                Ok(resp) if resp.status().is_success() => {
-                    let parsed: RecoveryArtifactResponse = resp.json().await.map_err(|e| {
-                        CliError::format(format!(
-                            "Failed to parse recovery backup upload response: {}",
-                            e
-                        ))
+        match protected_upload_recovery_artifact(
+            &identity,
+            &context,
+            &pending,
+            status.artifact_version,
+            Some(&credential.credential_id),
+        )
+        .await
+        {
+            Ok(response) => {
+                let version = response["version"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        CliError::format("Recovery upload response has invalid revision")
                     })?;
-                    save_artifact_meta(session_manager, parsed.version)?;
-                    merged_retry.save_to_path(&session_manager.recovery_artifact_path()?)?;
-                    return Ok(());
-                }
-                Ok(resp) => {
-                    if idx == retry_delays_secs.len() - 1 {
-                        ui::warning("Automatic backup upload failed repeatedly. Ensure network is available and your OS keychain/keyring is unlocked. Until fixed, automatic epoch backups are disabled and data is at risk if devices are lost.");
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_default();
-                        return Err(CliError::network(format!(
-                            "Recovery backup upload failed after retry ({}): {}",
-                            status, body
-                        )));
-                    }
-                    ui::warning(&format!(
-                        "Recovery backup upload conflict retry {}/{} returned {}. Retrying in {} seconds...",
-                        attempt,
-                        total_attempts,
-                        resp.status(),
-                        delay_sec
-                    ));
-                }
-                Err(err) => {
-                    if idx == retry_delays_secs.len() - 1 {
-                        ui::warning("Automatic backup upload failed repeatedly. Ensure network is available and your OS keychain/keyring is unlocked. Until fixed, automatic epoch backups are disabled and data is at risk if devices are lost.");
-                        return Err(CliError::network(format!(
-                            "Retry failed uploading backup after retries: {}",
-                            err
-                        )));
-                    }
-                    ui::warning(&format!(
-                        "Recovery backup upload conflict retry {}/{} failed: {}. Retrying in {} seconds...",
-                        attempt, total_attempts, err, delay_sec
-                    ));
-                }
+                save_artifact_meta(session_manager, version)?;
+                pending.save_to_path(&session_manager.recovery_artifact_path()?)?;
+                return Ok(());
             }
-        } else if idx == retry_delays_secs.len() - 1 {
-            let body = response.text().await.unwrap_or_default();
-            ui::warning("Automatic backup upload failed repeatedly. Ensure network is available and your OS keychain/keyring is unlocked. Until fixed, automatic epoch backups are disabled and data is at risk if devices are lost.");
-            return Err(CliError::network(format!(
-                "Server rejected backup upload ({}): {}",
-                status, body
-            )));
-        } else {
-            ui::warning(&format!(
-                "Recovery backup upload attempt {}/{} returned {}. Retrying in {} seconds...",
-                attempt, total_attempts, status, delay_sec
-            ));
+            Err(error) => {
+                // A lost response can follow a successful upload. Refetch the
+                // current revision and retry an identical, deduplicated merge.
+                ui::warning(&format!("Recovery upload did not complete: {}", error));
+            }
         }
-
-        tokio::time::sleep(std::time::Duration::from_secs(*delay_sec)).await;
     }
-
-    ui::warning("Automatic backup upload disabled after repeated failures. Ensure keyring and network are working; otherwise prompts will be required on next rekey.");
-    Err(CliError::network(
-        "Recovery backup upload aborted after retries".to_string(),
+    Err(CliError::operation(
+        "Recovery upload could not be confirmed. The local sealed backup was preserved.",
     ))
 }
 
@@ -1373,7 +1367,7 @@ pub(crate) async fn upload_coverage_registry_entries(
         .map_err(|e| CliError::network(format!("Failed to upload coverage registry: {}", e)))?;
 
     if resp.status() == StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("coverage_registry_upload")?;
+        session_manager.invalidate_session("coverage_registry_upload").await?;
         return Err(CliError::authentication(
             "Authentication token rejected. Please login again.".to_string(),
         ));
@@ -1413,7 +1407,7 @@ async fn download_backup_artifact_with_version(
     match response.status() {
         StatusCode::OK => {}
         StatusCode::UNAUTHORIZED => {
-            session_manager.invalidate_session("download_backup_artifact")?;
+            session_manager.invalidate_session("download_backup_artifact").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected. Please login again.".to_string(),
             ));
@@ -1437,6 +1431,7 @@ async fn download_backup_artifact_with_version(
     })?;
     Ok(DownloadedBackupArtifact {
         artifact: BackupArtifact::from_base64(&envelope.artifact_blob)?,
+        artifact_blob: envelope.artifact_blob,
         server_version: envelope.version,
     })
 }
@@ -1600,7 +1595,10 @@ fn decrypt_registry_blob(opaque_export_key: &[u8; 64], blob_b64: &str) -> Result
     Ok(package.registry_json)
 }
 
-fn merge_artifacts(server: BackupArtifact, local: BackupArtifact) -> BackupArtifact {
+fn merge_artifacts(mut server: BackupArtifact, mut local: BackupArtifact) -> BackupArtifact {
+    if !server.has_same_envelope(&local) {
+        return server;
+    }
     // Prefer higher version as base.
     let mut merged = if server.version >= local.version {
         server.clone()
@@ -1615,7 +1613,10 @@ fn merge_artifacts(server: BackupArtifact, local: BackupArtifact) -> BackupArtif
             seen.insert(ct);
         }
     }
-    for e in local.entries.into_iter().chain(server.entries.into_iter()) {
+    for e in std::mem::take(&mut local.entries)
+        .into_iter()
+        .chain(std::mem::take(&mut server.entries))
+    {
         if let Ok(ct) = serde_json::to_vec(&e) {
             if seen.insert(ct.clone()) {
                 merged.entries.push(e);
@@ -1627,7 +1628,6 @@ fn merge_artifacts(server: BackupArtifact, local: BackupArtifact) -> BackupArtif
     // Persist the canonical format version to avoid leaking bumped values from older clients.
     merged.version = crate::recovery_artifact::BACKUP_VERSION;
 
-    // Prefer a registry blob if present in either artifact (server wins ties).
     merged
 }
 
@@ -1645,7 +1645,7 @@ async fn download_coverage_registry(
         .map_err(|e| CliError::network(format!("Failed to fetch coverage registry: {}", e)))?;
 
     if resp.status() == StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("download_coverage_registry")?;
+        session_manager.invalidate_session("download_coverage_registry").await?;
         return Err(CliError::authentication(
             "Authentication token rejected. Please login again.".to_string(),
         ));
@@ -1770,9 +1770,7 @@ pub async fn append_active_epoch_to_artifact(
 
     let path = session_manager.recovery_artifact_path()?;
     artifact.save_to_path(&path)?;
-    upload_backup_artifact(&artifact, &session, session_manager)
-        .await
-        .ok();
+    upload_backup_artifact(&artifact, &session, session_manager).await?;
     ui::dim(&format!(
         "Updated unified backup artifact with epoch {} at {}",
         epoch.epoch_number,
@@ -1780,154 +1778,6 @@ pub async fn append_active_epoch_to_artifact(
     ));
 
     Ok(())
-}
-
-async fn notify_recovery_completion(
-    session_manager: &SessionManager,
-    session: &Session,
-    group_id: Uuid,
-) -> Result<RecoveryCompletionResponse, CliError> {
-    let url = build_completion_endpoint(&session.server_url, group_id)?;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&url)
-        .bearer_auth(&session.token)
-        .send()
-        .await
-        .map_err(|err| {
-            CliError::network(format!("Failed to notify server of recovery: {}", err))
-        })?;
-
-    let status = response.status();
-    if status == StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("recovery_completion")?;
-        return Err(CliError::authentication(
-            "Authentication token rejected. Please login again.".to_string(),
-        ));
-    }
-    if status.is_success() {
-        let payload: RecoveryCompletionResponse = response.json().await.map_err(|err| {
-            CliError::network(format!(
-                "Failed to parse recovery completion response: {}",
-                err
-            ))
-        })?;
-        session_manager.mark_device_recovered()?;
-        Ok(payload)
-    } else {
-        let body = response.text().await.unwrap_or_default();
-        Err(CliError::network(format!(
-            "Server rejected recovery completion ({}) {}",
-            status, body
-        )))
-    }
-}
-
-async fn self_issue_recovery_welcome<S, N>(
-    session_manager: &SessionManager,
-    session: &Session,
-    client: &hybridcipher_client::state::client::Client<S, N>,
-    group_id: Uuid,
-) -> Result<SubmitWelcomeResponse, CliError>
-where
-    S: hybridcipher_client::storage::Storage + Send + Sync + 'static,
-    N: hybridcipher_client::network::Network + Send + Sync + 'static,
-{
-    let user_id = Uuid::parse_str(&session.user_id).map_err(|err| {
-        CliError::configuration(format!(
-            "Active session contains invalid user identifier '{}': {}",
-            session.user_id, err
-        ))
-    })?;
-
-    let generated = client
-        .generate_self_welcome_after_recovery(group_id, user_id)
-        .await
-        .map_err(|err| {
-            CliError::operation(format!(
-                "Failed to prepare recovery Welcome payload: {}",
-                err
-            ))
-        })?;
-
-    let request = SubmitWelcomeRequest {
-        encrypted_epoch_key: generated.encrypted_epoch_key.clone(),
-        signature: generated.signature.clone(),
-        signing_public_key: generated.signing_public_key.clone(),
-        created_at: generated.created_at,
-        expires_at: generated.expires_at,
-    };
-
-    let base_url = session.server_url.trim_end_matches('/');
-    let api_base = if base_url.ends_with("/api/v1") {
-        base_url.to_string()
-    } else {
-        format!("{}/api/v1", base_url)
-    };
-
-    let endpoint = format!(
-        "{}/groups/{}/devices/{}/welcome",
-        api_base, group_id, session.device_id
-    );
-
-    let http_client = reqwest::Client::new();
-    let response = http_client
-        .post(&endpoint)
-        .bearer_auth(&session.token)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|err| {
-            CliError::network(format!(
-                "Failed to submit recovery Welcome payload: {}",
-                err
-            ))
-        })?;
-
-    if response.status() == StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("recovery_self_welcome")?;
-        return Err(CliError::authentication(
-            "Authentication token rejected. Please login again.".to_string(),
-        ));
-    }
-
-    if response.status().is_success() {
-        let confirmation: SubmitWelcomeResponse = response.json().await.map_err(|err| {
-            CliError::network(format!(
-                "Failed to parse recovery Welcome submission response: {}",
-                err
-            ))
-        })?;
-
-        ui::success(&format!(
-            "Recovery Welcome message {} stored; device is provisioned for epoch access.",
-            confirmation.message_id
-        ));
-        Ok(confirmation)
-    } else {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        Err(CliError::network(format!(
-            "Server rejected recovery Welcome submission ({}): {}",
-            status, body
-        )))
-    }
-}
-
-fn build_completion_endpoint(base_url: &str, group_id: Uuid) -> Result<String, CliError> {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/api/v1") {
-        Ok(format!(
-            "{}/groups/{}/recovery-capsule/complete",
-            trimmed, group_id
-        ))
-    } else {
-        Ok(format!(
-            "{}/api/v1/groups/{}/recovery-capsule/complete",
-            trimmed, group_id
-        ))
-    }
 }
 
 async fn auto_recover_coverage_after_restore(client: &LocalClient) -> Result<(), CliError> {
@@ -2220,3 +2070,7 @@ async fn ensure_join_card_published(session_manager: &SessionManager) -> Result<
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/recovery/test_recovery_workflow.rs"]
+mod recovery_workflow_tests;

@@ -36,6 +36,14 @@ pub struct InvitationKeyPair {
     pub expires_at: DateTime<Utc>,
 }
 
+/// How long a newly signed join card stays valid. Devices re-sign their card on
+/// login and while running, so expiry means "this device has not checked in",
+/// not "this device's keys are old".
+pub const JOIN_CARD_VALIDITY_DAYS: i64 = 30;
+
+/// A published card with less than this much validity left is re-signed.
+pub const JOIN_CARD_REFRESH_BEFORE_DAYS: i64 = 7;
+
 /// Simplified join card for testing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinCard {
@@ -94,9 +102,23 @@ impl InvitationKeyPair {
         })
     }
 
-    /// Create a simple join card for testing
+    /// Sign a join card valid for [`JOIN_CARD_VALIDITY_DAYS`] from now.
+    ///
+    /// The card's expiry is independent of the key pair's creation date: the same
+    /// keys are re-attested with a fresh expiry each time the card is published.
     pub fn create_join_card(&self, user_id: Uuid) -> Result<JoinCard, ClientError> {
-        let expires_unix = self.expires_at.timestamp();
+        self.create_join_card_expiring(
+            user_id,
+            Utc::now() + chrono::Duration::days(JOIN_CARD_VALIDITY_DAYS),
+        )
+    }
+
+    fn create_join_card_expiring(
+        &self,
+        user_id: Uuid,
+        expires_at: DateTime<Utc>,
+    ) -> Result<JoinCard, ClientError> {
+        let expires_unix = expires_at.timestamp();
         if expires_unix < 0 {
             return Err(ClientError::InvalidInput(
                 "Join card expiration precedes Unix epoch".to_string(),
@@ -145,7 +167,7 @@ impl InvitationKeyPair {
             device_id: self.device_id.clone(),
             identity_public: self.identity_public_key.clone(),
             invitation_public: self.hybrid_public_key.clone(),
-            expires_at: self.expires_at,
+            expires_at: DateTime::from_timestamp(expires_unix, 0).unwrap_or(expires_at),
             signature: signature.to_bytes().to_vec(),
         })
     }
@@ -260,11 +282,42 @@ impl JoinCard {
     pub fn is_valid(&self) -> bool {
         Utc::now() < self.expires_at
     }
+
+    /// Whether the owning device should publish a re-signed card: expired, or
+    /// within [`JOIN_CARD_REFRESH_BEFORE_DAYS`] of expiring.
+    pub fn needs_refresh(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at - now < chrono::Duration::days(JOIN_CARD_REFRESH_BEFORE_DAYS)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_cards_from_old_keys_are_freshly_valid_and_verifiable() {
+        let mut invitation = InvitationKeyPair::generate("old-device".to_string()).unwrap();
+        // Keys created 40 days ago used to yield a card that was already expired.
+        invitation.created_at = Utc::now() - chrono::Duration::days(40);
+        invitation.expires_at = Utc::now() - chrono::Duration::days(10);
+
+        let card = invitation.create_join_card(Uuid::new_v4()).unwrap();
+        assert!(card.is_valid());
+        card.verify_signature().unwrap();
+        let remaining = card.expires_at - Utc::now();
+        assert!(remaining > chrono::Duration::days(JOIN_CARD_VALIDITY_DAYS - 1));
+        assert!(!card.needs_refresh(Utc::now()));
+    }
+
+    #[test]
+    fn join_cards_need_refresh_shortly_before_and_after_expiry() {
+        let invitation = InvitationKeyPair::generate("device".to_string()).unwrap();
+        let card = invitation.create_join_card(Uuid::new_v4()).unwrap();
+        let near_expiry = card.expires_at - chrono::Duration::days(JOIN_CARD_REFRESH_BEFORE_DAYS - 1);
+        assert!(card.needs_refresh(near_expiry));
+        assert!(card.needs_refresh(card.expires_at + chrono::Duration::days(1)));
+        assert!(!card.needs_refresh(card.expires_at - chrono::Duration::days(JOIN_CARD_REFRESH_BEFORE_DAYS + 1)));
+    }
 
     #[test]
     fn test_invitation_keypair_generation() {

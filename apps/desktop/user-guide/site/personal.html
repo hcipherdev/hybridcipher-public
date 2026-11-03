@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HybridCipher Personal Guide</title>
+<meta name="description" content="Set up HybridCipher Desktop on your own computer: save your recovery kit, protect a folder and open it in Finder or File Explorer.">
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="guide.css">
+</head>
+<body>
+<main class="page">
+
+    <header class="intro">
+        <span class="eyebrow">HybridCipher Desktop · Personal guide</span>
+        <h1>Protect your files on this computer</h1>
+        <p class="lead">
+            Set up HybridCipher on your own, without an account. You'll save a recovery kit,
+            protect a folder, and then work with its files as usual while they stay encrypted.
+        </p>
+        <ul class="facts" aria-label="At a glance">
+            <li>About 5 minutes</li>
+            <li>macOS and Windows</li>
+            <li>No account needed</li>
+        </ul>
+    </header>
+
+    <section class="player" aria-labelledby="playerTitle">
+        <div class="player-head">
+            <h2 id="playerTitle">Quick walkthrough</h2>
+            <span class="player-count" id="playerCount" aria-live="polite"></span>
+        </div>
+        <div class="screen" id="playerScreen"></div>
+        <p class="subtitle" id="playerSubtitle" aria-live="polite"></p>
+        <div class="controls">
+            <button class="btn" id="playerPrev" type="button">Back</button>
+            <button class="btn btn-primary" id="playerPlay" type="button">Play</button>
+            <button class="btn" id="playerNext" type="button">Next</button>
+            <div class="dots" id="playerDots" role="group" aria-label="Go to step"></div>
+        </div>
+    </section>
+
+    <ol class="steps">
+
+        <li class="step" id="open-the-app">
+            <span class="step-num" aria-hidden="true">1</span>
+            <div class="step-body">
+                <h2>Open the app</h2>
+                <p>
+                    The first time you open HybridCipher, it sets itself up on this computer.
+                    You don't need an account. Click <span class="ui">Get started</span>.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="Open HybridCipher and click <b>Get started</b>. No account is needed.">
+                    <img src="img/personal/01-welcome.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Welcome window titled You're ready to protect files, with the Get started button highlighted.">
+                    <figcaption>The welcome window lists the three things you'll do next.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="checklist">
+            <span class="step-num" aria-hidden="true">2</span>
+            <div class="step-body">
+                <h2>Follow the Get started checklist</h2>
+                <p>
+                    Home shows a short checklist. Only the next step has a button, so you can
+                    always see what to do now. The rest of this guide follows the same order.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="Home shows a <b>Get started</b> checklist. Work through it from the top.">
+                    <img src="img/personal/02-home.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Personal workspace Home with the Get started checklist highlighted: save your recovery kit, protect your first folder, open it in Finder.">
+                    <figcaption>The checklist: save your recovery kit, protect a folder, open it.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="recovery-kit">
+            <span class="step-num" aria-hidden="true">3</span>
+            <div class="step-body">
+                <h2>Save your recovery kit</h2>
+                <p>
+                    Without an account there is no online backup of your key. If this computer is
+                    lost, reset or replaced, the recovery kit is the only way to open your files again.
+                </p>
+                <ol>
+                    <li>Click <span class="ui">Save recovery kit</span>, then <span class="ui">Save recovery kit…</span></li>
+                    <li>Choose where to save the kit file (<code>.hcrk</code>), for example a USB drive.</li>
+                    <li>The app shows your recovery key. Write it down or store it in a password manager.</li>
+                    <li>Type the key's last 4 characters and click <span class="ui">I've saved it</span>.</li>
+                </ol>
+            </div>
+            <div class="shots two">
+                <figure data-slide data-subtitle="Click <b>Save recovery kit…</b> and save the kit file somewhere other than this computer.">
+                    <img src="img/personal/03-kit-intro.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Save your recovery kit window with the Save recovery kit button highlighted.">
+                    <figcaption>Save the kit file first.</figcaption>
+                </figure>
+                <figure data-slide data-subtitle="Keep the <b>recovery key</b> safe, then type its last 4 characters to confirm.">
+                    <img src="img/personal/04-kit-key.jpg" width="2560" height="1600" loading="lazy"
+                        alt="The recovery key shown in a box with a Copy button, and a field to type its last four characters.">
+                    <figcaption>Then confirm you kept the key.</figcaption>
+                </figure>
+            </div>
+            <p class="tip">
+                <strong>Keep them apart.</strong> Store the kit file and the recovery key in different
+                places, for example the file on a USB drive and the key in a password manager.
+                HybridCipher does not keep a copy of either.
+            </p>
+        </li>
+
+        <li class="step" id="protect-folder">
+            <span class="step-num" aria-hidden="true">4</span>
+            <div class="step-body">
+                <h2>Protect your first folder</h2>
+                <p>
+                    Click <span class="ui">Choose a folder</span> and pick the folder you want to
+                    protect. Confirm with <span class="ui">Proceed</span>. Its files are encrypted in
+                    place with post-quantum protection.
+                </p>
+            </div>
+            <div class="shots two">
+                <figure data-slide data-subtitle="Click <b>Choose a folder</b>, pick a folder, then click <b>Proceed</b>.">
+                    <img src="img/personal/05-add-folder.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Add Protected Folder confirmation for the folder Documents/Personal, with the Proceed button highlighted.">
+                    <figcaption>Confirm the folder you picked.</figcaption>
+                </figure>
+                <figure data-slide data-subtitle="The folder now appears under <b>Protected folders</b>.">
+                    <img src="img/personal/06-folder-protected.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Home showing the Personal folder in the sidebar and the checklist at 2 of 3 done, with the Open it in Finder step highlighted.">
+                    <figcaption>The folder is listed in the sidebar, and the checklist moves on.</figcaption>
+                </figure>
+            </div>
+            <p class="tip">
+                <strong>Add more later.</strong> Use <span class="ui">Add Protected Folder</span> in
+                the sidebar to protect other folders at any time.
+            </p>
+        </li>
+
+        <li class="step" id="open-in-finder">
+            <span class="step-num" aria-hidden="true">5</span>
+            <div class="step-body">
+                <h2>Open it in Finder or File Explorer</h2>
+                <p>
+                    Click <span class="ui">Mount folder</span>. The folder opens in Finder under
+                    Locations (on Windows, in File Explorer's navigation pane). Work with your files
+                    as usual. Anything you save there is encrypted automatically.
+                </p>
+                <p>
+                    To open it again later, select the folder in the sidebar and click
+                    <span class="ui">Open mounted folder</span>.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="Click <b>Mount folder</b>. Files you save in the mounted folder are encrypted automatically.">
+                    <img src="img/personal/07-mounted.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Folder details for Personal, marked Mounted and Ready to use, with the Open mounted folder button highlighted.">
+                    <figcaption>A mounted folder is marked <span class="ui">Mounted</span> and <span class="ui">Ready to use</span>.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="other-devices">
+            <span class="step-num" aria-hidden="true">6</span>
+            <div class="step-body">
+                <h2>Use your files on other devices <span class="optional-tag">Optional</span></h2>
+                <p>
+                    Everything so far stays on this computer. To open your files on another device,
+                    click <span class="ui">Create account</span> on Home. The folders you already
+                    protected become part of the account. Nothing is re-encrypted, and your files never
+                    leave this computer unencrypted.
+                </p>
+                <p>
+                    Enter your email and a password, and paste the recovery key you saved in step 3.
+                    It keeps working for the account.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="Optional: click <b>Create account</b> to use your protected files on other devices.">
+                    <img src="img/personal/08-other-devices.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Use your files on other devices window with fields for email, password, confirm password and recovery key.">
+                    <figcaption>Already have an account? Choose <span class="ui">Sign in to existing account</span> instead.</figcaption>
+                </figure>
+            </div>
+        </li>
+    </ol>
+
+    <footer class="next">
+        <h2>Working with a team?</h2>
+        <p>The <a href="team.html">team admin guide</a> covers creating groups, inviting people and sharing protected folders.</p>
+    </footer>
+</main>
+
+<script src="guide.js"></script>
+</body>
+</html>

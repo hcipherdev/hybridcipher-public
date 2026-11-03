@@ -1,4 +1,5 @@
 //! Confined, non-overwriting plaintext restoration.
+use super::durability::OutputDurability;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read},
@@ -55,17 +56,35 @@ pub fn destination(source: &Path, name: Option<&str>) -> io::Result<PathBuf> {
 /// Create a new plaintext file. Windows ancestor handles prevent directory
 /// replacement while writing; reparse points and existing outputs are rejected.
 pub fn write_new(path: &Path, data: &[u8]) -> io::Result<()> {
-    write_new_from_reader(path, &mut io::Cursor::new(data))
+    write_new_with(path, data, OutputDurability::Full)
+}
+
+/// As [`write_new`], with the caller choosing how the output is synced.
+pub fn write_new_with(path: &Path, data: &[u8], durability: OutputDurability) -> io::Result<()> {
+    write_new_from_reader(path, &mut io::Cursor::new(data), durability)
 }
 
 /// Publish a fully authenticated private restore through the same guarded,
 /// non-overwriting destination check as write_new, without loading it in memory.
 pub fn publish_new(path: &Path, authenticated_private_path: &Path) -> io::Result<()> {
-    let mut source = File::open(authenticated_private_path)?;
-    write_new_from_reader(path, &mut source)
+    publish_new_with(path, authenticated_private_path, OutputDurability::Full)
 }
 
-fn write_new_from_reader(path: &Path, source: &mut impl Read) -> io::Result<()> {
+/// As [`publish_new`], with the caller choosing how the output is synced.
+pub fn publish_new_with(
+    path: &Path,
+    authenticated_private_path: &Path,
+    durability: OutputDurability,
+) -> io::Result<()> {
+    let mut source = File::open(authenticated_private_path)?;
+    write_new_from_reader(path, &mut source, durability)
+}
+
+fn write_new_from_reader(
+    path: &Path,
+    source: &mut impl Read,
+    durability: OutputDurability,
+) -> io::Result<()> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -136,7 +155,12 @@ fn write_new_from_reader(path: &Path, source: &mut impl Read) -> io::Result<()> 
         }
         #[cfg(not(windows))]
         {
-            let metadata = fs::symlink_metadata(&current)?;
+            let mut metadata = fs::symlink_metadata(&current)?;
+            if metadata.file_type().is_symlink() && is_trusted_system_link(&current)? {
+                // e.g. macOS /var -> private/var: follow it and keep checking from its target.
+                current = fs::canonicalize(&current)?;
+                metadata = fs::symlink_metadata(&current)?;
+            }
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -145,20 +169,44 @@ fn write_new_from_reader(path: &Path, source: &mut impl Read) -> io::Result<()> 
             }
         }
     }
+    // Create the file in the folder that was checked, not through the original path.
+    let output = current.join(name);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&absolute)?;
+        .open(&output)?;
     // Retain ciphertext on every error. A partial output is a visible conflict
     // for recovery, and must never cause the source to be removed.
-    let result = io::copy(source, &mut file).and_then(|_| file.sync_all());
+    let result = io::copy(source, &mut file).and_then(|_| durability.apply(&file));
     drop(file);
     if let Err(err) = result {
-        let _ = fs::remove_file(&absolute);
+        let _ = fs::remove_file(&output);
         return Err(err);
     }
     drop(directory_guards);
     Ok(())
+}
+
+/// A link only root could have made or changed: owned by root, in a root-owned folder that
+/// no one else can write to. Operating-system links such as macOS `/var`, `/tmp` and `/etc`
+/// qualify; links a user or another program planted do not.
+#[cfg(unix)]
+fn is_trusted_system_link(link: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = link.parent() else {
+        return Ok(false);
+    };
+    let link_metadata = fs::symlink_metadata(link)?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    Ok(link_metadata.uid() == 0
+        && parent_metadata.is_dir()
+        && parent_metadata.uid() == 0
+        && parent_metadata.mode() & 0o022 == 0)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn is_trusted_system_link(_link: &Path) -> io::Result<bool> {
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -208,6 +256,29 @@ mod security_regression {
         assert!(publish_new(&output, &private).is_err());
         assert_eq!(fs::read(&output).unwrap(), b"authenticated");
         assert_eq!(fs::read(&private).unwrap(), b"authenticated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlink_planted_inside_the_output_path() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let link = root.path().join("redirect");
+        std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
+        let err = write_new(&link.join("file.txt"), b"data").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!elsewhere.path().join("file.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_root_owned_links_in_protected_folders_are_trusted() {
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("mine");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        assert!(!is_trusted_system_link(&link).unwrap());
+        #[cfg(target_os = "macos")]
+        assert!(is_trusted_system_link(Path::new("/var")).unwrap());
     }
 
     #[cfg(windows)]

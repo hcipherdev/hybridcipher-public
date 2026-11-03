@@ -14,6 +14,9 @@ pub async fn handle_devices_command(
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
     match action {
+        Some(DeviceSubcommand::ConfirmTrust) => {
+            auth::handle_confirm_device_trust(session_manager).await
+        }
         Some(DeviceSubcommand::Remove { device_id }) => {
             auth::handle_remove_device(Some(device_id), session_manager).await
         }

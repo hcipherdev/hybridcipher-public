@@ -91,6 +91,7 @@ impl VaultCompatibility {
             last_read_error: match self.last_read_error.load(Ordering::Acquire) {
                 1 => Some(ProviderFileErrorCode::LegacyConsentRequired),
                 2 => Some(ProviderFileErrorCode::IntegrityFailure),
+                3 => Some(ProviderFileErrorCode::KeyUnavailable),
                 _ => None,
             },
             encrypted_backup_directory: self.backup_directory.clone(),
@@ -121,7 +122,7 @@ impl VaultCompatibility {
         Ok(self.status())
     }
 
-    pub(crate) fn record_read_result<T>(
+    pub fn record_read_result<T>(
         &self,
         result: &std::result::Result<T, hybridcipher_mount_sync::MountSyncError>,
     ) {
@@ -129,12 +130,24 @@ impl VaultCompatibility {
         let code = match result {
             Err(MountSyncError::LegacyCompatibilityRequired) => 1,
             Err(MountSyncError::FileIntegrity(_)) => 2,
+            Err(MountSyncError::KeyUnavailable { .. }) => 3,
+            // A readable file means a restored or migrated key; integrity and consent
+            // results stay until the user acts on them.
+            Ok(_) => {
+                let _ = self.last_read_error.compare_exchange(
+                    3,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return;
+            }
             _ => return,
         };
         self.last_read_error.store(code, Ordering::Release);
     }
 
-    pub(crate) fn observe(&self, entries: &[ProviderEntry]) {
+    pub fn observe(&self, entries: &[ProviderEntry]) {
         self.legacy_files.store(
             entries
                 .iter()
@@ -146,6 +159,15 @@ impl VaultCompatibility {
                 .count(),
             Ordering::Release,
         );
+    }
+
+    /// Preserve a legacy ciphertext before a provider write, rename, or delete.
+    /// Current-format objects are left alone.
+    pub fn preserve_before_change(&self, encrypted_path: &Path) -> Result<()> {
+        if let Some(backup) = self.preserve(self.root_id, encrypted_path)? {
+            backup.verify_current()?;
+        }
+        Ok(())
     }
 
     /// Snapshot ciphertext before a destructive operation; never archive plaintext.

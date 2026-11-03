@@ -4,12 +4,13 @@ use crate::coverage::{
 };
 use crate::epoch_key_source::EpochKeySource;
 use crate::errors::{ErrorCode, ErrorContext};
+use crate::file::ciphertext::{self, CiphertextKind, ContentKind};
 use crate::file::encrypt::{
     build_wrap_aad, chunked_encrypted_size, derive_chunk_nonce, encrypt_content,
     encrypt_content_chunked, generate_file_id, hash_wrap_aad, serialize_encrypted_header,
     write_encrypted_file_atomic_for_coverage, PlatformFileMetadata, SerializedEncryptedHeader,
-    SparseFileMetadata, AEAD_TAG_SIZE, CHUNKED_HEADER_VERSION, MAX_CONTENT_CHUNK_SIZE,
-    MAX_IN_MEMORY_PLAINTEXT_BYTES,
+    SparseFileMetadata, AEAD_TAG_SIZE, CHUNKED_HEADER_VERSION, ENCRYPTED_FILE_SEPARATOR,
+    MAX_CONTENT_CHUNK_SIZE, MAX_IN_MEMORY_PLAINTEXT_BYTES,
 };
 use crate::invitation::InvitationKeyPair;
 use crate::network::Network;
@@ -20,11 +21,9 @@ use crate::pinning::{
 use crate::rekey::api::ActivationDecision;
 use crate::rekey::api::{PolicyEvaluationSnapshot, RootCoverageKpiPayload};
 use crate::rekey::{
-    ApiMigrationProgress, ApiRekeyError, CutoverRequest, CutoverResponsePayload,
-    EncryptedWelcomeMessage, EpochChangeReason, RekeyDescriptorList, RekeyDescriptorSummary,
-    RekeyFallbackRequestPayload, RekeyFallbackResponsePayload, RekeyHeartbeatRequestPayload,
-    RekeyInitiateRequest, RekeyProgressState, RekeyProgressUpdateRequest, RekeyResponsePayload,
-    RekeyStatus, RekeyStatusPayload,
+    ApiMigrationProgress, ApiRekeyError, EncryptedWelcomeMessage, EpochChangeReason,
+    RekeyHeartbeatRequestPayload, RekeyInitiateRequest, RekeyProgressState,
+    RekeyProgressUpdateRequest, RekeyResponsePayload, RekeyStatus, RekeyStatusPayload,
 };
 use crate::security::{ClientConfiguration, DeploymentMode, SecurityValidator};
 use crate::storage::{
@@ -51,10 +50,7 @@ use hybridcipher_crypto::{
     kdf::{hkdf_expand, HkdfContext},
     open, AeadKey, AeadNonce,
 };
-use hybridcipher_crypto::{
-    rekey::cutover_commit_message,
-    signatures::{Ed25519KeyPair, VERIFYING_KEY_LEN},
-};
+use hybridcipher_crypto::signatures::{Ed25519KeyPair, VERIFYING_KEY_LEN};
 use hybridcipher_merkle::InclusionProof;
 use hybridcipher_messages::join_card::JoinCard as MessagesJoinCard;
 use notify::event::{CreateKind, Event, EventKind};
@@ -100,8 +96,6 @@ const COVERAGE_WATCHER_ROOT_REFRESH_SECS: u64 = 5;
 const COVERAGE_LOG_SNAPSHOT_INTERVAL: u64 = 128;
 const COVERAGE_MARKER_PREFIX: &str = ".hybridcipher-root-";
 const COVERAGE_MARKER_SUFFIX: &str = ".json";
-const DIRECTORY_METADATA_FILE_NAME: &str = ".hybridcipher_dir.encrypted";
-const ENCRYPTED_FILE_SEPARATOR: &[u8] = b"\n---ENCRYPTED_DATA---\n";
 
 const DEFAULT_SERVER_URL: &str = "https://api.hybridcipher.com";
 const ACCOUNT_KEY_CACHE_FILE: &str = ".account_key_cache";
@@ -110,23 +104,43 @@ const SESSION_FILE_AAD: &[u8] = b"hybridcipher/session";
 const DEVICE_KEY_FILE_AAD: &[u8] = b"hybridcipher/device_key_material";
 const GROUP_MEMBERSHIP_INDEX_KEY: &str = "group_membership_index";
 const COVERAGE_ROOT_REGISTRY_KEY: &str = "coverage_root_registry";
+/// Serialises read-modify-write of the coverage root registry. The registry is
+/// shared by every storage on the device, so the lock is process-wide rather
+/// than per client (a vault and an account are separate clients).
+static COVERAGE_ROOT_REGISTRY_LOCK: Mutex<()> = Mutex::const_new(());
+/// Coverage log snapshots are written one at a time, each from the latest log,
+/// so files encrypted in parallel can never leave an older snapshot on disk.
+static COVERAGE_LOG_SNAPSHOT_LOCK: Mutex<()> = Mutex::const_new(());
 
 mod coverage;
 mod coverage_filesystem;
 mod files;
 mod groups;
 mod initialization;
+mod key_receipts;
+mod leftover_key_files;
+mod local_vault;
 mod local_write_access;
 mod persistence;
 mod rekey;
+mod saved_code_recovery;
 mod security;
 mod session;
 #[cfg(test)]
 mod tests;
 mod welcome;
+mod welcome_trust;
 
+pub(crate) use self::files::PlainNamedContents;
+pub use self::key_receipts::{KeyReceiptReport, KeyReceiptReports};
+use self::leftover_key_files::needs_key_migration;
+pub use self::leftover_key_files::{
+    KeyStateFolder, KeyStateReport, LeftoverKeyFiles, LeftoverKeyMigration,
+};
+pub use self::local_vault::{LocalVaultInfo, LOCAL_VAULT_CONFIG_KEY};
 use self::coverage_filesystem::{
-    canonicalize_existing_path, coverage_log_from_data, coverage_log_to_data, find_marker_for_path,
+    canonicalize_existing_path, coverage_log_from_data, coverage_log_to_data,
+    find_marker_for_path, find_marker_for_root_id, folder_markers_in_dir,
     make_placeholder_file_epoch_entry, marker_path_from_marker, paths_overlap, rekey_debug_enabled,
     remove_marker_for_root, write_marker_for_root, FileExclusionList,
 };
@@ -226,6 +240,7 @@ struct SelfIssuedWelcomePayload {
 
 #[derive(Debug, Serialize)]
 struct SubmitSelfWelcomeRequest {
+    pub group_id: String,
     pub encrypted_epoch_key: Vec<u8>,
     pub signature: Vec<u8>,
     pub signing_public_key: Vec<u8>,
@@ -534,6 +549,15 @@ pub struct CoverageMigrationProgress {
     pub failed_files: usize,
 }
 
+/// A file or folder record a migration could not move to the new key, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageMigrationFailure {
+    pub path: String,
+    /// Key version the file is still on, when known.
+    pub from_version: Option<u64>,
+    pub reason: String,
+}
+
 /// Result returned when adopting a file into coverage tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverageAdoptResult {
@@ -602,6 +626,9 @@ struct IdleCrawlerState {
 #[derive(Debug, Default)]
 struct CoverageWatcherState {
     running: bool,
+    /// Set once the owner drops this client; the watcher never starts again.
+    stopped: bool,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Default)]
@@ -1071,7 +1098,8 @@ enum CoverageWatcherEvent {
 
 struct CoverageRootWatcher {
     _root_id: Uuid,
-    _path: PathBuf,
+    /// The path this watcher is attached to; a relocated root needs a new one.
+    path: PathBuf,
     _watcher: RecommendedWatcher,
 }
 
@@ -1133,7 +1161,7 @@ impl CoverageRootWatcher {
 
         Ok(Self {
             _root_id: root_id,
-            _path: path,
+            path,
             _watcher: watcher,
         })
     }
@@ -1180,6 +1208,20 @@ pub struct CoverageRootStats {
     pub recent_orphans: Vec<CoverageOrphanSample>,
     #[serde(default)]
     pub recent_unmanaged: Vec<CoverageOrphanSample>,
+    /// Which key the folder's files are on: protection alone counts a file still on an older
+    /// key as covered.
+    #[serde(default)]
+    pub keys: CoverageKeyCounts,
+}
+
+/// How many of a folder's indexed files are on the key they should be on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageKeyCounts {
+    /// The rotation target while one runs, otherwise the current key version.
+    pub target_version: u64,
+    pub on_target: usize,
+    /// Files still to move to `target_version`.
+    pub on_other: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1363,35 +1405,6 @@ impl Default for RekeyInitiationOptions {
             member_updates: None,
         }
     }
-}
-
-/// Summary returned after a successful cutover
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CutoverSummary {
-    pub cutover_id: Uuid,
-    pub group_id: Uuid,
-    pub new_epoch_id: Uuid,
-    pub old_epoch_id: Uuid,
-    pub completed_at: DateTime<Utc>,
-    pub cleanup_status: String,
-}
-
-/// Summary returned after cancelling an active rekey operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RekeyFallbackSummary {
-    pub rekey_id: Uuid,
-    pub group_id: Uuid,
-    pub cancelled_at: DateTime<Utc>,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub new_epoch_id: Option<Uuid>,
-    #[serde(default)]
-    pub new_epoch_number: Option<u64>,
-    #[serde(default)]
-    pub previous_epoch_id: Option<Uuid>,
-    #[serde(default)]
-    pub previous_epoch_number: Option<u64>,
 }
 
 #[cfg(feature = "mount-fs")]
@@ -2067,8 +2080,14 @@ mod rekey_tests {
 /// - Migration state is consistent across concurrent file operations
 pub struct Client<S: Storage, N: Network> {
     local_group_id: Option<Uuid>,
+    /// Accountless vaults never read a login session, even one left by
+    /// another account on this machine.
+    local_only: Arc<AtomicBool>,
     local_access_refresh: Arc<Mutex<Option<std::time::Instant>>>,
     local_write_identity: Arc<std::sync::RwLock<Option<(String, String)>>>,
+    /// Groups whose write access was verified recently, so bulk work checks once
+    /// per window instead of once per file. Only successes are kept.
+    local_write_verified: Arc<std::sync::Mutex<HashMap<Uuid, std::time::Instant>>>,
     /// Device identity key pair for signing operations
     device_identity: Ed25519KeyPair,
 
@@ -2140,8 +2159,10 @@ impl<S: Storage, N: Network> Clone for Client<S, N> {
     fn clone(&self) -> Self {
         Self {
             local_group_id: self.local_group_id,
+            local_only: self.local_only.clone(),
             local_access_refresh: self.local_access_refresh.clone(),
             local_write_identity: self.local_write_identity.clone(),
+            local_write_verified: self.local_write_verified.clone(),
             device_identity: self.device_identity.clone(),
             storage: self.storage.clone(),
             network: self.network.clone(),
@@ -2284,9 +2305,6 @@ pub struct ClientState {
 
     /// Last time we warned the user about purged retention content
     last_retention_purge_warning: Option<DateTime<Utc>>,
-
-    /// Cached welcome signing keys keyed by server URL
-    welcome_signing_keys: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2910,7 +2928,6 @@ impl<S: Storage, N: Network> Client<S, N> {
             invitation_keypair: None,
             last_retention_warning: None,
             last_retention_purge_warning: None,
-            welcome_signing_keys: HashMap::new(),
         };
 
         // Initialize security validator based on deployment mode
@@ -2970,8 +2987,10 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let client = Self {
             local_group_id: None,
+            local_only: Arc::new(AtomicBool::new(false)),
             local_access_refresh: Arc::new(Mutex::new(None)),
             local_write_identity: Arc::new(std::sync::RwLock::new(None)),
+            local_write_verified: Arc::new(std::sync::Mutex::new(HashMap::new())),
             device_identity,
             storage,
             network,

@@ -212,51 +212,6 @@ impl<S: Storage, N: Network> Client<S, N> {
         });
     }
 
-    pub(in super::super) async fn cancel_idle_crawler(&self) {
-        // Set abort flag
-        {
-            let mut worker = self.idle_crawler.lock().await;
-            if worker.running {
-                worker.abort = true;
-                if rekey_debug_enabled() {
-                    eprintln!(
-                        "DEBUG cancel_idle_crawler: Set abort=true, waiting for crawler to stop"
-                    );
-                }
-            } else {
-                if rekey_debug_enabled() {
-                    eprintln!("DEBUG cancel_idle_crawler: Crawler not running, nothing to cancel");
-                }
-                return; // Not running, nothing to cancel
-            }
-        }
-
-        // Wait for crawler to actually stop (with timeout)
-        let timeout = std::time::Duration::from_secs(10);
-        let start = std::time::Instant::now();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let mut worker = self.idle_crawler.lock().await;
-            if !worker.running {
-                // Ensure clean state for next crawler
-                worker.abort = false;
-                if rekey_debug_enabled() {
-                    eprintln!("DEBUG cancel_idle_crawler: Crawler stopped, state reset");
-                }
-                break;
-            }
-            if start.elapsed() > timeout {
-                if rekey_debug_enabled() {
-                    eprintln!("DEBUG cancel_idle_crawler: Timeout waiting for crawler to stop, forcing state reset");
-                }
-                // Force reset on timeout to prevent deadlock
-                worker.running = false;
-                worker.abort = false;
-                break;
-            }
-        }
-    }
-
     /// Public method to trigger idle crawler after state reloads
     /// This is useful for mount daemons that need to detect externally-started rekeys
     pub async fn trigger_rewrap_processing(&self) {

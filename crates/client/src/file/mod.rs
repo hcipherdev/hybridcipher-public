@@ -5,9 +5,12 @@
 /// file access patterns and intelligent scheduling for optimal performance.
 pub mod access;
 pub mod cache;
+pub mod ciphertext;
 pub mod content_manifest;
 pub mod decrypt;
+pub mod durability;
 pub mod encrypt;
+pub mod group_transfer;
 pub(crate) mod plaintext_output;
 pub mod rewrap;
 pub mod safe_restore;

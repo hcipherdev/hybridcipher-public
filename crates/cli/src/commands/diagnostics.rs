@@ -56,7 +56,7 @@ pub async fn fetch_device_audit(
         .map_err(|e| CliError::network(format!("Failed to contact server: {}", e)))?;
 
     if response.status() == StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("device_audit")?;
+        session_manager.invalidate_session("device_audit").await?;
         return Err(CliError::authentication(
             "Authentication token rejected. Please login again.",
         ));

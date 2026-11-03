@@ -243,4 +243,8 @@ impl CoverageIpcHandler for DesktopCoverageIpcHandler {
     async fn coverage_transparency_config(&self) -> Option<TransparencyConfig> {
         current_transparency_config()
     }
+
+    async fn key_state_report(&self) -> Result<hybridcipher_client::KeyStateReport, ClientError> {
+        self.client.key_state_report().await
+    }
 }

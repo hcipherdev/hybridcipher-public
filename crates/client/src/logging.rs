@@ -544,6 +544,26 @@ impl StructuredLogger {
     }
 
     fn write_log_entry(&self, entry: &LogEntry) {
+        // Also hand every entry to the `log` facade, so a host that keeps a log (the desktop
+        // writes one to disk) records what went wrong; with no logger installed this is a no-op.
+        let level = match entry.level {
+            LogLevel::Trace => log::Level::Trace,
+            LogLevel::Debug => log::Level::Debug,
+            LogLevel::Info => log::Level::Info,
+            LogLevel::Warn => log::Level::Warn,
+            LogLevel::Error | LogLevel::Critical => log::Level::Error,
+        };
+        match entry.operation.as_deref() {
+            Some(operation) => log::log!(
+                target: "hybridcipher_client",
+                level,
+                "[{}] {}",
+                operation,
+                entry.message
+            ),
+            None => log::log!(target: "hybridcipher_client", level, "{}", entry.message),
+        }
+
         // Suppress JSON logging unless explicitly enabled via HYBRIDCIPHER_VERBOSE
         // This prevents verbose JSON output from cluttering CLI commands
         if matches!(self.config.format, LogFormat::Json | LogFormat::CompactJson) {

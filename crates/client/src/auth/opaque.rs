@@ -1,6 +1,8 @@
 use crate::audit::{audit_logger, AuditOutcome};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
+use hybridcipher_crypto::signatures::Ed25519KeyPair;
+use hybridcipher_messages::device_actions::login_device_proof_payload;
 use opaque_ke::{
     key_exchange::tripledh::TripleDh, ClientLoginFinishParameters,
     ClientRegistrationFinishParameters, CredentialResponse,
@@ -14,6 +16,7 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Default cipher suite for OPAQUE operations using proper CipherSuite implementation
 struct DefaultCipherSuite;
@@ -33,6 +36,9 @@ impl CipherSuite for DefaultCipherSuite {
 pub struct OpaqueAuth {
     device_id: String,
     http_client: HttpClient,
+    /// Identity key of this device, used to prove at login that a registered device ID
+    /// really is this device. Without it the server asks an MFA-enrolled account for MFA.
+    device_identity: Option<Ed25519KeyPair>,
 }
 
 /// Metadata the client supplies when initiating a login so the server can
@@ -133,7 +139,14 @@ impl OpaqueAuth {
         Self {
             device_id,
             http_client: HttpClient::new(),
+            device_identity: None,
         }
+    }
+
+    /// Sign logins of this already-registered device with its identity key.
+    pub fn with_device_identity(mut self, identity: Ed25519KeyPair) -> Self {
+        self.device_identity = Some(identity);
+        self
     }
 
     /// Get the device ID associated with this authenticator
@@ -379,11 +392,24 @@ impl OpaqueAuth {
         let server_public_key = finish.server_s_pk.serialize().to_vec();
 
         let finalization = general_purpose::STANDARD.encode(finish.message.serialize().to_vec());
+        let device_proof = self
+            .device_identity
+            .as_ref()
+            .filter(|_| !start_body.is_new_device)
+            .map(|identity| {
+                let payload = login_device_proof_payload(
+                    &start_body.login_id.to_string(),
+                    &start_body.user_id.to_string(),
+                    &self.device_id,
+                );
+                general_purpose::STANDARD.encode(identity.sign(&payload))
+            });
         let finish_request = LoginFinishRequestBody {
             login_id: start_body.login_id,
             credential_finalization: finalization,
             mfa_code: device_metadata.mfa_code.clone(),
             backup_code: device_metadata.backup_code.clone(),
+            device_proof,
         };
 
         let finish_response = self
@@ -467,6 +493,65 @@ impl OpaqueAuth {
         server_url: &str,
         device_metadata: DeviceLoginMetadata,
     ) -> Result<DeviceRecoveryChallenge, OpaqueError> {
+        self.device_recovery_start_at(
+            username_or_email,
+            password,
+            server_url,
+            device_metadata,
+            "/auth/device-recovery/start",
+            None,
+        )
+        .await
+    }
+
+    /// Reconfirm an existing identity through account recovery without evicting a device.
+    pub async fn device_trust_recovery_start(
+        &self,
+        username_or_email: &str,
+        password: &str,
+        server_url: &str,
+        device_metadata: DeviceLoginMetadata,
+    ) -> Result<DeviceRecoveryChallenge, OpaqueError> {
+        self.device_recovery_start_at(
+            username_or_email,
+            password,
+            server_url,
+            device_metadata,
+            "/auth/device-trust/recovery/start",
+            None,
+        )
+        .await
+    }
+
+    /// Prove the current password for saved encryption-code recovery.
+    pub async fn saved_code_recovery_start(
+        &self,
+        username_or_email: &str,
+        password: &str,
+        server_url: &str,
+        device_metadata: DeviceLoginMetadata,
+        token: &str,
+    ) -> Result<DeviceRecoveryChallenge, OpaqueError> {
+        self.device_recovery_start_at(
+            username_or_email,
+            password,
+            server_url,
+            device_metadata,
+            "/auth/saved-code-recovery/start",
+            Some(token),
+        )
+        .await
+    }
+
+    async fn device_recovery_start_at(
+        &self,
+        username_or_email: &str,
+        password: &str,
+        server_url: &str,
+        device_metadata: DeviceLoginMetadata,
+        endpoint: &str,
+        token: Option<&str>,
+    ) -> Result<DeviceRecoveryChallenge, OpaqueError> {
         let mut rng = OsRng;
         let ClientLoginStartResult { message, state } =
             ClientLogin::<DefaultCipherSuite>::start(&mut rng, password.as_bytes()).map_err(
@@ -483,10 +568,17 @@ impl OpaqueAuth {
             device_display_name: device_metadata.device_display_name,
         };
 
-        let start_response = self
+        let request = self
             .http_client
-            .post(api_url(server_url, "/auth/device-recovery/start"))
-            .json(&start_request)
+            .post(api_url(server_url, endpoint))
+            .json(&start_request);
+        let request = if let Some(token) = token {
+            request.bearer_auth(token)
+        } else {
+            request
+        };
+        let start_response = request
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .map_err(|e| OpaqueError::NetworkError(e.to_string()))?;
@@ -547,6 +639,72 @@ impl OpaqueAuth {
         mfa_code: Option<String>,
         backup_code: Option<String>,
     ) -> Result<DeviceRecoveryVerified, OpaqueError> {
+        self.device_recovery_verify_at(
+            server_url,
+            otp_code,
+            finalization,
+            mfa_code,
+            backup_code,
+            "/auth/device-recovery/verify",
+            None,
+        )
+        .await
+    }
+
+    /// Verify the account-recovery proof for current-device trust confirmation.
+    pub async fn device_trust_recovery_verify(
+        &self,
+        server_url: &str,
+        otp_code: Option<String>,
+        finalization: DeviceRecoveryFinalization,
+        mfa_code: Option<String>,
+        backup_code: Option<String>,
+    ) -> Result<DeviceRecoveryVerified, OpaqueError> {
+        self.device_recovery_verify_at(
+            server_url,
+            otp_code,
+            finalization,
+            mfa_code,
+            backup_code,
+            "/auth/device-trust/recovery/verify",
+            None,
+        )
+        .await
+    }
+
+    /// Finish the password proof; the saved code supplies the recovery factor.
+    pub async fn saved_code_recovery_verify(
+        &self,
+        server_url: &str,
+        finalization: DeviceRecoveryFinalization,
+        token: &str,
+    ) -> Result<DeviceRecoveryVerified, OpaqueError> {
+        self.device_recovery_verify_at(
+            server_url,
+            None,
+            finalization,
+            None,
+            None,
+            "/auth/saved-code-recovery/verify",
+            Some(token),
+        )
+        .await
+    }
+
+    async fn device_recovery_verify_at(
+        &self,
+        server_url: &str,
+        otp_code: Option<String>,
+        mut finalization: DeviceRecoveryFinalization,
+        mfa_code: Option<String>,
+        backup_code: Option<String>,
+        endpoint: &str,
+        token: Option<&str>,
+    ) -> Result<DeviceRecoveryVerified, OpaqueError> {
+        let session_key = Zeroizing::new(finalization.session_key);
+        let export_key = Zeroizing::new(finalization.export_key);
+        finalization.session_key.zeroize();
+        finalization.export_key.zeroize();
         let verify_request = DeviceRecoveryVerifyRequestBody {
             login_id: finalization.login_id,
             otp_code,
@@ -555,10 +713,17 @@ impl OpaqueAuth {
             backup_code,
         };
 
-        let verify_response = self
+        let request = self
             .http_client
-            .post(api_url(server_url, "/auth/device-recovery/verify"))
-            .json(&verify_request)
+            .post(api_url(server_url, endpoint))
+            .json(&verify_request);
+        let request = if let Some(token) = token {
+            request.bearer_auth(token)
+        } else {
+            request
+        };
+        let verify_response = request
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .map_err(|e| OpaqueError::NetworkError(e.to_string()))?;
@@ -605,8 +770,8 @@ impl OpaqueAuth {
         Ok(DeviceRecoveryVerified {
             recovery_session_id: verify_body.recovery_session_id,
             devices,
-            session_key: finalization.session_key,
-            export_key: finalization.export_key,
+            session_key: *session_key,
+            export_key: *export_key,
             server_public_key: finalization.server_public_key,
         })
     }
@@ -851,10 +1016,8 @@ struct LoginStartRequestBody {
 #[derive(Deserialize)]
 struct LoginStartResponseBody {
     login_id: Uuid,
-    #[serde(rename = "user_id")]
-    _user_id: Uuid,
-    #[serde(rename = "is_new_device")]
-    _is_new_device: bool,
+    user_id: Uuid,
+    is_new_device: bool,
     #[serde(rename = "mfa_required", default)]
     _mfa_required: bool,
     #[serde(rename = "mfa_enrolled", default)]
@@ -870,6 +1033,8 @@ struct LoginFinishRequestBody {
     mfa_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backup_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_proof: Option<String>,
 }
 
 #[derive(Deserialize)]

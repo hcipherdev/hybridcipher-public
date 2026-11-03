@@ -88,6 +88,9 @@ pub struct AdminGroupSummary {
     pub member_count: u32,
     pub device_count: Option<u32>,
     pub current_epoch_id: Option<String>,
+    pub current_key_version: Option<u64>,
+    /// This account's role, so the app knows which groups it can hand out access to.
+    pub user_role: crate::http_client::GroupRole,
 }
 
 #[tauri::command]
@@ -163,6 +166,8 @@ pub async fn get_group_summaries(
             member_count: group.member_count,
             device_count,
             current_epoch_id: group.current_epoch,
+            current_key_version: group.current_key_version,
+            user_role: group.user_role,
         });
     }
 

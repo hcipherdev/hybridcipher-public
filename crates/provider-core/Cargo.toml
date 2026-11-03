@@ -33,6 +33,12 @@ windows = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Integration tests use the synthetic ciphertext fixtures behind this feature.
+hybridcipher-provider-core = { path = ".", features = ["native-verification"] }
 hybridcipher-crypto = { path = "../crypto" }
 tempfile = "3.0"
 tokio = { version = "1.0", features = ["macros", "rt", "sync"] }
+
+[[test]]
+name = "legacy_upgrade"
+path = "tests/compatibility/legacy_upgrade.rs"

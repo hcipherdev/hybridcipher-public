@@ -8,6 +8,7 @@ fn main() {
     validate_platform_app_version();
     build_macos_file_provider_bridge();
     stage_bundled_cli();
+    record_build_commit();
     let mut attributes = tauri_build::Attributes::new();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=windows/identity/app.manifest.in");
@@ -123,10 +124,12 @@ fn stage_bundled_cli() {
     let staged_path = staged_dir.join(&binary_name);
 
     println!("cargo:rerun-if-env-changed=HYBRIDCIPHER_CLI_PATH");
-    println!("cargo:rerun-if-changed={}", source.display());
 
     let override_source = std::env::var_os("HYBRIDCIPHER_CLI_PATH").map(PathBuf::from);
     let candidate = override_source.as_ref().unwrap_or(&source);
+    // Watch the file actually staged: watching only the default path left a rebuilt CLI at
+    // an unchanged HYBRIDCIPHER_CLI_PATH unstaged, so an older CLI shipped with a newer app.
+    println!("cargo:rerun-if-changed={}", candidate.display());
 
     if !candidate.exists() {
         println!(
@@ -176,6 +179,39 @@ fn stage_bundled_cli() {
             staged_path.display(),
             err
         ),
+    }
+}
+
+/// `HYBRIDCIPHER_BUILD_COMMIT`: the environment's value when set (builds without git),
+/// otherwise the short HEAD commit, or "unknown". Re-runs whenever HEAD moves. The bundled
+/// CLI records the same, so the app can tell when the two come from different builds.
+fn record_build_commit() {
+    println!("cargo:rerun-if-env-changed=HYBRIDCIPHER_BUILD_COMMIT");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let commit = std::env::var("HYBRIDCIPHER_BUILD_COMMIT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=HYBRIDCIPHER_BUILD_COMMIT={commit}");
+
+    // --git-path resolves inside worktrees too.
+    let mut watched = vec!["HEAD".to_string(), "packed-refs".to_string()];
+    if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        watched.push(reference);
+    }
+    for name in watched {
+        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
 }
 

@@ -771,6 +771,9 @@ pub enum StorageError {
 
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    #[error("File index unavailable: {0}")]
+    FileIndexUnavailable(String),
 }
 
 /// Storage configuration parameters

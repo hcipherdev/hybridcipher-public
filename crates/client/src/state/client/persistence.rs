@@ -285,7 +285,6 @@ impl<S: Storage, N: Network> Client<S, N> {
                 state.last_retention_warning = serializable_state.last_retention_warning;
                 state.last_retention_purge_warning =
                     serializable_state.last_retention_purge_warning;
-                state.welcome_signing_keys.clear();
 
                 log::info!("Loaded client state with {} epochs", state.epochs.len());
                 Ok(())

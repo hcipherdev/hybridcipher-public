@@ -142,6 +142,22 @@ impl CliError {
         }
     }
 
+    /// Network error that keeps each underlying cause, such as a reset connection
+    /// or TLS failure behind reqwest's "error sending request".
+    pub fn network_from(error: &(dyn std::error::Error + 'static)) -> Self {
+        let mut message = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            let text = cause.to_string();
+            if !message.contains(&text) {
+                message.push_str(": ");
+                message.push_str(&text);
+            }
+            source = cause.source();
+        }
+        Self::network(message)
+    }
+
     /// Create a cryptographic error with context
     pub fn cryptographic<S: Into<String>>(message: S) -> Self {
         Self::Cryptographic {

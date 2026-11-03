@@ -67,6 +67,7 @@ const MEMBERSHIP_PROOF_CACHE_PREFIX: &str = "membership_proof_cache";
 pub async fn handle_add_member(
     user_id: String,
     require_verified: bool,
+    for_invitation: Option<uuid::Uuid>,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
     // Require authentication
@@ -129,6 +130,12 @@ pub async fn handle_add_member(
         }
     }
 
+    // An invited person without published devices joins first; a group admin's app then
+    // finishes the add. Local join card files are for adding people directly.
+    if for_invitation.is_some() && join_card_materials.is_empty() {
+        report_invitation_staged(group_id, &user_id, 0, &[]);
+        return Ok(());
+    }
     if join_card_materials.is_empty() {
         join_card_materials.push(load_join_card_for_member(&user_id, session_manager)?);
     }
@@ -185,7 +192,9 @@ pub async fn handle_add_member(
         };
 
         match pin_state {
-            JoinCardPinState::AlreadyPinned | JoinCardPinState::RestoredFromCache => {}
+            JoinCardPinState::AlreadyPinned
+            | JoinCardPinState::RestoredFromCache
+            | JoinCardPinState::RestoredFromOwnDevice { .. } => {}
             JoinCardPinState::Unverified { auto_pinned } => {
                 pin_ok = false;
                 if auto_pinned {
@@ -378,6 +387,10 @@ pub async fn handle_add_member(
         }
     }
 
+    if welcome_messages.is_empty() && for_invitation.is_some() {
+        report_invitation_staged(group_id, &user_id, 0, &[]);
+        return Ok(());
+    }
     if welcome_messages.is_empty() {
         return Err(CliError::member_management(
             "No valid join cards were available to generate Welcome messages.".to_string(),
@@ -385,9 +398,22 @@ pub async fn handle_add_member(
     }
 
     let welcome_json = crate::commands::welcome::serialize_welcome_payloads(&welcome_messages)?;
+    let devices_added = welcome_json.len();
+
+    if let Some(invitation_id) = for_invitation {
+        session_manager
+            .stage_invitation_welcomes_http(invitation_id, group_id, welcome_json)
+            .await?;
+        ui::success(&format!(
+            "'{}' gets access to this group as soon as they accept the invitation",
+            user_id
+        ));
+        report_invitation_staged(group_id, &user_id, devices_added, &unverified_devices);
+        return Ok(());
+    }
 
     match session_manager
-        .add_member_http(&user_id, welcome_json)
+        .add_member_http(group_id, &user_id, welcome_json)
         .await
     {
         Ok(()) => {
@@ -441,7 +467,49 @@ pub async fn handle_add_member(
         }
     }
 
+    ui::desktop::report_result(
+        "member_added",
+        serde_json::json!({
+            "group_id": group_id,
+            "member": user_id,
+            "devices_added": devices_added,
+            "unverified_devices": unverified_devices
+                .iter()
+                .map(|device| serde_json::json!({
+                    "user_id": device.user_id,
+                    "device_id": device.device_id,
+                    "reasons": device.reasons,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
     Ok(())
+}
+
+/// `staged` is false when the person has no devices yet, so an admin finishes after they join.
+fn report_invitation_staged(
+    group_id: uuid::Uuid,
+    member: &str,
+    devices_added: usize,
+    unverified_devices: &[UnverifiedDevice],
+) {
+    ui::desktop::report_result(
+        "invitation_staged",
+        serde_json::json!({
+            "group_id": group_id,
+            "member": member,
+            "staged": devices_added > 0,
+            "devices_added": devices_added,
+            "unverified_devices": unverified_devices
+                .iter()
+                .map(|device| serde_json::json!({
+                    "user_id": device.user_id,
+                    "device_id": device.device_id,
+                    "reasons": device.reasons,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
 }
 
 /// List unverified devices recorded for a group
@@ -1195,6 +1263,10 @@ pub async fn handle_remove_member(
         Ok(()) => {
             ui::success(&format!("Member '{}' removed successfully!", user_id));
             ui::info("Group membership updated on the server");
+            ui::desktop::report_result(
+                "member_removed",
+                serde_json::json!({ "group_id": group_id, "member": user_id, "user_id": target_user_id }),
+            );
         }
         Err(e) => {
             ui::error(&format!("Failed to remove member: {}", e));
@@ -1205,24 +1277,25 @@ pub async fn handle_remove_member(
     if auto_rekey {
         let start_rekey = yes
             || ui::prompts::confirm_with_default(
-                "Start rekey now? (activation delay: immediate)",
+                "Rotate the group keys now?",
                 true,
             )?;
         if start_rekey {
             ui::info("Starting rekey now...");
             rekey::handle_rekey_command(
                 RekeyCommands::Start {
-                    activation_delay: Some("immediate".to_string()),
                     force: false,
                     welcome_file: None,
                     local_migration: if yes { "defer" } else { "prompt" }.to_string(),
+                    // Starting the rotation was just confirmed above.
+                    yes: true,
                 },
                 session_manager,
             )
             .await?;
         } else {
             ui::info(
-                "Rekey deferred. Run 'hybridcipher rekey start --activation-delay immediate' when ready.",
+                "Rekey deferred. Run 'hybridcipher rekey start' when ready.",
             );
         }
     }
@@ -1505,7 +1578,7 @@ pub async fn handle_verify_membership(
             match response.status() {
                 StatusCode::OK => {}
                 StatusCode::UNAUTHORIZED => {
-                    session_manager.invalidate_session("membership_proof")?;
+                    session_manager.invalidate_session("membership_proof").await?;
                     return Err(CliError::authentication(
                         "Authentication token rejected. Please login again.".to_string(),
                     ));

@@ -138,7 +138,8 @@ impl LocalClientProvider {
         keys: Option<(&[u8; 32], &[u8; 32])>,
     ) -> Result<(), String> {
         let resolved = resolve_session_context(&self.config_dir, session)?;
-        let client = build_local_client(&self.config_dir, &resolved.storage_id, keys).await?;
+        let client =
+            build_local_client(&self.config_dir, &resolved.storage_id, keys, false).await?;
 
         let client = Arc::new(client);
         client
@@ -179,9 +180,59 @@ impl LocalClientProvider {
             }
         }
 
-        let mut guard = self.client.lock().await;
-        *guard = Some(client);
+        self.replace_client(Some(client)).await;
         Ok(())
+    }
+
+    /// Open an accountless vault's storage with a client that never reads a
+    /// login session or serves the CLI's coverage socket.
+    pub async fn initialize_for_local_vault(
+        &self,
+        storage_id: &str,
+    ) -> Result<Arc<LocalClient>, String> {
+        // Opening must never create the vault's folder: an empty folder left by a
+        // failed open would be taken for the vault on the next start.
+        if !crate::local_vault::storage_present(&self.config_dir, storage_id) {
+            return Err(crate::local_vault::STORAGE_MISSING_MESSAGE.into());
+        }
+        // The vault's loader checks the keychain against the folder's own key copy.
+        let (account_key, state_key) =
+            crate::local_vault::load_storage_keys(&self.config_dir, storage_id)?;
+        let client = Arc::new(
+            build_local_client(
+                &self.config_dir,
+                storage_id,
+                Some((&account_key, &state_key)),
+                true,
+            )
+            .await?,
+        );
+        {
+            let mut ipc_guard = self.coverage_ipc.lock().await;
+            if let Some(server) = ipc_guard.take() {
+                server.shutdown().await;
+            }
+        }
+        self.replace_client(Some(client.clone())).await;
+        Ok(client)
+    }
+
+    /// Open a vault's storage beside the active client, which stays in place:
+    /// moving the vault into a signed-in account needs both at once. The caller
+    /// stops the returned client's folder watcher when done with it.
+    pub async fn open_local_vault_detached(&self, storage_id: &str) -> Result<LocalClient, String> {
+        if !crate::local_vault::storage_present(&self.config_dir, storage_id) {
+            return Err(crate::local_vault::STORAGE_MISSING_MESSAGE.into());
+        }
+        let (account_key, state_key) =
+            crate::local_vault::load_storage_keys(&self.config_dir, storage_id)?;
+        build_local_client(
+            &self.config_dir,
+            storage_id,
+            Some((&account_key, &state_key)),
+            true,
+        )
+        .await
     }
 
     /// Drop the active client (typically during logout).
@@ -190,8 +241,19 @@ impl LocalClientProvider {
         if let Some(server) = ipc_guard.take() {
             server.shutdown().await;
         }
-        let mut guard = self.client.lock().await;
-        *guard = None;
+        self.replace_client(None).await;
+    }
+
+    /// Swap the active client. The replaced client's folder watcher keeps its own
+    /// copy of that client and would otherwise keep writing state to its storage,
+    /// recreating it after a vault moves, so it is stopped here.
+    async fn replace_client(&self, next: Option<Arc<LocalClient>>) {
+        let previous = std::mem::replace(&mut *self.client.lock().await, next.clone());
+        if let Some(previous) = previous {
+            if !next.is_some_and(|next| Arc::ptr_eq(&next, &previous)) {
+                previous.stop_coverage_watchers().await;
+            }
+        }
     }
 
     /// Return the current client or an error if no session is active.
@@ -455,6 +517,7 @@ async fn build_local_client(
     base_dir: &Path,
     storage_id: &str,
     keys: Option<(&[u8; 32], &[u8; 32])>,
+    local_only: bool,
 ) -> Result<LocalClient, String> {
     let user_dir = base_dir.join(USERS_DIR).join(storage_id);
     fs::create_dir_all(&user_dir).map_err(|e| {
@@ -499,6 +562,8 @@ async fn build_local_client(
     let client_config = config_loader::load_client_config_from_files();
     let client =
         Client::with_client_config(device_keypair, storage.clone(), network, client_config);
+    // Set before any group selection, which may otherwise look up a login session.
+    client.set_local_only(local_only);
 
     if let Some(group_id) = load_active_group_id(&storage).await? {
         if let Err(err) = client.use_group(group_id).await {
@@ -529,22 +594,100 @@ async fn load_active_group_id(storage: &LocalFsStorage) -> Result<Option<Uuid>, 
     Ok(Some(parsed))
 }
 
+/// The device state key, and whether the keystore entry must be rewritten to it.
+#[derive(Debug, PartialEq)]
+enum StateKeyChoice {
+    Use([u8; 32]),
+    UseAndStore([u8; 32]),
+}
+
+/// Pick between the keystore's state key and the folder's own copy (wrapped by
+/// the account key). The keystore entry outlives deleted folders, and login
+/// writes the device keypair with the folder copy, so a disagreeing entry is
+/// replaced — unless it is the one that opens the device keypair, which is
+/// then kept rather than destroyed.
+fn choose_state_key(
+    keystore: Option<[u8; 32]>,
+    folder: Option<[u8; 32]>,
+    opens_device_keypair: impl Fn(&[u8; 32]) -> Option<bool>,
+) -> Option<StateKeyChoice> {
+    match (keystore, folder) {
+        (Some(keystore), Some(folder)) if keystore == folder => Some(StateKeyChoice::Use(keystore)),
+        (Some(keystore), Some(folder)) => {
+            if opens_device_keypair(&folder) != Some(false) {
+                Some(StateKeyChoice::UseAndStore(folder))
+            } else if opens_device_keypair(&keystore) == Some(true) {
+                Some(StateKeyChoice::Use(keystore))
+            } else {
+                Some(StateKeyChoice::Use(folder))
+            }
+        }
+        (Some(keystore), None) => Some(StateKeyChoice::Use(keystore)),
+        (None, Some(folder)) => Some(StateKeyChoice::UseAndStore(folder)),
+        (None, None) => None,
+    }
+}
+
+/// Whether `key` opens this folder's protected device keypair; `None` when
+/// there is no protected keypair to test it against.
+fn device_keypair_opens_with(user_dir: &Path, key: &[u8; 32]) -> Option<bool> {
+    let raw = fs::read_to_string(user_dir.join(DEVICE_KEYPAIR_FILE)).ok()?;
+    let protected: ProtectedData = serde_json::from_str(&raw).ok()?;
+    if protected.magic != PROTECTED_DATA_MAGIC {
+        return None;
+    }
+    Some(decrypt_with_ad(&protected, *key, DEVICE_KEYPAIR_FILE_AAD).is_ok())
+}
+
 fn load_state_encryption_key(
     user_dir: &Path,
     storage_id: &str,
     account_key: &[u8; 32],
 ) -> Result<[u8; 32], String> {
-    if let Some(key) = load_device_key_from_keystore(storage_id)? {
-        return Ok(key);
+    let keystore_result = load_device_key_from_keystore(storage_id);
+    let folder_result = load_folder_state_key(user_dir, account_key);
+    let keystore = keystore_result.as_ref().ok().copied().flatten();
+    let folder = folder_result.as_ref().ok().copied().flatten();
+    match choose_state_key(keystore, folder, |key| {
+        device_keypair_opens_with(user_dir, key)
+    }) {
+        Some(StateKeyChoice::Use(key)) => Ok(key),
+        Some(StateKeyChoice::UseAndStore(key)) => {
+            if keystore.is_some() {
+                warn!(
+                    "OS keystore state key for {} did not match {}; replacing it",
+                    storage_id, DEVICE_KEY_FILE
+                );
+            }
+            if let Err(err) = store_device_key_in_keystore(storage_id, &key) {
+                warn!(
+                    "Could not persist device state key to OS keystore for {}: {}",
+                    storage_id, err
+                );
+            }
+            Ok(key)
+        }
+        None => {
+            keystore_result?;
+            folder_result?;
+            Err(format!(
+                "Device state key is unavailable (missing in OS keystore and {} is absent). \
+                 Please log out and log in again to recover local encryption state.",
+                user_dir.join(DEVICE_KEY_FILE).display()
+            ))
+        }
     }
+}
 
+/// The state key wrapped in the folder's `device_key.protected`; `None` when
+/// that file is absent.
+fn load_folder_state_key(
+    user_dir: &Path,
+    account_key: &[u8; 32],
+) -> Result<Option<[u8; 32]>, String> {
     let path = user_dir.join(DEVICE_KEY_FILE);
     if !path.exists() {
-        return Err(format!(
-            "Device state key is unavailable (missing in OS keystore and {} is absent). \
-             Please log out and log in again to recover local encryption state.",
-            path.display()
-        ));
+        return Ok(None);
     }
 
     let raw = fs::read_to_string(&path)
@@ -577,13 +720,7 @@ fn load_state_encryption_key(
 
     let mut key = [0u8; 32];
     key.copy_from_slice(&decrypted);
-    if let Err(err) = store_device_key_in_keystore(storage_id, &key) {
-        warn!(
-            "Could not persist device state key to OS keystore for {}: {}",
-            storage_id, err
-        );
-    }
-    Ok(key)
+    Ok(Some(key))
 }
 
 fn load_account_key_from_cache(user_dir: &Path) -> Result<[u8; 32], String> {
@@ -674,6 +811,73 @@ mod session_context_tests {
         let user_dir = root.path().join(USERS_DIR).join(storage_id);
         assert!(!user_dir.join(ACCOUNT_KEY_CACHE_FILE).exists());
         assert!(user_dir.join(DEVICE_KEYPAIR_FILE).exists());
+    }
+
+    #[test]
+    fn stale_keystore_state_key_is_replaced_by_the_folder_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let (stale, folder) = ([1u8; 32], [2u8; 32]);
+        write_protected_string(
+            &root.path().join(DEVICE_KEYPAIR_FILE),
+            "keypair",
+            DEVICE_KEYPAIR_FILE_AAD,
+            &folder,
+        )
+        .unwrap();
+        let opens = |key: &[u8; 32]| device_keypair_opens_with(root.path(), key);
+
+        assert_eq!(opens(&folder), Some(true));
+        assert_eq!(opens(&stale), Some(false));
+        assert_eq!(
+            choose_state_key(Some(stale), Some(folder), opens),
+            Some(StateKeyChoice::UseAndStore(folder))
+        );
+        // A keystore entry that does open the keypair is kept, not destroyed.
+        assert_eq!(
+            choose_state_key(Some(folder), Some(stale), opens),
+            Some(StateKeyChoice::Use(folder))
+        );
+    }
+
+    #[test]
+    fn state_key_choice_without_a_disagreement() {
+        let key = [3u8; 32];
+        let no_keypair = |_: &[u8; 32]| None;
+        assert_eq!(
+            choose_state_key(Some(key), Some(key), no_keypair),
+            Some(StateKeyChoice::Use(key))
+        );
+        assert_eq!(
+            choose_state_key(Some(key), None, no_keypair),
+            Some(StateKeyChoice::Use(key))
+        );
+        assert_eq!(
+            choose_state_key(None, Some(key), no_keypair),
+            Some(StateKeyChoice::UseAndStore(key))
+        );
+        assert_eq!(
+            choose_state_key(Some([4u8; 32]), Some(key), no_keypair),
+            Some(StateKeyChoice::UseAndStore(key))
+        );
+        assert_eq!(choose_state_key(None, None, no_keypair), None);
+    }
+
+    #[test]
+    fn folder_state_key_opens_with_the_account_key() {
+        let root = tempfile::tempdir().unwrap();
+        let (account_key, state_key) = ([5u8; 32], [6u8; 32]);
+        assert_eq!(load_folder_state_key(root.path(), &account_key), Ok(None));
+        let protected = encrypt_with_ad(&state_key, account_key, DEVICE_KEY_FILE_AAD).unwrap();
+        fs::write(
+            root.path().join(DEVICE_KEY_FILE),
+            serde_json::to_string(&protected).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_folder_state_key(root.path(), &account_key),
+            Ok(Some(state_key))
+        );
+        assert!(load_folder_state_key(root.path(), &[7u8; 32]).is_err());
     }
 }
 

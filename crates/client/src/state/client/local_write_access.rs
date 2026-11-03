@@ -1,6 +1,9 @@
 use super::*;
 use crate::local_write_access::{self, GroupCache, LocalWriteAccess};
 
+/// Matches the background refresh interval in `refresh_local_write_access`.
+const LOCAL_WRITE_VERIFIED_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl<S: Storage, N: Network> Client<S, N> {
     pub async fn cache_team_directory(&self, value: &serde_json::Value) -> Result<(), ClientError> {
         self.storage
@@ -36,6 +39,7 @@ impl<S: Storage, N: Network> Client<S, N> {
             .write()
             .map_err(|_| ClientError::InvalidState("Local access lock unavailable".into()))? =
             Some(identity);
+        self.forget_verified_write_access();
         Ok(())
     }
 
@@ -65,6 +69,9 @@ impl<S: Storage, N: Network> Client<S, N> {
         let Some((issuer, user_id)) = identity else {
             return Ok(());
         };
+        if self.write_access_recently_verified(group_id) {
+            return Ok(());
+        }
         self.refresh_local_write_access().await;
         let raw = self
             .storage
@@ -107,7 +114,28 @@ impl<S: Storage, N: Network> Client<S, N> {
             group_id,
             &keys,
             Utc::now().timestamp(),
-        )
+        )?;
+        if let Ok(mut verified) = self.local_write_verified.lock() {
+            verified.insert(group_id, std::time::Instant::now());
+        }
+        Ok(())
+    }
+
+    /// A passed check is trusted for as long as the background refresh waits:
+    /// another process (the CLI) may record a revocation, and is seen within it.
+    fn write_access_recently_verified(&self, group_id: Uuid) -> bool {
+        self.local_write_verified.lock().is_ok_and(|verified| {
+            verified
+                .get(&group_id)
+                .is_some_and(|at| at.elapsed() < LOCAL_WRITE_VERIFIED_FOR)
+        })
+    }
+
+    /// Called whenever an input to the check changes in this process.
+    pub(crate) fn forget_verified_write_access(&self) {
+        if let Ok(mut verified) = self.local_write_verified.lock() {
+            verified.clear();
+        }
     }
 
     pub async fn require_local_write(&self) -> Result<(), ClientError> {
@@ -122,7 +150,7 @@ impl<S: Storage, N: Network> Client<S, N> {
     /// authorizes a request; network failures leave the signed offline grant intact.
     async fn refresh_local_write_access(&self) {
         let mut last = self.local_access_refresh.lock().await;
-        if last.is_some_and(|time| time.elapsed() < std::time::Duration::from_secs(30)) {
+        if last.is_some_and(|time| time.elapsed() < LOCAL_WRITE_VERIFIED_FOR) {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -286,6 +314,11 @@ impl<S: Storage, N: Network> Client<S, N> {
         self.storage
             .store_config("group_metadata_cache", &cache.to_string())
             .await?;
+        self.forget_verified_write_access();
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/licensing/test_local_write_cache.rs"]
+mod local_write_cache_tests;

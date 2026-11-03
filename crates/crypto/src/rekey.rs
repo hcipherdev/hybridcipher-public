@@ -28,7 +28,7 @@ mod tests {
 
     #[test]
     fn cutover_commit_message_matches_layout() {
-        let operation_id = Uuid::new_v4();
+        let operation_id = Uuid::from_u128(0x1234);
         let commitment = [0xABu8; 32];
         let message = cutover_commit_message(operation_id, &commitment);
 

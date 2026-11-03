@@ -7,7 +7,6 @@ use crate::{
     ui,
 };
 use chrono::{DateTime, Utc};
-use humantime::parse_duration;
 use hybridcipher_client::{
     network::MockNetwork, rekey::RekeyProgressState, storage::LocalFsStorage, ClientError,
 };
@@ -33,69 +32,19 @@ fn status_poll_interval() -> Duration {
 
 type LocalClient = hybridcipher_client::state::client::Client<LocalFsStorage, MockNetwork>;
 
-fn parse_activation_delay_argument(raw: &str) -> Result<u64, CliError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(CliError::invalid_input(
-            "Activation delay value cannot be empty",
-        ));
-    }
-
-    let normalized = trimmed.to_lowercase();
-    if matches!(normalized.as_str(), "immediate" | "now" | "0" | "0s") {
-        return Ok(0);
-    }
-
-    if let Ok(secs) = normalized.parse::<u64>() {
-        return Ok(secs);
-    }
-
-    match parse_duration(trimmed) {
-        Ok(duration) => {
-            let secs = duration.as_secs();
-            if secs > i64::MAX as u64 {
-                Err(CliError::invalid_input(
-                    "Activation delay exceeds supported range",
-                ))
-            } else {
-                Ok(secs)
-            }
-        }
-        Err(err) => Err(CliError::invalid_input(format!(
-            "Invalid activation delay '{}': {}",
-            raw, err
-        ))),
-    }
-}
-
 pub async fn handle_rekey_command(
     command: RekeyCommands,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
     match command {
         RekeyCommands::Start {
-            activation_delay,
             force,
             welcome_file,
             local_migration,
-        } => {
-            handle_rekey_start(
-                force,
-                activation_delay,
-                welcome_file,
-                local_migration,
-                session_manager,
-            )
-            .await
-        }
+            yes,
+        } => handle_rekey_start(force, welcome_file, local_migration, yes, session_manager).await,
+        RekeyCommands::Preflight { json } => handle_rekey_preflight(json, session_manager).await,
         RekeyCommands::Status { watch } => handle_rekey_status(watch, session_manager).await,
-        RekeyCommands::Cutover {
-            force,
-            immediate_cleanup,
-        } => handle_rekey_cutover(force, immediate_cleanup, session_manager).await,
-        RekeyCommands::Fallback { reason, yes } => {
-            handle_rekey_fallback(reason, yes, session_manager).await
-        }
     }
 }
 
@@ -105,13 +54,138 @@ struct SkippedDevice {
     user_id: Uuid,
     device_id: String,
     reason: String,
+    /// Stable reason for the desktop's pre-rotation check (`rekey preflight --json`).
+    code: &'static str,
+}
+
+/// Device problems the rotation would stop on, as `rekey preflight` reports them.
+const NOT_VERIFIED_HERE_REASON: &str = "Not verified on this computer";
+
+/// How `rekey start` reads the server's answer. Only a 409 means a rotation is already
+/// running; every other failure is a rejection whose message must be shown.
+#[derive(Debug, PartialEq, Eq)]
+enum RekeyStartOutcome {
+    Accepted,
+    AlreadyRunning,
+    Rejected,
+}
+
+fn classify_rekey_start_response(status: StatusCode) -> RekeyStartOutcome {
+    if status.is_success() {
+        RekeyStartOutcome::Accepted
+    } else if status == StatusCode::CONFLICT {
+        RekeyStartOutcome::AlreadyRunning
+    } else {
+        RekeyStartOutcome::Rejected
+    }
+}
+
+/// The `error`/`message` field of a JSON error body, or the body itself.
+fn server_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            ["error", "message"]
+                .iter()
+                .find_map(|key| value.get(*key).and_then(|field| field.as_str()).map(str::to_string))
+        })
+        .unwrap_or_else(|| body.trim().to_string())
+}
+
+/// Reset an in-progress migration record to idle. Returns whether it was active.
+fn reset_stale_migration(info: &mut MigrationInfo) -> bool {
+    if !info.phase.is_active() {
+        return false;
+    }
+    info.phase = MigrationPhase::Idle;
+    info.target_epoch = None;
+    info.progress = 0.0;
+    info.pending_files.clear();
+    true
+}
+
+/// The server has no rotation for this group, so a local "migration in progress"
+/// record (for example from a start the server rejected) is stale.
+fn clear_stale_migration_record(session_manager: &SessionManager) -> Result<bool, CliError> {
+    let Some(mut info) = session_manager.migration_info() else {
+        return Ok(false);
+    };
+    if !reset_stale_migration(&mut info) {
+        return Ok(false);
+    }
+    session_manager.update_migration_info(info)?;
+    Ok(true)
+}
+
+/// One device the rotation would stop on (or skip with `--force`), for the desktop's check.
+#[derive(Debug, serde::Serialize)]
+struct PreflightDevice {
+    user_id: Uuid,
+    email: Option<String>,
+    device_id: String,
+    device_name: Option<String>,
+    reason_code: &'static str,
+    reason: String,
+}
+
+/// Run the rotation's per-device checks without starting one, so the desktop can offer
+/// "Verify now" or "Rotate without them" before anything fails.
+async fn handle_rekey_preflight(json: bool, session_manager: &SessionManager) -> Result<(), CliError> {
+    let group_id = session_manager.ensure_current_group().await?;
+    session_manager
+        .require_group_admin(group_id, "hybridcipher rekey preflight")
+        .await?;
+    let audit = diagnostics::fetch_device_audit(session_manager, group_id, 30).await?;
+    let (_, problems) =
+        auto_generate_welcome_payloads(session_manager, group_id, &audit, 0, true, true).await?;
+    let emails = if problems.is_empty() {
+        HashMap::new()
+    } else {
+        fetch_group_member_emails(session_manager, group_id).await?
+    };
+    let devices: Vec<PreflightDevice> = problems
+        .into_iter()
+        .map(|problem| PreflightDevice {
+            email: emails.get(&problem.user_id).cloned(),
+            device_name: audit
+                .devices
+                .iter()
+                .find(|device| device.device_id == problem.device_id)
+                .and_then(|device| device.device_name.clone()),
+            user_id: problem.user_id,
+            device_id: problem.device_id,
+            reason_code: problem.code,
+            reason: problem.reason,
+        })
+        .collect();
+
+    if json {
+        let output = serde_json::json!({ "group_id": group_id, "devices": devices });
+        println!("{}", output);
+        return Ok(());
+    }
+    ui::section("Rotation Check");
+    if devices.is_empty() {
+        ui::success("Every device in this group can receive a new key from this computer.");
+        return Ok(());
+    }
+    for device in &devices {
+        let owner = device.email.clone().unwrap_or_else(|| device.user_id.to_string());
+        ui::warning(&format!("  {} ({}) - {}", device.device_id, owner, device.reason));
+    }
+    let reasons: Vec<&str> = devices
+        .iter()
+        .map(|device| device.reason.as_str())
+        .collect();
+    println!("{}", rekey_problem_guidance(&reasons));
+    Ok(())
 }
 
 async fn handle_rekey_start(
     force: bool,
-    activation_delay: Option<String>,
     welcome_file: Option<PathBuf>,
     local_migration: String,
+    assume_yes: bool,
     session_manager: &SessionManager,
 ) -> Result<(), CliError> {
     ui::section("Start Rekey Operation");
@@ -181,11 +255,9 @@ async fn handle_rekey_start(
                     existing_status.progress.total_files
                 ));
                 println!();
-                ui::info("To proceed, you must first complete or cancel the existing rekey:");
-                ui::info("  • Run 'hybridcipher rekey cutover' to complete the migration");
-                ui::info("  • Run 'hybridcipher rekey fallback' to cancel and rollback");
+                ui::info("The server finishes it within a minute; then start the new rotation.");
                 return Err(CliError::migration(
-                    "Cannot start a new rekey while another is in progress. Complete or cancel the existing rekey first."
+                    "Cannot start a new rekey while another one is still finishing. Try again in a minute.",
                 ));
             }
         }
@@ -199,42 +271,28 @@ async fn handle_rekey_start(
         }
     }
 
-    let activation_delay_seconds = activation_delay
-        .as_deref()
-        .map(parse_activation_delay_argument)
-        .transpose()?;
-
     let audit = diagnostics::fetch_device_audit(session_manager, group_id, 30).await?;
 
-    let stale_devices: Vec<String> = audit
-        .devices
-        .iter()
-        .filter(|device| device.stale)
-        .map(|device| format!("{} (user {})", device.device_id, device.user_id))
-        .collect();
+    let stale_devices = stale_devices_blocking_rekey(&audit.devices);
     if !stale_devices.is_empty() {
-        return Err(CliError::migration(format!(
-            "Device audit detected stale or incomplete records. Resolve before rekey: {}",
+        if !force {
+            return Err(CliError::migration(format!(
+                "Device audit detected stale or incomplete records. Resolve before rekey, or use --force to continue without them: {}",
+                stale_devices.join(", ")
+            )));
+        }
+        ui::warning(&format!(
+            "Continuing with stale devices (--force). Any that cannot receive the new key are skipped: {}",
             stale_devices.join(", ")
-        )));
+        ));
     }
 
     // Always use fresh client state as the authoritative source
     let current_epoch = hc_client.current_epoch().await;
-
-    // Only use migration state if it's for a future epoch (active migration)
-    // Ignore completed migrations where to_epoch == current_epoch
-    let target_epoch = hc_client
-        .migration_snapshot()
-        .await
-        .and_then(|state| {
-            if state.to_epoch > current_epoch {
-                Some(state.to_epoch)
-            } else {
-                None // Stale/completed migration, ignore it
-            }
-        })
-        .unwrap_or_else(|| current_epoch.saturating_add(1));
+    let staged_epoch = hc_client.migration_snapshot().await.map(|state| state.to_epoch);
+    let highest_issued =
+        fetch_highest_key_version(&http_client, &session, group_id, &server_url).await;
+    let target_epoch = choose_rekey_target(current_epoch, staged_epoch, highest_issued);
 
     let migration_snapshot = session_manager.migration_info();
 
@@ -270,8 +328,15 @@ async fn handle_rekey_start(
         }
         None => {
             ui::dim("No welcome bundle provided; generating payloads for all active devices.");
-            auto_generate_welcome_payloads(session_manager, group_id, &audit, target_epoch, force)
-                .await?
+            auto_generate_welcome_payloads(
+                session_manager,
+                group_id,
+                &audit,
+                target_epoch,
+                force,
+                false,
+            )
+            .await?
         }
     };
 
@@ -316,6 +381,7 @@ async fn handle_rekey_start(
         target_epoch,
         affected_files,
         coverage_info,
+        assume_yes,
     )? {
         ui::info("Rekey start cancelled");
         return Ok(());
@@ -342,7 +408,6 @@ async fn handle_rekey_start(
             .collect();
     }
     migration_record.progress = 0.0;
-    session_manager.update_migration_info(migration_record)?;
 
     let welcome_json = welcome::serialize_welcome_payloads(&messages)?;
 
@@ -362,12 +427,18 @@ async fn handle_rekey_start(
         "client_epoch_id".into(),
         serde_json::Value::Number(serde_json::Number::from(target_epoch)),
     );
-    if let Some(secs) = activation_delay_seconds {
-        payload.insert(
-            "policy_overrides".into(),
-            serde_json::json!({ "activation_delay_seconds": secs }),
-        );
-    }
+    // Only --force leaves devices out; the server accepts missing Welcomes only for these.
+    payload.insert(
+        "skip_devices".into(),
+        serde_json::Value::Array(
+            skipped_devices
+                .iter()
+                .map(|device| {
+                    serde_json::json!({ "user_id": device.user_id, "device_id": device.device_id })
+                })
+                .collect(),
+        ),
+    );
     let payload = serde_json::Value::Object(payload);
 
     let response = http_client
@@ -379,19 +450,38 @@ async fn handle_rekey_start(
         .map_err(|e| CliError::network(format!("Failed to contact server: {}", e)))?;
 
     if response.status() == StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("rekey_start")?;
+        session_manager.invalidate_session("rekey_start").await?;
         return Err(CliError::authentication(
             "Authentication token rejected. Please login again.".to_string(),
         ));
     }
 
-    let active_status = if response.status().is_success() {
+    let outcome = classify_rekey_start_response(response.status());
+    let active_status = if outcome == RekeyStartOutcome::Accepted {
         let rekey: ApiRekeyResponse = response
             .json()
             .await
             .map_err(|e| CliError::network(format!("Failed to parse rekey response: {}", e)))?;
+        session_manager.update_migration_info(migration_record)?;
 
         ui::success("Epoch descriptor published");
+        ui::desktop::report_result(
+            "keys_rotation_started",
+            serde_json::json!({
+                "group_id": group_id,
+                "rekey_id": rekey.rekey_id,
+                "new_epoch_id": rekey.new_epoch_id,
+                "devices_welcomed": messages.len(),
+                "skipped_devices": skipped_devices
+                    .iter()
+                    .map(|device| serde_json::json!({
+                        "user_id": device.user_id,
+                        "device_id": device.device_id,
+                        "reason": device.reason,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
         ui::info(&format!("Rekey ID: {}", rekey.rekey_id));
         ui::info(&format!(
             "Target epoch: {}",
@@ -403,11 +493,17 @@ async fn handle_rekey_start(
         ));
         ui::info(&format!("Initiated: {}", rekey.initiated_at));
 
-        // Brief delay to allow server to fully persist the rekey operation
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-        // Send initial heartbeat before fetching status so server has file counts
-        if let Err(err) = ensure_initiator_progress(&hc_client).await {
+        if rekey.status.eq_ignore_ascii_case("completed") {
+            // The rotation finished as it started: switch this device to the new key, which
+            // the files moved below are encrypted with.
+            if let Err(err) = hc_client.rekey_status().await {
+                ui::warning(&format!(
+                    "This device has not switched to the new key yet: {}",
+                    err
+                ));
+            }
+        // An older server keeps the rotation running until it is cut over.
+        } else if let Err(err) = ensure_initiator_progress(&hc_client).await {
             let is_transient_race = match &err {
                 ClientError::NetworkError { context, .. } => {
                     context.message.contains("No active rekey operation")
@@ -440,9 +536,7 @@ async fn handle_rekey_start(
                 None
             }
         }
-    } else if response.status() == StatusCode::CONFLICT
-        || response.status() == StatusCode::BAD_REQUEST
-    {
+    } else if outcome == RekeyStartOutcome::AlreadyRunning {
         ui::warning("An active rekey operation already exists – displaying dashboard");
         fetch_rekey_status(
             &http_client,
@@ -459,9 +553,10 @@ async fn handle_rekey_start(
             .text()
             .await
             .unwrap_or_else(|_| "<unavailable>".to_string());
-        return Err(CliError::network(format!(
-            "Rekey publish failed with status {}: {}",
-            status, body
+        return Err(CliError::migration(format!(
+            "The server rejected the key rotation ({}): {}",
+            status,
+            server_error_message(&body)
         )));
     };
 
@@ -473,9 +568,12 @@ async fn handle_rekey_start(
             render_rekey_dashboard(status);
         }
         update_session_migration_from_status(session_manager, status).await?;
+        if is_cutover_complete(status) {
+            ui::success("Key rotation finished: the group now uses the new key.");
+            let mut backup_refreshed = false;
+            ensure_cutover_backup(session_manager, status, &mut backup_refreshed).await?;
+        }
     }
-
-    ui::info("Run 'hybridcipher rekey status --watch' to monitor progress.");
 
     // Display warning about skipped devices if any
     if !skipped_devices.is_empty() {
@@ -517,20 +615,22 @@ async fn handle_rekey_start(
         println!();
     }
 
+    let print_deferred = || {
+        ui::info("Files on this device stay readable on the old key. To move them later, run:");
+        ui::info("  hybridcipher coverage scan");
+        ui::info("  hybridcipher coverage migrate --all");
+    };
     match local_migration.trim().to_ascii_lowercase().as_str() {
         "now" => run_local_coverage_migration(&hc_client).await?,
-        "defer" => {
-            ui::info("Migration deferred. When ready, run:");
-            ui::info("  hybridcipher coverage scan");
-            ui::info("  hybridcipher coverage migrate --all");
-        }
+        "defer" => print_deferred(),
         "prompt" | "" => {
-            if ui::prompts::confirm_with_default("Run local coverage migration now?", true)? {
+            if ui::prompts::confirm_with_default(
+                "Move this device's files to the new key now?",
+                true,
+            )? {
                 run_local_coverage_migration(&hc_client).await?;
             } else {
-                ui::info("Migration deferred. When ready, run:");
-                ui::info("  hybridcipher coverage scan");
-                ui::info("  hybridcipher coverage migrate --all");
+                print_deferred();
             }
         }
         other => {
@@ -544,12 +644,122 @@ async fn handle_rekey_start(
     Ok(())
 }
 
+/// Stale devices that stop a rekey before payload generation. An expired join card
+/// alone is left to the per-device checks, which name the fix and honour --force.
+fn stale_devices_blocking_rekey(devices: &[diagnostics::DeviceAuditEntry]) -> Vec<String> {
+    devices
+        .iter()
+        .filter(|device| device.stale)
+        .filter(|device| {
+            device.reasons.is_empty()
+                || device
+                    .reasons
+                    .iter()
+                    .any(|reason| !reason.starts_with(JOIN_CARD_EXPIRED_REASON))
+        })
+        .map(|device| {
+            format!(
+                "{} (user {}; {})",
+                device.device_id,
+                device.user_id,
+                device.reasons.join("; ")
+            )
+        })
+        .collect()
+}
+
+/// Problem label for devices whose published join card has expired.
+const JOIN_CARD_EXPIRED_REASON: &str = "Join card expired";
+
+/// "To resolve" section of the rekey refusal, listing a fix for each problem kind present.
+fn rekey_problem_guidance(reasons: &[&str]) -> String {
+    // Reasons may carry details after the label ("Join card expired at …").
+    let has = |label: &str| reasons.iter().any(|reason| reason.starts_with(label));
+    let mut guidance = String::from("\nTo resolve:\n");
+    if has("Join card not found") || has("Invitation key missing") {
+        guidance.push_str(
+            "  • Missing join card: ask the device owner to run `hybridcipher publish-joincard` on the affected device\n",
+        );
+    }
+    if has(JOIN_CARD_EXPIRED_REASON) {
+        guidance.push_str(
+            "  • Expired join card: open HybridCipher (or sign in) on that device so it re-publishes its join card, then retry\n",
+        );
+    }
+    if has(NOT_VERIFIED_HERE_REASON) {
+        guidance.push_str(
+            "  • Not verified on this computer: compare the device's fingerprint with its owner and verify it (Team administration → Devices to verify, or `hybridcipher pin verify <USER_ID_OR_EMAIL> <DEVICE_ID>`)\n",
+        );
+    }
+    if has("Pinned key expired") {
+        guidance.push_str("  • Expired pin: request a fresh join card, then re-pin and verify\n");
+    }
+    guidance.push_str("  • Or remove unused devices\n");
+    guidance.push_str(
+        "  • Or use --force to skip these devices (they will not receive the new epoch key)\n",
+    );
+    guidance
+}
+
+/// Member emails by user ID, for naming devices in messages. A failed lookup leaves them out;
+/// only a rejected sign-in is an error.
+async fn fetch_group_member_emails(
+    session_manager: &SessionManager,
+    group_id: Uuid,
+) -> Result<HashMap<Uuid, String>, CliError> {
+    let mut user_emails = HashMap::new();
+    let session = session_manager.require_auth()?;
+    let members_url = format!("{}/api/v1/groups/{}/members", session.server_url, group_id);
+    let Ok(response) = reqwest::Client::new()
+        .get(&members_url)
+        .bearer_auth(&session.token)
+        .send()
+        .await
+    else {
+        return Ok(user_emails);
+    };
+    if response.status() == StatusCode::UNAUTHORIZED {
+        session_manager
+            .invalidate_session("rekey_missing_join_cards")
+            .await?;
+        return Err(CliError::authentication(
+            "Authentication token rejected. Please login again.".to_string(),
+        ));
+    }
+    if !response.status().is_success() {
+        return Ok(user_emails);
+    }
+    if let Ok(members_data) = response.json::<serde_json::Value>().await {
+        for member in members_data
+            .get("members")
+            .and_then(|m| m.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(user_id), Some(email)) = (
+                member
+                    .get("user_id")
+                    .and_then(|id| id.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok()),
+                member.get("email").and_then(|e| e.as_str()),
+            ) {
+                user_emails.insert(user_id, email.to_string());
+            }
+        }
+    }
+    Ok(user_emails)
+}
+
+/// Build the new key's Welcome payload for every device that can safely receive it. `check_only`
+/// runs the same per-device checks without generating anything or stopping on problems, so the
+/// pre-rotation check and the rotation itself cannot disagree.
 async fn auto_generate_welcome_payloads(
     session_manager: &SessionManager,
     group_id: Uuid,
     audit: &diagnostics::DeviceAuditResponse,
     target_epoch: u64,
     force: bool,
+    check_only: bool,
 ) -> Result<(Vec<welcome::ApiWelcomeMessage>, Vec<SkippedDevice>), CliError> {
     if audit.devices.is_empty() {
         return Err(CliError::migration(
@@ -574,6 +784,7 @@ async fn auto_generate_welcome_payloads(
     let mut missing_join_cards = Vec::new();
     let mut missing_pins = Vec::new();
     let mut expired_pins = Vec::new();
+    let mut expired_join_cards = Vec::new();
     let mut payloads = Vec::new();
     let mut skipped_devices = Vec::new();
 
@@ -584,7 +795,12 @@ async fn auto_generate_welcome_payloads(
         }
 
         let device_key = (device.user_id, device.device_id.clone());
-        let join_card = if let Some(card) = cached_cards.get(&device_key) {
+        // A locally cached card can be older than the one the device has since
+        // re-published, so only an unexpired cached card short-circuits the directory.
+        let join_card = if let Some(card) = cached_cards
+            .get(&device_key)
+            .filter(|card| card.is_valid())
+        {
             card.clone()
         } else {
             if !directory_cache.contains_key(&device.user_id) {
@@ -614,6 +830,13 @@ async fn auto_generate_welcome_payloads(
             }
         };
 
+        // Report expired cards with the other per-device problems instead of
+        // letting the pin check abort the whole rotation.
+        if !join_card.is_valid() {
+            expired_join_cards.push((device.device_id.clone(), device.user_id, join_card.expires_at));
+            continue;
+        }
+
         match session_manager
             .check_or_restore_join_card_pin(&join_card)
             .await?
@@ -623,6 +846,12 @@ async fn auto_generate_welcome_payloads(
                 ui::dim(&format!(
                     "Restored cached verification for {} (device {}).",
                     device.user_id, device.device_id
+                ));
+            }
+            JoinCardPinState::RestoredFromOwnDevice { verifier_device_id } => {
+                ui::dim(&format!(
+                    "Device {} (user {}) was verified on your device {}.",
+                    device.device_id, device.user_id, verifier_device_id
                 ));
             }
             JoinCardPinState::Unverified { .. } => {
@@ -656,6 +885,9 @@ async fn auto_generate_welcome_payloads(
             }
         }
 
+        if check_only {
+            continue;
+        }
         let generated = client
             .generate_welcome_for_join_card(group_id, join_card.clone(), Some(target_epoch))
             .await
@@ -680,6 +912,7 @@ async fn auto_generate_welcome_payloads(
                 user_id: device.user_id,
                 device_id: device.device_id.clone(),
                 reason: "Invitation key missing".to_string(),
+                code: "invitation_key_missing",
             });
         }
     }
@@ -694,6 +927,7 @@ async fn auto_generate_welcome_payloads(
                 user_id: device.user_id,
                 device_id: device.device_id.clone(),
                 reason: "Join card not found".to_string(),
+                code: "join_card_missing",
             });
         }
     }
@@ -707,9 +941,22 @@ async fn auto_generate_welcome_payloads(
             skipped_devices.push(SkippedDevice {
                 user_id: device.user_id,
                 device_id: device.device_id.clone(),
-                reason: "Key pinning verification required".to_string(),
+                reason: NOT_VERIFIED_HERE_REASON.to_string(),
+                code: "not_verified_here",
             });
         }
+    }
+
+    for (device_id, user_id, expired_at) in &expired_join_cards {
+        skipped_devices.push(SkippedDevice {
+            user_id: *user_id,
+            device_id: device_id.clone(),
+            reason: format!(
+                "Join card expired at {}",
+                ui::formatting::format_local_datetime(expired_at)
+            ),
+            code: "join_card_expired",
+        });
     }
 
     for (device_id, user_id, pinned_at) in &expired_pins {
@@ -720,7 +967,12 @@ async fn auto_generate_welcome_payloads(
                 "Pinned key expired at {}",
                 ui::formatting::format_local_datetime(&pinned_at)
             ),
+            code: "pin_expired",
         });
+    }
+
+    if check_only {
+        return Ok((payloads, skipped_devices));
     }
 
     // When force is false, return errors as before
@@ -765,9 +1017,13 @@ async fn auto_generate_welcome_payloads(
                 problem_devices.push((
                     device.user_id,
                     device.device_id.clone(),
-                    "Join card not pinned",
+                    NOT_VERIFIED_HERE_REASON,
                 ));
             }
+        }
+
+        for (device_id, user_id, _) in &expired_join_cards {
+            problem_devices.push((*user_id, device_id.clone(), JOIN_CARD_EXPIRED_REASON));
         }
 
         for (device_id, user_id, _) in &expired_pins {
@@ -775,58 +1031,12 @@ async fn auto_generate_welcome_payloads(
         }
 
         if !problem_devices.is_empty() {
-            // Fetch user emails from group members list
-            let mut user_emails = HashMap::new();
-
-            let http_client = reqwest::Client::new();
-            let session = session_manager.require_auth()?;
-            let server_url = session.server_url.clone();
-
-            // Fetch group members to get email addresses
-            let members_url = format!("{}/api/v1/groups/{}/members", server_url, group_id);
-            if let Ok(response) = http_client
-                .get(&members_url)
-                .bearer_auth(&session.token)
-                .send()
-                .await
-            {
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    session_manager.invalidate_session("rekey_missing_join_cards")?;
-                    return Err(CliError::authentication(
-                        "Authentication token rejected. Please login again.".to_string(),
-                    ));
-                }
-
-                if response.status().is_success() {
-                    if let Ok(members_data) = response.json::<serde_json::Value>().await {
-                        if let Some(members) =
-                            members_data.get("members").and_then(|m| m.as_array())
-                        {
-                            for member in members {
-                                if let (Some(user_id), Some(email)) = (
-                                    member
-                                        .get("user_id")
-                                        .and_then(|id| id.as_str())
-                                        .and_then(|s| Uuid::parse_str(s).ok()),
-                                    member.get("email").and_then(|e| e.as_str()),
-                                ) {
-                                    user_emails.insert(user_id, email.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let user_emails = fetch_group_member_emails(session_manager, group_id).await?;
 
             // Build detailed error message
             let mut error_msg = String::from(
                 "Rekey cannot start because device join card or pin requirements are not met for the following devices:\n\n",
             );
-
-            let mut has_missing_join_card = false;
-            let mut has_missing_invitation_key = false;
-            let mut has_unverified_pin = false;
-            let mut has_expired_pin = false;
 
             for (idx, (user_id, device_id, reason)) in problem_devices.iter().enumerate() {
                 let user_id_str = user_id.to_string();
@@ -841,36 +1051,13 @@ async fn auto_generate_welcome_payloads(
                     email,
                     reason
                 ));
-
-                match *reason {
-                    "Join card not found" => has_missing_join_card = true,
-                    "Invitation key missing" => has_missing_invitation_key = true,
-                    "Join card not pinned" => has_unverified_pin = true,
-                    "Pinned key expired" => has_expired_pin = true,
-                    _ => {}
-                }
             }
 
-            error_msg.push_str("\nTo resolve:\n");
-            if has_missing_join_card || has_missing_invitation_key {
-                error_msg.push_str(
-                    "  • Missing join card: ask the device owner to run `hybridcipher publish-joincard` on the affected device\n",
-                );
-            }
-            if has_unverified_pin {
-                error_msg.push_str(
-                    "  • Unverified device: run `hybridcipher pin verify <USER_ID_OR_EMAIL> <DEVICE_ID>` to verify the pin\n",
-                );
-            }
-            if has_expired_pin {
-                error_msg.push_str(
-                    "  • Expired pin: request a fresh join card, then re-pin and verify\n",
-                );
-            }
-            error_msg.push_str("  • Or remove unused devices\n");
-            error_msg.push_str(
-                "  • Or use --force to skip these devices (they will not receive the new epoch key)\n",
-            );
+            let reasons = problem_devices
+                .iter()
+                .map(|(_, _, reason)| *reason)
+                .collect::<Vec<_>>();
+            error_msg.push_str(&rekey_problem_guidance(&reasons));
 
             return Err(CliError::migration(error_msg));
         }
@@ -914,7 +1101,7 @@ async fn fetch_user_emails_for_devices(
         let url = format!("{}/api/v1/users/{}", server_url, user_id);
         match client.get(&url).bearer_auth(&session.token).send().await {
             Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                session_manager.invalidate_session("rekey_fetch_user_emails")?;
+                session_manager.invalidate_session("rekey_fetch_user_emails").await?;
                 return Err(CliError::authentication(
                     "Authentication token rejected. Please login again.".to_string(),
                 ));
@@ -1252,136 +1439,52 @@ async fn handle_rekey_status(
     Ok(())
 }
 
-async fn handle_rekey_cutover(
-    force: bool,
-    immediate_cleanup: bool,
-    session_manager: &SessionManager,
-) -> Result<(), CliError> {
-    ui::section("Force Rekey Cutover");
-
-    let group_id = session_manager.ensure_current_group().await?;
-    session_manager
-        .require_group_admin(group_id, "hybridcipher rekey cutover")
-        .await?;
-
-    let client = session_manager.create_client().await?;
-
-    match client.rekey_status().await? {
-        Some(_) => {}
-        None => {
-            return Err(CliError::validation(
-                "No active rekey operation is available for cutover",
-            ));
-        }
+/// The rotation's new key version: the staged one if a start is being retried, otherwise
+/// current + 1, but always past every version the server has issued. A cancelled rotation's
+/// version is never reused, because devices that took part in it still hold that key.
+fn choose_rekey_target(current: u64, staged: Option<u64>, highest_issued: Option<u64>) -> u64 {
+    let candidate = staged
+        .filter(|staged| *staged > current)
+        .unwrap_or_else(|| current.saturating_add(1));
+    match highest_issued {
+        Some(highest) if highest >= candidate => highest.saturating_add(1),
+        _ => candidate,
     }
-    let summary = client
-        .cutover_rekey(force, immediate_cleanup)
-        .await
-        .map_err(CliError::from)?;
-
-    ui::success("Cutover completed.");
-    ui::info(&format!("Cutover ID: {}", summary.cutover_id));
-    ui::info(&format!("New epoch: {}", summary.new_epoch_id));
-    ui::info(&format!("Old epoch: {}", summary.old_epoch_id));
-    ui::info(&format!("Completed at: {}", summary.completed_at));
-    ui::info(&format!("Cleanup status: {}", summary.cleanup_status));
-    ui::info("Run 'hybridcipher rekey status' to verify the migration state.");
-
-    if let Err(err) = crate::commands::recovery::append_active_epoch_to_artifact(
-        session_manager,
-        summary.group_id,
-    )
-    .await
-    {
-        ui::warning(&format!(
-            "Cutover completed but failed to append backup artifact: {}",
-            err
-        ));
-    }
-
-    Ok(())
 }
 
-async fn handle_rekey_fallback(
-    reason: Option<String>,
-    assume_yes: bool,
-    session_manager: &SessionManager,
-) -> Result<(), CliError> {
-    ui::section("Cancel Rekey Operation");
-
-    let group_id = session_manager.ensure_current_group().await?;
-    session_manager
-        .require_group_admin(group_id, "hybridcipher rekey fallback")
-        .await?;
-
-    let normalized_reason = reason
-        .as_ref()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string());
-
-    if !assume_yes {
-        let mut prompt = String::from(
-            "This will cancel the active rekey operation and restore the previous epoch. Continue?",
-        );
-        if let Some(ref detail) = normalized_reason {
-            prompt.push_str(&format!("\nReason: {}", detail));
-        }
-
-        if !ui::prompts::confirm_with_default(&prompt, false)? {
-            ui::info("Rekey fallback aborted at user request.");
-            return Ok(());
-        }
+/// Highest key version the server has issued for the group, cancelled rotations included.
+/// `None` when the server can't say (an older server); the server still refuses a used version.
+async fn fetch_highest_key_version(
+    client: &reqwest::Client,
+    session: &crate::session::Session,
+    group_id: Uuid,
+    server_url: &str,
+) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct KeyStatus {
+        #[serde(default)]
+        versions: Vec<KeyVersion>,
     }
-
-    session_manager.require_auth()?;
-    session_manager.ensure_current_group().await?;
-    let client = session_manager.create_client().await?;
-
-    let summary = client
-        .fallback_rekey(normalized_reason.clone())
+    #[derive(Deserialize)]
+    struct KeyVersion {
+        version: u64,
+    }
+    let response = client
+        .get(format!("{}/api/v1/groups/{}/key-status", server_url, group_id))
+        .bearer_auth(&session.token)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
         .await
-        .map_err(CliError::from)?;
-
-    if let Some(mut info) = session_manager.migration_info() {
-        info.phase = MigrationPhase::Failed {
-            error: "Rekey cancelled via fallback".to_string(),
-        };
-        info.target_epoch = None;
-        info.progress = 0.0;
-        info.total_files = 0;
-        info.pending_files.clear();
-        session_manager.update_migration_info(info)?;
+        .ok()?;
+    if !response.status().is_success() {
+        ui::dim(&format!(
+            "Note: could not read the group's key versions ({}); using the next version after the current one.",
+            response.status()
+        ));
+        return None;
     }
-
-    session_manager.synchronize_migration_state().await?;
-
-    ui::success("Rekey operation cancelled.");
-    let group_label = session_manager.group_label(&summary.group_id).await;
-    ui::info(&format!("Group: {}", group_label));
-    ui::info(&format!("Rekey ID: {}", summary.rekey_id));
-    ui::info(&format!(
-        "Cancelled at: {}",
-        ui::formatting::format_local_datetime(&summary.cancelled_at)
-    ));
-
-    if let Some(reason) = summary.reason.as_ref() {
-        ui::info(&format!("Reason: {}", reason));
-    }
-
-    if let Some(epoch) = summary.previous_epoch_number {
-        ui::info(&format!("Restored epoch: {}", epoch));
-    } else {
-        ui::dim("Previous epoch information unavailable; verify with status command.");
-    }
-
-    if let Some(epoch) = summary.new_epoch_number {
-        ui::dim(&format!("Discarded staged epoch: {}", epoch));
-    }
-
-    ui::info("Run 'hybridcipher rekey status' to confirm the current state.");
-
-    Ok(())
+    let status: KeyStatus = response.json().await.ok()?;
+    status.versions.iter().map(|version| version.version).max()
 }
 
 async fn fetch_rekey_status(
@@ -1402,13 +1505,14 @@ async fn fetch_rekey_status(
         .map_err(|e| CliError::network(format!("Failed to query rekey status: {}", e)))?;
 
     if response.status() == StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("rekey_status")?;
+        session_manager.invalidate_session("rekey_status").await?;
         return Err(CliError::authentication(
             "Authentication token rejected. Please login again.".to_string(),
         ));
     }
 
     if response.status() == StatusCode::NOT_FOUND {
+        clear_stale_migration_record(session_manager)?;
         return Err(CliError::validation(
             "No active rekey operation for the current group",
         ));
@@ -1697,17 +1801,11 @@ async fn run_local_coverage_migration(client: &LocalClient) -> Result<(), CliErr
             "Migrated {} of {} files ({} failed).",
             progress.migrated_files, progress.total_files, progress.failed_files
         ));
-        println!();
-        ui::info("ℹ️  Cutover will be performed automatically after 24 hours, or you can perform it manually using:");
-        ui::info("   hybridcipher rekey cutover");
     } else {
         ui::success(&format!(
             "Migrated {} of {} files.",
             progress.migrated_files, progress.total_files
         ));
-        println!();
-        ui::info("ℹ️  Cutover will be performed automatically after 24 hours, or you can perform it manually using:");
-        ui::info("   hybridcipher rekey cutover");
     }
 
     Ok(())
@@ -1729,7 +1827,7 @@ async fn ensure_cutover_backup(
         return Ok(());
     }
 
-    ui::dim("Detected rekey cutover completion; refreshing recovery backup...");
+    ui::dim("Key rotation finished; refreshing recovery backup...");
     match crate::commands::recovery::append_active_epoch_to_artifact(
         session_manager,
         status.group_id,
@@ -1856,8 +1954,7 @@ struct ApiRekeyResponse {
     #[serde(rename = "group_id")]
     _group_id: Uuid,
     new_epoch_id: String,
-    #[serde(rename = "status")]
-    _status: String,
+    status: String,
     initiated_at: DateTime<Utc>,
     #[serde(rename = "estimated_completion")]
     _estimated_completion: DateTime<Utc>,
@@ -1882,6 +1979,8 @@ struct ApiRekeyStatus {
     policy: Option<ApiPolicySnapshot>,
     #[serde(default)]
     descriptor_commitment: Option<String>,
+    #[serde(default)]
+    scheduled_cutover_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1890,8 +1989,7 @@ struct ApiMigrationProgress {
     migrated_files: u64,
     #[serde(rename = "total_members")]
     _total_members: u32,
-    #[serde(rename = "confirmed_members")]
-    _confirmed_members: u32,
+    confirmed_members: u32,
     #[serde(default)]
     #[serde(rename = "reporting_members")]
     _reporting_members: u32,
@@ -1932,3 +2030,15 @@ struct ApiPolicySnapshot {
     #[serde(default)]
     stale_devices: usize,
 }
+
+#[cfg(test)]
+#[path = "../../tests/rekey/test_rekey_join_card_guidance.rs"]
+mod join_card_guidance_tests;
+
+#[cfg(test)]
+#[path = "../../tests/rekey/test_rekey_start_outcome.rs"]
+mod start_outcome_tests;
+
+#[cfg(test)]
+#[path = "../../tests/rekey/test_rekey_one_way.rs"]
+mod one_way_tests;

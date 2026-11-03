@@ -306,8 +306,14 @@ enum ProviderSocketRequest: Encodable {
     }
 }
 
+enum ProviderFileErrorCode: String, Codable {
+    case legacyConsentRequired = "legacy_consent_required"
+    case integrityFailure = "integrity_failure"
+}
+
 struct ProviderSocketResponse: Codable {
     let ok: Bool
+    let errorCode: ProviderFileErrorCode?
     let status: MacFileProviderStatus?
     let runtimeStatus: MountSyncRuntimeStatus?
     let snapshots: [ProviderItemSnapshot]?
@@ -316,9 +322,12 @@ struct ProviderSocketResponse: Codable {
     let latestSyncAnchor: UInt64?
     let syncAnchorExpired: Bool?
     let message: String?
+    /// The host refused the request for now; the system should try it again later.
+    let retryLater: Bool?
 
     enum CodingKeys: String, CodingKey {
         case ok
+        case errorCode = "error_code"
         case status
         case runtimeStatus = "runtime_status"
         case snapshots
@@ -327,5 +336,6 @@ struct ProviderSocketResponse: Codable {
         case latestSyncAnchor = "latest_sync_anchor"
         case syncAnchorExpired = "sync_anchor_expired"
         case message
+        case retryLater = "retry_later"
     }
 }

@@ -70,22 +70,14 @@
     function buildMountProgressModel({
         folderLabel = 'folder',
         folderPath = '',
-        elapsedMs = 0,
-        continueEnableMs = 10000,
     } = {}) {
-        const remainingMs = Math.max(0, Number(continueEnableMs || 0) - Number(elapsedMs || 0));
-        const remainingSecs = Math.ceil(remainingMs / 1000);
-        const canContinue = remainingMs <= 0;
-
         return {
             title: `Mounting ${folderLabel}`,
             folderLabel,
             folderPath,
-            status: canContinue ? 'Mounting folder in background...' : 'Starting mount...',
-            hint: canContinue
-                ? 'You can continue in background and keep using the app while HybridCipher finishes mounting this folder.'
-                : `Continue in background available in ${remainingSecs}s while HybridCipher initializes this folder.`,
-            canContinue,
+            status: 'Mounting folder...',
+            hint: 'You can continue in background and keep using the app. The folder list shows progress until the mount finishes.',
+            canContinue: true,
         };
     }
 

@@ -1,6 +1,26 @@
 use super::*;
 
 impl<S: Storage, N: Network> Client<S, N> {
+    /// Sign a validated action transcript with this client's existing device key.
+    pub async fn device_action_proof(
+        &self,
+        context: &crate::device_actions::DeviceActionContext<'_>,
+        action: hybridcipher_messages::device_actions::DeviceAction,
+        target_device_id: &str,
+        target_identity_sha256: Option<&str>,
+        payload: &serde_json::Value,
+    ) -> Result<crate::device_actions::DeviceActionProof, String> {
+        crate::device_actions::signed_device_action(
+            &self.device_identity,
+            context,
+            action,
+            target_device_id,
+            target_identity_sha256,
+            payload,
+        )
+        .await
+    }
+
     /// Validate current state consistency
     ///
     /// Performs comprehensive state validation to detect:

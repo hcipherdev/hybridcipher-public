@@ -1150,6 +1150,356 @@ pub async fn handle_unmount(
     }
 }
 
+/// Revoke only after every recorded mount has drained and its host has exited.
+const DEVICE_REMOVAL_MOUNT_TRACKER: &str = "device_removal_pending_mounts.json";
+#[derive(Serialize, Deserialize)]
+struct DeviceRemovalMountTracker {
+    pending_device_removal_mounts: Vec<MountRuntimeState>,
+}
+
+pub(crate) async fn stop_all_mounts_before_device_removal(
+    session_manager: &SessionManager,
+) -> Result<(), CliError> {
+    let user_dir = session_manager
+        .user_config_dir()
+        .ok_or_else(|| CliError::session("No active user context configured"))?;
+    ensure_no_native_provider_registrations(&user_dir)?;
+    let state_dir = mount_state_dir(session_manager)?;
+    let legacy_path = mount_state_path_legacy(session_manager)?;
+    let records = read_mount_records_for_device_removal(&state_dir, &legacy_path)?;
+    for (_, state) in &records {
+        validate_device_removal_mount_before_stop(
+            state,
+            wait_for_safe_unmount_status(session_manager, state.root_id, &state.mountpoint),
+        )
+        .await?;
+    }
+    // Persist the original views before mount hosts or generic unmount cleanup
+    // can delete their records. A failed attempt must remain visible on retry.
+    write_device_removal_mount_tracker(&state_dir, &records)?;
+    for (path, state) in &records {
+        validate_device_removal_mount_before_stop(
+            state,
+            wait_for_safe_unmount_status(session_manager, state.root_id, &state.mountpoint),
+        )
+        .await?;
+        unmount_single_mount(session_manager, path, state, false).await?;
+    }
+    for (_, state) in &records {
+        validate_stopped_device_removal_mount(state).await?;
+    }
+    if !read_remaining_mount_records_for_device_removal(&state_dir, &legacy_path)?.is_empty() {
+        return Err(CliError::mount("Protected folder state still remains. Device removal was cancelled and the session was preserved."));
+    }
+    ensure_no_native_provider_registrations(&user_dir)?;
+    complete_device_removal_mount_tracking(&state_dir)?;
+    Ok(())
+}
+
+async fn validate_device_removal_mount_before_stop<H>(
+    state: &MountRuntimeState,
+    health: H,
+) -> Result<(), CliError>
+where
+    H: std::future::Future<Output = Result<Option<MountSyncRuntimeStatus>, CliError>>,
+{
+    let mounted = mountpoint_has_fuse_mount_checked(&state.mountpoint).await?;
+    if state.host_pid.is_none() {
+        return Err(CliError::mount("Cannot confirm the recorded mount host. Stop protected folders before removing this device."));
+    }
+    if state.backend().supports_conflict_recovery() {
+        if state.host_pid.is_some_and(process_is_running) || mounted {
+            let status = health.await?;
+            validate_device_removal_mount_health(state, status.as_ref(), chrono::Utc::now())?;
+        } else {
+            ensure_stale_device_removal_view_is_empty(&state.mountpoint)?;
+        }
+    }
+    Ok(())
+}
+
+async fn validate_stopped_device_removal_mount(state: &MountRuntimeState) -> Result<(), CliError> {
+    if state.host_pid.is_none()
+        || state.host_pid.is_some_and(process_is_running)
+        || mountpoint_has_fuse_mount_checked(&state.mountpoint).await?
+    {
+        return Err(CliError::mount("A protected folder host is still active or unknown. Device removal was cancelled and the session was preserved."));
+    }
+    if state.backend().supports_conflict_recovery() {
+        ensure_device_removal_view_is_empty(&state.mountpoint)?;
+    }
+    Ok(())
+}
+
+fn complete_device_removal_mount_tracking(state_dir: &Path) -> Result<(), CliError> {
+    fs::remove_file(state_dir.join(DEVICE_REMOVAL_MOUNT_TRACKER)).map_err(|error| {
+        CliError::mount(format!(
+            "Cannot complete protected folder shutdown tracking: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn write_device_removal_mount_tracker(
+    state_dir: &Path,
+    records: &[(PathBuf, MountRuntimeState)],
+) -> Result<(), CliError> {
+    let tracker = DeviceRemovalMountTracker {
+        pending_device_removal_mounts: records.iter().map(|(_, state)| state.clone()).collect(),
+    };
+    let payload =
+        serde_json::to_vec(&tracker).map_err(|error| CliError::mount(error.to_string()))?;
+    let temporary = state_dir.join(format!(".device_removal_pending_{}.tmp", Uuid::new_v4()));
+    let destination = state_dir.join(DEVICE_REMOVAL_MOUNT_TRACKER);
+    let result = (|| {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| CliError::mount(error.to_string()))?;
+        file.write_all(&payload)
+            .map_err(|error| CliError::mount(error.to_string()))?;
+        file.sync_all()
+            .map_err(|error| CliError::mount(error.to_string()))?;
+        fs::rename(&temporary, &destination).map_err(|error| CliError::mount(error.to_string()))?;
+        #[cfg(unix)]
+        fs::File::open(state_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| CliError::mount(error.to_string()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn ensure_no_native_provider_registrations(user_dir: &Path) -> Result<(), CliError> {
+    #[cfg(target_os = "macos")]
+    let unknown_native_state = native_provider_inventory_has_candidates(
+        &user_dir.join("macos-file-provider").join("domains"),
+    )?;
+    #[cfg(target_os = "windows")]
+    let unknown_native_state =
+        native_provider_inventory_has_candidates(&user_dir.join("cloud-files").join("roots"))?;
+    #[cfg(target_os = "macos")]
+    let has_roots = !hybridcipher_macos_file_provider::MacFileProviderHost::new(
+        hybridcipher_macos_file_provider::ProviderHostConfig {
+            user_config_dir: user_dir.to_path_buf(),
+            socket_path: None,
+            provider_identifier: None,
+        },
+    )
+    .load_registrations()
+    .map_err(|error| CliError::mount(error.to_string()))?
+    .is_empty();
+    #[cfg(target_os = "windows")]
+    let has_roots = !hybridcipher_windows_cloud_provider::CloudProviderHost::new(
+        hybridcipher_windows_cloud_provider::ProviderHostConfig {
+            user_config_dir: user_dir.to_path_buf(),
+            pipe_name: None,
+        },
+    )
+    .load_registrations()
+    .map_err(|error| CliError::mount(error.to_string()))?
+    .is_empty();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let has_roots = {
+        let _ = user_dir;
+        false
+    };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let has_roots = has_roots || unknown_native_state;
+    if has_roots {
+        return Err(CliError::mount("Native protected folders are registered. Stop and remove their mounts in the Desktop app before removing this device."));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn native_provider_inventory_has_candidates(path: &Path) -> Result<bool, CliError> {
+    if !strict_mount_inventory_directory(path)? {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path).map_err(|error| CliError::mount(error.to_string()))? {
+        let entry = entry.map_err(|error| CliError::mount(error.to_string()))?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".json") || name.ends_with(".json.bak"))
+        {
+            // Any registration candidate, including a dangling symlink or
+            // unreadable file skipped by an SDK loader, blocks self-removal.
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_stale_device_removal_view_is_empty(path: &Path) -> Result<(), CliError> {
+    let home =
+        dirs::home_dir().ok_or_else(|| CliError::mount("Cannot confirm protected folder scope"))?;
+    let base = home.join(hybridcipher_client::config_loader::account_data_location());
+    if !mountpoint_is_under_hybridcipher_base(path, &base) {
+        return Err(CliError::mount("The stopped protected view is outside the managed folder scope. Review recovery data before removing this device."));
+    }
+    ensure_device_removal_view_is_empty(path)
+}
+
+fn ensure_device_removal_view_is_empty(path: &Path) -> Result<(), CliError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CliError::mount(format!(
+            "Cannot inspect the stopped protected view: {error}"
+        ))),
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            Err(CliError::mount(
+                "The stopped protected view cannot be confirmed as an empty directory.",
+            ))
+        }
+        Ok(_) => {
+            let mut entries =
+                fs::read_dir(path).map_err(|error| CliError::mount(error.to_string()))?;
+            match entries.next() {
+                None => Ok(()),
+                Some(Err(error)) => Err(CliError::mount(error.to_string())),
+                Some(Ok(_)) => Err(CliError::mount("The stopped protected view still contains recovery or plaintext files. Review them before removing this device.")),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/device_security/test_revocation_mounts.rs"]
+mod device_removal_mount_tests;
+
+fn validate_device_removal_mount_health(
+    state: &MountRuntimeState,
+    status: Option<&MountSyncRuntimeStatus>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), CliError> {
+    let status = status.ok_or_else(|| {
+        CliError::mount("Protected folder health is unavailable. Device removal was cancelled.")
+    })?;
+    let age = now.signed_duration_since(status.updated_at).num_seconds();
+    if !(0..=15).contains(&age) {
+        return Err(CliError::mount(
+            "Protected folder health is stale. Device removal was cancelled.",
+        ));
+    }
+    if status.safe_to_unmount && !mount_sync_unsafe_reasons(&state.mountpoint, status).is_empty() {
+        return Err(CliError::mount(
+            "Protected folder health contains unresolved work. Device removal was cancelled.",
+        ));
+    }
+    if let Some(message) = unsafe_unmount_block_message(state.root_id, &state.mountpoint, status) {
+        return Err(CliError::mount(message));
+    }
+    Ok(())
+}
+
+fn read_mount_records_for_device_removal(
+    state_dir: &Path,
+    legacy_path: &Path,
+) -> Result<Vec<(PathBuf, MountRuntimeState)>, CliError> {
+    let mut records = read_remaining_mount_records_for_device_removal(state_dir, legacy_path)?;
+    if let Some(raw) =
+        read_device_removal_state_json(&state_dir.join(DEVICE_REMOVAL_MOUNT_TRACKER))?
+    {
+        let tracker: DeviceRemovalMountTracker =
+            serde_json::from_str(&raw).map_err(|error| CliError::mount(error.to_string()))?;
+        for state in tracker.pending_device_removal_mounts {
+            if let Some((_, current)) = records
+                .iter()
+                .find(|(_, current)| current.root_id == state.root_id)
+            {
+                if current.mountpoint != state.mountpoint
+                    || current.encrypted_dir != state.encrypted_dir
+                    || current.host_pid != state.host_pid
+                {
+                    return Err(CliError::mount("A protected folder changed while shutdown recovery was pending. Resolve its original view before removing this device."));
+                }
+            } else {
+                records.push((
+                    state_dir.join(format!("mount_state_{}.json", state.root_id)),
+                    state,
+                ));
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn read_remaining_mount_records_for_device_removal(
+    state_dir: &Path,
+    legacy_path: &Path,
+) -> Result<Vec<(PathBuf, MountRuntimeState)>, CliError> {
+    let mut records = Vec::new();
+    if strict_mount_inventory_directory(state_dir)? {
+        for entry in fs::read_dir(state_dir).map_err(|error| CliError::mount(error.to_string()))? {
+            let path = entry
+                .map_err(|error| CliError::mount(error.to_string()))?
+                .path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("mount_state_") && name.ends_with(".json"))
+            {
+                if let Some(state) = read_device_removal_mount_record(&path)? {
+                    records.push((path, state));
+                }
+            }
+        }
+    }
+    if let Some(state) = read_device_removal_mount_record(legacy_path)? {
+        records.push((legacy_path.to_path_buf(), state));
+    }
+    Ok(records)
+}
+
+fn strict_mount_inventory_directory(path: &Path) -> Result<bool, CliError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliError::mount(format!(
+            "Cannot inspect protected folder inventory: {error}"
+        ))),
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => Err(
+            CliError::mount("Protected folder inventory is not a readable managed directory."),
+        ),
+        Ok(_) => {
+            fs::read_dir(path).map_err(|error| CliError::mount(error.to_string()))?;
+            Ok(true)
+        }
+    }
+}
+
+fn read_device_removal_mount_record(path: &Path) -> Result<Option<MountRuntimeState>, CliError> {
+    read_device_removal_state_json(path)?
+        .map(|raw| serde_json::from_str(&raw).map_err(|error| CliError::mount(error.to_string())))
+        .transpose()
+}
+
+fn read_device_removal_state_json(path: &Path) -> Result<Option<String>, CliError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::mount(format!(
+                "Cannot inspect mount state: {error}"
+            )))
+        }
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            return Err(CliError::mount(
+                "Mount state is not a readable managed file.",
+            ))
+        }
+        Ok(_) => {}
+    }
+    fs::read_to_string(path)
+        .map(Some)
+        .map_err(|error| CliError::mount(error.to_string()))
+}
+
 pub async fn handle_mount_command(
     session_manager: &SessionManager,
     command: MountCommands,
@@ -1793,13 +2143,16 @@ async fn unmount_single_mount(
     state: &MountRuntimeState,
     force: bool,
 ) -> Result<(), CliError> {
-    let stale = runtime_mount_state_is_stale(state).await;
+    let mounted = mountpoint_has_fuse_mount_checked(&state.mountpoint).await?;
+    let stale = !mounted && runtime_mount_state_is_stale(state).await;
     if state.requested_unmount && !stale {
         ui::info("Unmount already requested – waiting for mount process to exit.");
-        return Ok(());
     }
 
     if stale {
+        if !force && state.backend().supports_conflict_recovery() {
+            ensure_device_removal_view_is_empty(&state.mountpoint)?;
+        }
         warn!(
             "Cleaning stale mount state for {} because the recorded host is no longer active",
             state.mountpoint.display()
@@ -1831,6 +2184,11 @@ async fn unmount_single_mount(
             return Ok(());
         }
         if let Err(err) = cleanup_mountpoint_safe(&state.mountpoint) {
+            if !force {
+                return Err(CliError::mount(format!(
+                    "Stale mount cleanup could not complete safely: {err}"
+                )));
+            }
             warn!(
                 "Safe cleanup failed for stale mountpoint {}: {}. Preserving mountpoint contents.",
                 state.mountpoint.display(),
@@ -1880,21 +2238,12 @@ async fn unmount_single_mount(
     let mut mount_exited = false;
 
     while waited < max_wait {
-        // Check if state file still exists and has requested_unmount flag
-        if let Ok(Some(current_state)) = read_runtime_state(state_path) {
-            if current_state.requested_unmount {
-                // Mount process should be exiting, wait a bit more
-                tokio::time::sleep(check_interval).await;
-                waited += check_interval;
-                continue;
-            }
-        } else {
-            // State file was cleared by mount process - it has exited
-            mount_exited = true;
-            break;
-        }
-
-        if mountpoint_is_detached(&state.mountpoint).await {
+        let current_state = read_runtime_state(state_path)?;
+        let host_running = state.host_pid.is_some_and(process_is_running);
+        if !host_running
+            && !mountpoint_has_fuse_mount_checked(&state.mountpoint).await?
+            && (current_state.is_none() || mountpoint_is_detached(&state.mountpoint).await)
+        {
             mount_exited = true;
             break;
         }
@@ -1930,7 +2279,12 @@ async fn unmount_single_mount(
         }
     }
 
-    if mountpoint_has_fuse_mount(&state.mountpoint).await {
+    let still_mounted = mountpoint_has_fuse_mount_checked(&state.mountpoint).await?;
+    if !force && (!mount_exited || still_mounted || state.host_pid.is_some_and(process_is_running))
+    {
+        return Err(CliError::mount(format!("Protected folder shutdown did not complete within {} seconds; mount state and session were preserved", max_wait.as_secs())));
+    }
+    if still_mounted {
         warn!(
             "Mountpoint {} is still mounted. Force unmounting before cleanup.",
             state.mountpoint.display()
@@ -2471,6 +2825,21 @@ async fn mountpoint_has_fuse_mount(path: &Path) -> bool {
 #[cfg(not(target_os = "linux"))]
 async fn mountpoint_has_fuse_mount(_path: &Path) -> bool {
     false
+}
+
+#[cfg(target_os = "linux")]
+async fn mountpoint_has_fuse_mount_checked(path: &Path) -> Result<bool, CliError> {
+    hybridcipher_mount::platform::is_mounted(path)
+        .await
+        .map_err(|error| {
+            CliError::mount(format!(
+                "Cannot confirm protected folder detachment: {error}"
+            ))
+        })
+}
+#[cfg(not(target_os = "linux"))]
+async fn mountpoint_has_fuse_mount_checked(_path: &Path) -> Result<bool, CliError> {
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -3031,7 +3400,7 @@ fn format_mount_safety_reason(mountpoint: &Path, reason: &MountSafetyReason) -> 
                 .cloned()
                 .unwrap_or_else(|| mountpoint.display().to_string());
             format!(
-                "{count} transactional path(s) are blocked because sync mount does not provide atomic-set guarantees for databases, packages, or bundle-style formats. Example: {example}"
+                "{count} transactional path(s) changed locally and cannot be synced because sync mount does not provide atomic-set guarantees for databases, packages, or bundle-style formats. Unmounting would discard these changes. Example: {example}"
             )
         }
         MountSafetyReason::HardLinkBlocked {

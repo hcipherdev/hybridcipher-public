@@ -1,1 +1,64 @@
-{"releases":[]}
+{
+  "releases": [
+    {
+      "version": "0.2.0",
+      "published_at": "2026-11-01",
+      "highlights": [
+        "A redesigned Team workspace. The sidebar now lists Team overview and every group in your organization. Team overview shows what needs your attention under To do, and each group has its own page with People, Devices, and Keys & security tabs.",
+        "Share with your team in a few clicks: create a group, use Add person to give someone access by email, and protect the group's folders so everyone in it can open the files on their approved devices. People already in your Team get access right away; anyone else is invited and gets access as soon as they join.",
+        "Invite to Team lets you choose which groups a new member joins before they arrive. The app shows a one-time invitation code to send them, and they paste it under Joining an existing Team? to join.",
+        "Members & devices lists everyone in your Team, their groups, devices, and open invitations, with filters for devices that need approval, have not been verified, missed a key update, or have not been used for a while. From there you can revoke a lost device, add someone to a group, or remove them from the Team.",
+        "Removing someone's access now rotates the group's keys in the same step, so they cannot open files added afterwards. Key rotation shows its progress, checks devices beforehand, finishes automatically once members confirm or its deadline passes, and then moves your files to the new key on its own.",
+        "Start without an account. HybridCipher sets itself up on first launch, and a short Get started checklist walks you through saving a recovery kit, protecting your first folder, and opening it in File Explorer. Create an account later to use your files on other devices; the folders you already protected join it without being re-encrypted.",
+        "The new Mount Center shows mounted folders from every workspace and group in one place. Mount all or Unmount all at once, follow each folder's progress, choose which folders mount automatically, and folders left mounted when the app last closed are reconnected when it starts again."
+      ],
+      "important_changes": [
+        "New devices are easier to set up. Devices waiting for approval or fingerprint verification are listed together under Devices to set up, and people can approve their own new device from another device they already trust instead of waiting for an admin.",
+        "A device you verify on one of your computers is now also trusted on your other computers, so you no longer need to verify the same device again on each one.",
+        "Before a key rotation, the app lists any device that has not been verified on this computer and offers Verify now, so the rotation does not stop partway through.",
+        "Folder status now shows which key your files are on, for example 57 of 66 files on the latest key, instead of only whether they are protected.",
+        "The app notifies you when this device is missing a key needed for some files, and when a group's keys have been updated.",
+        "Team administration is available only on a verified device. If the current device is not verified yet, the app explains how to verify it from a trusted device or confirm it with your password.",
+        "Manage your recovery kit in Settings. If you lose the kit file or its recovery key, make a new one there. You can also use a recovery kit to open files you protected on another computer without an account.",
+        "Protecting or removing protection from a folder now runs in the background with its own progress window. If a protected folder was renamed or moved, the app helps you locate it again.",
+        "The folder menu now includes Decrypt and remove protection, and actions that cannot be undone are clearly marked.",
+        "Account security is stronger: signing in on a known PC needs proof from that device's key, or your MFA code if it has none. Authenticator codes, MFA backup codes, and password reset links now work only once, and sessions have a maximum lifetime after which you sign in again.",
+        "Settings → Advanced tools now includes Copy key diagnostics, a summary of this device's key status for support that names no files or folders. The app also keeps a local log file to help troubleshoot problems.",
+        "The built-in console now runs only HybridCipher commands, and the old file browser and command list have been removed. Protected folders, Mount Center, and the Team pages cover these tasks.",
+        "If File Explorer cannot serve a mounted folder safely, the folder now says it needs attention and shows what went wrong, instead of failing silently."
+      ],
+      "fixes": [
+        "Fixed folder scans and Move files on Windows sometimes working from an empty file list, which could show 100% protected or report success without moving anything.",
+        "Fixed some group details failing to save on Windows.",
+        "Opening a file from the app now hands it straight to Windows, so files with unusual names from shared folders open safely.",
+        "Files that are already encrypted are now recognized by their contents, not their names, so they are never encrypted a second time.",
+        "Fixed a leftover session from a previous run blocking sign-in when the app starts.",
+        "If this device's saved identity can no longer be read, the app now guides you through setting the device up again instead of failing.",
+        "Folder status shows No files indexed yet instead of 0% covered for a folder that has not been scanned."
+      ]
+    },
+    {
+      "version": "0.1.1",
+      "published_at": "2026-10-06",
+      "highlights": [
+        "Recover with code: sign in on a new PC and use your account password plus your saved encryption recovery code to restore your encryption keys and fully trust the device, with no email code or approval from another device needed.",
+        "A protected folder's details now list its older-format files. Open each one to check it, then upgrade one or all of them to the current format. An exact encrypted backup of each original is always kept.",
+        "Removing a protected folder now lets you choose to keep its files encrypted or decrypt them, with a warning before plaintext could reach cloud storage."
+      ],
+      "important_changes": [
+        "Mounting continues in the background as soon as it starts. Close the progress window at any time; the folder shows a Mounting or Unmounting indicator until the operation finishes.",
+        "Devices → This device now offers Show fingerprint and Copy. Device verification explains where to find the fingerprint and accepts it with or without spaces.",
+        "Device management is safer: the app explains when your current device needs approval or fingerprint verification before it can manage other devices, and asks for confirmation before removing one.",
+        "The Personal workspace focuses on your files and devices and always uses your account's default group. If that group is missing, the home screen offers Recover with code, Repair Personal workspace, Check status, or Open Devices.",
+        "Recovery backups created by older versions need a one-time upgrade with an email code, authenticator code, or MFA backup code. After that, your saved recovery code works on its own. Older app versions can no longer update recovery backups, so update the app on all of your devices."
+      ],
+      "fixes": [
+        "Fixed expanded sections in a folder's details, such as Details for older files, collapsing every few seconds during background status refreshes.",
+        "Retry disappears once an action succeeds, helping prevent accidental repeats.",
+        "Removing the device you are using first checks that protected folders can close safely. If pending work prevents a safe shutdown, device removal stops so you can resolve it first.",
+        "Fixed recovery leaving the Personal workspace without a default group, and a background refresh that could interrupt Repair Personal workspace.",
+        "Device approval and revocation now report an expired authorization clearly and ask you to check your PC's date and time when its clock is far off, instead of failing with a generic error."
+      ]
+    }
+  ]
+}

@@ -857,6 +857,7 @@ pub async fn handle_coverage_command(
         CoverageCommands::Pending { verbose, epoch } => {
             handle_coverage_pending(verbose, epoch, session_manager).await
         }
+        CoverageCommands::KeyState { json } => handle_coverage_key_state(json, session_manager).await,
         CoverageCommands::RecoverMarkers {
             search,
             max_depth,
@@ -1462,6 +1463,24 @@ fn render_root_summary(summary: &CoverageRootStats) {
             "  coverage: {:.1}% ({}/{} files)",
             coverage_pct, summary.tracked_files, total_files
         ));
+    }
+    // Coverage counts protected files; this says which key they are on.
+    let keys = summary.keys;
+    if keys.target_version > 0 && keys.on_target + keys.on_other > 0 {
+        let line = format!(
+            "  key: {} of {} files on v{}",
+            keys.on_target,
+            keys.on_target + keys.on_other,
+            keys.target_version
+        );
+        if keys.on_other > 0 {
+            ui::warning(&format!(
+                "{line} ({} still to move; run `hybridcipher coverage migrate --all`)",
+                keys.on_other
+            ));
+        } else {
+            ui::info(&line);
+        }
     }
 
     ui::info(&format!(
@@ -2203,7 +2222,8 @@ async fn handle_coverage_migrate(
         update_migration_progress_ui(&mut progress_bar, &mut progress_total, progress);
     };
 
-    let progress = match try_coverage_ipc_migrate_orphans_with_progress(
+    // The desktop's service reports counts only; a direct run also knows why files failed.
+    let (progress, failures) = match try_coverage_ipc_migrate_orphans_with_progress(
         session_manager,
         file.clone(),
         root.clone(),
@@ -2212,11 +2232,11 @@ async fn handle_coverage_migrate(
     )
     .await?
     {
-        Some(progress) => progress,
+        Some(progress) => (progress, Vec::new()),
         None => {
             let client: LocalClient = session_manager.create_client().await?;
             client
-                .coverage_migrate_orphans_with_progress(file, root, all, |progress| {
+                .coverage_migrate_orphans_detailed(file, root, all, |progress| {
                     on_progress(progress);
                 })
                 .await
@@ -2251,6 +2271,130 @@ async fn handle_coverage_migrate(
         }
     }
 
+    for failure in failures.iter().take(MIGRATION_FAILURES_SHOWN) {
+        ui::warning(&format!("  {}: {}", failure.path, failure.reason));
+    }
+    if failures.len() > MIGRATION_FAILURES_SHOWN {
+        ui::warning(&format!(
+            "  …and {} more",
+            failures.len() - MIGRATION_FAILURES_SHOWN
+        ));
+    }
+    if progress.failed_files > 0 {
+        return Err(CliError::coverage(format!(
+            "{} file(s) could not be moved to the current key and stay on their older key.",
+            progress.failed_files
+        )));
+    }
+
+    Ok(())
+}
+
+/// How many per-file migration failures `coverage migrate` prints before summarising the rest.
+const MIGRATION_FAILURES_SHOWN: usize = 5;
+
+/// Report this device's keys and which key its files are on. The desktop app's view is used
+/// when it is running, since it owns the file index.
+async fn handle_coverage_key_state(json: bool, session_manager: &SessionManager) -> Result<(), CliError> {
+    // An app older than this CLI does not know the request and closes the connection.
+    let mut app_too_old = false;
+    let from_app = match coverage_ipc_socket_path(session_manager) {
+        Some(socket_path) => match CoverageIpcClient::new(socket_path).key_state_report().await {
+            Ok(report) => Some(report),
+            Err(err) if err.is_connection_error() => None,
+            Err(CoverageIpcError::Remote(message))
+                if message == "empty response from coverage IPC server" =>
+            {
+                app_too_old = true;
+                None
+            }
+            Err(err) => {
+                return Err(CliError::coverage(format!(
+                    "The desktop app could not report key state: {}",
+                    err
+                )))
+            }
+        },
+        None => None,
+    };
+    let (report, source) = match from_app {
+        Some(report) => (report, "desktop app"),
+        None => {
+            let client: LocalClient = session_manager.create_client().await?;
+            let report = client.key_state_report().await.map_err(|err| {
+                if app_too_old {
+                    CliError::coverage(format!(
+                        "The running HybridCipher app is older than this CLI and cannot report key state; update the app, or close it and retry. ({})",
+                        err
+                    ))
+                } else {
+                    CliError::coverage(format!("Failed to read key state: {}", err))
+                }
+            })?;
+            (report, "this command")
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "source": source,
+                "cli_version": env!("CARGO_PKG_VERSION"),
+                "report": report,
+            })
+        );
+        return Ok(());
+    }
+
+    ui::section("Key State");
+    ui::info(&format!("  read by: {}", source));
+    ui::info(&format!("  current key: v{}", report.current_version));
+    if let Some((from, to)) = report.local_rotation {
+        ui::info(&format!("  rotation on record: v{} → v{}", from, to));
+    }
+    let held: Vec<String> = report
+        .held_versions
+        .iter()
+        .map(|version| format!("v{}", version))
+        .collect();
+    ui::info(&format!("  keys held: {}", held.join(", ")));
+    for folder in &report.folders {
+        let by_version: Vec<String> = folder
+            .by_version
+            .iter()
+            .map(|(version, count)| match version {
+                0 => format!("{} without a recorded key", count),
+                version => format!("{} on v{}", count, version),
+            })
+            .collect();
+        ui::info(&format!(
+            "  folder {} ({}, {}): {} tracked, {} orphaned, {} unprotected; {}",
+            folder.root_id,
+            folder.kind,
+            folder.state,
+            folder.tracked,
+            folder.orphaned,
+            folder.unmanaged,
+            if by_version.is_empty() {
+                "nothing indexed".to_string()
+            } else {
+                by_version.join(", ")
+            }
+        ));
+    }
+    let leftovers = &report.leftovers;
+    if leftovers.files + leftovers.folders > 0 {
+        ui::warning(&format!(
+            "  still to move to v{}: {} files, {} folder records",
+            leftovers.target_version, leftovers.files, leftovers.folders
+        ));
+    } else {
+        ui::success(&format!(
+            "  every indexed file is on v{}",
+            leftovers.target_version
+        ));
+    }
     Ok(())
 }
 

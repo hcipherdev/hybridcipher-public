@@ -332,7 +332,7 @@ pub enum ClientError {
         retry_after: Option<Duration>,
     },
 
-    #[error("Network operation failed")]
+    #[error("Network operation failed: {}", context.message)]
     NetworkError {
         context: ErrorContext,
         retry_count: u32,
@@ -424,6 +424,10 @@ pub enum ClientError {
 
     #[error("Older file format requires legacy compatibility for this vault. Its original completeness cannot be verified.")]
     LegacyCompatibilityRequired,
+
+    /// Approval sends only the current key, so a device that missed a rotation lacks older versions.
+    #[error("This device does not have key version {epoch_id} for this group")]
+    EpochKeyUnavailable { epoch_id: u64 },
 
     #[error("Encrypted file integrity verification failed: {0}")]
     FileIntegrity(String),

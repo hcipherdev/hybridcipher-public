@@ -54,7 +54,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         // Set as current epoch
         if Self::get_epoch_state(&state, welcome_message.group_id, epoch_state.epoch_id)
             .is_some_and(|existing| {
-                existing.key_source.is_verified()
+                existing.key_source.is_locally_usable()
                     && existing.encryption_key != epoch_state.encryption_key
             })
         {
@@ -189,7 +189,134 @@ impl<S: Storage, N: Network> Client<S, N> {
         }
         Ok(epoch_id)
     }
+    /// Fetch Welcome messages, letting a trusted device that already holds the
+    /// current group key republish its own Welcome once when the server asks for approval.
     pub(super) async fn fetch_server_welcome_messages(
+        &self,
+        group_id: Uuid,
+        auth_token: &str,
+    ) -> Result<Option<WelcomeMessagesResponse>, ClientError> {
+        match self
+            .fetch_server_welcome_messages_once(group_id, auth_token)
+            .await
+        {
+            Err(ClientError::ConsistencyError { context, .. })
+                if context.code == ErrorCode::GroupDeviceApprovalRequired
+                    && self
+                        .republish_trusted_self_welcome(group_id, auth_token)
+                        .await =>
+            {
+                self.fetch_server_welcome_messages_once(group_id, auth_token)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    /// Republish this device's own Welcome when the server still marks it pending
+    /// but it is trusted and holds the verified key for the group's current epoch.
+    async fn republish_trusted_self_welcome(&self, group_id: Uuid, auth_token: &str) -> bool {
+        let attempt = async {
+            let session = self.get_session_info().await?;
+            let (Some(user_id), Some(device_id)) = (session.user_id, session.device_id.clone())
+            else {
+                return Ok(false);
+            };
+            let server_base_url = Self::resolve_server_base_url(session.server_url.clone());
+            let actor_user = user_id.to_string();
+            let trust = crate::device_actions::fetch_device_trust(
+                &crate::device_actions::DeviceActionContext {
+                    server_url: &server_base_url,
+                    token: auth_token,
+                    user_id: &actor_user,
+                    device_id: &device_id,
+                },
+            )
+            .await
+            .map_err(ClientError::InvalidState)?;
+            let identity_sha256 =
+                hex::encode(Sha256::digest(self.device_identity.public_key_bytes()));
+            if !(trust.approved && trust.fingerprint_verified)
+                || trust.identity_key_sha256 != identity_sha256
+            {
+                return Ok(false);
+            }
+
+            let Some(current_epoch_uuid) = self
+                .fetch_group_list(auth_token)
+                .await?
+                .into_iter()
+                .find(|group| group.id == group_id)
+                .and_then(|group| group.current_epoch)
+                .and_then(|epoch| Uuid::parse_str(&epoch).ok())
+            else {
+                return Ok(false);
+            };
+            // Only the verified key for the server's exact current epoch may be republished.
+            {
+                let mut state = self.state.write().await;
+                let selected = state.epochs.iter().find_map(|(number, entries)| {
+                    (EpochIdMapper::u64_to_uuid(*number, group_id.as_bytes()) == current_epoch_uuid
+                        && entries.iter().any(|epoch| {
+                            epoch.group_id == Some(group_id) && epoch.key_source.is_verified()
+                        }))
+                    .then_some(*number)
+                });
+                let (Some(selected), Some(membership)) =
+                    (selected, state.group_memberships.get_mut(&group_id))
+                else {
+                    return Ok(false);
+                };
+                membership.current_epoch_id = Some(selected);
+            }
+
+            self.publish_self_welcome(group_id, user_id, &server_base_url, auth_token)
+                .await?;
+            Ok::<bool, ClientError>(true)
+        };
+        match attempt.await {
+            Ok(republished) => {
+                if republished {
+                    self.logger.log(
+                        crate::logging::LogLevel::Info,
+                        "Republished this trusted device's Welcome for the current group epoch",
+                        Some(&format!("group_id: {}", group_id)),
+                    );
+                }
+                republished
+            }
+            Err(err) => {
+                self.logger.log(
+                    crate::logging::LogLevel::Warn,
+                    &format!("Unable to republish this device's Welcome: {}", err),
+                    Some(&format!("group_id: {}", group_id)),
+                );
+                false
+            }
+        }
+    }
+
+    /// Generate and submit this device's own Welcome for the group's locally current epoch.
+    pub(super) async fn publish_self_welcome(
+        &self,
+        group_id: Uuid,
+        user_id: Uuid,
+        server_base_url: &str,
+        auth_token: &str,
+    ) -> Result<(), ClientError> {
+        let message = self
+            .generate_self_welcome_after_recovery(group_id, user_id)
+            .await?;
+        self.submit_self_welcome_payloads(
+            &reqwest::Client::new(),
+            server_base_url,
+            auth_token,
+            &[SelfIssuedWelcomePayload::from((group_id, message))],
+        )
+        .await
+    }
+
+    pub(super) async fn fetch_server_welcome_messages_once(
         &self,
         group_id: Uuid,
         auth_token: &str,
@@ -249,9 +376,15 @@ impl<S: Storage, N: Network> Client<S, N> {
                 return Ok(None);
             }
 
+            // 403 means the account or device may no longer read this group's keys.
+            let code = if status == StatusCode::FORBIDDEN {
+                ErrorCode::GroupPermissionDenied
+            } else {
+                ErrorCode::NetworkProtocol
+            };
             return Err(ClientError::NetworkError {
                 context: ErrorContext::new(
-                    ErrorCode::NetworkProtocol,
+                    code,
                     format!("Server returned error {}: {}", status, error_text),
                     "welcome_response".to_string(),
                 ),
@@ -339,16 +472,6 @@ impl<S: Storage, N: Network> Client<S, N> {
         let server_base_url = Self::resolve_server_base_url(session_info.server_url.clone());
         let endpoint = format!("{}/api/v1/auth/device/rotate-invitation", server_base_url);
 
-        let mut payload = serde_json::Map::new();
-        payload.insert(
-            "invitation_public_key".into(),
-            Value::String(hex::encode(invitation_public_key)),
-        );
-        payload.insert(
-            "identity_public_key".into(),
-            Value::String(hex::encode(identity_public_key)),
-        );
-
         let session_user_id = session_info.user_id;
 
         let self_welcome_messages = if let Some(user_id) = session_user_id {
@@ -378,31 +501,57 @@ impl<S: Storage, N: Network> Client<S, N> {
             Vec::new()
         };
 
-        if !self_welcome_messages.is_empty() {
-            match serde_json::to_value(&self_welcome_messages) {
-                Ok(value) => {
-                    payload.insert("self_welcome_messages".into(), value);
-                }
-                Err(err) => {
-                    self.logger.log(
-                        crate::logging::LogLevel::Warn,
-                        &format!(
-                            "Failed to serialize self Welcome payloads during invitation rotation: {}",
-                            err
-                        ),
-                        None,
-                    );
-                }
+        let welcome_payload = match serde_json::to_value(&self_welcome_messages) {
+            Ok(value) => value,
+            Err(err) => {
+                self.logger.log(
+                    crate::logging::LogLevel::Warn,
+                    &format!(
+                        "Failed to serialize self Welcome payloads during invitation rotation: {}",
+                        err
+                    ),
+                    None,
+                );
+                Value::Array(Vec::new())
             }
-        }
-
-        let payload = Value::Object(payload);
+        };
+        let payload = crate::device_actions::device_invitation_rotation_payload(
+            &invitation_public_key,
+            &identity_public_key,
+            welcome_payload,
+        )
+        .map_err(ClientError::InvalidState)?;
+        let actor_user = session_user_id
+            .ok_or_else(|| {
+                ClientError::InvalidState(
+                    "The invitation rotation requires an authenticated account.".into(),
+                )
+            })?
+            .to_string();
+        let proof = self
+            .device_action_proof(
+                &crate::device_actions::DeviceActionContext {
+                    server_url: &server_base_url,
+                    token: &session_info.token,
+                    user_id: &actor_user,
+                    device_id: &device_id,
+                },
+                hybridcipher_messages::device_actions::DeviceAction::RotateInvitation,
+                &device_id,
+                None,
+                &payload,
+            )
+            .await
+            .map_err(ClientError::InvalidState)?;
 
         let client = reqwest::Client::new();
-        let response = client
-            .post(&endpoint)
-            .header("Authorization", format!("Bearer {}", session_info.token))
-            .json(&payload)
+        let response = proof
+            .apply(
+                client
+                    .post(&endpoint)
+                    .header("Authorization", format!("Bearer {}", session_info.token))
+                    .json(&payload),
+            )
             .send()
             .await
             .map_err(|e| ClientError::NetworkError {
@@ -479,14 +628,34 @@ impl<S: Storage, N: Network> Client<S, N> {
             return Ok(());
         }
 
-        let api_base = if server_base_url.ends_with("/api/v1") {
-            server_base_url.to_string()
-        } else {
-            format!("{}/api/v1", server_base_url)
-        };
+        let api_base = crate::device_actions::api_base(server_base_url);
+        let session = self.get_session_info().await?;
+        if session.token != auth_token
+            || crate::device_actions::api_base(&Self::resolve_server_base_url(
+                session.server_url.clone(),
+            )) != api_base
+        {
+            return Err(ClientError::InvalidState(
+                "The session changed before refreshing device Welcome messages.".into(),
+            ));
+        }
+        let actor_user = session
+            .user_id
+            .ok_or_else(|| ClientError::InvalidState("Authenticated account is missing.".into()))?
+            .to_string();
+        let actor_device = session
+            .device_id
+            .ok_or_else(|| ClientError::InvalidState("Authenticated device is missing.".into()))?;
+        let identity_sha256 = hex::encode(Sha256::digest(self.device_identity.public_key_bytes()));
 
         for payload in payloads {
+            if payload.device_id != actor_device {
+                return Err(ClientError::InvalidState(
+                    "A self Welcome refresh cannot approve another device.".into(),
+                ));
+            }
             let request = SubmitSelfWelcomeRequest {
+                group_id: payload.group_id.to_string(),
                 encrypted_epoch_key: payload.encrypted_epoch_key.clone(),
                 signature: payload.signature.clone(),
                 signing_public_key: payload.signing_public_key.clone(),
@@ -499,10 +668,25 @@ impl<S: Storage, N: Network> Client<S, N> {
                 api_base, payload.group_id, payload.device_id
             );
 
-            let response = client
-                .post(&endpoint)
-                .header("Authorization", format!("Bearer {}", auth_token))
-                .json(&request)
+            let body = serde_json::to_value(&request)
+                .map_err(|error| ClientError::InvalidState(error.to_string()))?;
+            let proof = self
+                .device_action_proof(
+                    &crate::device_actions::DeviceActionContext {
+                        server_url: server_base_url,
+                        token: auth_token,
+                        user_id: &actor_user,
+                        device_id: &actor_device,
+                    },
+                    hybridcipher_messages::device_actions::DeviceAction::ApproveWelcome,
+                    &actor_device,
+                    Some(&identity_sha256),
+                    &body,
+                )
+                .await
+                .map_err(ClientError::InvalidState)?;
+            let response = proof
+                .apply(client.post(&endpoint).bearer_auth(auth_token).json(&body))
                 .send()
                 .await
                 .map_err(|e| ClientError::NetworkError {
@@ -605,110 +789,6 @@ impl<S: Storage, N: Network> Client<S, N> {
                 })?;
 
         Ok(list_response.groups)
-    }
-
-    pub(super) async fn get_welcome_signing_key(
-        &self,
-        server_url: &str,
-    ) -> Result<Vec<u8>, ClientError> {
-        if let Some(cached) = {
-            let state = self.state.read().await;
-            state.welcome_signing_keys.get(server_url).cloned()
-        } {
-            return Ok(cached);
-        }
-
-        let key = self
-            .fetch_welcome_signing_key_from_server(server_url)
-            .await?;
-
-        let mut state = self.state.write().await;
-        state
-            .welcome_signing_keys
-            .insert(server_url.to_string(), key.clone());
-
-        Ok(key)
-    }
-
-    pub(super) async fn fetch_welcome_signing_key_from_server(
-        &self,
-        server_url: &str,
-    ) -> Result<Vec<u8>, ClientError> {
-        let client = reqwest::Client::new();
-        let info_url = format!("{}/api/v1/server/info", server_url);
-
-        let response = client
-            .get(&info_url)
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|e| ClientError::NetworkError {
-                context: ErrorContext::new(
-                    ErrorCode::NetworkConnection,
-                    format!("Failed to fetch server info: {}", e),
-                    "fetch_server_info".to_string(),
-                ),
-                retry_count: 0,
-                last_attempt: std::time::SystemTime::now(),
-                connection_state: "welcome_signing_key_fetch_failed".to_string(),
-            })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            return Err(ClientError::NetworkError {
-                context: ErrorContext::new(
-                    ErrorCode::NetworkProtocol,
-                    format!(
-                        "Server info endpoint returned status {}: {}",
-                        status, error_text
-                    ),
-                    "fetch_server_info".to_string(),
-                ),
-                retry_count: 0,
-                last_attempt: std::time::SystemTime::now(),
-                connection_state: "welcome_signing_key_fetch_failed".to_string(),
-            });
-        }
-
-        let info: ServerInfoResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| ClientError::NetworkError {
-                    context: ErrorContext::new(
-                        ErrorCode::NetworkProtocol,
-                        format!("Failed to parse server info response: {}", e),
-                        "fetch_server_info".to_string(),
-                    ),
-                    retry_count: 0,
-                    last_attempt: std::time::SystemTime::now(),
-                    connection_state: "welcome_signing_key_parse_failed".to_string(),
-                })?;
-
-        let descriptor = info.public_keys.welcome_signing.ok_or_else(|| {
-            ClientError::InvalidState("Server did not advertise a welcome signing key".to_string())
-        })?;
-
-        let key_bytes = general_purpose::STANDARD
-            .decode(descriptor.public_key.trim().as_bytes())
-            .map_err(|e| {
-                ClientError::InvalidState(format!("Welcome signing key is not valid base64: {}", e))
-            })?;
-
-        if key_bytes.len() != 32 {
-            return Err(ClientError::InvalidState(format!(
-                "Welcome signing key must be 32 bytes, got {}",
-                key_bytes.len()
-            )));
-        }
-
-        Ok(key_bytes)
     }
 
     pub(super) async fn upsert_group_membership(
@@ -846,6 +926,19 @@ impl<S: Storage, N: Network> Client<S, N> {
                 {
                     Ok(()) => {
                         self.upsert_group_membership(group, Some(epoch_id)).await?;
+                        if let Err(err) = self
+                            .install_missed_epoch_keys(group.id, epoch_id, auth_token)
+                            .await
+                        {
+                            self.logger.log(
+                                crate::logging::LogLevel::Warn,
+                                &format!(
+                                    "Could not fetch older key versions missed for group {}: {}",
+                                    group.name, err
+                                ),
+                                Some(&group.id.to_string()),
+                            );
+                        }
                         Ok(WelcomeSyncResult {
                             group_id: group.id,
                             group_name: group.name.clone(),
@@ -889,6 +982,217 @@ impl<S: Storage, N: Network> Client<S, N> {
                 }
             }
         }
+    }
+
+    /// Most older key versions fetched in one sync, so a long gap cannot flood the server.
+    const MISSED_EPOCH_FETCH_LIMIT: usize = 16;
+
+    /// Key versions below `current_version` that this device skipped: newer than the oldest one
+    /// it holds for the group, so versions from before it joined are never asked for. At most
+    /// the newest [`Self::MISSED_EPOCH_FETCH_LIMIT`], oldest first.
+    pub(super) fn missed_epoch_versions(
+        state: &ClientState,
+        group_id: Uuid,
+        current_version: u64,
+    ) -> Vec<u64> {
+        let held: HashSet<u64> = state
+            .epochs
+            .keys()
+            .copied()
+            .filter(|version| {
+                Self::get_epoch_state(state, group_id, *version)
+                    .is_some_and(|epoch| epoch.key_source.is_locally_usable())
+            })
+            .collect();
+        let Some(oldest) = held.iter().min().copied() else {
+            return Vec::new();
+        };
+        let mut missing: Vec<u64> = ((oldest + 1)..current_version)
+            .filter(|version| !held.contains(version))
+            .collect();
+        let skip = missing.len().saturating_sub(Self::MISSED_EPOCH_FETCH_LIMIT);
+        missing.drain(..skip);
+        missing
+    }
+
+    /// Install the key versions this device missed between its oldest key and the group's
+    /// current one, as readable keys that do not change the current key. A device offline
+    /// across more than one rotation otherwise gets only the newest key, and files still on a
+    /// version in between stay unreadable on it. A version with no Welcome for this device (it
+    /// was not in the group yet, or the Welcome expired) is skipped. Returns the versions
+    /// installed.
+    pub(super) async fn install_missed_epoch_keys(
+        &self,
+        group_id: Uuid,
+        current_version: u64,
+        auth_token: &str,
+    ) -> Result<Vec<u64>, ClientError> {
+        let missing = {
+            let state = self.state.read().await;
+            Self::missed_epoch_versions(&state, group_id, current_version)
+        };
+        if missing.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let session_info = self.get_session_info().await.ok();
+        let Some(user_id) = session_info.as_ref().and_then(|info| info.user_id) else {
+            return Ok(Vec::new());
+        };
+        let server_url = match &session_info {
+            Some(info) => Self::resolve_server_base_url(info.server_url.clone()),
+            None => self.active_server_base_url().await,
+        };
+        let client = reqwest::Client::new();
+
+        let mut installed = Vec::new();
+        for version in missing {
+            let epoch_uuid = EpochIdMapper::u64_to_uuid(version, group_id.as_bytes());
+            let url = format!(
+                "{}/api/v1/groups/{}/epochs/{}/welcome/{}",
+                server_url, group_id, epoch_uuid, user_id
+            );
+            let response = client
+                .get(&url)
+                .bearer_auth(auth_token)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| ClientError::NetworkError {
+                    context: ErrorContext::new(
+                        ErrorCode::NetworkConnection,
+                        format!(
+                            "Failed to fetch the Welcome for key version {}: {:?}",
+                            version, e
+                        ),
+                        "missed_epoch_welcome_request".to_string(),
+                    ),
+                    retry_count: 0,
+                    last_attempt: std::time::SystemTime::now(),
+                    connection_state: "request_failed".to_string(),
+                })?;
+            if response.status() == StatusCode::NOT_FOUND {
+                continue;
+            }
+            if !response.status().is_success() {
+                self.logger.log(
+                    crate::logging::LogLevel::Warn,
+                    &format!(
+                        "Server refused the Welcome for key version {}: {}",
+                        version,
+                        response.status()
+                    ),
+                    Some(&group_id.to_string()),
+                );
+                continue;
+            }
+            let payload: WelcomeMessagePayload = match response.json().await {
+                Ok(payload) => payload,
+                Err(err) => {
+                    self.logger.log(
+                        crate::logging::LogLevel::Warn,
+                        &format!("Unreadable Welcome for key version {}: {}", version, err),
+                        Some(&group_id.to_string()),
+                    );
+                    continue;
+                }
+            };
+            if self
+                .install_missed_epoch_welcome(group_id, version, payload, user_id)
+                .await?
+            {
+                installed.push(version);
+            }
+        }
+
+        if !installed.is_empty() {
+            self.logger.log(
+                crate::logging::LogLevel::Info,
+                &format!("Installed missed key versions {:?}", installed),
+                Some(&group_id.to_string()),
+            );
+            self.save_client_state().await?;
+        }
+        Ok(installed)
+    }
+
+    /// Verify and install one missed key version's Welcome as a readable key, leaving the current
+    /// key alone. Returns false when the Welcome is not this device's, has expired, cannot be
+    /// opened, or the version is already held; a Welcome whose key names another version is
+    /// rejected as tampering.
+    pub(super) async fn install_missed_epoch_welcome(
+        &self,
+        group_id: Uuid,
+        version: u64,
+        payload: WelcomeMessagePayload,
+        user_id: Uuid,
+    ) -> Result<bool, ClientError> {
+        let epoch_uuid = EpochIdMapper::u64_to_uuid(version, group_id.as_bytes());
+        let invitation_keypair = self.ensure_invitation_keypair().await?;
+        if payload.recipient_device_id != invitation_keypair.device_id
+            || payload.recipient_user_id != user_id
+            || payload.group_id != group_id
+            || payload.epoch_id != epoch_uuid
+            || payload
+                .expires_at
+                .is_some_and(|expiry| expiry <= Utc::now())
+        {
+            return Ok(false);
+        }
+
+        let welcome_manager = WelcomeManager::new(self.storage.clone(), invitation_keypair);
+        let server_message = ServerWelcomeMessage {
+            recipient_device_id: payload.recipient_device_id,
+            encrypted_epoch_key: payload.encrypted_epoch_key,
+            signature: payload.signature,
+            signing_public_key: payload.signing_public_key,
+            created_at: payload.created_at,
+            expires_at: payload.expires_at,
+        };
+        let epoch_secrets = match self
+            .open_trusted_welcome(&welcome_manager, &server_message, group_id, epoch_uuid)
+            .await
+        {
+            Ok(secrets) => secrets,
+            Err(err) => {
+                self.logger.log(
+                    crate::logging::LogLevel::Warn,
+                    &format!(
+                        "Could not open the Welcome for key version {}: {}",
+                        version, err
+                    ),
+                    Some(&group_id.to_string()),
+                );
+                return Ok(false);
+            }
+        };
+        if epoch_secrets.epoch_id != version {
+            return Err(initialization::setup_error(
+                ErrorCode::SecurityTampering,
+                "Welcome encryption key belongs to a different group epoch",
+            ));
+        }
+
+        let missed_epoch = EpochState {
+            group_id: Some(group_id),
+            epoch_id: version,
+            encryption_key: epoch_secrets.epoch_key,
+            key_source: EpochKeySource::Welcome,
+            members: Self::hydrate_group_members(&epoch_secrets.group_members)?,
+            created_at: epoch_secrets.active_at,
+            is_active: false,
+            file_count: 0,
+            marked_for_removal: false,
+            removal_eligible_at: None,
+        };
+        let mut state = self.state.write().await;
+        if Self::get_epoch_state(&state, group_id, version)
+            .is_some_and(|existing| existing.key_source.is_locally_usable())
+        {
+            return Ok(false);
+        }
+        Self::upsert_epoch_state(&mut state, group_id, missed_epoch);
+        Ok(true)
     }
 
     /// Synchronize Welcome messages for all groups the user belongs to
@@ -1135,8 +1439,9 @@ impl<S: Storage, N: Network> Client<S, N> {
         group_id: Uuid,
         epoch_id: u64,
     ) -> Result<(), ClientError> {
+        // Runs once per encrypted file, so it logs below Info.
         self.logger.log(
-            crate::logging::LogLevel::Info,
+            crate::logging::LogLevel::Debug,
             &format!("Ensuring epoch key available for epoch {}", epoch_id),
             Some(&format!(
                 "epoch_id: {}, checking local then server",
@@ -1160,32 +1465,17 @@ impl<S: Storage, N: Network> Client<S, N> {
                 .map(|migration| migration.to_epoch == epoch_id)
                 .unwrap_or(false);
 
-            // DEBUG: Log what epochs we actually have
             self.logger.log(
-                crate::logging::LogLevel::Info,
+                crate::logging::LogLevel::Trace,
                 &format!(
-                    "DEBUG: Checking local epoch availability - epoch_id: {}, group_id: {}, exists: {}",
-                    epoch_id, group_id, exists
-                ),
-                Some(&format!(
-                    "total_epoch_keys: {}, epochs_for_id_{}: {}, all_epoch_ids: {:?}",
-                    state.epochs.len(),
+                    "Local epoch availability - epoch_id: {}, group_id: {}, exists: {}, epoch keys held: {}",
                     epoch_id,
-                    state.epochs.get(&epoch_id).map(|v| v.len()).unwrap_or(0),
-                    state.epochs.keys().collect::<Vec<_>>()
-                )),
+                    group_id,
+                    exists,
+                    state.epochs.values().map(Vec::len).sum::<usize>()
+                ),
+                None,
             );
-
-            // DEBUG: Log all epochs we have
-            for (eid, entries) in &state.epochs {
-                for entry in entries {
-                    self.logger.log(
-                        crate::logging::LogLevel::Info,
-                        &format!("DEBUG: Have epoch {} for group {:?}", eid, entry.group_id),
-                        None,
-                    );
-                }
-            }
 
             let age = now.signed_duration_since(state.last_sync).num_seconds();
 
@@ -1285,6 +1575,15 @@ impl<S: Storage, N: Network> Client<S, N> {
                     }
                 }
 
+                if let ClientError::NetworkError { context, .. } = &err {
+                    if context.code == ErrorCode::GroupPermissionDenied {
+                        return Err(ClientError::Unauthorized(format!(
+                            "this account cannot receive the key for epoch {} of group {}. \
+                             It may have been removed from the group, or this device is not approved for it.",
+                            epoch_id, group_id
+                        )));
+                    }
+                }
                 return Err(err);
             }
         };
@@ -1615,8 +1914,13 @@ impl<S: Storage, N: Network> Client<S, N> {
             expires_at: welcome_payload.expires_at,
         };
 
-        let epoch_secrets = welcome_manager
-            .process_server_welcome_message(&server_message, group_id, welcome_payload.epoch_id)
+        let epoch_secrets = self
+            .open_trusted_welcome(
+                &welcome_manager,
+                &server_message,
+                group_id,
+                welcome_payload.epoch_id,
+            )
             .await?;
 
         if epoch_secrets.epoch_id != welcome_response.epoch_id && !welcome_response.legacy_mapping {
@@ -1654,7 +1958,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         {
             let mut state = self.state.write().await;
             if Self::get_epoch_state(&state, group_id, new_epoch.epoch_id).is_some_and(|existing| {
-                existing.key_source.is_verified()
+                existing.key_source.is_locally_usable()
                     && existing.encryption_key != new_epoch.encryption_key
             }) {
                 return Err(initialization::setup_error(
@@ -2054,8 +2358,15 @@ impl<S: Storage, N: Network> Client<S, N> {
         let invitation_keypair = self.ensure_invitation_keypair().await?;
         let welcome_manager = WelcomeManager::new(self.storage.clone(), invitation_keypair);
 
-        let encrypted_epoch_key = welcome_manager
-            .encrypt_epoch_key_for_device(&epoch_state.encryption_key, &invitation_public_key)?;
+        let encrypted_epoch_key = self
+            .encrypt_welcome_epoch(
+                &welcome_manager,
+                group_id,
+                &epoch_state,
+                &join_card.identity_public,
+                &invitation_public_key,
+            )
+            .await?;
 
         let signing_public_key = self.device_identity.public_key_bytes().to_vec();
         let created_at = Utc::now();
@@ -2097,6 +2408,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         device_id: &str,
         recipient_user_id: Uuid,
         invitation_public_key_bytes: &[u8],
+        recipient_identity_key: &[u8],
     ) -> Result<GeneratedWelcomeMessage, ClientError> {
         self.ensure_state_loaded().await?;
 
@@ -2135,8 +2447,15 @@ impl<S: Storage, N: Network> Client<S, N> {
         let invitation_keypair = self.ensure_invitation_keypair().await?;
         let welcome_manager = WelcomeManager::new(self.storage.clone(), invitation_keypair);
 
-        let encrypted_epoch_key = welcome_manager
-            .encrypt_epoch_key_for_device(&epoch_state.encryption_key, &invitation_public_key)?;
+        let encrypted_epoch_key = self
+            .encrypt_welcome_epoch(
+                &welcome_manager,
+                group_id,
+                &epoch_state,
+                recipient_identity_key,
+                &invitation_public_key,
+            )
+            .await?;
 
         let signing_public_key = self.device_identity.public_key_bytes().to_vec();
         let created_at = Utc::now();
@@ -2201,7 +2520,12 @@ impl<S: Storage, N: Network> Client<S, N> {
             &device_id,
             user_id,
             public_key_bytes.as_ref(),
+            &self.device_identity.public_key_bytes(),
         )
         .await
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/rekey/test_missed_epoch_keys.rs"]
+mod missed_epoch_keys_tests;

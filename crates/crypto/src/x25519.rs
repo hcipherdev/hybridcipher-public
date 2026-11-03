@@ -113,12 +113,18 @@ impl X25519PrivateKey {
     }
 
     /// Perform X25519 ECDH with another public key
-    #[must_use]
-    pub fn diffie_hellman(&self, public: &X25519PublicKey) -> X25519SharedSecret {
+    ///
+    /// # Errors
+    /// Returns [`CryptoError::InvalidKey`] when `public` is a low-order point,
+    /// which forces the all-zero shared secret.
+    pub fn diffie_hellman(&self, public: &X25519PublicKey) -> CryptoResult<X25519SharedSecret> {
         let shared = self.inner.diffie_hellman(&public.inner);
-        X25519SharedSecret {
-            bytes: *shared.as_bytes(),
+        if !shared.was_contributory() {
+            return Err(non_contributory_error());
         }
+        Ok(X25519SharedSecret {
+            bytes: *shared.as_bytes(),
+        })
     }
 
     /// Export private key as bytes (use with caution)
@@ -194,23 +200,35 @@ impl core::fmt::Debug for X25519SharedSecret {
     }
 }
 
+fn non_contributory_error() -> CryptoError {
+    CryptoError::InvalidKey(alloc::string::String::from(
+        "X25519 public key is a low-order point (all-zero shared secret)",
+    ))
+}
+
 /// Perform ephemeral X25519 ECDH (generate key pair and do DH in one step)
-#[must_use]
+///
+/// # Errors
+/// Returns [`CryptoError::InvalidKey`] when `public_key` is a low-order point,
+/// which forces the all-zero shared secret.
 pub fn ephemeral_diffie_hellman<R: RngCore + CryptoRng>(
     rng: &mut R,
     public_key: &X25519PublicKey,
-) -> (X25519PublicKey, X25519SharedSecret) {
+) -> CryptoResult<(X25519PublicKey, X25519SharedSecret)> {
     let ephemeral_secret = EphemeralSecret::random_from_rng(rng);
     let ephemeral_public = X25519PublicKey {
         inner: PublicKey::from(&ephemeral_secret),
     };
 
     let shared = ephemeral_secret.diffie_hellman(&public_key.inner);
+    if !shared.was_contributory() {
+        return Err(non_contributory_error());
+    }
     let shared_secret = X25519SharedSecret {
         bytes: *shared.as_bytes(),
     };
 
-    (ephemeral_public, shared_secret)
+    Ok((ephemeral_public, shared_secret))
 }
 
 #[cfg(test)]
@@ -236,10 +254,16 @@ mod tests {
         let bob_keypair = X25519KeyPair::generate(&mut OsRng);
 
         // Alice computes shared secret
-        let alice_shared = alice_keypair.private.diffie_hellman(&bob_keypair.public);
+        let alice_shared = alice_keypair
+            .private
+            .diffie_hellman(&bob_keypair.public)
+            .unwrap();
 
         // Bob computes shared secret
-        let bob_shared = bob_keypair.private.diffie_hellman(&alice_keypair.public);
+        let bob_shared = bob_keypair
+            .private
+            .diffie_hellman(&alice_keypair.public)
+            .unwrap();
 
         // Shared secrets should be equal
         assert_eq!(alice_shared.as_bytes(), bob_shared.as_bytes());
@@ -250,10 +274,13 @@ mod tests {
         let static_keypair = X25519KeyPair::generate(&mut OsRng);
 
         let (ephemeral_public, ephemeral_shared) =
-            ephemeral_diffie_hellman(&mut OsRng, &static_keypair.public);
+            ephemeral_diffie_hellman(&mut OsRng, &static_keypair.public).unwrap();
 
         // Static party computes the same shared secret
-        let static_shared = static_keypair.private.diffie_hellman(&ephemeral_public);
+        let static_shared = static_keypair
+            .private
+            .diffie_hellman(&ephemeral_public)
+            .unwrap();
 
         assert_eq!(ephemeral_shared.as_bytes(), static_shared.as_bytes());
     }

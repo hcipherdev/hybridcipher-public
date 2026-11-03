@@ -576,7 +576,8 @@ impl<S: Storage, N: Network> Client<S, N> {
                 let mut file_id = entry.file_id.clone();
 
                 let should_parse_header =
-                    Self::path_has_encrypted_suffix(&path) && (epoch_id == 0 || file_id.is_none());
+                    ciphertext::classify(&path) == CiphertextKind::File
+                        && (epoch_id == 0 || file_id.is_none());
                 let header = if should_parse_header {
                     Self::parse_encrypted_file_metadata(&path)
                 } else {

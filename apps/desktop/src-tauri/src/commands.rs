@@ -70,19 +70,39 @@ use tokio::{
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod cli_terminal;
+mod device_trust;
 mod file_ops;
+mod folder_jobs;
 mod groups;
 mod license;
+mod local_vault;
+mod mount_center;
+mod mount_queue;
 mod operations;
+mod path_opener;
+mod personal_workspace;
 mod rekey;
+mod saved_code_recovery;
 mod settings;
+mod team_devices;
+mod team_tasks;
+mod unmount_batch;
 
+pub use device_trust::*;
 pub use file_ops::*;
 pub use groups::*;
 pub use license::*;
+pub use team_devices::*;
+pub use local_vault::*;
+pub use mount_center::*;
+pub use mount_queue::*;
 pub use operations::*;
+pub use personal_workspace::*;
 pub use rekey::*;
+pub use saved_code_recovery::*;
 pub use settings::*;
+pub use unmount_batch::*;
 
 /// Standard response wrapper for all commands
 #[derive(Debug, Serialize, Deserialize)]
@@ -171,6 +191,12 @@ pub async fn check_email_confirmation(
     if state.session.lock().await.is_some() {
         return Ok(CommandResponse::err(
             "Log out of the current desktop session before checking another login.",
+        ));
+    }
+    if local_vault::vault_upgrade_blocks_login(&state, &email) {
+        return Ok(CommandResponse::err_with_code(
+            "LOCAL_VAULT_UPGRADE_PENDING",
+            local_vault::LOCAL_VAULT_UPGRADE_PENDING,
         ));
     }
     let login_result = state
@@ -449,7 +475,7 @@ pub async fn request_password_reset(
 
     if response.status().is_success() {
         return Ok(CommandResponse::ok(
-            "If an account exists for that email, a reset token has been sent.".to_string(),
+            "If an account exists for that email and your MFA code is valid, a reset token has been sent. No email usually means the MFA code was wrong or MFA is not enabled.".to_string(),
         ));
     }
 
@@ -489,7 +515,18 @@ pub async fn login_user(
 ) -> Result<CommandResponse<crate::client::LoginResult>, String> {
     tracing::info!("Login command called for email: {}", email);
     let password = Zeroizing::new(password);
+    // An account and a vault never run at once. Closed before the login lock is
+    // taken, because the vault upgrade takes the two locks the other way round.
+    // A login refused for a pending upgrade below leaves that vault open.
+    let upgrading = local_vault::pending_vault_upgrade(&state)
+        .is_some_and(|(_, pending)| pending.eq_ignore_ascii_case(email.trim()));
+    if !upgrading {
+        if let Err(error) = local_vault::close_open_vault(&state).await {
+            return Ok(CommandResponse::err(error));
+        }
+    }
     let _login_guard = LOGIN_OPERATION_LOCK.lock().await;
+    let _account_guard = UPDATE_OPERATION_GATE.read().await;
 
     let remember_me = persist_session.unwrap_or_else(default_remember_me);
     // The shared client changes its auth scope and keys during login. Keep an
@@ -497,6 +534,14 @@ pub async fn login_user(
     if state.session.lock().await.is_some() {
         return Ok(CommandResponse::err(
             "Log out of the current desktop session before signing in again.",
+        ));
+    }
+    if local_vault::pending_vault_upgrade(&state)
+        .is_some_and(|(_, pending)| pending.eq_ignore_ascii_case(email.trim()))
+    {
+        return Ok(CommandResponse::err_with_code(
+            "LOCAL_VAULT_UPGRADE_PENDING",
+            local_vault::LOCAL_VAULT_UPGRADE_PENDING,
         ));
     }
 
@@ -557,6 +602,12 @@ pub async fn login_user(
             };
             login_result.recovery_code = recovery_code.or(auto_recovery_code);
 
+            // The vault lock is taken after the login lock is released, in the
+            // same order as the vault upgrade takes them.
+            drop(_account_guard);
+            drop(_login_guard);
+            local_vault::discard_pristine_vault(&state).await;
+
             Ok(CommandResponse::ok(login_result))
         }
         Err(e) => {
@@ -566,10 +617,61 @@ pub async fn login_user(
     }
 }
 
+/// Recovery for `DEVICE_IDENTITY_UNREADABLE`: after the password is checked and
+/// the saved identity is confirmed unreadable, stop this account's mounts and
+/// move its folder aside. Signing in again then sets this computer up as a new
+/// device, which still needs approval or the saved recovery code.
+#[tauri::command]
+pub async fn set_up_device_again(
+    email: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<String>, String> {
+    let password = Zeroizing::new(password);
+    let _login_guard = LOGIN_OPERATION_LOCK.lock().await;
+    let _account_guard = UPDATE_OPERATION_GATE.read().await;
+    if state.session.lock().await.is_some() {
+        return Ok(CommandResponse::err(
+            "Log out of the current desktop session before setting this device up again.",
+        ));
+    }
+
+    if let Err(error) = state
+        .client
+        .confirm_unreadable_device_identity(&email, &password)
+    {
+        return Ok(CommandResponse::err(error));
+    }
+    let user_dir = match state.client.device_identity_dir(&email) {
+        Ok(dir) => dir,
+        Err(error) => return Ok(CommandResponse::err(error)),
+    };
+    if let Err(error) = state.mount_manager.unmount_account(&user_dir, false).await {
+        return Ok(CommandResponse::err(format!(
+            "Protected folders for this account are still open and couldn't be closed: {error}"
+        )));
+    }
+    match state.client.move_device_identity_aside(&email) {
+        Ok(replaced) => {
+            tracing::warn!(
+                "Device identity for {} moved aside to {}",
+                email,
+                replaced.display()
+            );
+            Ok(CommandResponse::ok(replaced.display().to_string()))
+        }
+        Err(error) => Ok(CommandResponse::err(error)),
+    }
+}
+
 async fn bootstrap_default_group_on_login(
     state: &AppState,
     password: &str,
 ) -> Result<Option<String>, String> {
+    // A vault upgrade commits its own key as this account's Personal genesis.
+    if local_vault::pending_vault_upgrade(state).is_some() {
+        return Ok(None);
+    }
     let session = {
         let guard = state.session.lock().await;
         guard
@@ -582,38 +684,54 @@ async fn bootstrap_default_group_on_login(
         .clone()
         .unwrap_or_else(|| state.client.server_url().to_string());
     let token = session.token.clone();
+    let scope = personal_workspace::WorkspaceSessionScope::capture(state, &session);
 
-    let groups = fetch_group_list(&server_url, &token).await?;
+    let personal = personal_workspace::personal_workspace_snapshot(state, &session, true).await?;
+    if personal["state"] != "available" {
+        return Ok(None);
+    }
+    let group_id = personal["personal_default_group_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or("Personal default identity is invalid")?;
     let client = state
         .local_client
         .client()
         .await
         .map_err(|e| format!("Local client unavailable: {}", e))?;
-    let target_group_id = groups
-        .groups
-        .iter()
-        .find(|group| group_needs_genesis(group))
-        .map(|group| group.id);
-
-    ensure_client_active_group_from_groups(client.as_ref(), &groups).await?;
-
-    let Some(group_id) = target_group_id else {
-        return Ok(None);
-    };
-
-    client
-        .use_group(group_id)
-        .await
-        .map_err(|err| map_active_group_selection_error(err))?;
-
-    client
-        .initialize_group_epoch(group_id, 1)
-        .await
-        .map_err(|e| format!("Failed to initialize default group: {}", e))?;
-
-    if let Err(err) = client.use_group(group_id).await {
-        tracing::warn!("Failed to cache default group {}: {}", group_id, err);
+    if let Some(epoch) = operations::group_epoch_uuid(&personal["group"])? {
+        if !client
+            .has_cached_group_epoch_key(group_id, epoch)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            client
+                .refresh_committed_group_epoch(group_id)
+                .await
+                .map_err(|error| format!("Failed to acquire Personal default keys: {error}"))?;
+        }
+    } else {
+        // Only an authoritative default with no committed epoch can initialize genesis.
+        let readiness = client
+            .prepare_group_for_use(group_id)
+            .await
+            .map_err(|error| format!("Failed to prepare Personal default group: {error}"))?;
+        if !matches!(
+            readiness,
+            hybridcipher_client::GroupInitializationReadiness::Ready { .. }
+        ) {
+            return Ok(None);
+        }
     }
+    let refreshed = personal_workspace::personal_workspace_snapshot(state, &session, true).await?;
+    let group = personal_workspace::available_personal_group(&refreshed, Some(group_id))?;
+    let epoch = operations::group_epoch_uuid(&group)?
+        .ok_or("Personal current epoch could not be confirmed")?;
+    scope.ensure_current(state).await?;
+    client
+        .use_group_at_epoch(group_id, epoch)
+        .await
+        .map_err(map_active_group_selection_error)?;
 
     if recovery_backup_exists(&server_url, &token, &session.email, state).await? {
         return Ok(None);
@@ -627,6 +745,7 @@ async fn bootstrap_default_group_on_login(
         client,
         group_id,
         state,
+        None,
     )
     .await?;
 
@@ -685,10 +804,6 @@ fn group_needs_genesis(group: &crate::http_client::GroupInfo) -> bool {
 const NO_WORKSPACE_AVAILABLE_MESSAGE: &str =
     "No workspace is available for this account yet. Create or join a group, then try again.";
 
-fn select_primary_group_id(groups: &GroupListResponse) -> Option<Uuid> {
-    groups.groups.first().map(|group| group.id)
-}
-
 fn is_active_group_context_error(message: &str) -> bool {
     message.contains("without an active group") || message.contains("No active group selected")
 }
@@ -696,6 +811,38 @@ fn is_active_group_context_error(message: &str) -> bool {
 #[cfg(test)]
 #[path = "../tests/coverage/test_folder_errors.rs"]
 mod folder_error_tests;
+
+#[cfg(test)]
+#[path = "../tests/coverage/test_missing_folder_rows.rs"]
+mod missing_folder_row_tests;
+
+#[cfg(test)]
+#[path = "../tests/local/test_local_vault_command_guards.rs"]
+mod local_vault_command_guard_tests;
+
+#[cfg(test)]
+#[path = "../tests/device_security/test_personal_device_scope.rs"]
+mod personal_device_scope_tests;
+
+#[cfg(test)]
+#[path = "../tests/device_security/test_group_pending_devices.rs"]
+mod group_pending_devices_tests;
+
+#[cfg(test)]
+#[path = "../tests/mounts/test_mount_availability.rs"]
+mod mount_availability_tests;
+
+#[cfg(test)]
+#[path = "../tests/mounts/test_unmount_batch.rs"]
+mod unmount_batch_tests;
+
+#[cfg(test)]
+#[path = "../tests/mounts/test_finder_wait.rs"]
+mod finder_wait_tests;
+
+#[cfg(test)]
+#[path = "../tests/mounts/test_reconnected_mounts.rs"]
+mod reconnected_mounts_tests;
 
 fn desktop_safe_client_error(error: impl ToString) -> String {
     let message = error.to_string();
@@ -715,44 +862,100 @@ fn map_active_group_selection_error(error: impl ToString) -> String {
     }
 }
 
-async fn ensure_client_active_group_from_groups(
-    client: &LocalClient,
-    groups: &GroupListResponse,
-) -> Result<Uuid, String> {
-    if let Some(group_id) = client.active_group_id_opt().await {
-        return Ok(group_id);
-    }
-
-    let group_id = select_primary_group_id(groups)
-        .ok_or_else(|| NO_WORKSPACE_AVAILABLE_MESSAGE.to_string())?;
-
-    client
-        .use_group(group_id)
+async fn ensure_local_active_group(state: &AppState) -> Result<Uuid, String> {
+    ensure_local_active_group_with_metadata(state)
         .await
-        .map_err(map_active_group_selection_error)?;
-
-    Ok(group_id)
+        .map(|(group_id, _)| group_id)
 }
 
-async fn ensure_local_active_group(state: &AppState) -> Result<Uuid, String> {
-    let client = state.local_client.client().await?;
-    if let Some(group_id) = client.active_group_id_opt().await {
-        return Ok(group_id);
+/// A group the account may use from the desktop: a group of its Team
+/// workspace, or the account's Personal default group.
+async fn validate_desktop_workspace_group(
+    state: &AppState,
+    session: &crate::state::UserSession,
+    id: Uuid,
+    refresh: bool,
+) -> Result<Value, String> {
+    let group = operations::validate_group_access(state, session, id, refresh).await?;
+    if let Some(organization) = group["organization_id"].as_str() {
+        let claims = license::verified_claims(session, true)?
+            .ok_or("Team workspace authorization is unavailable")?;
+        if claims.organization_id != organization {
+            return Err("The selected group belongs to another Team workspace".into());
+        }
+        Ok(group)
+    } else {
+        let snapshot =
+            personal_workspace::personal_workspace_snapshot(state, session, refresh).await?;
+        personal_workspace::available_personal_group(&snapshot, Some(id))
     }
+}
 
+/// The selected group and, for an account, its server metadata. The
+/// accountless vault has no metadata.
+async fn ensure_local_active_group_with_metadata(
+    state: &AppState,
+) -> Result<(Uuid, Option<Value>), String> {
+    if let Some(group_id) = state.local_vault_group().await {
+        let client = state.local_client.client().await?;
+        if !client
+            .has_local_vault_key(group_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err("This device's vault key is unavailable".into());
+        }
+        return Ok((group_id, None));
+    }
     let session = state
         .session
         .lock()
         .await
         .clone()
         .ok_or_else(|| "No active session found".to_string())?;
-    let server_url = session
-        .server_url
-        .clone()
-        .unwrap_or_else(|| state.client.server_url().to_string());
-    let groups = fetch_group_list(&server_url, &session.token).await?;
-
-    ensure_client_active_group_from_groups(client.as_ref(), &groups).await
+    let scope = personal_workspace::WorkspaceSessionScope::capture(state, &session);
+    let client = state.local_client.client().await?;
+    let refresh = session.expires_at > chrono::Utc::now().timestamp();
+    // An explicitly unavailable UI selection must stay unavailable; cached
+    // client activity and group-list order cannot choose the folder namespace.
+    let selected = client
+        .load_local_config("desktop_ui_group_id")
+        .await
+        .map_err(|error| error.to_string())?;
+    let metadata = match selected {
+        Some(selected) => {
+            let id = Uuid::parse_str(&selected).map_err(|_| NO_WORKSPACE_AVAILABLE_MESSAGE)?;
+            validate_desktop_workspace_group(state, &session, id, refresh).await?
+        }
+        None => {
+            let snapshot =
+                personal_workspace::personal_workspace_snapshot(state, &session, refresh).await?;
+            personal_workspace::available_personal_group(&snapshot, None)?
+        }
+    };
+    let id = Uuid::parse_str(metadata["id"].as_str().unwrap_or_default())
+        .map_err(|_| "Invalid workspace group")?;
+    let epoch = operations::group_epoch_uuid(&metadata)?
+        .ok_or("The workspace encryption keys are not initialized")?;
+    if !client
+        .has_cached_group_epoch_key(id, epoch)
+        .await
+        .map_err(|error| error.to_string())?
+        && refresh
+    {
+        let _ = client.refresh_committed_group_epoch(id).await;
+    }
+    scope.ensure_current(state).await?;
+    client.use_group_at_epoch(id, epoch).await.map_err(|_| "The current workspace encryption keys are unavailable on this device. Recover with your saved code or complete device setup.")?;
+    client
+        .store_local_config("desktop_ui_group_id", &id.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .store_local_config("group_id", &id.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((id, Some(metadata)))
 }
 
 fn recovery_artifact_path(
@@ -812,24 +1015,7 @@ async fn recovery_backup_exists(
 }
 
 fn parse_recovery_code_input(input: &str) -> Result<Vec<u8>, String> {
-    let normalized: String = input
-        .chars()
-        .filter(|character| !character.is_whitespace() && *character != '-')
-        .collect();
-
-    if normalized.len() != RECOVERY_CODE_BYTES * 2 {
-        return Err(format!(
-            "Recovery code must contain exactly {} hexadecimal characters, ignoring dashes.",
-            RECOVERY_CODE_BYTES * 2
-        ));
-    }
-
-    let bytes = hex::decode(&normalized)
-        .map_err(|err| format!("Recovery code is not valid hexadecimal: {}", err))?;
-    if bytes.len() != RECOVERY_CODE_BYTES {
-        return Err("Recovery code has an unexpected length.".to_string());
-    }
-    Ok(bytes)
+    hybridcipher_client::saved_code_recovery::parse_recovery_code(input).map(|code| code.to_vec())
 }
 
 async fn load_or_download_recovery_artifact(
@@ -871,6 +1057,7 @@ async fn download_recovery_artifact_with_version(
     let response = reqwest::Client::new()
         .get(endpoint)
         .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
         .map_err(|e| format!("Failed to fetch recovery backup: {}", e))?;
@@ -939,6 +1126,9 @@ fn recovery_auto_backup_state(
     session: &crate::state::UserSession,
     state: &AppState,
 ) -> &'static str {
+    if !session.persistent {
+        return "temporary_session";
+    }
     if session.device_id.trim().is_empty() {
         return "missing_device_id";
     }
@@ -1018,6 +1208,9 @@ fn persist_recovery_writer_blob_with_key(
     writer_key: &[u8; 32],
     epoch_key: &[u8; 32],
 ) -> Result<(), String> {
+    if !session.persistent {
+        return Err("Automatic backup credentials require a persistent sign-in session.".into());
+    }
     let blob = encrypt_with_ad(epoch_key, *writer_key, WRITER_AAD)
         .map_err(|e| format!("Failed to seal writer blob: {}", e))?;
 
@@ -1028,12 +1221,9 @@ fn persist_recovery_writer_blob_with_key(
     let storage_id = state
         .local_client
         .user_storage_id_for_session(&session.email, &server_url);
-    if let Err(err) = key_bundle::store_writer_key(&storage_id, &session.device_id, writer_key) {
-        tracing::warn!(
-            "Could not store writer key in secure storage; silent recovery backup may be unavailable: {}",
-            err
-        );
-    }
+    key_bundle::store_writer_key(&storage_id, &session.device_id, writer_key).map_err(|_| {
+        "Automatic backup credentials could not be saved in secure storage".to_string()
+    })?;
 
     let user_dir = state
         .local_client
@@ -1054,6 +1244,9 @@ fn load_recovery_writer_material(
     state: &AppState,
     session: &crate::state::UserSession,
 ) -> Result<Option<WriterMaterial>, String> {
+    if !session.persistent {
+        return Ok(None);
+    }
     let server_url = session
         .server_url
         .clone()
@@ -1131,6 +1324,7 @@ async fn bootstrap_recovery_backup(
     client: std::sync::Arc<LocalClient>,
     group_id: Uuid,
     state: &AppState,
+    existing_code: Option<&[u8]>,
 ) -> Result<String, String> {
     let capsule = client
         .export_recovery_capsule(group_id)
@@ -1153,12 +1347,19 @@ async fn bootstrap_recovery_backup(
         return Err("No epoch secrets available to back up".to_string());
     }
 
-    let mut recovery_secret_bytes = [0u8; RECOVERY_CODE_BYTES];
-    OsRng.fill_bytes(&mut recovery_secret_bytes);
-    let formatted_code = format_recovery_code(&recovery_secret_bytes);
+    let mut recovery_secret_bytes = Zeroizing::new([0u8; RECOVERY_CODE_BYTES]);
+    match existing_code {
+        // An upgraded local vault keeps the recovery code its owner already saved.
+        Some(code) if code.len() == RECOVERY_CODE_BYTES => {
+            recovery_secret_bytes.copy_from_slice(code)
+        }
+        Some(_) => return Err("Recovery code has an unexpected length".into()),
+        None => OsRng.fill_bytes(recovery_secret_bytes.as_mut()),
+    }
+    let formatted_code = format_recovery_code(recovery_secret_bytes.as_ref());
 
-    let mut artifact = BackupArtifact::new(password, &recovery_secret_bytes)?;
-    artifact.append_entries(&entries, password, &recovery_secret_bytes)?;
+    let mut artifact = BackupArtifact::new(password, recovery_secret_bytes.as_ref())?;
+    artifact.append_entries(&entries, password, recovery_secret_bytes.as_ref())?;
 
     let session = state
         .session
@@ -1167,7 +1368,7 @@ async fn bootstrap_recovery_backup(
         .clone()
         .ok_or_else(|| "No active session found".to_string())?;
     let path = recovery_artifact_path(state, email, server_url)?;
-    let k_file = artifact.unwrap_file_key(password, &recovery_secret_bytes)?;
+    let k_file = artifact.unwrap_file_key(password, recovery_secret_bytes.as_ref())?;
     let hkdf_salt = general_purpose::STANDARD
         .decode(&artifact.hkdf_salt_b64)
         .map_err(|e| format!("Invalid HKDF salt encoding: {}", e))?;
@@ -1175,19 +1376,45 @@ async fn bootstrap_recovery_backup(
     let mut k_file_bytes = [0u8; 32];
     k_file_bytes.copy_from_slice(k_file.as_ref());
 
-    upload_recovery_artifact(server_url, token, state, &session, &artifact).await?;
-
-    if let Err(err) = persist_recovery_writer_material(state, &session, &k_file_bytes, &epoch_key) {
-        tracing::warn!(
-            "Recovery backup uploaded, but local writer material could not be persisted: {}",
-            err
-        );
+    let material = state.client.device_crypto_material(email)?;
+    if material.device_id != session.device_id {
+        return Err("Backup identity does not match this session".into());
     }
-    if let Err(err) = artifact.save_to_path(&path) {
-        tracing::warn!(
-            "Recovery backup uploaded, but local artifact could not be persisted: {}",
-            err
-        );
+    let identity =
+        hybridcipher_crypto::signatures::Ed25519KeyPair::from_bytes(&material.identity_secret)
+            .map_err(|e| e.to_string())?;
+    let context = hybridcipher_client::device_actions::DeviceActionContext {
+        server_url,
+        token,
+        user_id: &session.user_id,
+        device_id: &session.device_id,
+    };
+    hybridcipher_client::saved_code_transport::enroll_recovery_credential(
+        &identity,
+        &context,
+        recovery_secret_bytes.as_ref(),
+        &artifact,
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    if session.persistent {
+        if let Err(err) =
+            persist_recovery_writer_material(state, &session, &k_file_bytes, &epoch_key)
+        {
+            tracing::warn!(
+                "Recovery backup uploaded, but local writer material could not be persisted: {}",
+                err
+            );
+        }
+        if let Err(err) = artifact.save_to_path(&path) {
+            tracing::warn!(
+                "Recovery backup uploaded, but local artifact could not be persisted: {}",
+                err
+            );
+        }
     }
 
     Ok(formatted_code)
@@ -1203,6 +1430,9 @@ async fn auto_provision_recovery_on_login(
             .clone()
             .ok_or_else(|| "No active session found".to_string())?
     };
+    if !session.persistent {
+        return Ok(None);
+    }
 
     let server_url = session
         .server_url
@@ -1269,6 +1499,7 @@ async fn auto_provision_recovery_on_login(
         client,
         group_id,
         state,
+        None,
     )
     .await?;
 
@@ -1282,80 +1513,53 @@ async fn upload_recovery_artifact(
     session: &crate::state::UserSession,
     artifact: &BackupArtifact,
 ) -> Result<(), String> {
-    #[derive(Serialize)]
-    struct UploadRecoveryArtifactRequest {
-        artifact_blob: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        expected_version: Option<u32>,
-    }
-
-    let client = reqwest::Client::new();
-    let endpoint = api_endpoint(server_url, "recovery-artifact");
-    let server_artifact = download_recovery_artifact_with_version(server_url, token).await?;
-    let expected_version = server_artifact
-        .as_ref()
-        .map(|downloaded| downloaded.server_version);
-    let merged = match server_artifact {
-        Some(downloaded) => merge_recovery_artifacts(downloaded.artifact, artifact.clone()),
-        None => artifact.clone(),
+    use hybridcipher_client::{
+        device_actions::DeviceActionContext,
+        saved_code_transport::{fetch_recovery_credential, protected_upload_recovery_artifact},
     };
-    let payload = UploadRecoveryArtifactRequest {
-        artifact_blob: merged.to_base64()?,
-        expected_version,
-    };
-
-    let response = client
-        .put(&endpoint)
-        .bearer_auth(token)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to upload recovery backup: {}", e))?;
-
-    if response.status().is_success() {
-        let path = recovery_artifact_path(state, &session.email, server_url)?;
-        merged.save_to_path(&path)?;
-        return Ok(());
+    use hybridcipher_crypto::signatures::Ed25519KeyPair;
+    let material = state.client.device_crypto_material(&session.email)?;
+    if material.device_id != session.device_id {
+        return Err("Backup identity does not match this session".into());
     }
-
-    if response.status() == reqwest::StatusCode::CONFLICT {
-        let fresh = download_recovery_artifact_with_version(server_url, token)
-            .await?
-            .ok_or_else(|| {
-                "Recovery backup conflict occurred, but no server artifact was available."
-                    .to_string()
-            })?;
-        let retry_merged = merge_recovery_artifacts(fresh.artifact, merged);
-        let retry_payload = UploadRecoveryArtifactRequest {
-            artifact_blob: retry_merged.to_base64()?,
-            expected_version: Some(fresh.server_version),
-        };
-        let retry = client
-            .put(&endpoint)
-            .bearer_auth(token)
-            .json(&retry_payload)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to retry recovery backup upload: {}", e))?;
-        if retry.status().is_success() {
-            let path = recovery_artifact_path(state, &session.email, server_url)?;
-            retry_merged.save_to_path(&path)?;
-            return Ok(());
+    let identity =
+        Ed25519KeyPair::from_bytes(&material.identity_secret).map_err(|e| e.to_string())?;
+    let context = DeviceActionContext {
+        server_url,
+        token,
+        user_id: &session.user_id,
+        device_id: &session.device_id,
+    };
+    let status = fetch_recovery_credential(&context).await?;
+    let credential = status.credential.ok_or("This backup needs a one-time upgrade. Recover with your saved encryption code to enable protected updates.")?;
+    let mut merged = artifact.clone();
+    for attempt in 0..2 {
+        let server_artifact = download_recovery_artifact_with_version(server_url, token).await?;
+        let expected = server_artifact.as_ref().map(|value| value.server_version);
+        if let Some(server_artifact) = server_artifact {
+            if !merged.has_same_envelope(&server_artifact.artifact) {
+                return Err("The saved recovery code has changed. Recover with the latest code before updating backup.".into());
+            }
+            merged = merge_recovery_artifacts(server_artifact.artifact, merged);
         }
-        let status = retry.status();
-        let body = retry.text().await.unwrap_or_default();
-        return Err(format!(
-            "Recovery backup upload retry failed with status {}: {}",
-            status, body
-        ));
+        match protected_upload_recovery_artifact(
+            &identity,
+            &context,
+            &merged,
+            expected,
+            Some(&credential.credential_id),
+        )
+        .await
+        {
+            Ok(_) => {
+                merged.save_to_path(&recovery_artifact_path(state, &session.email, server_url)?)?;
+                return Ok(());
+            }
+            Err(error) if attempt == 0 && error.starts_with("409") => continue,
+            Err(error) => return Err(error),
+        }
     }
-
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Err(format!(
-        "Recovery backup upload failed with status {}: {}",
-        status, body
-    ))
+    Err("Recovery backup changed concurrently. Try again.".into())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1392,17 +1596,46 @@ struct RefreshTokenResponseBody {
 }
 
 const SESSION_REFRESH_WINDOW_SECS: i64 = 5 * 60;
+/// Pause after a refresh round fails on network errors, so every waiting command does not retry it.
+const SESSION_REFRESH_BACKOFF_SECS: u64 = 30;
+/// Used when a 429 response does not say when to retry.
+const SESSION_REFRESH_RATE_LIMIT_SECS: u64 = 60;
+const SESSION_LOGIN_REQUIRED: &str =
+    "Your session has expired. Sign in again to sync and manage your Team.";
+
+/// Why a session refresh failed, which decides whether it is worth retrying.
+enum SessionRefreshError {
+    /// The server refused this refresh token; only a new login helps.
+    Rejected(String),
+    /// The server is throttling refreshes; wait before the next attempt.
+    RateLimited(String, Duration),
+    /// Network trouble or a server error; a quick retry may succeed.
+    Transient(String),
+}
+
+impl SessionRefreshError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Rejected(message) | Self::RateLimited(message, _) | Self::Transient(message) => {
+                message
+            }
+        }
+    }
+}
 
 async fn refresh_desktop_session(
     state: &AppState,
     session: &crate::state::UserSession,
-) -> Result<crate::state::UserSession, String> {
+) -> Result<crate::state::UserSession, SessionRefreshError> {
+    use SessionRefreshError::{RateLimited, Rejected, Transient};
     if session.refresh_token.trim().is_empty() {
-        return Err("Session refresh token is unavailable. Please login again.".to_string());
+        return Err(Rejected(
+            "Session refresh token is unavailable. Please login again.".to_string(),
+        ));
     }
 
     let user_id = Uuid::parse_str(session.user_id.trim())
-        .map_err(|_| "Session user ID is invalid. Please login again.".to_string())?;
+        .map_err(|_| Rejected("Session user ID is invalid. Please login again.".to_string()))?;
     let server_url = session
         .server_url
         .clone()
@@ -1420,25 +1653,33 @@ async fn refresh_desktop_session(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("Failed to refresh session token: {}", e))?;
+        .map_err(|e| Transient(format!("Failed to refresh session token: {}", e)))?;
 
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("Session refresh was rejected by the server. Please login again.".to_string());
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(Rejected(
+            "Session refresh was rejected by the server. Please login again.".to_string(),
+        ));
     }
 
-    if !response.status().is_success() {
-        let status = response.status();
+    if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "Session refresh failed with status {}: {}",
-            status, body
-        ));
+        let message = format!("Session refresh failed with status {}: {}", status, body);
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|body| body["retry_after_seconds"].as_u64())
+                .unwrap_or(SESSION_REFRESH_RATE_LIMIT_SECS)
+                .max(1);
+            return Err(RateLimited(message, Duration::from_secs(wait)));
+        }
+        return Err(Transient(message));
     }
 
     let body: RefreshTokenResponseBody = response
         .json()
         .await
-        .map_err(|e| format!("Invalid token refresh response: {}", e))?;
+        .map_err(|e| Transient(format!("Invalid token refresh response: {}", e)))?;
 
     let mut refreshed = session.clone();
     refreshed.token = body.access_token;
@@ -1447,8 +1688,48 @@ async fn refresh_desktop_session(
         .timestamp()
         .saturating_add(body.expires_in.max(1));
 
-    state.persist_refreshed_session(refreshed.clone()).await?;
+    state
+        .persist_refreshed_session(refreshed.clone())
+        .await
+        .map_err(Transient)?;
     Ok(refreshed)
+}
+
+/// The message of a hold that still blocks refreshing this session, if any.
+fn session_refresh_held(state: &AppState, session: &crate::state::UserSession) -> Option<String> {
+    let hold = state.session_refresh_hold.lock().ok()?;
+    hold.as_ref()
+        .filter(|hold| hold.blocks(&session.refresh_token))
+        .map(|hold| hold.message.clone())
+}
+
+/// True once the server has refused this session's refresh token, so only a new login helps.
+fn session_refresh_rejected(state: &AppState, session: &crate::state::UserSession) -> bool {
+    state.session_refresh_hold.lock().is_ok_and(|hold| {
+        hold.as_ref()
+            .is_some_and(|hold| hold.rejected() && hold.blocks(&session.refresh_token))
+    })
+}
+
+fn hold_session_refresh(
+    state: &AppState,
+    session: &crate::state::UserSession,
+    error: &SessionRefreshError,
+) {
+    let until = match error {
+        SessionRefreshError::Rejected(_) => None,
+        SessionRefreshError::RateLimited(_, wait) => Some(std::time::Instant::now() + *wait),
+        SessionRefreshError::Transient(_) => {
+            Some(std::time::Instant::now() + Duration::from_secs(SESSION_REFRESH_BACKOFF_SECS))
+        }
+    };
+    if let Ok(mut hold) = state.session_refresh_hold.lock() {
+        *hold = Some(crate::state::SessionRefreshHold {
+            token_sha256: crate::state::SessionRefreshHold::token_sha256(&session.refresh_token),
+            until,
+            message: error.message().to_string(),
+        });
+    }
 }
 
 async fn ensure_session_ready_internal(
@@ -1507,10 +1788,16 @@ async fn ensure_session_ready_impl(
     if force_refresh || now >= refresh_cutoff {
         let mut last_err = String::new();
         let mut succeeded = false;
-        // Retry up to 3 times with backoff to tolerate network delays on system wake.
+        // Retry network failures up to 3 times with backoff to tolerate delays on system wake.
+        // A rejected or throttled token is not retried, and the hold stops other commands
+        // from sending it again until a new login or the server's retry time.
         for attempt in 0u32..3 {
             if attempt > 0 {
                 sleep(Duration::from_secs(1u64 << (attempt - 1))).await;
+            }
+            if let Some(message) = session_refresh_held(state, &session) {
+                last_err = message;
+                break;
             }
             match refresh_desktop_session(state, &session).await {
                 Ok(updated) => {
@@ -1520,8 +1807,16 @@ async fn ensure_session_ready_impl(
                     break;
                 }
                 Err(err) => {
-                    tracing::warn!("Session refresh attempt {} failed: {}", attempt + 1, err);
-                    last_err = err;
+                    tracing::warn!(
+                        "Session refresh attempt {} failed: {}",
+                        attempt + 1,
+                        err.message()
+                    );
+                    last_err = err.message().to_string();
+                    if !matches!(err, SessionRefreshError::Transient(_)) || attempt == 2 {
+                        hold_session_refresh(state, &session, &err);
+                        break;
+                    }
                 }
             }
         }
@@ -1562,19 +1857,20 @@ pub async fn get_session_info(
     force_refresh: Option<bool>,
 ) -> Result<SessionInfo, String> {
     match ensure_session_ready_impl(&state, force_refresh.unwrap_or(false)).await {
-        Ok(Some((session, refreshed))) => Ok(SessionInfo {
-            status: if session.expires_at <= chrono::Utc::now().timestamp() {
-                "offline".to_string()
-            } else {
-                "active".to_string()
-            },
-            email: Some(session.email.clone()),
-            device_id: Some(session.device_id.clone()),
-            expires_at: Some(session.expires_at),
-            refreshed,
-            persistent: session.persistent,
-            error: None,
-        }),
+        Ok(Some((session, refreshed))) => {
+            let offline = session.expires_at <= chrono::Utc::now().timestamp();
+            Ok(SessionInfo {
+                status: if offline { "offline" } else { "active" }.to_string(),
+                email: Some(session.email.clone()),
+                device_id: Some(session.device_id.clone()),
+                expires_at: Some(session.expires_at),
+                refreshed,
+                persistent: session.persistent,
+                // Cached Team data keeps working offline, but the app should ask for a new login.
+                error: (offline && session_refresh_rejected(&state, &session))
+                    .then(|| SESSION_LOGIN_REQUIRED.to_string()),
+            })
+        }
         Ok(None) => Ok(SessionInfo {
             status: "none".to_string(),
             email: None,
@@ -1682,104 +1978,8 @@ pub async fn get_command_help(
 }
 
 // ============================================================================
-// Trust & Transparency Commands
-// ============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ServerTrustVerifyRequest {
-    pub safety_number: String,
-}
-
-#[tauri::command]
-pub async fn server_trust_verify(
-    request: ServerTrustVerifyRequest,
-    _state: State<'_, AppState>,
-) -> Result<CommandResponse<bool>, String> {
-    tracing::info!(
-        "Server trust verify command called for safety number: {}",
-        request.safety_number
-    );
-
-    // Server identity verification is not yet wired into this desktop command.
-    // Return a placeholder success response while the UI contract remains stable.
-
-    Ok(CommandResponse::ok(true))
-}
-
-#[tauri::command]
-pub async fn get_transparency_proof(
-    _state: State<'_, AppState>,
-) -> Result<CommandResponse<String>, String> {
-    tracing::info!("Get transparency proof command called");
-
-    // Transparency proof retrieval is not yet wired into this desktop command.
-    Ok(CommandResponse::ok(
-        "Transparency proof not available yet".to_string(),
-    ))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MerkleProofRequest {
-    pub group_id: String,
-    pub proof: String,
-}
-
-#[tauri::command]
-pub async fn verify_merkle_proof(
-    request: MerkleProofRequest,
-    _state: State<'_, AppState>,
-) -> Result<CommandResponse<bool>, String> {
-    tracing::info!(
-        "Verify merkle proof command called for group: {}",
-        request.group_id
-    );
-
-    // Merkle proof verification is not yet wired into this desktop command.
-    Ok(CommandResponse::ok(false))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PinServerIdentityRequest {
-    pub fingerprint: String,
-}
-
-#[tauri::command]
-pub async fn pin_server_identity(
-    request: PinServerIdentityRequest,
-    _state: State<'_, AppState>,
-) -> Result<CommandResponse<bool>, String> {
-    tracing::info!(
-        "Pin server identity command called with fingerprint: {}",
-        request.fingerprint
-    );
-
-    // Server identity pinning is not yet wired into this desktop command.
-    Ok(CommandResponse::ok(true))
-}
-
-// ============================================================================
 // Audit & Coverage Commands
 // ============================================================================
-
-#[tauri::command]
-pub async fn audit_devices(
-    _state: State<'_, AppState>,
-) -> Result<CommandResponse<Vec<String>>, String> {
-    tracing::info!("Audit devices command called");
-
-    // Device audit retrieval is not yet wired into this desktop command.
-    Ok(CommandResponse::ok(Vec::new()))
-}
-
-#[tauri::command]
-pub async fn audit_stale_devices(
-    _state: State<'_, AppState>,
-) -> Result<CommandResponse<Vec<String>>, String> {
-    tracing::info!("Audit stale devices command called");
-
-    // Stale device retrieval is not yet wired into this desktop command.
-    Ok(CommandResponse::ok(Vec::new()))
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PendingDeviceSummary {
@@ -1787,14 +1987,27 @@ pub struct PendingDeviceSummary {
     pub email: String,
     pub device_name: Option<String>,
     pub pending_since: Option<String>,
+    /// Approved device a key rotation skipped; approving it issues the current key.
+    #[serde(default)]
+    pub missing_current_key: bool,
+    /// The owner has another trusted device holding the key, so admins need no reminder.
+    #[serde(default)]
+    pub owner_can_self_approve: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StaleDeviceSummary {
+    pub user_id: String,
     pub device_id: String,
     pub email: String,
     pub device_name: Option<String>,
     pub last_seen: Option<String>,
+    /// Server audit reasons, e.g. "Last seen 31 day(s) ago" or a missing invitation key.
+    pub reasons: Vec<String>,
+    pub invitation_key_present: bool,
+    /// Only the owning account may remove a device, so the UI offers removal for these.
+    pub owned_by_current_user: bool,
+    pub is_current_device: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1804,6 +2017,9 @@ pub struct UnverifiedDeviceSummary {
     pub email: String,
     pub device_name: Option<String>,
     pub last_seen: Option<String>,
+    /// The owner has another trusted device holding the key, so admins need no reminder.
+    #[serde(default)]
+    pub owner_can_self_approve: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1818,14 +2034,24 @@ struct RegisteredDeviceApiRecord {
     created_at: chrono::DateTime<chrono::Utc>,
     last_seen: chrono::DateTime<chrono::Utc>,
     is_current_device: bool,
+    #[serde(default)]
+    approved: bool,
+    #[serde(default)]
+    fingerprint_verified: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct PendingDeviceApiRecord {
+    #[serde(default)]
+    user_id: Option<Uuid>,
     device_id: String,
     device_name: Option<String>,
     #[serde(with = "chrono::serde::ts_seconds")]
     pending_since: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    missing_current_key: bool,
+    #[serde(default)]
+    owner_can_self_approve: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1834,6 +2060,8 @@ struct GroupUnverifiedDeviceInfo {
     device_id: String,
     #[serde(with = "chrono::serde::ts_seconds")]
     last_seen_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    owner_can_self_approve: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1874,6 +2102,14 @@ struct DeviceHealthEntry {
     #[serde(with = "chrono::serde::ts_seconds")]
     last_seen: chrono::DateTime<chrono::Utc>,
     stale: bool,
+    #[serde(default)]
+    reasons: Vec<String>,
+    #[serde(default = "default_invitation_key_present")]
+    invitation_key_present: bool,
+}
+
+fn default_invitation_key_present() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -1889,6 +2125,9 @@ pub struct GroupMember {
     email: String,
     #[serde(default)]
     is_owner: bool,
+    // The members listing reports owners as "admin"; only read to gate admin-only requests.
+    #[serde(default, skip_serializing)]
+    role: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1906,6 +2145,9 @@ pub struct MemberDeviceSummary {
     pub device_name: Option<String>,
     pub last_seen: Option<String>,
     pub added_at: Option<String>,
+    /// Server audit verdict: not seen within the stale window or missing its invitation key.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1941,6 +2183,8 @@ struct GroupDeviceRosterEntry {
     last_seen: chrono::DateTime<chrono::Utc>,
     #[serde(default, with = "chrono::serde::ts_seconds_option")]
     created_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    stale: bool,
 }
 
 async fn fetch_registered_device_records_internal(
@@ -1976,22 +2220,14 @@ async fn fetch_registered_device_records_internal(
         .await
         .map_err(|e| format!("Failed to parse registered devices response: {}", e))?;
 
-    let current_device = current_device.map(|snapshot| {
-        (
-            snapshot.device_id.as_str().to_string(),
-            snapshot.is_verified,
-        )
-    });
+    // Local login/pinning flags cannot grant server device-management trust.
+    let _ = current_device;
 
     Ok(payload
         .devices
         .into_iter()
         .map(|device| {
-            let is_verified = current_device
-                .as_ref()
-                .filter(|(device_id, _)| *device_id == device.device_id)
-                .map(|(_, is_verified)| *is_verified)
-                .unwrap_or(true);
+            let is_verified = device.approved && device.fingerprint_verified;
             RegisteredDeviceRecord {
                 device_id: device.device_id,
                 device_name: device.device_name,
@@ -1999,6 +2235,8 @@ async fn fetch_registered_device_records_internal(
                 last_seen: device.last_seen.to_rfc3339(),
                 is_current_device: device.is_current_device,
                 is_verified,
+                is_approved: device.approved,
+                fingerprint_verified: device.fingerprint_verified,
             }
         })
         .collect())
@@ -2043,8 +2281,40 @@ async fn fetch_pending_device_records_internal(
             email: session.email.clone(),
             device_name: device.device_name,
             observed_at: Some(device.pending_since.to_rfc3339()),
+            missing_current_key: device.missing_current_key,
         })
         .collect())
+}
+
+/// Group audit and unverified-device lists cover every member, so the personal
+/// Devices page keeps only records owned by the signed-in account.
+fn is_session_owned_device(session_user_id: &str, owner_user_id: &str) -> bool {
+    match (
+        Uuid::parse_str(session_user_id.trim()),
+        Uuid::parse_str(owner_user_id.trim()),
+    ) {
+        (Ok(session_id), Ok(owner_id)) => session_id == owner_id,
+        _ => false,
+    }
+}
+
+fn own_stale_device_records(
+    audit_devices: &[DeviceHealthEntry],
+    session_user_id: &str,
+    session_email: &str,
+) -> Vec<StaleDeviceRecord> {
+    audit_devices
+        .iter()
+        .filter(|device| {
+            device.stale && is_session_owned_device(session_user_id, &device.user_id.to_string())
+        })
+        .map(|device| StaleDeviceRecord {
+            device_id: device.device_id.clone(),
+            email: session_email.to_string(),
+            device_name: device.device_name.clone(),
+            last_seen: Some(device.last_seen.to_rfc3339()),
+        })
+        .collect()
 }
 
 async fn fetch_group_device_audit_internal(
@@ -2104,7 +2374,10 @@ async fn fetch_unverified_device_records_internal(
         reqwest::StatusCode::UNAUTHORIZED => {
             Err("Authentication token rejected. Please login again.".to_string())
         }
-        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND => Ok(Vec::new()),
+        // Members, and admins on an unverified device, see only their own devices.
+        reqwest::StatusCode::FORBIDDEN
+        | reqwest::StatusCode::PRECONDITION_REQUIRED
+        | reqwest::StatusCode::NOT_FOUND => Ok(Vec::new()),
         status if !status.is_success() => {
             let body = response.text().await.unwrap_or_default();
             Err(format!(
@@ -2128,6 +2401,7 @@ async fn fetch_unverified_device_records_internal(
                         .unwrap_or_else(|| session.email.clone()),
                     device_name: device_name_map.get(&device.device_id).cloned(),
                     last_seen: Some(device.last_seen_at.to_rfc3339()),
+                    owner_can_self_approve: device.owner_can_self_approve,
                 })
                 .collect())
         }
@@ -2158,7 +2432,8 @@ async fn load_personal_devices_overview_input_internal(
         .collect::<HashMap<_, _>>();
 
     if let Some(group_id) = active_group_id_for_session(state).await {
-        let email_map = fetch_group_member_emails(session, &api_base, group_id).await?;
+        let directory = fetch_group_member_directory(session, &api_base, group_id).await?;
+        let email_map = directory.emails;
         if let Some(audit) = fetch_group_device_audit_internal(session, &api_base, group_id).await?
         {
             for device in &audit.devices {
@@ -2169,30 +2444,40 @@ async fn load_personal_devices_overview_input_internal(
                 }
             }
 
-            stale_devices = audit
-                .devices
-                .iter()
-                .filter(|device| device.stale)
-                .map(|device| StaleDeviceRecord {
-                    device_id: device.device_id.clone(),
-                    email: email_map
-                        .get(&device.user_id)
-                        .cloned()
-                        .unwrap_or_else(|| session.email.clone()),
-                    device_name: device.device_name.clone(),
-                    last_seen: Some(device.last_seen.to_rfc3339()),
-                })
-                .collect();
+            stale_devices =
+                own_stale_device_records(&audit.devices, &session.user_id, &session.email);
         }
 
-        unverified_devices = fetch_unverified_device_records_internal(
-            session,
-            &api_base,
-            group_id,
-            &email_map,
-            &device_name_map,
-        )
-        .await?;
+        // Only owners and admins may list a group's unverified devices; members would get a 403.
+        if directory.session_is_admin {
+            unverified_devices = fetch_unverified_device_records_internal(
+                session,
+                &api_base,
+                group_id,
+                &email_map,
+                &device_name_map,
+            )
+            .await?;
+            unverified_devices
+                .retain(|entry| is_session_owned_device(&session.user_id, &entry.user_id));
+        }
+    }
+
+    for device in &registered_devices {
+        if !device.is_verified
+            && !unverified_devices
+                .iter()
+                .any(|entry| entry.device_id == device.device_id)
+        {
+            unverified_devices.push(UnverifiedDeviceRecord {
+                user_id: session.user_id.clone(),
+                device_id: device.device_id.clone(),
+                email: session.email.clone(),
+                device_name: device.device_name.clone(),
+                last_seen: Some(device.last_seen.clone()),
+                owner_can_self_approve: false,
+            });
+        }
     }
 
     Ok(PersonalDevicesOverviewInput {
@@ -2207,6 +2492,9 @@ async fn load_personal_devices_overview_input_internal(
         unverified_devices,
         rename_supported: false,
         revoke_supported: true,
+        device_trust: device_trust::current_device_trust(state, session)
+            .await
+            .ok(),
     })
 }
 
@@ -2224,9 +2512,237 @@ pub async fn get_pending_devices(
             email: device.email,
             device_name: device.device_name,
             pending_since: device.observed_at,
+            missing_current_key: device.missing_current_key,
+            owner_can_self_approve: false,
         })
         .collect();
     Ok(CommandResponse::ok(summaries))
+}
+
+/// Devices awaiting a Welcome in the selected group, across all members (admin-only):
+/// newly added devices plus approved devices a key rotation skipped.
+#[tauri::command]
+pub async fn get_group_pending_devices(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<Vec<PendingDeviceSummary>>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    let Some(group_id) = active_group_id_for_session(&state).await else {
+        return Ok(CommandResponse::ok(Vec::new()));
+    };
+    let server_url = current_server_url(&state, &session);
+    let api_base = api_base_url(&server_url);
+    let response = reqwest::Client::new()
+        .get(format!("{}/groups/{}/pending-devices", api_base, group_id))
+        .bearer_auth(&session.token)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch pending devices: {}", e))?;
+    match response.status() {
+        reqwest::StatusCode::UNAUTHORIZED => {
+            return Err("Authentication token rejected. Please login again.".to_string())
+        }
+        // Members without admin rights, and admins on an unverified device, cannot approve devices for the group.
+        reqwest::StatusCode::FORBIDDEN
+        | reqwest::StatusCode::PRECONDITION_REQUIRED
+        | reqwest::StatusCode::NOT_FOUND => return Ok(CommandResponse::ok(Vec::new())),
+        status if !status.is_success() => {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Pending devices request failed ({}): {}", status, body));
+        }
+        _ => {}
+    }
+    let payload: Vec<PendingDeviceApiRecord> = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse pending devices response: {}", e))?;
+    let email_map = fetch_group_member_emails(&session, &api_base, group_id).await?;
+    Ok(CommandResponse::ok(group_pending_device_summaries(
+        payload, &email_map,
+    )))
+}
+
+/// The active group's key versions and each device's progress onto the current key.
+/// Members without admin rights get `None`.
+#[tauri::command]
+pub async fn get_group_key_status(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<Option<Value>>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    let Some(group_id) = active_group_id_for_session(&state).await else {
+        return Ok(CommandResponse::ok(None));
+    };
+    let server_url = current_server_url(&state, &session);
+    let response = reqwest::Client::new()
+        .get(format!("{}/groups/{}/key-status", api_base_url(&server_url), group_id))
+        .bearer_auth(&session.token)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch key status: {}", e))?;
+    match response.status() {
+        reqwest::StatusCode::UNAUTHORIZED => {
+            return Err("Authentication token rejected. Please login again.".to_string())
+        }
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND => {
+            return Ok(CommandResponse::ok(None))
+        }
+        status if !status.is_success() => {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Key status request failed ({}): {}", status, body));
+        }
+        _ => {}
+    }
+    let payload = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse key status response: {}", e))?;
+    Ok(CommandResponse::ok(Some(payload)))
+}
+
+/// Confirm to the server which key version this device holds in each group,
+/// installing a newer key first when one is waiting.
+#[tauri::command]
+pub async fn report_key_receipts(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<Value>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let client = state.local_client.client().await?;
+    match client.report_key_receipts().await {
+        Ok(reports) => Ok(CommandResponse::ok(key_receipt_reports_json(&reports))),
+        Err(error) => Ok(CommandResponse::err(error.to_string())),
+    }
+}
+
+/// `failed_groups` above zero tells the app to retry sooner than the hourly check.
+fn key_receipt_reports_json(reports: &hybridcipher_client::KeyReceiptReports) -> Value {
+    json!({
+        "reported": reports
+            .reported
+            .iter()
+            .map(|report| json!({ "group_id": report.group_id, "version": report.version }))
+            .collect::<Vec<_>>(),
+        "failed_groups": reports.failed_groups,
+    })
+}
+
+/// Count this device's enrolled files still on an older group key.
+#[tauri::command]
+pub async fn get_leftover_key_files(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<Option<hybridcipher_client::LeftoverKeyFiles>>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let Some(group_id) = active_group_id_for_session(&state).await else {
+        return Ok(CommandResponse::ok(None));
+    };
+    let client = state.local_client.client().await?.for_local_group(group_id);
+    match client.leftover_key_files().await {
+        Ok(leftovers) => Ok(CommandResponse::ok(Some(leftovers))),
+        Err(error) => Ok(CommandResponse::err(desktop_safe_client_error(error))),
+    }
+}
+
+/// This device's keys and which key its protected files are on, for support. Names no files.
+#[tauri::command]
+pub async fn get_key_state_report(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<serde_json::Value>, String> {
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    let client = match state.local_client.client().await {
+        Ok(client) => client.for_local_group(group_id),
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    match client.key_state_report().await {
+        Ok(report) => {
+            let bundled_cli = tokio::task::spawn_blocking(crate::cli_utils::bundled_cli_version)
+                .await
+                .ok()
+                .flatten();
+            Ok(CommandResponse::ok(serde_json::json!({
+                "app_version": env!("CARGO_PKG_VERSION"),
+                "app_build": crate::cli_utils::APP_BUILD_COMMIT,
+                "bundled_cli": bundled_cli,
+                "bundled_cli_matches_app": bundled_cli.as_deref().map(crate::cli_utils::cli_matches_app_build),
+                "platform": std::env::consts::OS,
+                "report": report,
+            })))
+        }
+        Err(error) => Ok(CommandResponse::err(desktop_safe_client_error(error))),
+    }
+}
+
+/// Move this device's files to the current group key when no rotation is running. `rescan`
+/// refreshes the file index from disk first (the Move files button); the hourly pass skips it.
+#[tauri::command]
+pub async fn migrate_leftover_key_files(
+    state: State<'_, AppState>,
+    rescan: Option<bool>,
+) -> Result<CommandResponse<hybridcipher_client::LeftoverKeyMigration>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let Some(group_id) = active_group_id_for_session(&state).await else {
+        return Ok(CommandResponse::ok(Default::default()));
+    };
+    let client = state.local_client.client().await?.for_local_group(group_id);
+    match client
+        .migrate_leftover_key_files_with(rescan.unwrap_or(false))
+        .await
+    {
+        Ok(outcome) => Ok(CommandResponse::ok(outcome)),
+        Err(error) => Ok(CommandResponse::err(desktop_safe_client_error(error))),
+    }
+}
+
+fn group_pending_device_summaries(
+    payload: Vec<PendingDeviceApiRecord>,
+    email_map: &HashMap<Uuid, String>,
+) -> Vec<PendingDeviceSummary> {
+    payload
+        .into_iter()
+        .map(|device| PendingDeviceSummary {
+            email: device
+                .user_id
+                .and_then(|user_id| email_map.get(&user_id).cloned())
+                .unwrap_or_default(),
+            device_id: device.device_id,
+            device_name: device.device_name,
+            pending_since: Some(device.pending_since.to_rfc3339()),
+            missing_current_key: device.missing_current_key,
+            owner_can_self_approve: device.owner_can_self_approve.unwrap_or(false),
+        })
+        .collect()
+}
+
+fn stale_device_summary(
+    device: DeviceHealthEntry,
+    email_map: &HashMap<Uuid, String>,
+    session: &crate::state::UserSession,
+) -> StaleDeviceSummary {
+    let owned_by_current_user =
+        is_session_owned_device(&session.user_id, &device.user_id.to_string());
+    // Falling back to the signed-in email would attribute another member's device
+    // to the admin, so unknown owners stay unnamed.
+    let email = email_map.get(&device.user_id).cloned().unwrap_or_else(|| {
+        if owned_by_current_user {
+            session.email.clone()
+        } else {
+            String::new()
+        }
+    });
+    StaleDeviceSummary {
+        user_id: device.user_id.to_string(),
+        is_current_device: owned_by_current_user && device.device_id == session.device_id,
+        device_id: device.device_id,
+        email,
+        device_name: device.device_name,
+        last_seen: Some(device.last_seen.to_rfc3339()),
+        reasons: device.reasons,
+        invitation_key_present: device.invitation_key_present,
+        owned_by_current_user,
+    }
 }
 
 #[tauri::command]
@@ -2250,15 +2766,7 @@ pub async fn get_stale_devices(
         .devices
         .into_iter()
         .filter(|device| device.stale)
-        .map(|device| StaleDeviceSummary {
-            device_id: device.device_id,
-            email: email_map
-                .get(&device.user_id)
-                .cloned()
-                .unwrap_or_else(|| session.email.clone()),
-            device_name: device.device_name,
-            last_seen: Some(device.last_seen.to_rfc3339()),
-        })
+        .map(|device| stale_device_summary(device, &email_map, &session))
         .collect::<Vec<_>>();
 
     Ok(CommandResponse::ok(summaries))
@@ -2275,7 +2783,12 @@ pub async fn get_unverified_devices(
     let Some(group_id) = active_group_id_for_session(&state).await else {
         return Ok(CommandResponse::ok(Vec::new()));
     };
-    let email_map = fetch_group_member_emails(&session, &api_base, group_id).await?;
+    let directory = fetch_group_member_directory(&session, &api_base, group_id).await?;
+    // Only owners and admins may list a group's unverified devices; members would get a 403.
+    if !directory.session_is_admin {
+        return Ok(CommandResponse::ok(Vec::new()));
+    }
+    let email_map = directory.emails;
 
     let mut device_name_map = HashMap::new();
     if let Some(audit) = fetch_group_device_audit_internal(&session, &api_base, group_id).await? {
@@ -2301,29 +2814,11 @@ pub async fn get_unverified_devices(
         email: device.email,
         device_name: device.device_name,
         last_seen: device.last_seen,
+        owner_can_self_approve: device.owner_can_self_approve,
     })
     .collect();
 
     Ok(CommandResponse::ok(summaries))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RemoveStaleDeviceRequest {
-    pub device_id: String,
-}
-
-#[tauri::command]
-pub async fn remove_stale_devices(
-    request: RemoveStaleDeviceRequest,
-    _state: State<'_, AppState>,
-) -> Result<CommandResponse<bool>, String> {
-    tracing::info!(
-        "Remove stale device command called for device: {}",
-        request.device_id
-    );
-
-    // Stale device removal is not yet wired into this desktop command.
-    Ok(CommandResponse::ok(true))
 }
 
 #[tauri::command]
@@ -2372,6 +2867,12 @@ pub struct CoverageFolderRow {
     pub needs_attention: bool,
     pub recommended_action_id: Option<String>,
     pub recommended_action_label: Option<String>,
+    /// Which key the folder's files are on, e.g. "57 of 66 files on v7".
+    #[serde(default)]
+    pub key_label: String,
+    /// False once the folder is gone from its saved path, e.g. renamed or moved.
+    #[serde(default)]
+    pub available: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2595,7 +3096,7 @@ async fn active_group_id_for_session(state: &AppState) -> Option<Uuid> {
                 return Uuid::parse_str(&group).ok();
             }
             client.active_group_id_opt().await
-        },
+        }
         None => None,
     }
 }
@@ -2781,6 +3282,7 @@ pub async fn get_group_members(
             user_id: member.user_id,
             email: member.email,
             is_owner: member.user_id == creator_id,
+            role: None,
         })
         .collect::<Vec<_>>();
 
@@ -2903,12 +3405,9 @@ pub async fn get_group_member_details(
         .clone()
         .ok_or_else(|| "No active session found".to_string())?;
 
-    let group_id = match state.local_client.client_opt().await {
-        Some(client) => client.active_group_id_opt().await,
-        None => None,
-    };
-
-    let Some(group_id) = group_id else {
+    // Match the stale/unverified queues, which follow the group selected in the UI
+    // rather than the CLI's last active group.
+    let Some(group_id) = active_group_id_for_session(&state).await else {
         return Ok(CommandResponse::ok(Vec::new()));
     };
 
@@ -2985,6 +3484,7 @@ pub async fn get_group_member_details(
                 device_name: device.device_name,
                 last_seen: Some(device.last_seen.to_rfc3339()),
                 added_at: device.created_at.map(|dt| dt.to_rfc3339()),
+                stale: device.stale,
             });
     }
 
@@ -3214,6 +3714,11 @@ pub async fn accept_recovery_writer_handoffs(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<SecurityStatus>, String> {
     let session = require_authenticated_session(&state).await?;
+    if !session.persistent {
+        return Ok(CommandResponse::ok(
+            load_security_status_internal(&state, &session).await?,
+        ));
+    }
     if session.device_id.trim().is_empty() {
         return Ok(CommandResponse::ok(
             load_security_status_internal(&state, &session).await?,
@@ -3346,89 +3851,9 @@ pub async fn enable_recovery_auto_backup(
     password: String,
     recovery_code: String,
     state: State<'_, AppState>,
-) -> Result<CommandResponse<SecurityStatus>, String> {
-    let session = require_authenticated_session(&state).await?;
-    if session.device_id.trim().is_empty() {
-        return Ok(CommandResponse::err_with_code(
-            "MISSING_DEVICE_ID",
-            "This session does not have a device ID, so automatic recovery backup cannot be enabled.",
-        ));
-    }
-    if password.trim().is_empty() {
-        return Ok(CommandResponse::err_with_code(
-            "PASSWORD_REQUIRED",
-            "Account password is required.",
-        ));
-    }
-    if recovery_code.trim().is_empty() {
-        return Ok(CommandResponse::err_with_code(
-            "RECOVERY_CODE_REQUIRED",
-            "Recovery code is required.",
-        ));
-    }
-
-    let server_url = current_server_url(&state, &session);
-    let recovery_secret = match parse_recovery_code_input(&recovery_code) {
-        Ok(secret) => secret,
-        Err(err) => return Ok(CommandResponse::err_with_code("INVALID_RECOVERY_CODE", err)),
-    };
-    let artifact = match load_or_download_recovery_artifact(
-        &server_url,
-        &session.token,
-        &session.email,
-        &state,
-    )
-    .await
-    {
-        Ok(artifact) => artifact,
-        Err(err) => {
-            return Ok(CommandResponse::err_with_code(
-                "RECOVERY_BACKUP_UNAVAILABLE",
-                err,
-            ))
-        }
-    };
-
-    let k_file = match artifact.unwrap_file_key(&password, &recovery_secret) {
-        Ok(key) => key,
-        Err(err) => {
-            return Ok(CommandResponse::err_with_code(
-                "RECOVERY_UNLOCK_FAILED",
-                err,
-            ))
-        }
-    };
-    let hkdf_salt = match general_purpose::STANDARD.decode(&artifact.hkdf_salt_b64) {
-        Ok(salt) => salt,
-        Err(err) => {
-            return Ok(CommandResponse::err_with_code(
-                "RECOVERY_BACKUP_MALFORMED",
-                format!("Invalid HKDF salt encoding: {}", err),
-            ))
-        }
-    };
-    let epoch_key = match artifact.derive_epoch_key_from_file_key(k_file.as_ref(), &hkdf_salt) {
-        Ok(key) => key,
-        Err(err) => {
-            return Ok(CommandResponse::err_with_code(
-                "RECOVERY_BACKUP_MALFORMED",
-                err,
-            ))
-        }
-    };
-    let mut k_file_bytes = [0u8; 32];
-    k_file_bytes.copy_from_slice(k_file.as_ref());
-    if let Err(err) = persist_recovery_writer_material(&state, &session, &k_file_bytes, &epoch_key)
-    {
-        return Ok(CommandResponse::err_with_code(
-            "RECOVERY_AUTO_BACKUP_ENABLE_FAILED",
-            err,
-        ));
-    }
-
-    Ok(CommandResponse::ok(
-        load_security_status_internal(&state, &session).await?,
-    ))
+) -> Result<CommandResponse<SavedCodeRecoveryResult>, String> {
+    // Compatibility entry point uses the same complete restore, including temporary sessions.
+    restore_saved_code_recovery(password, recovery_code, None, state).await
 }
 
 #[tauri::command]
@@ -3579,6 +4004,13 @@ pub struct TerminalOutputPayload {
     pub chunk: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TerminalExitPayload {
+    pub session_id: String,
+    /// `None` when the command was closed from the UI or its status was unavailable.
+    pub exit_code: Option<u32>,
+}
+
 struct TerminalSession {
     child: Box<dyn portable_pty::Child + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -3599,7 +4031,6 @@ static TERMINAL_SESSIONS: Lazy<Mutex<HashMap<String, TerminalSession>>> =
 static PASSWORD_RESET_SESSIONS: Lazy<Mutex<HashMap<String, PasswordResetSession>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-const EXIT_STATUS_SENTINEL: &str = "__HYBRIDCIPHER_EXIT_STATUS__=";
 const MAX_COMMAND_OUTPUT_BYTES: usize = 512 * 1024;
 const COMMAND_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &str = "\n[output truncated]\n";
@@ -3722,14 +4153,6 @@ fn collect_child_output_limited(
     Ok((status, stdout, stderr))
 }
 
-fn wrap_shell_command_for_status(command: &str) -> String {
-    format!(
-        "{command}; __hc_status=$?; printf '\\n{sentinel}%s\\n' \"$__hc_status\"; exit \"$__hc_status\"",
-        command = command,
-        sentinel = EXIT_STATUS_SENTINEL
-    )
-}
-
 fn summarize_password_reset_output(output: &str) -> Option<String> {
     let normalized = output.replace('\r', "");
     for line in normalized.lines().rev() {
@@ -3746,28 +4169,6 @@ fn summarize_password_reset_output(output: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
     None
-}
-
-fn extract_wrapped_exit_status(output: &mut String) -> Option<i32> {
-    let mut parsed_status = None;
-    let mut kept_lines: Vec<&str> = Vec::new();
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(status) = trimmed.strip_prefix(EXIT_STATUS_SENTINEL) {
-            if let Ok(code) = status.trim().parse::<i32>() {
-                parsed_status = Some(code);
-                continue;
-            }
-        }
-        kept_lines.push(line);
-    }
-
-    if parsed_status.is_some() {
-        *output = kept_lines.join("\n");
-    }
-
-    parsed_status
 }
 
 #[cfg(test)]
@@ -3800,32 +4201,12 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 3, 24, 9, 0, 0).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2026, 3, 24, 9, 0, 0).unwrap(),
             current_epoch: current_epoch.map(str::to_string),
+            current_key_version: None,
             member_count: 1,
             settings: GroupSettings::default(),
             user_role,
             last_activity: None,
         }
-    }
-
-    fn test_group_list(groups: Vec<HttpGroupInfo>) -> GroupListResponse {
-        GroupListResponse {
-            total_count: groups.len() as u32,
-            groups,
-            has_more: false,
-            next_cursor: None,
-        }
-    }
-
-    #[test]
-    fn select_primary_group_id_uses_first_server_group_with_epoch() {
-        let first_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-        let second_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
-        let groups = test_group_list(vec![
-            test_group(first_id, Some("7"), GroupRole::Member),
-            test_group(second_id, Some("3"), GroupRole::Admin),
-        ]);
-
-        assert_eq!(select_primary_group_id(&groups), Some(first_id));
     }
 
     #[test]
@@ -3849,13 +4230,6 @@ mod tests {
         assert!(group_needs_genesis(&admin_empty_epoch));
         assert!(!group_needs_genesis(&member_empty_epoch));
         assert!(!group_needs_genesis(&admin_with_epoch));
-    }
-
-    #[test]
-    fn select_primary_group_id_returns_none_for_empty_group_list() {
-        let groups = test_group_list(Vec::new());
-
-        assert_eq!(select_primary_group_id(&groups), None);
     }
 
     #[test]
@@ -3905,6 +4279,30 @@ mod tests {
             classify_recovery_backup_presence(false, Err("server unavailable".to_string())),
             Err("server unavailable".to_string())
         );
+    }
+
+    #[test]
+    fn group_member_listing_role_gates_admin_only_requests() {
+        let listing: MembersListResponse = serde_json::from_value(serde_json::json!({
+            "members": [
+                {"user_id": "8c210866-75d7-42d7-b6d7-8b5ca76fb5f4", "email": "a@x", "role": "admin"},
+                {"user_id": "0d0cb0c7-6eb2-4d59-8000-000000000001", "email": "b@x", "role": "member"},
+                {"user_id": "0d0cb0c7-6eb2-4d59-8000-000000000002", "email": "c@x"}
+            ],
+            "has_more": false,
+            "next_offset": null
+        }))
+        .unwrap();
+        let admin: Vec<bool> = listing
+            .members
+            .iter()
+            .map(|member| is_group_admin_role(member.role.as_deref()))
+            .collect();
+        assert_eq!(admin, vec![true, false, false]);
+        assert!(is_group_admin_role(Some("owner")));
+        // The role is internal and never reaches the frontend's member list.
+        let serialized = serde_json::to_value(&listing.members[0]).unwrap();
+        assert!(serialized.get("role").is_none());
     }
 
     #[test]
@@ -3980,10 +4378,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_file_provider_url_matches_domain_display_name_path() {
-        let root_id = Uuid::parse_str("00741c18-f05f-45f2-8f54-4c1c84a7bc14").expect("valid uuid");
-        let encrypted_dir = Path::new("/Users/example/Desktop/wetgzfolder/hybridcipher_websitev3");
-
-        let provider_url = determine_desktop_file_provider_url(encrypted_dir, root_id)
+        let provider_url = determine_desktop_file_provider_url("Personal · hybridcipher_websitev3")
             .expect("derive macOS File Provider URL");
 
         assert_eq!(
@@ -3991,7 +4386,107 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .expect("provider url basename"),
-            "HybridCipher-hybridcipher_websitev3-00741c18-mount"
+            "HybridCipher-Personal · hybridcipher_websitev3"
+        );
+    }
+
+    #[test]
+    fn mount_display_name_names_the_workspace_and_folder() {
+        let folder = Path::new("/Users/example/Desktop/wetgzfolder/hybridcipher_websitev3");
+        let personal = json!({"id": "g1", "name": "Personal", "organization_id": null});
+        let team = json!({"id": "g2", "name": "Engineering", "organization_id": "org"});
+        let unnamed_team = json!({"id": "g3", "name": "  ", "organization_id": "org"});
+
+        assert_eq!(
+            desktop_mount_display_name(mount_workspace_label(Some(&personal)).as_deref(), folder),
+            "Personal · hybridcipher_websitev3"
+        );
+        assert_eq!(
+            desktop_mount_display_name(mount_workspace_label(Some(&team)).as_deref(), folder),
+            "Engineering · hybridcipher_websitev3"
+        );
+        assert_eq!(
+            desktop_mount_display_name(
+                mount_workspace_label(Some(&unnamed_team)).as_deref(),
+                folder
+            ),
+            "Team · hybridcipher_websitev3"
+        );
+        // The accountless vault is the only workspace, so the folder name is enough.
+        assert_eq!(
+            desktop_mount_display_name(mount_workspace_label(None).as_deref(), folder),
+            "hybridcipher_websitev3"
+        );
+    }
+
+    #[test]
+    fn mount_display_name_drops_path_separators_and_stays_short() {
+        let folder = Path::new("/tmp/a:b");
+        assert_eq!(
+            desktop_mount_display_name(Some("R&D / Ops"), folder),
+            "R&D - Ops · a-b"
+        );
+
+        let long = "x".repeat(200);
+        let name = desktop_mount_display_name(Some("Personal"), Path::new(&long));
+        assert_eq!(name.chars().count(), MOUNT_DISPLAY_NAME_MAX_CHARS);
+    }
+
+    #[test]
+    fn a_folder_cannot_be_mounted_twice_at_once() {
+        let root_id = Uuid::new_v4();
+        let first = MountInFlight::claim(root_id).expect("first mount claims the folder");
+        assert!(
+            MountInFlight::claim(root_id).is_none(),
+            "second mount must wait"
+        );
+        assert!(
+            MountInFlight::claim(Uuid::new_v4()).is_some(),
+            "other folders are free"
+        );
+        drop(first);
+        assert!(
+            MountInFlight::claim(root_id).is_some(),
+            "released when the mount ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_display_name_gets_a_suffix_only_when_taken() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_dir = temp.path();
+        std::fs::create_dir_all(mount_states_dir(user_dir)).unwrap();
+        let mounted = Uuid::new_v4();
+        let other = Uuid::parse_str("ce196929-0000-4000-8000-000000000000").unwrap();
+        let record = MountRuntimeState {
+            root_id: mounted.to_string(),
+            mountpoint: user_dir.join("mount"),
+            encrypted_dir: user_dir.join("encrypted"),
+            platform: std::env::consts::OS.into(),
+            backend: Some(MountBackend::Sync),
+            host_pid: None,
+            fallback_reason: None,
+            ready: true,
+            requested_unmount: false,
+            display_name: Some("Personal · docs".into()),
+        };
+        std::fs::write(
+            mount_states_dir(user_dir).join(format!("mount_state_{mounted}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            unique_mount_display_name(user_dir, other, "Personal · docs".into()).await,
+            "Personal · docs (ce19)"
+        );
+        assert_eq!(
+            unique_mount_display_name(user_dir, mounted, "Personal · docs".into()).await,
+            "Personal · docs"
+        );
+        assert_eq!(
+            unique_mount_display_name(user_dir, other, "Personal · notes".into()).await,
+            "Personal · notes"
         );
     }
 
@@ -4031,13 +4526,13 @@ mod tests {
         let mut collector = LimitedOutputCollector::new(8, 64);
         collector.push(b"abcdefgh");
         collector.push(b"ijklmnop");
-        collector.push(format!("\n{}17\n", EXIT_STATUS_SENTINEL).as_bytes());
+        collector.push(b"\nexit-status=17\n");
 
         let rendered = collector.finish();
 
         assert!(rendered.starts_with("abcdefgh"));
         assert!(rendered.contains("[output truncated]"));
-        assert!(rendered.contains(EXIT_STATUS_SENTINEL));
+        assert!(rendered.contains("exit-status="));
         assert!(rendered.ends_with("17\n"));
     }
 
@@ -4192,23 +4687,28 @@ mod tests {
             current_device_id: Some("device-current".to_string()),
             registered_devices: vec![
                 RegisteredDeviceRecord {
+                    fingerprint_verified: false,
                     device_id: "device-current".to_string(),
                     device_name: Some("This Mac".to_string()),
                     created_at: "2026-03-22T09:00:00Z".to_string(),
                     last_seen: "2026-03-24T11:55:00Z".to_string(),
                     is_current_device: true,
                     is_verified: true,
+                    is_approved: true,
                 },
                 RegisteredDeviceRecord {
+                    fingerprint_verified: false,
                     device_id: "device-laptop".to_string(),
                     device_name: Some("Travel Laptop".to_string()),
                     created_at: "2026-03-20T09:00:00Z".to_string(),
                     last_seen: "2026-03-24T09:30:00Z".to_string(),
                     is_current_device: false,
                     is_verified: true,
+                    is_approved: true,
                 },
             ],
             pending_devices: vec![PendingDeviceRecord {
+                missing_current_key: false,
                 device_id: "device-phone".to_string(),
                 email: "user@example.com".to_string(),
                 device_name: Some("Phone".to_string()),
@@ -4221,6 +4721,7 @@ mod tests {
                 last_seen: Some("2026-02-10T08:00:00Z".to_string()),
             }],
             unverified_devices: vec![UnverifiedDeviceRecord {
+                owner_can_self_approve: false,
                 user_id: "33333333-3333-3333-3333-333333333333".to_string(),
                 device_id: "device-tablet".to_string(),
                 email: "user@example.com".to_string(),
@@ -4229,6 +4730,7 @@ mod tests {
             }],
             rename_supported: false,
             revoke_supported: true,
+            device_trust: None,
         });
 
         assert_eq!(
@@ -4271,16 +4773,19 @@ mod tests {
         let overview = build_personal_devices_overview(PersonalDevicesOverviewInput {
             current_device_id: Some("device-current".to_string()),
             registered_devices: vec![RegisteredDeviceRecord {
+                fingerprint_verified: false,
                 device_id: "device-tablet".to_string(),
                 device_name: None,
                 created_at: "2026-03-20T09:00:00Z".to_string(),
                 last_seen: "2026-03-24T09:30:00Z".to_string(),
                 is_current_device: false,
                 is_verified: true,
+                is_approved: true,
             }],
             pending_devices: vec![],
             stale_devices: vec![],
             unverified_devices: vec![UnverifiedDeviceRecord {
+                owner_can_self_approve: false,
                 user_id: "33333333-3333-3333-3333-333333333333".to_string(),
                 device_id: "device-tablet".to_string(),
                 email: "member@example.com".to_string(),
@@ -4289,6 +4794,7 @@ mod tests {
             }],
             rename_supported: false,
             revoke_supported: true,
+            device_trust: None,
         });
 
         assert_eq!(overview.setup_devices.len(), 1);
@@ -4309,6 +4815,7 @@ mod tests {
             current_device_id: Some("device-current".to_string()),
             registered_devices: vec![],
             pending_devices: vec![PendingDeviceRecord {
+                missing_current_key: false,
                 device_id: "device-current".to_string(),
                 email: "user@example.com".to_string(),
                 device_name: Some("This Mac".to_string()),
@@ -4318,6 +4825,7 @@ mod tests {
             unverified_devices: vec![],
             rename_supported: false,
             revoke_supported: true,
+            device_trust: None,
         });
 
         assert_eq!(
@@ -4329,6 +4837,20 @@ mod tests {
             Some(("device-current", "pending", true))
         );
         assert!(overview.setup_devices.is_empty());
+    }
+
+    #[test]
+    fn coverage_key_label_says_how_many_files_are_on_the_current_key() {
+        let keys = |target_version, on_target, on_other| hybridcipher_client::CoverageKeyCounts {
+            target_version,
+            on_target,
+            on_other,
+        };
+        assert_eq!(coverage_key_label(&keys(7, 57, 9)), "57 of 66 files on v7");
+        assert_eq!(coverage_key_label(&keys(7, 0, 1)), "0 of 1 file on v7");
+        assert_eq!(coverage_key_label(&keys(7, 66, 0)), "All files on v7");
+        assert_eq!(coverage_key_label(&keys(7, 0, 0)), "");
+        assert_eq!(coverage_key_label(&keys(0, 3, 0)), "");
     }
 
     #[test]
@@ -4360,6 +4882,7 @@ mod tests {
                 coverage_ratio: 1.0,
                 recent_orphans: vec![],
                 recent_unmanaged: vec![],
+                keys: Default::default(),
             },
             CoverageRootStats {
                 root: CoverageRoot {
@@ -4385,6 +4908,7 @@ mod tests {
                 coverage_ratio: 0.84,
                 recent_orphans: vec![],
                 recent_unmanaged: vec![],
+                keys: Default::default(),
             },
         ];
 
@@ -4397,6 +4921,7 @@ mod tests {
                 registry_last_upload: None,
                 registry_version: None,
             },
+            |_| true,
         );
 
         assert_eq!(snapshot.overall_coverage_percent, 92);
@@ -4474,6 +4999,7 @@ mod tests {
             coverage_ratio: 0.99,
             recent_orphans: vec![],
             recent_unmanaged: vec![],
+            keys: Default::default(),
         };
         let records = vec![
             CoverageFileRecord {
@@ -4552,6 +5078,7 @@ mod tests {
             coverage_ratio: 0.87,
             recent_orphans: vec![],
             recent_unmanaged: vec![],
+            keys: Default::default(),
         };
         let records = vec![
             CoverageFileRecord {
@@ -4600,101 +5127,6 @@ mod tests {
     }
 }
 
-#[tauri::command]
-pub async fn run_shell_command(
-    command: String,
-    cwd: Option<String>,
-    input: Option<String>,
-) -> Result<CommandResponse<TerminalResult>, String> {
-    if command.trim().is_empty() {
-        return Ok(CommandResponse::err("No command provided"));
-    }
-
-    #[cfg(feature = "individual-edition")]
-    if let Some(command_name) = restricted_individual_command_name(&command) {
-        return Ok(CommandResponse::err_with_code(
-            "INDIVIDUAL_EDITION_RESTRICTED",
-            individual_command_restriction_message(command_name),
-        ));
-    }
-
-    // Prefer a pseudo-TTY so interactive commands (dialoguer, etc.) behave like a real terminal.
-    // On macOS: script -q /dev/null sh -lc "<cmd>"
-    // On Linux: script -q -c "<cmd>" /dev/null
-    // On Windows: fallback to cmd/powershell (no PTY available here).
-    // On Unix we wrap commands to print an explicit exit marker so we can
-    // recover child exit status even when script(1) normalizes process exits.
-    let wrapped_command = if cfg!(target_os = "windows") {
-        command.clone()
-    } else {
-        wrap_shell_command_for_status(&command)
-    };
-
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = StdCommand::new("cmd.exe");
-        c.arg("/C").arg(wrapped_command);
-        c
-    } else if cfg!(target_os = "macos") {
-        let mut c = StdCommand::new("script");
-        c.args(["-q", "/dev/null", "sh", "-lc", &wrapped_command]);
-        c
-    } else {
-        let mut c = StdCommand::new("script");
-        c.args(["-q", "-c", &wrapped_command, "/dev/null"]);
-        c
-    };
-
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-
-    configure_background_std_command(&mut cmd);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    match cmd.spawn() {
-        Ok(mut child) => {
-            if let Some(input_data) = input {
-                if let Some(mut stdin) = child.stdin.take() {
-                    if let Err(err) = stdin.write_all(input_data.as_bytes()) {
-                        return Ok(CommandResponse::err(format!(
-                            "Failed to write command input: {}",
-                            err
-                        )));
-                    }
-                }
-            } else {
-                drop(child.stdin.take());
-            }
-
-            match collect_child_output_limited(
-                child,
-                MAX_COMMAND_OUTPUT_BYTES,
-                COMMAND_OUTPUT_TAIL_BYTES,
-            ) {
-                Ok((exit_status, mut stdout, mut stderr)) => {
-                    let mut status = exit_status.code().unwrap_or(-1);
-
-                    if let Some(parsed) = extract_wrapped_exit_status(&mut stdout)
-                        .or_else(|| extract_wrapped_exit_status(&mut stderr))
-                    {
-                        status = parsed;
-                    }
-
-                    Ok(CommandResponse::ok(TerminalResult {
-                        stdout,
-                        stderr,
-                        status,
-                    }))
-                }
-                Err(e) => Ok(CommandResponse::err(format!("Failed to execute: {}", e))),
-            }
-        }
-        Err(e) => Ok(CommandResponse::err(format!("Failed to execute: {}", e))),
-    }
-}
-
 /// Run a desktop-owned CLI action without involving the user's shell. Each
 /// argument reaches the bundled executable as one argument, including Windows
 /// paths containing percent signs or trailing backslashes.
@@ -4709,7 +5141,9 @@ pub async fn run_bundled_cli(
     let group = active_group_id_for_session(&state).await;
     operations::validate_cli_args(&args, group)?;
     if !operations::background_cli_args_allowed(&args) || input.is_some() {
-        return Ok(CommandResponse::err("Use the desktop operation dialog for actions that change data or need input"));
+        return Ok(CommandResponse::err(
+            "Use the desktop operation dialog for actions that change data or need input",
+        ));
     }
     if args.is_empty() || args[0].is_empty() {
         return Ok(CommandResponse::err("No CLI action provided"));
@@ -4745,8 +5179,13 @@ pub async fn run_bundled_cli(
     cmd.args(&args);
     cmd.env("HYBRIDCIPHER_DESKTOP_OPERATION", "1")
         .env("HYBRIDCIPHER_DESKTOP_ACCOUNT", &session.user_id)
-        .env("HYBRIDCIPHER_DESKTOP_SERVER", current_server_url(&state, &session));
-    if let Some(group) = group { cmd.env("HYBRIDCIPHER_DESKTOP_GROUP", group.to_string()); }
+        .env(
+            "HYBRIDCIPHER_DESKTOP_SERVER",
+            current_server_url(&state, &session),
+        );
+    if let Some(group) = group {
+        cmd.env("HYBRIDCIPHER_DESKTOP_GROUP", group.to_string());
+    }
     configure_background_std_command(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -4784,51 +5223,6 @@ pub async fn run_bundled_cli(
     }
 }
 
-fn default_shell_command() -> CommandBuilder {
-    if cfg!(target_os = "windows") {
-        let mut cmd = CommandBuilder::new("cmd.exe");
-        cmd.arg("/K");
-        cmd
-    } else {
-        let fallback_shell = if cfg!(target_os = "macos") {
-            "/bin/zsh"
-        } else {
-            "/bin/bash"
-        };
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| fallback_shell.to_string());
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.arg("-l");
-        cmd
-    }
-}
-
-#[cfg(feature = "individual-edition")]
-fn is_hybridcipher_command_token(token: &str) -> bool {
-    let trimmed = token.trim_matches(|ch| ch == '"' || ch == '\'');
-    Path::new(trimmed)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower == "hybridcipher" || lower == "hybridcipher.exe"
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(feature = "individual-edition")]
-fn restricted_individual_command_name(command: &str) -> Option<&'static str> {
-    let tokens = shell_words::split(command).ok()?;
-    let hybridcipher_index = tokens
-        .iter()
-        .position(|token| is_hybridcipher_command_token(token))?;
-    let args = &tokens[hybridcipher_index + 1..];
-
-    restricted_individual_args_name(args)
-}
-
 #[cfg(feature = "individual-edition")]
 fn restricted_individual_args_name(args: &[String]) -> Option<&'static str> {
     match args {
@@ -4849,12 +5243,6 @@ fn restricted_individual_args_name(args: &[String]) -> Option<&'static str> {
         }
         [subcommand, action, ..] if subcommand == "rekey" && action == "status" => {
             Some("rekey status")
-        }
-        [subcommand, action, ..] if subcommand == "rekey" && action == "cutover" => {
-            Some("rekey cutover")
-        }
-        [subcommand, action, ..] if subcommand == "rekey" && action == "fallback" => {
-            Some("rekey fallback")
         }
         _ => None,
     }
@@ -4885,21 +5273,62 @@ fn emit_terminal_chunk(app: &AppHandle, session_id: &str, chunk: &str) {
     let _ = app.emit("terminal_output", payload);
 }
 
+/// Start directory for console commands: the requested folder when it exists and is
+/// not inside a HybridCipher mount (stale mount CWDs break commands), else home.
+fn resolve_terminal_cwd(cwd: Option<&str>) -> Option<PathBuf> {
+    let home_dir = dirs::home_dir();
+    let hc_base = home_dir
+        .as_ref()
+        .map(|h| h.join(hybridcipher_client::config_loader::account_data_location()));
+    cwd.map(PathBuf::from)
+        .filter(|p| p.exists() && p.is_dir())
+        .filter(|p| hc_base.as_ref().map_or(true, |base| !p.starts_with(base)))
+        .or(home_dir)
+}
+
+/// Run one console line as the bundled `hybridcipher` binary in a PTY. No shell is
+/// involved: the line is split into arguments by `cli_terminal::parse_cli_line`, and
+/// anything that is not a hybridcipher command is refused. Output arrives as
+/// `terminal_output` events, followed by one `terminal_exit` event.
 #[tauri::command]
-pub async fn start_terminal_session(
+pub async fn start_cli_terminal_command(
     app: tauri::AppHandle,
+    line: String,
     cwd: Option<String>,
 ) -> Result<CommandResponse<TerminalSessionInfo>, String> {
+    let args = match cli_terminal::parse_cli_line(&line) {
+        Ok(args) => args,
+        Err(message) => {
+            return Ok(CommandResponse::err_with_code(
+                "CONSOLE_COMMAND_REFUSED",
+                message,
+            ))
+        }
+    };
+
+    #[cfg(feature = "individual-edition")]
+    if let Some(command_name) = restricted_individual_args_name(&args) {
+        return Ok(CommandResponse::err_with_code(
+            "INDIVIDUAL_EDITION_RESTRICTED",
+            individual_command_restriction_message(command_name),
+        ));
+    }
+
+    let (cli_path, _) = match locate_cli_binary() {
+        Ok(found) => found,
+        Err(error) => return Ok(CommandResponse::err(error)),
+    };
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(default_pty_size())
         .map_err(|e| format!("Failed to open PTY: {}", e))?;
 
-    let mut cmd = default_shell_command();
+    let mut cmd = CommandBuilder::new(cli_path);
+    cmd.args(&args);
     if cfg!(not(target_os = "windows")) {
-        // App bundles launched from Finder often lack TERM/COLORTERM.
-        // Without TERM, interactive shells may downgrade to TERM=dumb, which breaks
-        // readline-style editing behavior (backspace/arrow keys).
+        // App bundles launched from Finder often lack TERM/COLORTERM, which makes
+        // interactive prompts fall back to a dumb terminal.
         let term = std::env::var("TERM")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -4914,41 +5343,7 @@ pub async fn start_terminal_session(
             cmd.env("COLORTERM", "truecolor");
         }
     }
-    if let Ok((cli_path, _)) = locate_cli_binary() {
-        if let Some(cli_dir) = cli_path.parent() {
-            let separator = if cfg!(target_os = "windows") {
-                ";"
-            } else {
-                ":"
-            };
-            let existing_path = std::env::var("PATH").unwrap_or_default();
-            let updated_path = if existing_path.is_empty() {
-                cli_dir.display().to_string()
-            } else {
-                format!("{}{}{}", cli_dir.display(), separator, existing_path)
-            };
-            cmd.env("PATH", updated_path);
-        }
-    }
-    // Use provided cwd if it exists and is not a HybridCipher mount path; otherwise fall back to home.
-    let home_dir = dirs::home_dir();
-    let hc_base = home_dir
-        .as_ref()
-        .map(|h| h.join(hybridcipher_client::config_loader::account_data_location()));
-    let resolved_cwd = cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .filter(|p| p.exists() && p.is_dir())
-        .filter(|p| {
-            // Avoid starting in mount directories under ~/.hybridcipher to prevent stale mount CWDs
-            if let Some(base) = hc_base.as_ref() {
-                !p.starts_with(base)
-            } else {
-                true
-            }
-        })
-        .or_else(|| home_dir);
-    if let Some(dir) = resolved_cwd {
+    if let Some(dir) = resolve_terminal_cwd(cwd.as_deref()) {
         cmd.cwd(dir);
     }
 
@@ -4956,7 +5351,9 @@ pub async fn start_terminal_session(
 
     let child = slave
         .spawn_command(cmd)
-        .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+        .map_err(|e| format!("Failed to start hybridcipher: {}", e))?;
+    // Only the child should hold the slave side, so the reader sees EOF when it exits.
+    drop(slave);
 
     let mut reader = master
         .try_clone_reader()
@@ -4971,15 +5368,11 @@ pub async fn start_terminal_session(
     // Spawn reader thread to push chunks to the frontend
     let app_handle = app.clone();
     let session_id_clone = session_id.clone();
-    thread::spawn(move || {
+    let reader_thread = thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => {
-                    // EOF
-                    emit_terminal_chunk(&app_handle, &session_id_clone, "\n[session closed]");
-                    break;
-                }
+                Ok(0) => break,
                 Ok(n) => {
                     if let Ok(s) = std::str::from_utf8(&buf[..n]) {
                         emit_terminal_chunk(&app_handle, &session_id_clone, s);
@@ -5011,6 +5404,40 @@ pub async fn start_terminal_session(
             .map_err(|e| format!("Session lock poisoned: {}", e))?;
         sessions.insert(session_id.clone(), session);
     }
+
+    // Wait for the command to end. Removing the session drops the PTY, which also ends
+    // the reader on Windows, where ConPTY output does not reach EOF when the child exits.
+    let session_id_clone = session_id.clone();
+    thread::spawn(move || {
+        let exit_code = loop {
+            thread::sleep(std::time::Duration::from_millis(100));
+            let Ok(mut sessions) = TERMINAL_SESSIONS.lock() else {
+                break None;
+            };
+            let Some(session) = sessions.get_mut(&session_id_clone) else {
+                break None; // closed from the UI
+            };
+            match session.child.try_wait() {
+                Ok(None) => continue,
+                Ok(Some(status)) => {
+                    sessions.remove(&session_id_clone);
+                    break Some(status.exit_code());
+                }
+                Err(_) => {
+                    sessions.remove(&session_id_clone);
+                    break None;
+                }
+            }
+        };
+        let _ = reader_thread.join();
+        let _ = app.emit(
+            "terminal_exit",
+            TerminalExitPayload {
+                session_id: session_id_clone,
+                exit_code,
+            },
+        );
+    });
 
     Ok(CommandResponse::ok(TerminalSessionInfo { session_id }))
 }
@@ -6075,6 +6502,8 @@ pub struct EnrolledFolder {
     pub orphaned_files: u64,
     pub unmanaged_files: u64,
     pub coverage_ratio: f64,
+    /// False once the folder is gone from its saved path, e.g. renamed or moved.
+    pub available: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6098,14 +6527,15 @@ pub struct FolderCoverageWorkflowResult {
 pub async fn list_enrolled_folders(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<EnrolledFolder>>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
     tracing::info!("List enrolled folders command called");
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
-    }
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
 
     let client = match state.local_client.client().await {
-        Ok(client) => client,
+        Ok(client) => std::sync::Arc::new(client.for_local_group(group_id)),
         Err(err) => return Ok(CommandResponse::err(err)),
     };
 
@@ -6134,7 +6564,18 @@ async fn get_enrolled_folders_from_client(
 }
 
 fn enrolled_folder_from_stats(summary: CoverageRootStats) -> EnrolledFolder {
-    let root = summary.root;
+    EnrolledFolder {
+        tracked_files: summary.tracked_files as u64,
+        tracked_bytes: summary.tracked_bytes,
+        orphaned_files: summary.orphaned_files as u64,
+        unmanaged_files: summary.unmanaged_files as u64,
+        coverage_ratio: summary.coverage_ratio,
+        ..enrolled_folder_from_root(&summary.root)
+    }
+}
+
+/// A folder without file counts, for when its stats are unavailable or moot.
+fn enrolled_folder_from_root(root: &hybridcipher_client::coverage::CoverageRoot) -> EnrolledFolder {
     EnrolledFolder {
         path: root.path.display().to_string(),
         root_id: root.root_id.to_string(),
@@ -6142,11 +6583,12 @@ fn enrolled_folder_from_stats(summary: CoverageRootStats) -> EnrolledFolder {
         state: describe_root_state(root.state).to_string(),
         enrolled_at: root.created_at.to_rfc3339(),
         last_scan: root.last_scan.map(|ts| ts.to_rfc3339()),
-        tracked_files: summary.tracked_files as u64,
-        tracked_bytes: summary.tracked_bytes,
-        orphaned_files: summary.orphaned_files as u64,
-        unmanaged_files: summary.unmanaged_files as u64,
-        coverage_ratio: summary.coverage_ratio,
+        tracked_files: 0,
+        tracked_bytes: 0,
+        orphaned_files: 0,
+        unmanaged_files: 0,
+        coverage_ratio: 0.0,
+        available: root.path.exists(),
     }
 }
 
@@ -6219,14 +6661,16 @@ pub async fn get_folder_coverage_review(
     folder_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<FolderCoverageReview>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
-    }
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
     let client = state
         .local_client
         .client()
         .await
+        .map(|client| std::sync::Arc::new(client.for_local_group(group_id)))
         .map_err(|err| format!("Failed to load folder coverage review: {}", err))?;
 
     match load_folder_coverage_review_internal(client.as_ref(), &folder_path).await {
@@ -6241,14 +6685,16 @@ pub async fn run_folder_coverage_action(
     folder_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<CoverageActionResult>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
-    }
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
     let client = state
         .local_client
         .client()
         .await
+        .map(|client| std::sync::Arc::new(client.for_local_group(group_id)))
         .map_err(|err| format!("Failed to load coverage action client: {}", err))?;
     let summary = find_coverage_root_summary(client.as_ref(), &folder_path).await?;
     let root_path = summary.root.path.clone();
@@ -6374,7 +6820,8 @@ fn coverage_ipc_state(settings: &SettingsStatus) -> &'static str {
     }
 }
 
-fn build_coverage_folder_row(summary: &CoverageRootStats) -> CoverageFolderRow {
+/// `available` is whether the folder is still at its saved path.
+fn build_coverage_folder_row(summary: &CoverageRootStats, available: bool) -> CoverageFolderRow {
     let tracked_files = summary.tracked_files as u64;
     let orphaned_files = summary.orphaned_files as u64;
     let unmanaged_files = summary.unmanaged_files as u64;
@@ -6403,6 +6850,17 @@ fn build_coverage_folder_row(summary: &CoverageRootStats) -> CoverageFolderRow {
         )
     };
 
+    // A folder gone from its path has nothing to review until it is located.
+    let (coverage_label, attention_label) = if available {
+        (coverage_label, attention_label)
+    } else {
+        (
+            "Folder not found".to_string(),
+            "Renamed or moved? Locate it under Protected folders.".to_string(),
+        )
+    };
+    let review = available && unresolved_files > 0;
+
     CoverageFolderRow {
         root_id: summary.root.root_id.to_string(),
         path: summary.root.path.display().to_string(),
@@ -6415,15 +6873,37 @@ fn build_coverage_folder_row(summary: &CoverageRootStats) -> CoverageFolderRow {
         coverage_percent,
         coverage_label,
         attention_label,
-        needs_attention: unresolved_files > 0,
-        recommended_action_id: (unresolved_files > 0).then(|| "review-folder-coverage".to_string()),
-        recommended_action_label: (unresolved_files > 0).then(|| "Review fixes".to_string()),
+        needs_attention: !available || unresolved_files > 0,
+        recommended_action_id: review.then(|| "review-folder-coverage".to_string()),
+        recommended_action_label: review.then(|| "Review fixes".to_string()),
+        key_label: coverage_key_label(&summary.keys),
+        available,
     }
+}
+
+/// "57 of 66 files on v7" when some files still use another key, "All files on v7" when none
+/// do, and nothing before any file is indexed or a key exists.
+fn coverage_key_label(keys: &hybridcipher_client::CoverageKeyCounts) -> String {
+    let total = keys.on_target + keys.on_other;
+    if total == 0 || keys.target_version == 0 {
+        return String::new();
+    }
+    if keys.on_other == 0 {
+        return format!("All files on v{}", keys.target_version);
+    }
+    format!(
+        "{} of {} {} on v{}",
+        keys.on_target,
+        total,
+        if total == 1 { "file" } else { "files" },
+        keys.target_version
+    )
 }
 
 fn build_coverage_center_snapshot(
     stats: &[CoverageRootStats],
     settings: &SettingsStatus,
+    is_available: impl Fn(&Path) -> bool,
 ) -> CoverageCenterSnapshot {
     let active_stats: Vec<&CoverageRootStats> = stats
         .iter()
@@ -6453,7 +6933,7 @@ fn build_coverage_center_snapshot(
 
     let folders = active_stats
         .iter()
-        .map(|entry| build_coverage_folder_row(entry))
+        .map(|entry| build_coverage_folder_row(entry, is_available(&entry.root.path)))
         .collect::<Vec<_>>();
 
     let attention_items = folders
@@ -6461,7 +6941,11 @@ fn build_coverage_center_snapshot(
         .filter(|folder| folder.needs_attention)
         .map(|folder| CoverageAttentionItem {
             id: folder.root_id.clone(),
-            title: format!("{} needs review", basename_for_path(&folder.path)),
+            title: if folder.available {
+                format!("{} needs review", basename_for_path(&folder.path))
+            } else {
+                format!("{} can’t be found", basename_for_path(&folder.path))
+            },
             detail: folder.attention_label.clone(),
             root_id: Some(folder.root_id.clone()),
             folder_path: Some(folder.path.clone()),
@@ -6549,16 +7033,18 @@ fn build_coverage_scan_result(
 pub async fn get_coverage_center_snapshot(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<CoverageCenterSnapshot>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
-    }
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
 
     let settings = load_settings_status_internal(&state).await?;
     let client = state
         .local_client
         .client()
         .await
+        .map(|client| std::sync::Arc::new(client.for_local_group(group_id)))
         .map_err(|err| format!("Failed to load coverage snapshot client: {}", err))?;
     let stats = client.coverage_root_stats().await.map_err(|err| {
         format!(
@@ -6568,7 +7054,9 @@ pub async fn get_coverage_center_snapshot(
     })?;
 
     Ok(CommandResponse::ok(build_coverage_center_snapshot(
-        &stats, &settings,
+        &stats,
+        &settings,
+        Path::exists,
     )))
 }
 
@@ -6578,15 +7066,17 @@ pub async fn run_coverage_scan(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<CommandResponse<CoverageScanResult>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
-    }
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
 
     let client = state
         .local_client
         .client()
         .await
+        .map(|client| std::sync::Arc::new(client.for_local_group(group_id)))
         .map_err(|err| format!("Failed to load coverage scan client: {}", err))?;
     let normalized_root_path = root_path
         .map(|value| value.trim().to_string())
@@ -6643,16 +7133,25 @@ pub async fn run_coverage_scan(
 #[tauri::command]
 pub async fn enroll_folder(
     folder_path: String,
+    expected_group_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<EnrolledFolder>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
     tracing::info!("Enroll folder command called: {}", folder_path);
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
+    if local_recovery_kit_missing(&state).await {
+        return Ok(CommandResponse::err_with_code(
+            LOCAL_RECOVERY_KIT_REQUIRED,
+            "Save your recovery kit before protecting files on this device.",
+        ));
     }
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    personal_workspace::validate_expected_group(expected_group_id.as_deref(), group_id)?;
 
     let client = match state.local_client.client().await {
-        Ok(client) => client,
+        Ok(client) => std::sync::Arc::new(client.for_local_group(group_id)),
         Err(err) => return Ok(CommandResponse::err(err)),
     };
 
@@ -6670,36 +7169,12 @@ pub async fn enroll_folder(
                         Ok(CommandResponse::ok(enrolled_folder_from_stats(summary)))
                     } else {
                         // Root was enrolled but stats not immediately available - return minimal info
-                        Ok(CommandResponse::ok(EnrolledFolder {
-                            path: root.path.display().to_string(),
-                            root_id: root.root_id.to_string(),
-                            kind: describe_root_kind(root.kind).to_string(),
-                            state: describe_root_state(root.state).to_string(),
-                            enrolled_at: root.created_at.to_rfc3339(),
-                            last_scan: None,
-                            tracked_files: 0,
-                            tracked_bytes: 0,
-                            orphaned_files: 0,
-                            unmanaged_files: 0,
-                            coverage_ratio: 0.0,
-                        }))
+                        Ok(CommandResponse::ok(enrolled_folder_from_root(&root)))
                     }
                 }
                 Err(_) => {
                     // Stats fetch failed but enrollment succeeded
-                    Ok(CommandResponse::ok(EnrolledFolder {
-                        path: root.path.display().to_string(),
-                        root_id: root.root_id.to_string(),
-                        kind: describe_root_kind(root.kind).to_string(),
-                        state: describe_root_state(root.state).to_string(),
-                        enrolled_at: root.created_at.to_rfc3339(),
-                        last_scan: None,
-                        tracked_files: 0,
-                        tracked_bytes: 0,
-                        orphaned_files: 0,
-                        unmanaged_files: 0,
-                        coverage_ratio: 0.0,
-                    }))
+                    Ok(CommandResponse::ok(enrolled_folder_from_root(&root)))
                 }
             }
         }
@@ -6713,16 +7188,27 @@ pub async fn enroll_folder(
 #[tauri::command]
 pub async fn enroll_folder_and_hydrate(
     folder_path: String,
+    expected_group_id: Option<String>,
+    job_id: Option<String>,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<CommandResponse<FolderCoverageWorkflowResult>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
     tracing::info!("Enroll and hydrate folder command called: {}", folder_path);
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
+    if local_recovery_kit_missing(&state).await {
+        return Ok(CommandResponse::err_with_code(
+            LOCAL_RECOVERY_KIT_REQUIRED,
+            "Save your recovery kit before protecting files on this device.",
+        ));
     }
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    personal_workspace::validate_expected_group(expected_group_id.as_deref(), group_id)?;
 
     let client = match state.local_client.client().await {
-        Ok(client) => client,
+        Ok(client) => std::sync::Arc::new(client.for_local_group(group_id)),
         Err(err) => return Ok(CommandResponse::err(err)),
     };
 
@@ -6736,57 +7222,61 @@ pub async fn enroll_folder_and_hydrate(
         }
     };
 
-    match hybridcipher_client::ipc::coverage_workflows::enroll_and_hydrate(
+    let name = folder_jobs::folder_display_name(&canonical);
+    let mut reporter = folder_jobs::FolderJobReporter::new(
+        app.clone(),
+        job_id.unwrap_or_default(),
+        folder_jobs::FolderJobKind::Protect,
+        &canonical,
+    );
+    let result = hybridcipher_client::ipc::coverage_workflows::enroll_and_hydrate_with_progress(
         client.as_ref(),
         canonical,
+        &mut |update| reporter.enroll(update),
     )
-    .await
-    {
+    .await;
+
+    match result {
         Ok(outcome) => {
             let folder = match client.coverage_root_stats().await {
                 Ok(stats) => stats
                     .into_iter()
                     .find(|summary| summary.root.root_id == outcome.root.root_id)
                     .map(enrolled_folder_from_stats)
-                    .unwrap_or_else(|| EnrolledFolder {
-                        path: outcome.root.path.display().to_string(),
-                        root_id: outcome.root.root_id.to_string(),
-                        kind: describe_root_kind(outcome.root.kind).to_string(),
-                        state: describe_root_state(outcome.root.state).to_string(),
-                        enrolled_at: outcome.root.created_at.to_rfc3339(),
-                        last_scan: outcome.root.last_scan.map(|ts| ts.to_rfc3339()),
-                        tracked_files: 0,
-                        tracked_bytes: 0,
-                        orphaned_files: 0,
-                        unmanaged_files: 0,
-                        coverage_ratio: 0.0,
-                    }),
-                Err(_) => EnrolledFolder {
-                    path: outcome.root.path.display().to_string(),
-                    root_id: outcome.root.root_id.to_string(),
-                    kind: describe_root_kind(outcome.root.kind).to_string(),
-                    state: describe_root_state(outcome.root.state).to_string(),
-                    enrolled_at: outcome.root.created_at.to_rfc3339(),
-                    last_scan: outcome.root.last_scan.map(|ts| ts.to_rfc3339()),
-                    tracked_files: 0,
-                    tracked_bytes: 0,
-                    orphaned_files: 0,
-                    unmanaged_files: 0,
-                    coverage_ratio: 0.0,
-                },
+                    .unwrap_or_else(|| enrolled_folder_from_root(&outcome.root)),
+                Err(_) => enrolled_folder_from_root(&outcome.root),
             };
+            let encrypted_files = outcome.hydration.newly_encrypted as u64;
+            let skipped_files = outcome.hydration.skipped_due_to_errors as u64;
+            let mut body = format!("{} encrypted.", folder_jobs::files_phrase(encrypted_files));
+            if skipped_files > 0 {
+                body.push_str(&format!(
+                    " {} could not be encrypted.",
+                    folder_jobs::files_phrase(skipped_files)
+                ));
+            }
+            folder_jobs::notify_folder_job_finished(
+                &app,
+                &format!("“{}” is protected", name),
+                &body,
+            );
 
             Ok(CommandResponse::ok(FolderCoverageWorkflowResult {
                 folder,
-                encrypted_files: outcome.hydration.newly_encrypted as u64,
+                encrypted_files,
                 decrypted_files: 0,
-                skipped_files: outcome.hydration.skipped_due_to_errors as u64,
+                skipped_files,
             }))
         }
-        Err(e) => Ok(CommandResponse::err(format!(
-            "Failed to protect folder: {}",
-            desktop_safe_client_error(e)
-        ))),
+        Err(e) => {
+            let message = format!("Failed to protect folder: {}", desktop_safe_client_error(e));
+            folder_jobs::notify_folder_job_finished(
+                &app,
+                &format!("Protecting “{}” didn’t finish", name),
+                &message,
+            );
+            Ok(CommandResponse::err(message))
+        }
     }
 }
 
@@ -6795,17 +7285,18 @@ pub async fn unenroll_folder_keep_encrypted(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<FolderCoverageWorkflowResult>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
     tracing::info!(
         "Unenroll folder without decryption command called: {}",
         root_id
     );
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
-    }
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
 
     let client = match state.local_client.client().await {
-        Ok(client) => client,
+        Ok(client) => std::sync::Arc::new(client.for_local_group(group_id)),
         Err(err) => return Ok(CommandResponse::err(err)),
     };
     let summary = match find_coverage_root_summary_by_id(client.as_ref(), &root_id).await {
@@ -6815,19 +7306,7 @@ pub async fn unenroll_folder_keep_encrypted(
 
     match client.coverage_unenroll_root(&summary.root.path).await {
         Ok(root) => Ok(CommandResponse::ok(FolderCoverageWorkflowResult {
-            folder: EnrolledFolder {
-                path: root.path.display().to_string(),
-                root_id: root.root_id.to_string(),
-                kind: describe_root_kind(root.kind).to_string(),
-                state: describe_root_state(root.state).to_string(),
-                enrolled_at: root.created_at.to_rfc3339(),
-                last_scan: root.last_scan.map(|ts| ts.to_rfc3339()),
-                tracked_files: 0,
-                tracked_bytes: 0,
-                orphaned_files: 0,
-                unmanaged_files: 0,
-                coverage_ratio: 0.0,
-            },
+            folder: enrolled_folder_from_root(&root),
             encrypted_files: 0,
             decrypted_files: 0,
             skipped_files: 0,
@@ -6842,16 +7321,19 @@ pub async fn unenroll_folder_keep_encrypted(
 #[tauri::command]
 pub async fn unenroll_folder_and_decrypt(
     root_id: String,
+    job_id: Option<String>,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<CommandResponse<FolderCoverageWorkflowResult>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
     tracing::info!("Unenroll and decrypt folder command called: {}", root_id);
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
-    }
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
 
     let client = match state.local_client.client().await {
-        Ok(client) => client,
+        Ok(client) => std::sync::Arc::new(client.for_local_group(group_id)),
         Err(err) => return Ok(CommandResponse::err(err)),
     };
 
@@ -6860,37 +7342,109 @@ pub async fn unenroll_folder_and_decrypt(
         Err(err) => return Ok(CommandResponse::err(err)),
     };
     let root_path = summary.root.path.clone();
-
-    match hybridcipher_client::ipc::coverage_workflows::unenroll_and_decrypt(
+    let name = folder_jobs::folder_display_name(&root_path);
+    let mut reporter = folder_jobs::FolderJobReporter::new(
+        app.clone(),
+        job_id.unwrap_or_default(),
+        folder_jobs::FolderJobKind::Unprotect,
+        &root_path,
+    );
+    let result = hybridcipher_client::ipc::coverage_workflows::unenroll_and_decrypt_with_progress(
         client.as_ref(),
         root_path,
+        &mut |update| reporter.decrypt(update),
     )
-    .await
-    {
-        Ok(outcome) => {
-            let folder = EnrolledFolder {
-                path: outcome.root.path.display().to_string(),
-                root_id: outcome.root.root_id.to_string(),
-                kind: describe_root_kind(outcome.root.kind).to_string(),
-                state: describe_root_state(outcome.root.state).to_string(),
-                enrolled_at: outcome.root.created_at.to_rfc3339(),
-                last_scan: outcome.root.last_scan.map(|ts| ts.to_rfc3339()),
-                tracked_files: 0,
-                tracked_bytes: 0,
-                orphaned_files: 0,
-                unmanaged_files: 0,
-                coverage_ratio: 0.0,
-            };
+    .await;
 
+    match result {
+        Ok(outcome) => {
+            let decrypted_files = outcome.decrypted_files as u64;
+            folder_jobs::notify_folder_job_finished(
+                &app,
+                &format!("Protection removed from “{}”", name),
+                &format!("{} decrypted.", folder_jobs::files_phrase(decrypted_files)),
+            );
             Ok(CommandResponse::ok(FolderCoverageWorkflowResult {
-                folder,
+                folder: enrolled_folder_from_root(&outcome.root),
                 encrypted_files: 0,
-                decrypted_files: outcome.decrypted_files as u64,
+                decrypted_files,
                 skipped_files: 0,
             }))
         }
+        Err(e) => {
+            let message = format!(
+                "Failed to remove protected folder: {}",
+                desktop_safe_client_error(e)
+            );
+            folder_jobs::notify_folder_job_finished(
+                &app,
+                &format!("Removing protection from “{}” didn’t finish", name),
+                &message,
+            );
+            Ok(CommandResponse::err(message))
+        }
+    }
+}
+
+/// The protected folder that `folder_path` was before it was renamed or moved,
+/// so the app can offer to update its location instead of protecting it anew.
+#[tauri::command]
+pub async fn find_moved_enrolled_folder(
+    folder_path: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<Option<EnrolledFolder>>, String> {
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    let client = match state.local_client.client().await {
+        Ok(client) => client.for_local_group(group_id),
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    match client.coverage_moved_root_for_path(&folder_path).await {
+        Ok(root) => Ok(CommandResponse::ok(
+            root.as_ref().map(enrolled_folder_from_root),
+        )),
+        Err(e) => Ok(CommandResponse::err(desktop_safe_client_error(e))),
+    }
+}
+
+/// Point a protected folder that was renamed or moved at its new location.
+#[tauri::command]
+pub async fn relocate_enrolled_folder(
+    root_id: String,
+    new_path: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<EnrolledFolder>, String> {
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
+    tracing::info!("Relocate folder command called: {}", root_id);
+    let group_id = match ensure_local_active_group(&state).await {
+        Ok(group_id) => group_id,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    let root_uuid = match Uuid::parse_str(&root_id) {
+        Ok(id) => id,
+        Err(_) => return Ok(CommandResponse::err("Protected folder id is invalid.")),
+    };
+    let client = match state.local_client.client().await {
+        Ok(client) => client.for_local_group(group_id),
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    match client.coverage_relocate_root(root_uuid, &new_path).await {
+        Ok(root) => {
+            let folder = match client.coverage_root_stats().await {
+                Ok(stats) => stats
+                    .into_iter()
+                    .find(|summary| summary.root.root_id == root.root_id)
+                    .map(enrolled_folder_from_stats)
+                    .unwrap_or_else(|| enrolled_folder_from_root(&root)),
+                Err(_) => enrolled_folder_from_root(&root),
+            };
+            Ok(CommandResponse::ok(folder))
+        }
         Err(e) => Ok(CommandResponse::err(format!(
-            "Failed to remove protected folder: {}",
+            "Failed to update the folder's location: {}",
             desktop_safe_client_error(e)
         ))),
     }
@@ -6934,7 +7488,33 @@ impl MountBackend {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Folders being mounted right now, so two requests for one folder (the
+/// background queue and a click) never race each other.
+static MOUNTS_IN_FLIGHT: Lazy<std::sync::Mutex<std::collections::HashSet<Uuid>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+struct MountInFlight(Uuid);
+
+impl MountInFlight {
+    fn claim(root_id: Uuid) -> Option<Self> {
+        let mut in_flight = MOUNTS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Built only when claimed: dropping an unused guard would lock again.
+        in_flight.insert(root_id).then(|| Self(root_id))
+    }
+}
+
+impl Drop for MountInFlight {
+    fn drop(&mut self) {
+        MOUNTS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MountRuntimeState {
     root_id: String,
     mountpoint: PathBuf,
@@ -6949,6 +7529,10 @@ struct MountRuntimeState {
     #[serde(default = "default_mount_ready")]
     ready: bool,
     requested_unmount: bool,
+    /// Name shown for this mount in Finder or File Explorer, when the desktop
+    /// provider registered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
 }
 
 impl MountRuntimeState {
@@ -7005,17 +7589,13 @@ fn determine_desktop_mountpoint(encrypted_dir: &Path, root_id: Uuid) -> Result<P
     Ok(mountpoint)
 }
 
+/// Where macOS is expected to place the domain. The real location is asked from
+/// the system after registration; this is only the fallback.
 #[cfg(target_os = "macos")]
-fn determine_desktop_file_provider_url(
-    encrypted_dir: &Path,
-    root_id: Uuid,
-) -> Result<PathBuf, String> {
+fn determine_desktop_file_provider_url(display_name: &str) -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "Unable to resolve home directory".to_string())?;
     let base = home.join("Library").join("CloudStorage");
-    Ok(base.join(format!(
-        "HybridCipher-{}",
-        derive_desktop_mount_label(encrypted_dir, root_id)
-    )))
+    Ok(base.join(format!("HybridCipher-{display_name}")))
 }
 
 #[cfg(target_os = "macos")]
@@ -7058,18 +7638,200 @@ fn unregister_stored_macos_file_provider_domain(
         .map_err(|err| err.to_string())
 }
 
-fn derive_desktop_mount_label(encrypted_dir: &Path, root_id: Uuid) -> String {
-    let encrypted_name = encrypted_dir
+const MOUNT_DISPLAY_NAME_MAX_CHARS: usize = 60;
+
+/// The workspace part of a mount's sidebar name: "Personal", the Team group's
+/// name, or nothing for the accountless vault (it is the only workspace).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn mount_workspace_label(group: Option<&Value>) -> Option<String> {
+    let group = group?;
+    if group["organization_id"].is_string() {
+        let name = group["name"].as_str().map(str::trim).unwrap_or_default();
+        Some(if name.is_empty() { "Team" } else { name }.to_string())
+    } else {
+        Some("Personal".to_string())
+    }
+}
+
+/// Sidebar name for a mounted folder, e.g. "Personal · Taxes". Finder adds
+/// "HybridCipher - " in front; File Explorer gets that prefix from the provider.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn desktop_mount_display_name(workspace_label: Option<&str>, encrypted_dir: &Path) -> String {
+    let clean = |value: &str| -> String {
+        value
+            .chars()
+            .map(|c| {
+                if c.is_control() || c == '/' || c == ':' || c == '\\' {
+                    '-'
+                } else {
+                    c
+                }
+            })
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let folder = encrypted_dir
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("encrypted");
-    let sanitized = sanitize_mount_name(encrypted_name);
-    let root_short = root_id.simple().to_string();
-    format!("{}-{}-mount", sanitized, &root_short[..8])
+        .map(clean)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Vault".to_string());
+    let name = match workspace_label.map(clean).filter(|label| !label.is_empty()) {
+        Some(label) => format!("{label} · {folder}"),
+        None => folder,
+    };
+    name.chars()
+        .take(MOUNT_DISPLAY_NAME_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Where macOS placed the domain's folder, falling back to the predicted path.
+#[cfg(target_os = "macos")]
+async fn resolve_macos_provider_url(root_id: Uuid, predicted: PathBuf) -> PathBuf {
+    let domain_identifier = format!("com.hybridcipher.root.{root_id}");
+    match tokio::task::spawn_blocking(move || {
+        crate::macos_file_provider_native::user_visible_url(&domain_identifier)
+    })
+    .await
+    {
+        Ok(Ok(url)) => url,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                "Could not read the Finder location of root {}: {}. Using {}.",
+                root_id,
+                err,
+                predicted.display()
+            );
+            predicted
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Finder location lookup for root {} failed: {}",
+                root_id,
+                err
+            );
+            predicted
+        }
+    }
+}
+
+/// Asks macOS to check the domain for changes, which starts the Finder
+/// extension and connects it to the bridge. A domain macOS kept from an
+/// earlier run otherwise stays idle until Finder opens it, so a mount made in
+/// the background was reported as unreachable.
+///
+/// macOS starts kept domains at login, before the app's bridges exist; the
+/// extension then reports "server unreachable" and macOS backs off, for over
+/// an hour after repeated failures, ignoring signals meanwhile. So the
+/// backoff is lifted first.
+#[cfg(target_os = "macos")]
+async fn wake_macos_file_provider_extension(root_id: Uuid) -> Result<(), String> {
+    let domain_identifier = format!("com.hybridcipher.root.{root_id}");
+    let result = tokio::task::spawn_blocking(move || {
+        crate::macos_file_provider_native::wake_domain(&domain_identifier)
+    })
+    .await
+    .map_err(|err| err.to_string())
+    .and_then(|result| result);
+    if let Err(err) = &result {
+        tracing::warn!(
+            "Could not wake the File Provider extension for root {}: {}",
+            root_id,
+            err
+        );
+    }
+    result
+}
+
+/// Reconnects Finder to a mounted folder whose File Provider extension has
+/// not reached the bridge, without unmounting it.
+#[tauri::command]
+pub async fn reconnect_mount(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<()>, String> {
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
+    let parsed_root_id =
+        Uuid::parse_str(&root_id).map_err(|e| format!("Invalid root_id format: {}", e))?;
+    let user_dir = active_storage_dir(&state).await?;
+    let Some((_, mount_state)) = read_any_mount_state_by_root_id(&user_dir, &root_id).await? else {
+        return Ok(CommandResponse::err("Mount not found"));
+    };
+    if !mount_state.backend().is_macos_file_provider() {
+        return Ok(CommandResponse::err(
+            "Only macOS File Provider mounts can be reconnected",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        tracing::info!("Reconnecting Finder to root {}", parsed_root_id);
+        match wake_macos_file_provider_extension(parsed_root_id).await {
+            Ok(()) => Ok(CommandResponse::ok(())),
+            Err(err) => Ok(CommandResponse::err(format!(
+                "Finder could not be reconnected: {err}"
+            ))),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = parsed_root_id;
+        Ok(CommandResponse::err(
+            "Only macOS File Provider mounts can be reconnected",
+        ))
+    }
+}
+
+/// Adds a short id when another live mount already uses the same name.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+async fn unique_mount_display_name(user_dir: &Path, root_id: Uuid, base: String) -> String {
+    let root = root_id.to_string();
+    let mut taken = false;
+    if let Ok(mut entries) = fs::read_dir(mount_states_dir(user_dir)).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(content) = fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            if let Ok(other) = serde_json::from_str::<MountRuntimeState>(&content) {
+                if other.root_id != root
+                    && !other.requested_unmount
+                    && other.display_name.as_deref() == Some(base.as_str())
+                {
+                    taken = true;
+                    break;
+                }
+            }
+        }
+    }
+    if taken {
+        format!("{base} ({})", &root_id.simple().to_string()[..4])
+    } else {
+        base
+    }
 }
 
 fn mount_state_host_is_active(state: &MountRuntimeState) -> bool {
-    state.host_pid.map(process_is_running).unwrap_or(true)
+    state.host_pid.map(host_process_is_running).unwrap_or(true)
+}
+
+/// Mounts are normally hosted by this app, which is running by definition; only
+/// another process's pid needs asking the system, which spawns `tasklist` on
+/// Windows and `kill` elsewhere, once per mount on every list refresh.
+fn host_process_is_running(pid: u32) -> bool {
+    pid == std::process::id() || process_is_running(pid)
+}
+
+/// `mount_state_runtime_is_active` for async code. The check can wait on a
+/// provider socket, so it runs on a blocking thread: a slow bridge must not
+/// hold one of the few async workers the whole backend shares.
+async fn mount_state_runtime_is_active_async(user_dir: &Path, state: &MountRuntimeState) -> bool {
+    let user_dir = user_dir.to_path_buf();
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || mount_state_runtime_is_active(&user_dir, &state))
+        .await
+        .unwrap_or(false)
 }
 
 fn mount_state_runtime_is_active(user_dir: &Path, state: &MountRuntimeState) -> bool {
@@ -7182,6 +7944,30 @@ fn get_user_dir(email: &str, server_url: &str) -> Result<PathBuf, String> {
         .join(&user_id))
 }
 
+/// Storage of the accountless vault while it is open and no account is.
+async fn local_vault_storage_dir(state: &AppState) -> Option<PathBuf> {
+    if state.session.lock().await.is_some() {
+        return None;
+    }
+    let vault = state.local_vault.lock().await;
+    let record = &vault.as_ref()?.record;
+    let config_dir = state.local_client.config_dir();
+    Some(crate::local_vault::user_dir(
+        config_dir,
+        &crate::local_vault::current_storage_id(config_dir, record),
+    ))
+}
+
+/// Storage that holds mount state: the open vault's, otherwise the account's.
+async fn active_storage_dir(state: &AppState) -> Result<PathBuf, String> {
+    if let Some(user_dir) = local_vault_storage_dir(state).await {
+        return Ok(user_dir);
+    }
+    let session = state.session.lock().await;
+    let session = session.as_ref().ok_or("No active session")?;
+    get_user_dir(&session.email, &current_server_url(state, session))
+}
+
 fn mount_sync_status_path(user_dir: &PathBuf, root_id: &str) -> PathBuf {
     user_dir
         .join("mount_states")
@@ -7229,6 +8015,21 @@ fn windows_cloud_provider_health(_user_dir: &Path, _root_id: &str) -> Option<ser
     None
 }
 
+/// `mount_operational_health` on a blocking thread, for the same reason as
+/// `mount_state_runtime_is_active_async`.
+async fn mount_operational_health_async(
+    user_dir: &Path,
+    root_id: &str,
+    backend: MountBackend,
+) -> Option<serde_json::Value> {
+    let user_dir = user_dir.to_path_buf();
+    let root_id = root_id.to_string();
+    tokio::task::spawn_blocking(move || mount_operational_health(&user_dir, &root_id, backend))
+        .await
+        .ok()
+        .flatten()
+}
+
 fn mount_operational_health(
     user_dir: &Path,
     root_id: &str,
@@ -7236,9 +8037,100 @@ fn mount_operational_health(
 ) -> Option<serde_json::Value> {
     if backend.is_windows_cloud_files() {
         windows_cloud_provider_health(user_dir, root_id)
+    } else if backend.is_macos_file_provider() {
+        macos_file_provider_unreached_health(user_dir, root_id)
     } else {
         None
     }
+}
+
+/// Shown when the File Provider extension never reached the bridge: the folder
+/// then stays empty in Finder although the host side looks healthy.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MACOS_EXTENSION_UNREACHED_MESSAGE: &str = "Finder hasn't synced with this folder since it was mounted, \
+so it shows the last copy macOS kept and changes aren't exchanged. This usually happens when macOS opened the folder \
+before HybridCipher was running and then paused it. Reconnect to resume syncing. If macOS asked whether to allow \
+HybridCipher in Finder, allow it. If Reconnect doesn't help, unmount and mount the folder again.";
+
+/// Health for a File Provider mount whose extension hasn't connected within
+/// the grace period; `None` while it's fine or still starting.
+fn macos_file_provider_unreached_health(
+    user_dir: &Path,
+    root_id: &str,
+) -> Option<serde_json::Value> {
+    #[cfg(target_os = "macos")]
+    {
+        let root_id = Uuid::parse_str(root_id).ok()?;
+        let health = macos_file_provider_host(user_dir)
+            .check_runtime_health(root_id)
+            .ok()?;
+        macos_unreached_health_from(&health)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (user_dir, root_id);
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_unreached_health_from(
+    health: &hybridcipher_macos_file_provider::MacFileProviderRuntimeHealth,
+) -> Option<serde_json::Value> {
+    let waiting = health.extension_waiting_secs?;
+    let grace = hybridcipher_macos_file_provider::EXTENSION_CONNECT_GRACE.as_secs();
+    (waiting >= grace).then(|| {
+        serde_json::json!({
+            "extension_connected": false,
+            "waiting_secs": waiting,
+            "error": MACOS_EXTENSION_UNREACHED_MESSAGE,
+        })
+    })
+}
+
+/// A macOS File Provider mount's liveness and health from a single bridge
+/// check: `None` when it isn't running, else its unreached-extension health.
+#[cfg(target_os = "macos")]
+fn macos_mount_inspection(
+    user_dir: &Path,
+    state: &MountRuntimeState,
+) -> Option<Option<serde_json::Value>> {
+    if !mount_state_host_is_active(state) {
+        return None;
+    }
+    let root_id = Uuid::parse_str(&state.root_id).ok()?;
+    let health = macos_file_provider_host(user_dir)
+        .check_runtime_health(root_id)
+        .ok()?;
+    if !(health.registration_present && health.socket_reachable) {
+        return None;
+    }
+    Some(macos_unreached_health_from(&health))
+}
+
+/// The status of a live mount, or `None` when it isn't running. A macOS
+/// mount is checked once, not separately for liveness and for health: each
+/// check asks the folder's bridge, and lists check every mount.
+async fn inspect_mount(
+    state: &AppState,
+    user_dir: &Path,
+    mount: &MountRuntimeState,
+) -> Option<MountStatusPayload> {
+    #[cfg(target_os = "macos")]
+    if mount.backend().is_macos_file_provider() {
+        let inspect_dir = user_dir.to_path_buf();
+        let snapshot = mount.clone();
+        let operational_health =
+            tokio::task::spawn_blocking(move || macos_mount_inspection(&inspect_dir, &snapshot))
+                .await
+                .ok()
+                .flatten()?;
+        return Some(status_payload_with_health(mount, operational_health));
+    }
+    if !mount_state_runtime_is_active_async(user_dir, mount).await {
+        return None;
+    }
+    Some(mount_status_payload(state, user_dir, mount).await)
 }
 
 fn cloud_health_is_usable(health: Option<&serde_json::Value>) -> bool {
@@ -7256,6 +8148,26 @@ fn cloud_health_is_usable(health: Option<&serde_json::Value>) -> bool {
             .and_then(|value| value.get("healthy"))
             .and_then(|value| value.as_bool())
             == Some(true)
+}
+
+/// Degraded when Cloud Files isn't healthy, or when the macOS File Provider
+/// extension never connected (Finder then shows an empty folder).
+fn mount_availability(
+    backend: MountBackend,
+    operational_health: Option<&serde_json::Value>,
+) -> &'static str {
+    let extension_unreached = backend.is_macos_file_provider()
+        && operational_health
+            .and_then(|health| health.get("extension_connected"))
+            .and_then(|value| value.as_bool())
+            == Some(false);
+    if (backend.is_windows_cloud_files() && !cloud_health_is_usable(operational_health))
+        || extension_unreached
+    {
+        "degraded"
+    } else {
+        "usable"
+    }
 }
 
 async fn mount_status_payload(
@@ -7278,26 +8190,27 @@ async fn mount_status_payload(
                             }),
                     ))
                 } else {
-                    mount_operational_health(user_dir, &mount.root_id, mount.backend())
+                    mount_operational_health_async(user_dir, &mount.root_id, mount.backend()).await
                 }
             } else {
-                mount_operational_health(user_dir, &mount.root_id, mount.backend())
+                mount_operational_health_async(user_dir, &mount.root_id, mount.backend()).await
             }
         }
         #[cfg(not(target_os = "windows"))]
         {
-            mount_operational_health(user_dir, &mount.root_id, mount.backend())
+            mount_operational_health_async(user_dir, &mount.root_id, mount.backend()).await
         }
     } else {
-        mount_operational_health(user_dir, &mount.root_id, mount.backend())
+        mount_operational_health_async(user_dir, &mount.root_id, mount.backend()).await
     };
-    let availability = if mount.backend().is_windows_cloud_files()
-        && !cloud_health_is_usable(operational_health.as_ref())
-    {
-        "degraded"
-    } else {
-        "usable"
-    };
+    status_payload_with_health(mount, operational_health)
+}
+
+fn status_payload_with_health(
+    mount: &MountRuntimeState,
+    operational_health: Option<serde_json::Value>,
+) -> MountStatusPayload {
+    let availability = mount_availability(mount.backend(), operational_health.as_ref());
     MountStatusPayload {
         mountpoint: mount.mountpoint.display().to_string(),
         backend: mount.backend().as_str().to_string(),
@@ -7376,7 +8289,7 @@ async fn read_mount_state_by_root_id(
     if !mount_state.requested_unmount
         && mount_state.is_ready()
         && mount_state.mountpoint.exists()
-        && mount_state_runtime_is_active(user_dir, &mount_state)
+        && mount_state_runtime_is_active_async(user_dir, &mount_state).await
     {
         return Ok(Some(mount_state));
     }
@@ -7420,6 +8333,7 @@ mod writeback_status_regression {
                 fallback_reason: None,
                 ready: true,
                 requested_unmount: false,
+                display_name: None,
             };
             fs::write(
                 mount_states_dir(&user_dir).join(format!("mount_state_{root_id}.json")),
@@ -7546,18 +8460,45 @@ fn ensure_sync_mount_backend(state: &MountRuntimeState, command_name: &str) -> R
     ))
 }
 
-fn load_mount_conflicts_for_root(
+/// Loads conflict records and the directory their relative paths resolve
+/// against. macOS File Provider keeps both in its private cache state.
+async fn load_mount_conflicts_for_mount(
+    state: &AppState,
     user_dir: &Path,
     root_id: &str,
-) -> Result<Vec<MountConflictRecord>, String> {
-    let registry_path = mount_conflict_registry_path(user_dir, root_id);
-    load_mount_conflict_registry(&registry_path).map_err(|err| {
+    mount_state: &MountRuntimeState,
+) -> Result<(Vec<MountConflictRecord>, PathBuf), String> {
+    #[cfg(target_os = "macos")]
+    let (registry_path, base_dir) = if mount_state.backend().is_macos_file_provider() {
+        let parsed_root_id =
+            Uuid::parse_str(root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
+        state
+            .cloud_provider
+            .macos_conflict_location(parsed_root_id)
+            .await?
+    } else {
+        (
+            mount_conflict_registry_path(user_dir, root_id),
+            mount_state.mountpoint.clone(),
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (registry_path, base_dir) = {
+        let _ = state;
+        (
+            mount_conflict_registry_path(user_dir, root_id),
+            mount_state.mountpoint.clone(),
+        )
+    };
+
+    let records = load_mount_conflict_registry(&registry_path).map_err(|err| {
         format!(
             "Failed to read conflict registry {}: {}",
             registry_path.display(),
             err
         )
-    })
+    })?;
+    Ok((records, base_dir))
 }
 
 fn load_mount_recovery_copies_for_root(
@@ -7736,22 +8677,17 @@ async fn matching_mount_state_for_root(
 async fn check_mount_status(
     folder_path: &str,
     root_id: &str,
-    email: &str,
-    server_url: &str,
+    user_dir: &Path,
     state: &AppState,
 ) -> Result<Option<MountStatusPayload>, String> {
-    let user_dir = get_user_dir(email, server_url)?;
+    let user_dir = user_dir.to_path_buf();
     let Some(mount) = matching_mount_state_for_root(&user_dir, root_id, folder_path).await? else {
         return Ok(None);
     };
-    if mount.requested_unmount
-        || !mount.is_ready()
-        || !mount.mountpoint.exists()
-        || !mount_state_runtime_is_active(&user_dir, &mount)
-    {
+    if mount.requested_unmount || !mount.is_ready() || !mount.mountpoint.exists() {
         return Ok(None);
     }
-    Ok(Some(mount_status_payload(state, &user_dir, &mount).await))
+    Ok(inspect_mount(state, &user_dir, &mount).await)
 }
 
 /// Check mount status by root_id
@@ -7760,26 +8696,13 @@ pub async fn check_mount_status_by_root_id(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountStatusPayload>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
 
     // Validate root_id format
     let _parsed_root_id =
         Uuid::parse_str(&root_id).map_err(|e| format!("Invalid root_id format: {}", e))?;
 
-    // Get current session info
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        let email = user_session.email.clone();
-        let server_url = user_session
-            .server_url
-            .as_deref()
-            .unwrap_or_else(|| state.client.server_url())
-            .to_string();
-        (email, server_url)
-    };
-
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some((_, mount_state)) = read_any_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err("Mount not found"));
     };
@@ -7793,16 +8716,182 @@ pub async fn check_mount_status_by_root_id(
             ),
         ));
     }
-    if mount_state.requested_unmount
-        || !mount_state.is_ready()
-        || !mount_state.mountpoint.exists()
-        || !mount_state_runtime_is_active(&user_dir, &mount_state)
+    if mount_state.requested_unmount || !mount_state.is_ready() || !mount_state.mountpoint.exists()
     {
         return Ok(CommandResponse::err("Mount not found"));
     }
-    Ok(CommandResponse::ok(
-        mount_status_payload(&state, &user_dir, &mount_state).await,
-    ))
+    match inspect_mount(&state, &user_dir, &mount_state).await {
+        Some(status) => Ok(CommandResponse::ok(status)),
+        None => Ok(CommandResponse::err("Mount not found")),
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn finder_mount_failed_message(folder: &str, reason: &str) -> String {
+    if reason.contains(FINDER_ACCESS_BLOCKED) {
+        // Mounting again in this app process meets the same block.
+        return format!(
+            "Finder couldn't open {folder} ({reason}). Quit and reopen HybridCipher, then mount it \
+again: macOS keeps this block until HybridCipher quits. If it keeps failing, check HybridCipher in \
+System Settings › Privacy & Security › Files & Folders."
+        );
+    }
+    format!(
+        "Finder couldn't open {folder} ({reason}). Try mounting it again. If it keeps failing, \
+check that HybridCipher is turned on in System Settings › General › Login Items & Extensions › File Providers."
+    )
+}
+
+/// How long a macOS mount waits for its folder to appear in Finder.
+#[cfg(target_os = "macos")]
+const FINDER_READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// While waiting, macOS is asked again where the folder is this often.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const FINDER_LOCATION_RECHECK: Duration = Duration::from_secs(5);
+/// A folder not readable this long is woken (backoff lifted, then signalled)...
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const FINDER_FIRST_WAKE_AFTER: Duration = Duration::from_secs(3);
+/// ...and again this often while it stays unreadable.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const FINDER_WAKE_EVERY: Duration = Duration::from_secs(10);
+
+/// What a Finder wait does on this pass, besides checking the folder.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FinderWaitSteps {
+    pub resolve: bool,
+    pub wake: bool,
+}
+
+/// `last_resolve` and `last_wake` are the elapsed times those steps last ran.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn finder_wait_steps(
+    elapsed: Duration,
+    last_resolve: Option<Duration>,
+    last_wake: Option<Duration>,
+) -> FinderWaitSteps {
+    FinderWaitSteps {
+        resolve: last_resolve
+            .is_none_or(|at| elapsed.saturating_sub(at) >= FINDER_LOCATION_RECHECK),
+        wake: match last_wake {
+            None => elapsed >= FINDER_FIRST_WAKE_AFTER,
+            Some(at) => elapsed.saturating_sub(at) >= FINDER_WAKE_EVERY,
+        },
+    }
+}
+
+/// How this app can reach a Finder folder that exists.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinderLocationAccess {
+    Readable,
+    /// macOS privacy (TCC) refused this app process. Finder can still open the
+    /// folder, and macOS keeps the refusal until the app quits, so waiting or
+    /// waking the domain never clears it.
+    Blocked,
+}
+
+/// Said in a mount error when `FinderLocationAccess::Blocked` caused it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const FINDER_ACCESS_BLOCKED: &str =
+    "macOS privacy settings blocked HybridCipher from reading the folder";
+
+/// How the app can reach the folder, or why it isn't there yet.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) async fn finder_location_state(path: &Path) -> Result<FinderLocationAccess, String> {
+    match fs::metadata(path).await {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err("does not exist".to_string()),
+        Err(err) => Err(format!("could not be inspected: {err}")),
+        Ok(metadata) if !metadata.is_dir() => Err("is not a folder".to_string()),
+        Ok(_) => match fs::read_dir(path).await {
+            Ok(_) => Ok(FinderLocationAccess::Readable),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                Ok(FinderLocationAccess::Blocked)
+            }
+            Err(err) => Err(format!("could not be read: {err}")),
+        },
+    }
+}
+
+/// Waits for a macOS File Provider folder to become readable and returns
+/// where it is. macOS may still be backing the domain off from a request the
+/// bridge missed, so a folder that stays unreadable is woken, and its location
+/// is asked again in case it differs from the first answer. A folder macOS
+/// privacy blocks this app from reading is returned at once as `Blocked`.
+#[cfg(target_os = "macos")]
+async fn wait_for_macos_provider_ready(
+    root_id: Uuid,
+    predicted: PathBuf,
+    timeout: Duration,
+) -> Result<(PathBuf, FinderLocationAccess), String> {
+    let started = std::time::Instant::now();
+    let mut path = predicted;
+    let mut last_resolve = None;
+    let mut last_wake = None;
+    loop {
+        let elapsed = started.elapsed();
+        let steps = finder_wait_steps(elapsed, last_resolve, last_wake);
+        if steps.resolve {
+            last_resolve = Some(elapsed);
+            let resolved = resolve_macos_provider_url(root_id, path.clone()).await;
+            if resolved != path {
+                tracing::info!(
+                    "mount {}: Finder location is {}",
+                    root_id,
+                    resolved.display()
+                );
+                path = resolved;
+            }
+        }
+        if steps.wake {
+            last_wake = Some(elapsed);
+            tracing::info!(
+                "mount {}: Finder location {} still unreadable after {} ms; waking it",
+                root_id,
+                path.display(),
+                elapsed.as_millis()
+            );
+            let _ = wake_macos_file_provider_extension(root_id).await;
+        }
+        let failure = match finder_location_state(&path).await {
+            Ok(FinderLocationAccess::Readable) => {
+                tracing::info!(
+                    "mount {}: Finder location {} ready after {} ms",
+                    root_id,
+                    path.display(),
+                    started.elapsed().as_millis()
+                );
+                return Ok((path, FinderLocationAccess::Readable));
+            }
+            Ok(FinderLocationAccess::Blocked) => {
+                tracing::warn!(
+                    "mount {}: macOS privacy blocked this app from reading {} after {} ms; \
+Finder can still open it, and quitting HybridCipher clears the block",
+                    root_id,
+                    path.display(),
+                    started.elapsed().as_millis()
+                );
+                return Ok((path, FinderLocationAccess::Blocked));
+            }
+            Err(failure) => failure,
+        };
+        if started.elapsed() >= timeout {
+            tracing::warn!(
+                "mount {}: Finder location {} {} after {} s",
+                root_id,
+                path.display(),
+                failure,
+                timeout.as_secs()
+            );
+            return Err(format!(
+                "Finder didn't show the folder at {} within {} s: it {}",
+                path.display(),
+                timeout.as_secs(),
+                failure
+            ));
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Wait for mount to become ready by polling mountpoint directory
@@ -7846,6 +8935,103 @@ async fn write_mount_runtime_state(path: &Path, state: &MountRuntimeState) -> Re
         .map_err(|e| format!("Failed to write mount state {}: {}", path.display(), e))
 }
 
+/// The mount state of a root this process reconnected: hosted here, ready, and
+/// no longer marked for unmount. `existing` is what the last run wrote, if
+/// anything; its display name and mountpoint are kept.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn reconnected_mount_state(
+    existing: Option<MountRuntimeState>,
+    root: &crate::cloud_provider::ReconnectedRoot,
+    backend: MountBackend,
+) -> MountRuntimeState {
+    let mut state = existing.unwrap_or_else(|| MountRuntimeState {
+        root_id: root.root_id.to_string(),
+        mountpoint: root.mountpoint.clone(),
+        encrypted_dir: root.encrypted_root.clone(),
+        platform: std::env::consts::OS.to_string(),
+        backend: Some(backend),
+        host_pid: None,
+        fallback_reason: None,
+        ready: true,
+        requested_unmount: false,
+        display_name: None,
+    });
+    state.backend = Some(backend);
+    state.host_pid = Some(std::process::id());
+    state.fallback_reason = None;
+    state.ready = true;
+    state.requested_unmount = false;
+    state
+}
+
+/// Mark the mounts a reconnect brought back as hosted by this process. Their
+/// state files still name the last run's process, so without this they stay
+/// hidden although Finder or File Explorer serves them again.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub(crate) async fn record_reconnected_mounts(
+    user_dir: &Path,
+    report: &crate::cloud_provider::ReconnectReport,
+) {
+    #[cfg(target_os = "macos")]
+    let backend = MountBackend::MacOsFileProvider;
+    #[cfg(not(target_os = "macos"))]
+    let backend = MountBackend::WindowsCloudFiles;
+    for root in &report.reconnected {
+        let path = user_dir
+            .join("mount_states")
+            .join(format!("mount_state_{}.json", root.root_id));
+        let existing = match fs::read(&path).await {
+            Ok(bytes) => serde_json::from_slice::<MountRuntimeState>(&bytes).ok(),
+            Err(_) => None,
+        };
+        let state = reconnected_mount_state(existing, root, backend);
+        if let Err(err) = write_mount_runtime_state(&path, &state).await {
+            tracing::warn!("Could not record reconnected mount {}: {}", root.root_id, err);
+        }
+    }
+    if !report.reconnected.is_empty() {
+        tracing::info!(
+            "Reconnected {} mount(s) left from the last run",
+            report.reconnected.len()
+        );
+    }
+    for failure in &report.failed {
+        tracing::warn!(
+            "Could not reconnect mount {} ({}): {}",
+            failure.root_id,
+            failure.name,
+            failure.error
+        );
+    }
+}
+
+/// Whether the open account may write Team data without a valid token: its
+/// signed Team entitlement must still verify offline.
+pub(crate) fn team_write_allowed_offline(
+    state: &AppState,
+    session: &crate::state::UserSession,
+) -> Result<(), String> {
+    if session.team_revoked {
+        return Err("Team license has been revoked".into());
+    }
+    let token = session
+        .team_entitlement
+        .as_deref()
+        .ok_or("No Team entitlement is cached")?;
+    let keys = hybridcipher_client::entitlement::trusted_keys_from_build()?;
+    hybridcipher_client::entitlement::verify(
+        token,
+        &keys,
+        session
+            .server_url
+            .as_deref()
+            .unwrap_or(state.client.server_url()),
+        &session.user_id,
+        chrono::Utc::now().timestamp(),
+    )?;
+    Ok(())
+}
+
 fn mount_fallback_error(desktop_error: Option<&str>, cli_error: String) -> String {
     match desktop_error {
         Some(primary) => {
@@ -7860,32 +9046,60 @@ pub async fn mount_enrolled_folder(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountStatusPayload>, String> {
-    let _operation_guard = ensure_local_team_write(&state).await?;
+    let _operation_guard = ensure_local_team_write_or_vault(&state).await?;
     tracing::info!("Mount enrolled folder request with root_id: {}", root_id);
-    if let Err(err) = ensure_local_active_group(&state).await {
-        return Ok(CommandResponse::err(err));
-    }
+    let (group_id, group) = match ensure_local_active_group_with_metadata(&state).await {
+        Ok(selection) => selection,
+        Err(err) => return Ok(CommandResponse::err(err)),
+    };
+    mount_root_in_group(&state, root_id, group_id, group.as_ref(), None).await
+}
 
+/// Mounts one enrolled folder of `group_id`. The caller has checked access to
+/// that group; this neither reads nor changes the workspace selected in the UI.
+async fn mount_root_in_group(
+    state: &AppState,
+    root_id: String,
+    group_id: Uuid,
+    group: Option<&Value>,
+    progress: Option<&mount_queue::MountProgress>,
+) -> Result<CommandResponse<MountStatusPayload>, String> {
+    // Only the native providers show a sidebar name built from the group.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = group;
     // Validate root_id format
     let parsed_root_id =
         Uuid::parse_str(&root_id).map_err(|e| format!("Invalid root_id format: {}", e))?;
+    let Some(_in_flight) = MountInFlight::claim(parsed_root_id) else {
+        return Ok(CommandResponse::err_with_code(
+            "MOUNT_IN_PROGRESS",
+            "This folder is already being mounted.",
+        ));
+    };
+    if unmount_batch::unmount_in_progress(parsed_root_id) {
+        return Ok(CommandResponse::err_with_code(
+            "UNMOUNT_IN_PROGRESS",
+            "This folder is still being unmounted. Mount it again when that finishes.",
+        ));
+    }
 
-    // Get current session info
-    let (email, server_url, persistent) = {
+    let user_dir = active_storage_dir(state).await?;
+    // The CLI sync fallback signs in as the account. The vault has none, so it
+    // mounts only through the native desktop provider.
+    let cli_fallback = if state.local_vault_group().await.is_some() {
+        None
+    } else {
         let session = state.session.lock().await;
         let user_session = session.as_ref().ok_or("No active session")?;
-        let email = user_session.email.clone();
-        let server_url = user_session
-            .server_url
-            .as_deref()
-            .unwrap_or_else(|| state.client.server_url())
-            .to_string();
-        (email, server_url, user_session.persistent)
+        Some((
+            current_server_url(state, user_session),
+            user_session.persistent,
+        ))
     };
 
     // Get folder path from root_id for mount status check
     let client = match state.local_client.client().await {
-        Ok(client) => client,
+        Ok(client) => std::sync::Arc::new(client.for_local_group(group_id)),
         Err(err) => {
             return Ok(CommandResponse::err(format!(
                 "Failed to get client: {}",
@@ -7911,16 +9125,15 @@ pub async fn mount_enrolled_folder(
     let encrypted_root = PathBuf::from(&folder.path);
 
     // Check the requested root before touching any other saved source path.
-    let existing =
-        match check_mount_status(&folder.path, &root_id, &email, &server_url, &state).await {
-            Ok(status) => status,
-            Err(error) => {
-                return Ok(CommandResponse::err_with_code(
-                    "MOUNT_SOURCE_UNAVAILABLE",
-                    error,
-                ))
-            }
-        };
+    let existing = match check_mount_status(&folder.path, &root_id, &user_dir, state).await {
+        Ok(status) => status,
+        Err(error) => {
+            return Ok(CommandResponse::err_with_code(
+                "MOUNT_SOURCE_UNAVAILABLE",
+                error,
+            ))
+        }
+    };
     if let Some(mount_status) = existing {
         if mount_status.availability == "degraded" {
             let diagnostics = mount_status
@@ -7954,13 +9167,32 @@ pub async fn mount_enrolled_folder(
     // Each folder can be mounted independently
     // The CLI mount command will handle checking if this specific folder is already mounted
 
+    // A kept root restarted after sign-in is still on its first sync; its mount
+    // state belongs to that run until it finishes.
+    #[cfg(target_os = "macos")]
+    if state.cloud_provider.is_root_starting(parsed_root_id) {
+        return Ok(CommandResponse::err_with_code(
+            "MOUNT_PREPARING",
+            format!(
+                "{} is still being prepared after sign-in. It opens in Finder when that finishes.",
+                mount_center::folder_name(&encrypted_root)
+            ),
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     let desktop_provider_fallback_reason: Option<String> = {
-        let user_dir = get_user_dir(&email, &server_url)?;
+        let user_dir = user_dir.clone();
         let mount_states_dir = user_dir.join("mount_states");
         let mount_state_path = mount_states_dir.join(format!("mount_state_{}.json", root_id));
-        let provider_url = determine_desktop_file_provider_url(&encrypted_root, parsed_root_id)?;
-        let runtime_state = MountRuntimeState {
+        let display_name = unique_mount_display_name(
+            &user_dir,
+            parsed_root_id,
+            desktop_mount_display_name(mount_workspace_label(group).as_deref(), &encrypted_root),
+        )
+        .await;
+        let provider_url = determine_desktop_file_provider_url(&display_name)?;
+        let mut runtime_state = MountRuntimeState {
             root_id: root_id.clone(),
             mountpoint: provider_url.clone(),
             encrypted_dir: encrypted_root.clone(),
@@ -7970,9 +9202,11 @@ pub async fn mount_enrolled_folder(
             fallback_reason: None,
             ready: false,
             requested_unmount: false,
+            display_name: Some(display_name.clone()),
         };
         write_mount_runtime_state(&mount_state_path, &runtime_state).await?;
 
+        mount_queue::report_mount_step(progress, "registering");
         let fallback_reason =
             match crate::cloud_provider::DesktopCloudProviderManager::file_provider_available(
                 user_dir.clone(),
@@ -7984,94 +9218,143 @@ pub async fn mount_enrolled_folder(
                         parsed_root_id,
                         provider_url.clone(),
                         encrypted_root.clone(),
-                        derive_desktop_mount_label(&encrypted_root, parsed_root_id),
+                        display_name.clone(),
                         client.clone(),
                     )
                     .await
                 {
-                    Ok(()) => match wait_for_mount_ready(&provider_url, 60).await {
-                        Ok(()) => {
-                            let runtime_unhealthy_reason = match macos_file_provider_host(&user_dir)
-                                .check_runtime_health(parsed_root_id)
-                            {
-                                Ok(health)
-                                    if health.registration_present && health.socket_reachable =>
-                                {
-                                    None
+                    Ok(()) => {
+                        mount_queue::report_mount_step(progress, "connecting_finder");
+                        match wait_for_macos_provider_ready(
+                            parsed_root_id,
+                            provider_url.clone(),
+                            FINDER_READY_TIMEOUT,
+                        )
+                        .await
+                        {
+                            // A `Blocked` folder is kept: Finder can still
+                            // open it, so the health check below decides.
+                            Ok((provider_url, access)) => {
+                                // macOS chooses the folder name itself.
+                                if provider_url != runtime_state.mountpoint {
+                                    runtime_state.mountpoint = provider_url.clone();
+                                    write_mount_runtime_state(&mount_state_path, &runtime_state)
+                                        .await?;
                                 }
-                                Ok(health) => Some(health.latest_error.unwrap_or_else(|| {
-                                    "registration or provider socket health check failed"
-                                        .to_string()
-                                })),
-                                Err(err) => Some(err.to_string()),
-                            };
-                            if let Some(reason) = runtime_unhealthy_reason {
-                                tracing::warn!(
-                                    "Desktop File Provider runtime for root {} is not healthy: {}. Falling back to sync mount.",
+                                mount_queue::report_mount_step(progress, "waking_extension");
+                                // Failures are logged; the health check below decides.
+                                let _ = wake_macos_file_provider_extension(parsed_root_id).await;
+                                let health_dir = user_dir.clone();
+                                let runtime_health = tokio::task::spawn_blocking(move || {
+                                    macos_file_provider_host(&health_dir)
+                                        .check_runtime_health(parsed_root_id)
+                                })
+                                .await
+                                .map_err(|err| err.to_string());
+                                let runtime_unhealthy_reason = match runtime_health {
+                                    Ok(Ok(health))
+                                        if health.registration_present
+                                            && health.socket_reachable =>
+                                    {
+                                        None
+                                    }
+                                    Ok(Ok(health)) => {
+                                        Some(health.latest_error.unwrap_or_else(|| {
+                                            "registration or provider socket health check failed"
+                                                .to_string()
+                                        }))
+                                    }
+                                    Ok(Err(err)) => Some(err.to_string()),
+                                    Err(err) => Some(err),
+                                };
+                                if let Some(reason) = runtime_unhealthy_reason {
+                                    tracing::warn!(
+                                    "Desktop File Provider runtime for root {} is not healthy: {}.",
                                     root_id,
                                     reason
                                 );
+                                    let _ = state
+                                        .cloud_provider
+                                        .stop_root(parsed_root_id, true, true)
+                                        .await;
+                                    let _ = fs::remove_file(&mount_state_path).await;
+                                    Some(match access {
+                                        FinderLocationAccess::Readable => format!(
+                                            "macOS File Provider runtime health check failed: {}",
+                                            reason
+                                        ),
+                                        FinderLocationAccess::Blocked => format!(
+                                            "{}, and the macOS File Provider runtime health check failed: {}",
+                                            FINDER_ACCESS_BLOCKED, reason
+                                        ),
+                                    })
+                                } else {
+                                    let mut ready_state = runtime_state;
+                                    ready_state.ready = true;
+                                    write_mount_runtime_state(&mount_state_path, &ready_state)
+                                        .await?;
+                                    return Ok(CommandResponse::ok(MountStatusPayload {
+                                        mountpoint: provider_url.display().to_string(),
+                                        backend: MountBackend::MacOsFileProvider
+                                            .as_str()
+                                            .to_string(),
+                                        availability: default_mount_availability(),
+                                        fallback_reason: None,
+                                        operational_health: None,
+                                    }));
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                "Desktop File Provider domain for root {} did not become visible: {}.",
+                                root_id,
+                                err
+                            );
                                 let _ = state
                                     .cloud_provider
                                     .stop_root(parsed_root_id, true, true)
                                     .await;
                                 let _ = fs::remove_file(&mount_state_path).await;
                                 Some(format!(
-                                    "macOS File Provider runtime health check failed: {}",
-                                    reason
+                                    "macOS File Provider domain did not become visible: {}",
+                                    err
                                 ))
-                            } else {
-                                let mut ready_state = runtime_state;
-                                ready_state.ready = true;
-                                write_mount_runtime_state(&mount_state_path, &ready_state).await?;
-                                return Ok(CommandResponse::ok(MountStatusPayload {
-                                    mountpoint: provider_url.display().to_string(),
-                                    backend: MountBackend::MacOsFileProvider.as_str().to_string(),
-                                    availability: default_mount_availability(),
-                                    fallback_reason: None,
-                                    operational_health: None,
-                                }));
                             }
                         }
-                        Err(err) => {
-                            tracing::warn!(
-                                "Desktop File Provider domain for root {} did not become visible: {}. Falling back to sync mount.",
-                                root_id,
-                                err
-                            );
-                            let _ = state
-                                .cloud_provider
-                                .stop_root(parsed_root_id, true, true)
-                                .await;
-                            let _ = fs::remove_file(&mount_state_path).await;
-                            Some(format!(
-                                "macOS File Provider domain did not become visible: {}",
-                                err
-                            ))
-                        }
-                    },
+                    }
                     Err(err) => {
                         tracing::warn!(
-                        "Desktop in-process File Provider mount failed for root {}: {}. Falling back to sync mount.",
-                        root_id,
-                        err
-                    );
+                            "Desktop in-process File Provider mount failed for root {}: {}.",
+                            root_id,
+                            err
+                        );
                         let _ = fs::remove_file(&mount_state_path).await;
                         Some(format!("macOS File Provider unavailable: {}", err))
                     }
                 },
                 Err(err) => {
                     tracing::warn!(
-                    "Desktop File Provider unavailable for root {}: {}. Falling back to sync mount.",
-                    root_id,
-                    err
-                );
+                        "Desktop File Provider unavailable for root {}: {}.",
+                        root_id,
+                        err
+                    );
                     let _ = fs::remove_file(&mount_state_path).await;
                     Some(format!("macOS File Provider unavailable: {}", err))
                 }
             };
         fallback_reason
     };
+
+    // The CLI sync mount can't stand in on macOS: it is a separate process and
+    // needs the file index this signed-in app holds, so it always fails, and its
+    // error hides the Finder problem the user can act on.
+    #[cfg(target_os = "macos")]
+    if let Some(reason) = desktop_provider_fallback_reason.as_deref() {
+        return Ok(CommandResponse::err_with_code(
+            "FINDER_MOUNT_FAILED",
+            finder_mount_failed_message(&mount_center::folder_name(&encrypted_root), reason),
+        ));
+    }
 
     #[cfg(not(target_os = "macos"))]
     let desktop_provider_fallback_reason: Option<String> = None;
@@ -8080,10 +9363,16 @@ pub async fn mount_enrolled_folder(
 
     #[cfg(target_os = "windows")]
     if crate::cloud_provider::DesktopCloudProviderManager::cloud_files_available() {
-        let user_dir = get_user_dir(&email, &server_url)?;
+        let user_dir = user_dir.clone();
         let mount_states_dir = user_dir.join("mount_states");
         let mount_state_path = mount_states_dir.join(format!("mount_state_{}.json", root_id));
         let mountpoint = determine_desktop_mountpoint(&encrypted_root, parsed_root_id)?;
+        let display_name = unique_mount_display_name(
+            &user_dir,
+            parsed_root_id,
+            desktop_mount_display_name(mount_workspace_label(group).as_deref(), &encrypted_root),
+        )
+        .await;
         let runtime_state = MountRuntimeState {
             root_id: root_id.clone(),
             mountpoint: mountpoint.clone(),
@@ -8094,9 +9383,11 @@ pub async fn mount_enrolled_folder(
             fallback_reason: None,
             ready: false,
             requested_unmount: false,
+            display_name: Some(display_name.clone()),
         };
         write_mount_runtime_state(&mount_state_path, &runtime_state).await?;
 
+        mount_queue::report_mount_step(progress, "registering");
         match state
             .cloud_provider
             .start_root(
@@ -8104,19 +9395,20 @@ pub async fn mount_enrolled_folder(
                 parsed_root_id,
                 mountpoint.clone(),
                 encrypted_root.clone(),
-                derive_desktop_mount_label(&encrypted_root, parsed_root_id),
+                display_name.clone(),
                 client.clone(),
             )
             .await
         {
             Ok(()) => {
+                mount_queue::report_mount_step(progress, "connecting_finder");
                 wait_for_mount_ready(&mountpoint, 60)
                     .await
                     .map_err(|e| format!("Mount ready check failed: {}", e))?;
                 let mut ready_state = runtime_state;
                 ready_state.ready = true;
                 write_mount_runtime_state(&mount_state_path, &ready_state).await?;
-                let status = mount_status_payload(&state, &user_dir, &ready_state).await;
+                let status = mount_status_payload(state, &user_dir, &ready_state).await;
                 if status.availability == "degraded" {
                     return Ok(CommandResponse::err_with_code(
                         "MOUNT_DEGRADED",
@@ -8140,11 +9432,19 @@ pub async fn mount_enrolled_folder(
         }
     }
 
+    let reason = desktop_cloud_error
+        .as_deref()
+        .or(desktop_provider_fallback_reason.as_deref())
+        .unwrap_or("A native desktop mount is unavailable");
+    let Some((server_url, persistent)) = cli_fallback else {
+        return Ok(CommandResponse::err_with_code(
+            "LOCAL_VAULT_NATIVE_MOUNT_REQUIRED",
+            format!(
+                "{reason}. Without an account, folders open only through the system's own file integration, and it isn't available right now."
+            ),
+        ));
+    };
     if !persistent {
-        let reason = desktop_cloud_error
-            .as_deref()
-            .or(desktop_provider_fallback_reason.as_deref())
-            .unwrap_or("A native desktop mount is unavailable");
         return Ok(CommandResponse::err_with_code(
             "PERSISTENT_LOGIN_REQUIRED",
             format!(
@@ -8178,6 +9478,7 @@ pub async fn mount_enrolled_folder(
     }
 
     configure_background_tokio_command(&mut cmd);
+    mount_queue::report_mount_step(progress, "sync_fallback");
     tracing::info!("Spawning CLI mount command for root_id: {}", root_id);
     let mut child = cmd.spawn().map_err(|e| {
         mount_fallback_error(
@@ -8190,7 +9491,6 @@ pub async fn mount_enrolled_folder(
     sleep(Duration::from_millis(1000)).await;
 
     // Poll mount state file to detect when mount is ready
-    let user_dir = get_user_dir(&email, &server_url)?;
     let mount_states_dir = user_dir.join("mount_states");
     let mount_state_path = mount_states_dir.join(format!("mount_state_{}.json", root_id));
 
@@ -8244,7 +9544,7 @@ pub async fn mount_enrolled_folder(
                         && !mount_state.requested_unmount
                         && mount_state.is_ready()
                         && mount_state.mountpoint.exists()
-                        && mount_state_runtime_is_active(&user_dir, &mount_state)
+                        && mount_state_runtime_is_active_async(&user_dir, &mount_state).await
                     {
                         mountpoint = Some(mount_state.mountpoint.clone());
                         break;
@@ -8275,7 +9575,7 @@ pub async fn mount_enrolled_folder(
                         && !mount_state.requested_unmount
                         && mount_state.is_ready()
                         && mount_state.mountpoint.exists()
-                        && mount_state_runtime_is_active(&user_dir, &mount_state)
+                        && mount_state_runtime_is_active_async(&user_dir, &mount_state).await
                     {
                         mountpoint = Some(mount_state.mountpoint.clone());
                         break;
@@ -8333,7 +9633,7 @@ pub async fn mount_enrolled_folder(
     }
 
     Ok(CommandResponse::ok(
-        mount_status_payload(&state, &user_dir, &mounted_state).await,
+        mount_status_payload(state, &user_dir, &mounted_state).await,
     ))
 }
 
@@ -8341,23 +9641,29 @@ pub async fn mount_enrolled_folder(
 pub async fn list_active_mounts(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountInfo>>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
     tracing::info!("List active mounts command called");
 
-    let session = current_local_session(&state).await?;
+    let user_dir = match local_vault_storage_dir(&state).await {
+        Some(user_dir) => user_dir,
+        None => {
+            let session = current_local_session(&state).await?;
+            get_user_dir(&session.email, &current_server_url(&state, &session))?
+        }
+    };
     Ok(CommandResponse::ok(
-        load_active_mounts_internal(&state, &session).await?,
+        load_active_mounts_internal(&state, &user_dir).await?,
     ))
 }
 
 async fn load_active_mounts_internal(
     state: &AppState,
-    session: &crate::state::UserSession,
+    user_dir: &Path,
 ) -> Result<Vec<MountInfo>, String> {
-    let server_url = current_server_url(state, session);
-    let user_dir = get_user_dir(&session.email, &server_url)?;
+    let started = std::time::Instant::now();
+    let user_dir = user_dir.to_path_buf();
     let mount_states_dir = user_dir.join("mount_states");
-    let mut mounts = Vec::new();
+    let mut candidates = Vec::new();
 
     if mount_states_dir.exists() {
         if let Ok(mut entries) = fs::read_dir(&mount_states_dir).await {
@@ -8371,29 +9677,7 @@ async fn load_active_mounts_internal(
                     if let Ok(content) = fs::read_to_string(&path).await {
                         if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content)
                         {
-                            if !mount_state.requested_unmount
-                                && mount_state.is_ready()
-                                && mount_state.mountpoint.exists()
-                                && mount_state_runtime_is_active(&user_dir, &mount_state)
-                            {
-                                let status =
-                                    mount_status_payload(state, &user_dir, &mount_state).await;
-                                let sync_status = if mount_state.backend().has_runtime_status() {
-                                    read_mount_sync_status(&user_dir, &mount_state.root_id).await
-                                } else {
-                                    None
-                                };
-                                mounts.push(MountInfo {
-                                    root_id: mount_state.root_id.clone(),
-                                    mountpoint: status.mountpoint,
-                                    encrypted_dir: mount_state.encrypted_dir.display().to_string(),
-                                    backend: status.backend,
-                                    availability: status.availability,
-                                    fallback_reason: status.fallback_reason,
-                                    sync_status,
-                                    operational_health: status.operational_health,
-                                });
-                            }
+                            candidates.push(mount_state);
                         }
                     }
                 }
@@ -8402,41 +9686,73 @@ async fn load_active_mounts_internal(
     }
 
     let legacy_path = user_dir.join("mount_state.json");
+    let mut legacy = None;
     if legacy_path.exists() {
         if let Ok(content) = fs::read_to_string(&legacy_path).await {
-            if let Ok(mount_state) = serde_json::from_str::<MountRuntimeState>(&content) {
-                if !mount_state.requested_unmount
-                    && mount_state.is_ready()
-                    && mount_state.mountpoint.exists()
-                    && mount_state_runtime_is_active(&user_dir, &mount_state)
-                {
-                    if !mounts
-                        .iter()
-                        .any(|m| m.mountpoint == mount_state.mountpoint.display().to_string())
-                    {
-                        let sync_status = if mount_state.backend().has_runtime_status() {
-                            read_mount_sync_status(&user_dir, &mount_state.root_id).await
-                        } else {
-                            None
-                        };
-                        let status = mount_status_payload(state, &user_dir, &mount_state).await;
-                        mounts.push(MountInfo {
-                            root_id: mount_state.root_id.clone(),
-                            mountpoint: status.mountpoint,
-                            encrypted_dir: mount_state.encrypted_dir.display().to_string(),
-                            backend: status.backend,
-                            availability: status.availability,
-                            fallback_reason: status.fallback_reason,
-                            sync_status,
-                            operational_health: status.operational_health,
-                        });
-                    }
-                }
+            legacy = serde_json::from_str::<MountRuntimeState>(&content).ok();
+        }
+    }
+
+    let candidate_count = candidates.len() + usize::from(legacy.is_some());
+    // Each mount is checked independently, so a slow bridge delays only its own row.
+    let mut mounts: Vec<MountInfo> = futures::future::join_all(
+        candidates
+            .iter()
+            .map(|mount_state| active_mount_info(state, &user_dir, mount_state)),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if let Some(mount_state) = legacy {
+        if !mounts
+            .iter()
+            .any(|m| m.mountpoint == mount_state.mountpoint.display().to_string())
+        {
+            if let Some(info) = active_mount_info(state, &user_dir, &mount_state).await {
+                mounts.push(info);
             }
         }
     }
 
+    let elapsed = started.elapsed();
+    if elapsed > Duration::from_secs(1) {
+        tracing::warn!(
+            "list_active_mounts took {} ms for {} mounts",
+            elapsed.as_millis(),
+            candidate_count
+        );
+    }
     Ok(mounts)
+}
+
+async fn active_mount_info(
+    state: &AppState,
+    user_dir: &Path,
+    mount_state: &MountRuntimeState,
+) -> Option<MountInfo> {
+    if mount_state.requested_unmount || !mount_state.is_ready() || !mount_state.mountpoint.exists()
+    {
+        return None;
+    }
+    let status = inspect_mount(state, user_dir, mount_state).await?;
+    let sync_status = if mount_state.backend().has_runtime_status() {
+        read_mount_sync_status(&user_dir.to_path_buf(), &mount_state.root_id).await
+    } else {
+        None
+    };
+    Some(MountInfo {
+        root_id: mount_state.root_id.clone(),
+        mountpoint: status.mountpoint,
+        encrypted_dir: mount_state.encrypted_dir.display().to_string(),
+        backend: status.backend,
+        availability: status.availability,
+        fallback_reason: status.fallback_reason,
+        sync_status,
+        operational_health: status.operational_health,
+        display_name: mount_state.display_name.clone(),
+    })
 }
 
 fn build_device_count_snapshot(input: &PersonalDevicesOverviewInput) -> DeviceCountSnapshot {
@@ -8538,7 +9854,11 @@ pub async fn get_individual_home_status(
         }
     };
 
-    let mounts = match load_active_mounts_internal(&state, &session).await {
+    let mounts = match get_user_dir(&session.email, &current_server_url(&state, &session)) {
+        Ok(user_dir) => load_active_mounts_internal(&state, &user_dir).await,
+        Err(err) => Err(err),
+    };
+    let mounts = match mounts {
         Ok(mounts) => mounts,
         Err(err) => {
             tracing::warn!("Workspace home: active mounts unavailable: {}", err);
@@ -8629,6 +9949,26 @@ pub async fn get_current_device_fingerprint(
     }))
 }
 
+/// Re-publish this device's join card with a fresh expiry (see `JOIN_CARD_VALIDITY_DAYS`).
+#[tauri::command]
+pub async fn refresh_join_card(state: State<'_, AppState>) -> Result<CommandResponse<bool>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    match state
+        .client
+        .refresh_published_join_card(
+            &session.email,
+            &session.user_id,
+            &session.device_id,
+            &session.token,
+        )
+        .await
+    {
+        Ok(()) => Ok(CommandResponse::ok(true)),
+        Err(message) => Ok(CommandResponse::err(message)),
+    }
+}
+
 #[tauri::command]
 pub async fn revoke_device(
     device_id: String,
@@ -8644,6 +9984,32 @@ pub async fn revoke_device(
         ));
     }
 
+    let server_url = current_server_url(&state, &session);
+    let endpoint = api_endpoint(&server_url, &format!("auth/device/{}", target_device_id));
+    let material = state.client.device_crypto_material(&session.email)?;
+    if material.device_id != session.device_id {
+        return Ok(CommandResponse::err(
+            "Local identity does not match the signed-in device.",
+        ));
+    }
+    let identity =
+        hybridcipher_crypto::signatures::Ed25519KeyPair::from_bytes(&material.identity_secret)
+            .map_err(|error| error.to_string())?;
+    let proof = hybridcipher_client::device_actions::signed_device_action(
+        &identity,
+        &hybridcipher_client::device_actions::DeviceActionContext {
+            server_url: &server_url,
+            token: &session.token,
+            user_id: &session.user_id,
+            device_id: &session.device_id,
+        },
+        hybridcipher_messages::device_actions::DeviceAction::Revoke,
+        target_device_id,
+        None,
+        &json!({}),
+    )
+    .await?;
+
     let revoking_current_device = target_device_id.eq_ignore_ascii_case(&session.device_id);
     // Stop mounts while the current device can still authenticate CLI unmount.
     // The server DELETE invalidates that credential, so cleanup afterward is
@@ -8654,8 +10020,10 @@ pub async fn revoke_device(
         let guard = UPDATE_OPERATION_GATE.write().await;
         let current = current_authenticated_session(&state).await?;
         if current.email != session.email
+            || current.user_id != session.user_id
             || current.device_id != session.device_id
             || current.token != session.token
+            || current_server_url(&state, &current) != server_url
         {
             return Ok(CommandResponse::err(
                 "Session changed while preparing device revocation. Please retry.",
@@ -8671,12 +10039,9 @@ pub async fn revoke_device(
         None
     };
 
-    let server_url = current_server_url(&state, &session);
-    let endpoint = api_endpoint(&server_url, &format!("auth/device/{}", target_device_id));
     let client = reqwest::Client::new();
-    let response = client
-        .delete(endpoint)
-        .bearer_auth(&session.token)
+    let response = proof
+        .apply(client.delete(endpoint).bearer_auth(&session.token))
         .send()
         .await
         .map_err(|e| format!("Failed to contact server: {}", e))?;
@@ -8732,22 +10097,10 @@ pub async fn list_mount_conflicts(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountConflictRecord>>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        let email = user_session.email.clone();
-        let server_url = user_session
-            .server_url
-            .as_deref()
-            .unwrap_or_else(|| state.client.server_url())
-            .to_string();
-        (email, server_url)
-    };
-
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err(format!(
             "No active mount found for root_id {}",
@@ -8758,8 +10111,8 @@ pub async fn list_mount_conflicts(
         return Ok(CommandResponse::err(err));
     }
 
-    match load_mount_conflicts_for_root(&user_dir, &root_id) {
-        Ok(records) => Ok(CommandResponse::ok(records)),
+    match load_mount_conflicts_for_mount(&state, &user_dir, &root_id, &mount_state).await {
+        Ok((records, _)) => Ok(CommandResponse::ok(records)),
         Err(err) => Ok(CommandResponse::err(err)),
     }
 }
@@ -8771,22 +10124,10 @@ pub async fn list_windows_cloud_conflicts(
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<hybridcipher_windows_cloud_provider::CloudConflictRecord>>, String>
 {
-    let _operation_guard = ensure_local_data_access(&state).await?;
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
     let parsed_root_id =
         Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {err}"))?;
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        (
-            user_session.email.clone(),
-            user_session
-                .server_url
-                .as_deref()
-                .unwrap_or_else(|| state.client.server_url())
-                .to_string(),
-        )
-    };
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err("No active mount found".to_string()));
     };
@@ -8812,22 +10153,10 @@ pub async fn recheck_windows_cloud_conflicts(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<()>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
     let parsed_root_id =
         Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {err}"))?;
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        (
-            user_session.email.clone(),
-            user_session
-                .server_url
-                .as_deref()
-                .unwrap_or_else(|| state.client.server_url())
-                .to_string(),
-        )
-    };
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err("No active mount found".to_string()));
     };
@@ -8862,24 +10191,12 @@ pub async fn get_mount_conflict_preview(
     conflict_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountConflictPreview>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
     let conflict_id = Uuid::parse_str(&conflict_id)
         .map_err(|err| format!("Invalid conflict_id format: {}", err))?;
 
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        let email = user_session.email.clone();
-        let server_url = user_session
-            .server_url
-            .as_deref()
-            .unwrap_or_else(|| state.client.server_url())
-            .to_string();
-        (email, server_url)
-    };
-
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err(format!(
             "No active mount found for root_id {}",
@@ -8890,10 +10207,11 @@ pub async fn get_mount_conflict_preview(
         return Ok(CommandResponse::err(err));
     }
 
-    let records = match load_mount_conflicts_for_root(&user_dir, &root_id) {
-        Ok(records) => records,
-        Err(err) => return Ok(CommandResponse::err(err)),
-    };
+    let (records, base_dir) =
+        match load_mount_conflicts_for_mount(&state, &user_dir, &root_id, &mount_state).await {
+            Ok(loaded) => loaded,
+            Err(err) => return Ok(CommandResponse::err(err)),
+        };
     let Some(record) = records.into_iter().find(|record| record.id == conflict_id) else {
         return Ok(CommandResponse::err(format!(
             "Conflict {} was not found",
@@ -8901,8 +10219,8 @@ pub async fn get_mount_conflict_preview(
         )));
     };
 
-    let live_path = mount_state.mountpoint.join(&record.live_relative_path);
-    let conflict_path = mount_state.mountpoint.join(&record.conflict_relative_path);
+    let live_path = base_dir.join(&record.live_relative_path);
+    let conflict_path = base_dir.join(&record.conflict_relative_path);
     if !conflict_path.exists() {
         return Ok(CommandResponse::err(format!(
             "Conflict copy no longer exists at {}",
@@ -8947,24 +10265,12 @@ pub async fn resolve_mount_conflict(
     destination_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<ConflictResolutionResult>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
     let conflict_id = Uuid::parse_str(&conflict_id)
         .map_err(|err| format!("Invalid conflict_id format: {}", err))?;
 
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        let email = user_session.email.clone();
-        let server_url = user_session
-            .server_url
-            .as_deref()
-            .unwrap_or_else(|| state.client.server_url())
-            .to_string();
-        (email, server_url)
-    };
-
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err(format!(
             "No active mount found for root_id {}",
@@ -8986,6 +10292,22 @@ pub async fn resolve_mount_conflict(
             .map(PathBuf::from),
         requested_at: chrono::Utc::now(),
     };
+
+    #[cfg(target_os = "macos")]
+    if mount_state.backend().is_macos_file_provider() {
+        let parsed_root_id =
+            Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
+        return Ok(
+            match state
+                .cloud_provider
+                .resolve_macos_conflict(parsed_root_id, request)
+                .await
+            {
+                Ok(result) => CommandResponse::ok(result),
+                Err(err) => CommandResponse::err(err),
+            },
+        );
+    }
 
     let response = match submit_mount_conflict_request(&user_dir, &root_id, &request).await {
         Ok(response) => response,
@@ -9013,22 +10335,10 @@ pub async fn list_mount_recovery_copies(
     root_id: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<Vec<MountRecoveryCopyRecord>>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        let email = user_session.email.clone();
-        let server_url = user_session
-            .server_url
-            .as_deref()
-            .unwrap_or_else(|| state.client.server_url())
-            .to_string();
-        (email, server_url)
-    };
-
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err(format!(
             "No active mount found for root_id {}",
@@ -9051,22 +10361,10 @@ pub async fn get_mount_recovery_copy_preview(
     recovery_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<MountRecoveryCopyPreview>, String> {
-    let _operation_guard = ensure_local_data_access(&state).await?;
+    let _operation_guard = ensure_local_data_or_vault(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        let email = user_session.email.clone();
-        let server_url = user_session
-            .server_url
-            .as_deref()
-            .unwrap_or_else(|| state.client.server_url())
-            .to_string();
-        (email, server_url)
-    };
-
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err(format!(
             "No active mount found for root_id {}",
@@ -9137,22 +10435,10 @@ pub async fn resolve_mount_recovery_copy(
     destination_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<RecoveryCopyResolutionResult>, String> {
-    let _operation_guard = ensure_authenticated(&state).await?;
+    let _operation_guard = ensure_account_or_local_vault(&state).await?;
     Uuid::parse_str(&root_id).map_err(|err| format!("Invalid root_id format: {}", err))?;
 
-    let (email, server_url) = {
-        let session = state.session.lock().await;
-        let user_session = session.as_ref().ok_or("No active session")?;
-        let email = user_session.email.clone();
-        let server_url = user_session
-            .server_url
-            .as_deref()
-            .unwrap_or_else(|| state.client.server_url())
-            .to_string();
-        (email, server_url)
-    };
-
-    let user_dir = get_user_dir(&email, &server_url)?;
+    let user_dir = active_storage_dir(&state).await?;
     let Some(mount_state) = read_mount_state_by_root_id(&user_dir, &root_id).await? else {
         return Ok(CommandResponse::err(format!(
             "No active mount found for root_id {}",
@@ -9208,6 +10494,9 @@ pub struct MountInfo {
     pub sync_status: Option<MountSyncRuntimeStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operational_health: Option<serde_json::Value>,
+    /// Name shown for the mount in Finder or File Explorer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -9436,6 +10725,7 @@ mod cloud_provider_health_payload_tests {
                 fallback_reason: None,
                 ready: true,
                 requested_unmount: false,
+                display_name: None,
             };
             fs::write(
                 states_dir.join(format!("mount_state_{root_id}.json")),
@@ -9451,7 +10741,7 @@ mod cloud_provider_health_payload_tests {
         assert_eq!(record_b.root_id, b);
         assert_eq!(
             dunce::canonicalize(record_b.encrypted_dir).unwrap(),
-            source_b
+            dunce::canonicalize(source_b).unwrap()
         );
         let source_a = user_dir.join("missing-source-a");
         assert!(
@@ -9510,7 +10800,22 @@ pub async fn get_vault_compatibility(
             .map_err(|e| e.to_string())?,
         ));
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(CommandResponse::ok(
+            serde_json::to_value(
+                state
+                    .cloud_provider
+                    .vault_compatibility(
+                        Uuid::parse_str(&root_id).map_err(|e| e.to_string())?,
+                        None,
+                    )
+                    .await?,
+            )
+            .map_err(|e| e.to_string())?,
+        ));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = (root_id, state);
         Ok(CommandResponse::ok(serde_json::Value::Null))
@@ -9538,10 +10843,76 @@ pub async fn set_vault_legacy_compatibility(
             .map_err(|e| e.to_string())?,
         ));
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(CommandResponse::ok(
+            serde_json::to_value(
+                state
+                    .cloud_provider
+                    .vault_compatibility(
+                        Uuid::parse_str(&root_id).map_err(|e| e.to_string())?,
+                        Some(enabled),
+                    )
+                    .await?,
+            )
+            .map_err(|e| e.to_string())?,
+        ));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = (root_id, enabled, state);
-        Err("Legacy mount compatibility is available on Windows".into())
+        Err("Legacy mount compatibility is available on Windows and macOS".into())
+    }
+}
+
+#[tauri::command]
+pub async fn list_legacy_files(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<serde_json::Value>, String> {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let files = state
+            .cloud_provider
+            .legacy_files(Uuid::parse_str(&root_id).map_err(|e| e.to_string())?)
+            .await?;
+        Ok(CommandResponse::ok(
+            serde_json::to_value(files).map_err(|e| e.to_string())?,
+        ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (root_id, state);
+        Ok(CommandResponse::ok(serde_json::json!([])))
+    }
+}
+
+/// Rewrites older-format files in the current format. `relative_paths` limits the
+/// run to those files; omitted, every older file in the mounted folder is upgraded.
+#[tauri::command]
+pub async fn upgrade_legacy_files(
+    root_id: String,
+    relative_paths: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<serde_json::Value>, String> {
+    let _operation_guard = ensure_authenticated(&state).await?;
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let report = state
+            .cloud_provider
+            .upgrade_legacy_files(
+                Uuid::parse_str(&root_id).map_err(|e| e.to_string())?,
+                relative_paths,
+            )
+            .await?;
+        Ok(CommandResponse::ok(
+            serde_json::to_value(report).map_err(|e| e.to_string())?,
+        ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (root_id, relative_paths, state);
+        Err("Older file upgrades are available on Windows and macOS".into())
     }
 }
 
@@ -9603,13 +10974,8 @@ pub async fn unmount_all_mounts(
 ) -> Result<CommandResponse<bool>, String> {
     let _operation_guard = UPDATE_OPERATION_GATE.read().await;
     tracing::info!("Unmount all request received");
-    let force = force.unwrap_or(false);
-    if let Err(err) = stop_all_desktop_cloud_roots(&state, force).await {
-        return Ok(CommandResponse::err(err));
-    }
-
-    match state.mount_manager.unmount_all(force).await {
-        Ok(_) => Ok(CommandResponse::ok(true)),
+    match unmount_batch::unmount_everything(&state, force.unwrap_or(false)).await {
+        Ok(()) => Ok(CommandResponse::ok(true)),
         Err(err) => Ok(CommandResponse::err(err)),
     }
 }
@@ -9644,23 +11010,31 @@ async fn unmount_desktop_cloud_root_if_active(
     root_id: &str,
     force: bool,
 ) -> Result<bool, String> {
-    let session = current_authenticated_session(state).await?;
-    let server_url = current_server_url(state, &session);
-    let user_dir = get_user_dir(&session.email, &server_url)?;
+    let user_dir = match local_vault_storage_dir(state).await {
+        Some(user_dir) => user_dir,
+        None => {
+            let session = current_authenticated_session(state).await?;
+            get_user_dir(&session.email, &current_server_url(state, &session))?
+        }
+    };
     let Some((state_path, mount_state)) =
         read_any_mount_state_by_root_id(&user_dir, root_id).await?
     else {
         return Ok(false);
     };
-    unmount_desktop_cloud_root_record(state, &user_dir, state_path, mount_state, force).await
+    unmount_desktop_cloud_root_record(state, &user_dir, state_path, mount_state, force, &|_| {})
+        .await
 }
 
+/// `on_step` hears `waiting_for_finder` before the provider stops (macOS
+/// waits there for edits Finder has not handed over) and `removing` after.
 async fn unmount_desktop_cloud_root_record(
     state: &AppState,
     user_dir: &Path,
     state_path: PathBuf,
     mount_state: MountRuntimeState,
     force: bool,
+    on_step: &(dyn Fn(&'static str) + Send + Sync),
 ) -> Result<bool, String> {
     let parsed_root_id = Uuid::parse_str(&mount_state.root_id)
         .map_err(|err| format!("Invalid root_id format: {}", err))?;
@@ -9669,6 +11043,13 @@ async fn unmount_desktop_cloud_root_record(
     {
         return Ok(false);
     }
+    let lock = unmount_batch::unmount_lock(parsed_root_id);
+    let _unmounting = lock.lock().await;
+    // Another unmount of this folder may have finished while this one waited.
+    if !state_path.exists() && !state.cloud_provider.is_root_active(parsed_root_id).await {
+        return Ok(true);
+    }
+    on_step("waiting_for_finder");
     if state.cloud_provider.is_root_active(parsed_root_id).await {
         state
             .cloud_provider
@@ -9708,6 +11089,7 @@ async fn unmount_desktop_cloud_root_record(
         #[cfg(not(target_os = "windows"))]
         return Err("Windows Cloud Files cleanup is unavailable on this platform".to_string());
     }
+    on_step("removing");
     if mount_state.backend().is_macos_file_provider() {
         #[cfg(target_os = "macos")]
         unregister_stored_macos_file_provider_domain(user_dir, parsed_root_id)?;
@@ -9725,17 +11107,62 @@ async fn unmount_desktop_cloud_root_record(
 
 async fn stop_all_desktop_cloud_roots(state: &AppState, force: bool) -> Result<(), String> {
     let session = state.session.lock().await.clone();
-    if let Some(session) = session {
-        let server_url = current_server_url(state, &session);
-        let user_dir = get_user_dir(&session.email, &server_url)?;
-        let records = load_cloud_mount_state_records_for_unmount(&user_dir).await?;
-        for (state_path, mount_state) in records {
-            unmount_desktop_cloud_root_record(state, &user_dir, state_path, mount_state, force)
-                .await?;
-        }
+    let user_dir = match session {
+        Some(session) => Some(get_user_dir(
+            &session.email,
+            &current_server_url(state, &session),
+        )?),
+        None => local_vault_storage_dir(state).await,
+    };
+    if let Some(user_dir) = user_dir {
+        stop_cloud_roots_recorded_in(state, &user_dir, force).await?;
     }
 
     state.cloud_provider.stop_all(true, force).await
+}
+
+async fn stop_cloud_roots_recorded_in(
+    state: &AppState,
+    user_dir: &Path,
+    force: bool,
+) -> Result<(), String> {
+    let records = load_cloud_mount_state_records_for_unmount(user_dir).await?;
+    // Folders stop side by side, each with its own unchanged safety steps; one
+    // refusing never leaves the others mounted.
+    let failures: Vec<String> = unmount_batch::run_bounded(
+        records,
+        unmount_batch::MAX_PARALLEL_UNMOUNTS,
+        |(state_path, mount_state)| async move {
+            unmount_desktop_cloud_root_record(
+                state,
+                user_dir,
+                state_path,
+                mount_state,
+                force,
+                &|_| {},
+            )
+            .await
+        },
+    )
+    .await
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Stop every mount, including those a vault that is not open recorded in its
+/// own storage, which `stop_all_mounts_safely` only finds while it is open.
+pub(crate) async fn stop_all_mounts_including(
+    state: &AppState,
+    vault_user_dir: &Path,
+) -> Result<(), String> {
+    stop_cloud_roots_recorded_in(state, vault_user_dir, false).await?;
+    stop_all_mounts_safely(state, false).await
 }
 
 pub(crate) async fn stop_cli_mounts_for_session_transition(
@@ -9776,40 +11203,151 @@ pub async fn exit_application(
     Ok(CommandResponse::ok(true))
 }
 
+/// Open a folder or an allow-listed document with the system handler. Anything that
+/// could run as a program is revealed in the file manager instead; the response says
+/// which happened (`"opened"` or `"revealed"`).
 #[tauri::command]
 pub async fn open_path_in_shell(
     path: String,
     _state: State<'_, AppState>,
     _window: tauri::Window,
-) -> Result<CommandResponse<bool>, String> {
-    let _operation_guard = ensure_authenticated(&_state).await?;
-    let target = PathBuf::from(&path);
+) -> Result<CommandResponse<String>, String> {
+    let _operation_guard = ensure_account_or_local_vault(&_state).await?;
+    let (target, decision) = match resolve_shell_target(&path) {
+        Ok(resolved) => resolved,
+        Err(response) => return Ok(response),
+    };
 
-    // Verify path exists
-    if !target.exists() {
-        return Ok(CommandResponse::err(format!(
-            "Path does not exist: {}",
-            target.display()
-        )));
+    match decision {
+        path_opener::OpenDecision::OpenFolder | path_opener::OpenDecision::OpenDocument => {
+            open_path_with_system_handler(&target)?;
+            Ok(CommandResponse::ok("opened".to_string()))
+        }
+        path_opener::OpenDecision::Reveal => {
+            reveal_path_with_system_handler(&target, false)?;
+            Ok(CommandResponse::ok("revealed".to_string()))
+        }
     }
-
-    open_path_with_system_handler(&target)?;
-
-    Ok(CommandResponse::ok(true))
 }
 
-fn open_path_with_system_handler(path: &Path) -> Result<(), String> {
+/// Show a path in the file manager without opening it: plain folders are browsed,
+/// files and bundles are shown selected in their parent folder.
+#[tauri::command]
+pub async fn reveal_path_in_shell(
+    path: String,
+    _state: State<'_, AppState>,
+) -> Result<CommandResponse<String>, String> {
+    let _operation_guard = ensure_account_or_local_vault(&_state).await?;
+    let (target, decision) = match resolve_shell_target(&path) {
+        Ok(resolved) => resolved,
+        Err(response) => return Ok(response),
+    };
+
+    reveal_path_with_system_handler(&target, decision == path_opener::OpenDecision::OpenFolder)?;
+    Ok(CommandResponse::ok("revealed".to_string()))
+}
+
+/// Resolve symlinks and `..` once, so the decision and the action use the same file.
+fn resolve_shell_target<T>(
+    path: &str,
+) -> Result<(PathBuf, path_opener::OpenDecision), CommandResponse<T>> {
+    let target = dunce::canonicalize(path)
+        .map_err(|_| CommandResponse::err(format!("Path does not exist: {}", path)))?;
+    let decision = path_opener::decide_open(&target).map_err(|error| {
+        CommandResponse::err(format!(
+            "Could not inspect path {}: {}",
+            target.display(),
+            error
+        ))
+    })?;
+    Ok((target, decision))
+}
+
+/// Reveal `path` in the file manager. `browse_folder` opens a plain folder itself;
+/// otherwise the item is shown selected, and nothing is launched.
+fn reveal_path_with_system_handler(path: &Path, browse_folder: bool) -> Result<(), String> {
+    if browse_folder {
+        return open_path_with_system_handler(path);
+    }
+
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = StdCommand::new("open");
-        command.arg(path);
+        command.arg("-R").arg(path);
         command
     };
 
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = StdCommand::new("cmd");
-        command.arg("/C").arg("start").arg("").arg(path);
+        use std::os::windows::process::CommandExt;
+        let display = path.display().to_string();
+        if display.contains('"') {
+            return Err(format!("Cannot reveal path {}", display));
+        }
+        let windows_dir = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let mut command = StdCommand::new(windows_dir.join("explorer.exe"));
+        // explorer expects `/select,"<path>"` verbatim; Rust's own quoting would wrap the
+        // whole argument and break it. explorer only selects the item, it never runs it.
+        command.raw_arg(format!("/select,\"{}\"", display));
+        command
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = StdCommand::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path));
+        command
+    };
+
+    configure_background_std_command(&mut command);
+    command
+        .spawn()
+        .map_err(|e| format!("Failed to reveal path {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// Hand `path` to the OS default handler. Only call this with a folder or document
+/// that `path_opener::decide_open` allowed; the handler would run a program.
+#[cfg(target_os = "windows")]
+fn open_path_with_system_handler(path: &Path) -> Result<(), String> {
+    use windows::core::{w, HSTRING, PCWSTR};
+    use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    // ShellExecuteW takes the path as one argument, so synced file names containing
+    // cmd.exe metacharacters (`&`, `|`, `^`) cannot run commands the way `cmd /C start` could.
+    let file = HSTRING::from(path.as_os_str());
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            &file,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Values above 32 mean success; anything else is a ShellExecute error code.
+    let code = result.0 as isize;
+    if code <= 32 {
+        return Err(format!(
+            "Failed to open path {}: ShellExecute error {}",
+            path.display(),
+            code
+        ));
+    }
+    Ok(())
+}
+
+/// Hand `path` to the OS default handler. Only call this with a folder or document
+/// that `path_opener::decide_open` allowed; the handler would run a program.
+#[cfg(not(target_os = "windows"))]
+fn open_path_with_system_handler(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = StdCommand::new("open");
+        command.arg(path);
         command
     };
 
@@ -9861,6 +11399,52 @@ async fn ensure_authenticated(
     }
 }
 
+/// A signed-in account, or the accountless vault while no account is open.
+pub(crate) async fn ensure_account_or_local_vault(
+    state: &AppState,
+) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    if state.local_vault_group().await.is_some() {
+        return Ok(UPDATE_OPERATION_GATE.read().await);
+    }
+    ensure_authenticated(state).await
+}
+
+/// Read access to protected data for an account or the accountless vault.
+async fn ensure_local_data_or_vault(
+    state: &AppState,
+) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    if state.local_vault_group().await.is_some() {
+        return Ok(UPDATE_OPERATION_GATE.read().await);
+    }
+    ensure_local_data_access(state).await
+}
+
+/// Mounting for an account (with its Team write checks) or the accountless vault.
+async fn ensure_local_team_write_or_vault(
+    state: &AppState,
+) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    if state.local_vault_group().await.is_some() {
+        return Ok(UPDATE_OPERATION_GATE.read().await);
+    }
+    ensure_local_team_write(state).await
+}
+
+pub(crate) const LOCAL_RECOVERY_KIT_REQUIRED: &str = "LOCAL_RECOVERY_KIT_REQUIRED";
+
+/// Protecting files in place without an account needs a saved recovery kit,
+/// because nothing else can reopen them if this device's keys are lost.
+async fn local_recovery_kit_missing(state: &AppState) -> bool {
+    if state.session.lock().await.is_some() {
+        return false;
+    }
+    state
+        .local_vault
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|vault| !vault.record.kit_saved)
+}
+
 async fn ensure_local_data_access(
     state: &AppState,
 ) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
@@ -9889,24 +11473,7 @@ async fn ensure_local_team_write(
     if session.expires_at > chrono::Utc::now().timestamp() {
         return Ok(guard);
     }
-    if session.team_revoked {
-        return Err("Team license has been revoked".into());
-    }
-    let token = session
-        .team_entitlement
-        .as_deref()
-        .ok_or("No Team entitlement is cached")?;
-    let keys = hybridcipher_client::entitlement::trusted_keys_from_build()?;
-    hybridcipher_client::entitlement::verify(
-        token,
-        &keys,
-        session
-            .server_url
-            .as_deref()
-            .unwrap_or(state.client.server_url()),
-        &session.user_id,
-        chrono::Utc::now().timestamp(),
-    )?;
+    team_write_allowed_offline(state, session)?;
     Ok(guard)
 }
 
@@ -9936,9 +11503,26 @@ async fn fetch_group_member_emails(
     api_base: &str,
     group_id: Uuid,
 ) -> Result<HashMap<Uuid, String>, String> {
+    Ok(fetch_group_member_directory(session, api_base, group_id)
+        .await?
+        .emails)
+}
+
+struct GroupMemberDirectory {
+    emails: HashMap<Uuid, String>,
+    /// Whether the session's account is an owner or admin of the group.
+    session_is_admin: bool,
+}
+
+async fn fetch_group_member_directory(
+    session: &crate::state::UserSession,
+    api_base: &str,
+    group_id: Uuid,
+) -> Result<GroupMemberDirectory, String> {
     let client = reqwest::Client::new();
     let mut offset = 0u32;
     let mut emails = HashMap::new();
+    let mut session_is_admin = false;
 
     loop {
         let url = format!(
@@ -9963,7 +11547,10 @@ async fn fetch_group_member_emails(
             response.status(),
             reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND
         ) {
-            return Ok(emails);
+            return Ok(GroupMemberDirectory {
+                emails,
+                session_is_admin,
+            });
         }
 
         if !response.status().is_success() {
@@ -9981,6 +11568,9 @@ async fn fetch_group_member_emails(
             .map_err(|e| format!("Failed to parse group members response: {}", e))?;
 
         for member in response_body.members {
+            if is_session_owned_device(&session.user_id, &member.user_id.to_string()) {
+                session_is_admin = is_group_admin_role(member.role.as_deref());
+            }
             emails.insert(member.user_id, member.email);
         }
 
@@ -9991,5 +11581,12 @@ async fn fetch_group_member_emails(
         }
     }
 
-    Ok(emails)
+    Ok(GroupMemberDirectory {
+        emails,
+        session_is_admin,
+    })
+}
+
+fn is_group_admin_role(role: Option<&str>) -> bool {
+    matches!(role, Some("admin" | "owner"))
 }

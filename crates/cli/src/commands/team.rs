@@ -114,13 +114,13 @@ async fn online_status(manager: &SessionManager) -> Result<Option<OrganizationSt
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|err| CliError::network(err.to_string()))?;
+        .map_err(|err| CliError::network_from(&err))?;
     let response = client
         .get(api_endpoint(&session.server_url, "organizations/me"))
         .bearer_auth(&session.token)
         .send()
         .await
-        .map_err(|err| CliError::network(err.to_string()))?;
+        .map_err(|err| CliError::network_from(&err))?;
     if !response.status().is_success() {
         return Err(CliError::permission(format!(
             "Organization status rejected: {}",
@@ -174,7 +174,7 @@ async fn online_status(manager: &SessionManager) -> Result<Option<OrganizationSt
         .bearer_auth(&session.token)
         .send()
         .await
-        .map_err(|err| CliError::network(err.to_string()))?;
+        .map_err(|err| CliError::network_from(&err))?;
     if !response.status().is_success() {
         return Err(CliError::permission(format!(
             "Entitlement refresh rejected: {}",
@@ -344,7 +344,7 @@ async fn sync_requests(manager: &SessionManager) -> Result<(), CliError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|err| CliError::network(err.to_string()))?;
+        .map_err(|err| CliError::network_from(&err))?;
     for index in 0..queue.len() {
         if queue[index].status == "initializing" {
             if !finish_group_setup(manager, &mut queue, index).await? {
@@ -468,7 +468,7 @@ pub async fn handle_team_command(
                 .json(&json!({"code": code.trim(), "organization_name": name.trim()}))
                 .send()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             if !response.status().is_success() {
                 return Err(CliError::network(format!(
                     "Team activation failed: {}",
@@ -478,7 +478,7 @@ pub async fn handle_team_command(
             let entitlement: EntitlementResponse = response
                 .json()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             verify_entitlement(&session, &entitlement)?;
             session.team_entitlement = Some(entitlement.token);
             session.team_revoked = false;
@@ -544,7 +544,7 @@ pub async fn handle_team_command(
                 .json(&json!({"invitation_code": code.trim()}))
                 .send()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             if !response.status().is_success() {
                 return Err(CliError::network(format!(
                     "Team invitation failed: {}",
@@ -565,7 +565,7 @@ pub async fn handle_team_command(
                 .json(&json!({"email": email.trim()}))
                 .send()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             if !response.status().is_success() {
                 return Err(CliError::network(format!(
                     "Invitation failed: {}",
@@ -575,7 +575,7 @@ pub async fn handle_team_command(
             let value: Value = response
                 .json()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             let code = value
                 .get("invitation_code")
                 .and_then(Value::as_str)
@@ -592,7 +592,7 @@ pub async fn handle_team_command(
                 .bearer_auth(&session.token)
                 .send()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             if !response.status().is_success() {
                 return Err(CliError::network(format!(
                     "Members request failed: {}",
@@ -602,7 +602,7 @@ pub async fn handle_team_command(
             let members: Vec<Value> = response
                 .json()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             for member in members {
                 println!(
                     "{}  {}  {}",
@@ -620,7 +620,7 @@ pub async fn handle_team_command(
                 .bearer_auth(&session.token)
                 .send()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             if !response.status().is_success() {
                 return Err(CliError::network(format!(
                     "Cancellation failed: {}",
@@ -639,7 +639,7 @@ pub async fn handle_team_command(
                 .bearer_auth(&session.token)
                 .send()
                 .await
-                .map_err(|err| CliError::network(err.to_string()))?;
+                .map_err(|err| CliError::network_from(&err))?;
             if !response.status().is_success() {
                 return Err(CliError::network(format!(
                     "Member removal failed: {}",

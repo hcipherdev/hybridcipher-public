@@ -21,7 +21,10 @@ const TRANSPARENCY_BYPASS_ENV: &str = "HYBRIDCIPHER_TRANSPARENCY_EXCEPTION";
 
 /// HybridCipher - End-to-end encrypted group file sharing with post-quantum security
 #[derive(Parser)]
-#[command(name = "hybridcipher", version = "0.1.0")]
+#[command(
+    name = "hybridcipher",
+    version = concat!("0.1.0 (", env!("HYBRIDCIPHER_BUILD_COMMIT"), ")")
+)]
 #[cfg_attr(
     not(feature = "individual-edition"),
     command(

@@ -111,6 +111,44 @@ pub fn store_state_key(storage_id: &str, key: &[u8; 32]) -> Result<(), String> {
     save_bundle(storage_id, &bundle)
 }
 
+/// Write the bundle that holds `state_key` under `to_storage_id`, replacing any
+/// entry there. Prefers the source's bundle (it carries the writer keys), then a
+/// destination bundle that already matches, else a bundle with just the key. The
+/// source is left in place for the caller to remove once its folder has moved.
+pub fn copy_bundle_for_key(
+    from_storage_id: &str,
+    to_storage_id: &str,
+    state_key: &[u8; 32],
+) -> Result<(), String> {
+    let encoded = general_purpose::STANDARD.encode(state_key);
+    let holds_key = |bundle: &DesktopKeyBundle| bundle.state_key_b64.as_deref() == Some(encoded.as_str());
+    let bundle = match load_bundle(from_storage_id)?.filter(|bundle| holds_key(bundle)) {
+        Some(bundle) => bundle,
+        None => match load_bundle(to_storage_id)?.filter(|bundle| holds_key(bundle)) {
+            Some(_) => return Ok(()),
+            None => DesktopKeyBundle {
+                version: DESKTOP_KEY_BUNDLE_VERSION,
+                state_key_b64: Some(encoded.clone()),
+                writer_keys_b64: HashMap::new(),
+            },
+        },
+    };
+    save_bundle(to_storage_id, &bundle)
+}
+
+/// Remove a storage identity's bundle from the keychain and the process cache.
+pub fn delete_bundle(storage_id: &str) -> Result<(), String> {
+    match bundle_entry(storage_id)?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => {}
+        Err(e) => return Err(format!("Failed to remove desktop secure bundle: {}", e)),
+    }
+    DESKTOP_KEY_BUNDLE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(storage_id);
+    Ok(())
+}
+
 pub fn load_writer_key(storage_id: &str, device_id: &str) -> Result<Option<[u8; 32]>, String> {
     let bundle = match load_bundle(storage_id)? {
         Some(bundle) => bundle,

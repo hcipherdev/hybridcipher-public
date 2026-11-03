@@ -16,6 +16,15 @@ impl<S: Storage, N: Network> Client<S, N> {
         Ok(())
     }
 
+    /// Stop the filesystem watchers for good. The watcher task holds its own copy
+    /// of this client, so call this before dropping a client whose storage moves
+    /// or closes; otherwise its periodic scan keeps writing state to the old path.
+    pub async fn stop_coverage_watchers(&self) {
+        let mut watcher = self.coverage_watcher.lock().await;
+        watcher.stopped = true;
+        watcher.wake.notify_one();
+    }
+
     /// Start the coverage replication worker in the background (non-blocking).
     /// This will upload coverage log entries to the server without blocking other operations.
     pub fn start_coverage_replication(&self) {
@@ -41,7 +50,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         }
 
         let mut watcher = self.coverage_watcher.lock().await;
-        if watcher.running {
+        if watcher.running || watcher.stopped {
             return;
         }
 
@@ -71,8 +80,16 @@ impl<S: Storage, N: Network> Client<S, N> {
             COVERAGE_WATCHER_ROOT_REFRESH_SECS,
         ));
         root_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let wake = control.lock().await.wake.clone();
 
         loop {
+            {
+                let mut guard = control.lock().await;
+                if guard.stopped {
+                    guard.running = false;
+                    break;
+                }
+            }
             let active_roots = self.active_coverage_roots_snapshot().await;
             if active_roots.is_empty() {
                 watchers.clear();
@@ -85,8 +102,13 @@ impl<S: Storage, N: Network> Client<S, N> {
             }
 
             let active_ids: HashSet<Uuid> = active_roots.iter().map(|root| root.root_id).collect();
+            let root_paths: HashMap<Uuid, PathBuf> = active_roots
+                .iter()
+                .map(|root| (root.root_id, root.path.clone()))
+                .collect();
 
-            watchers.retain(|root_id, _| active_ids.contains(root_id));
+            // A relocated root keeps its id, so compare paths to re-attach it.
+            watchers.retain(|root_id, watcher| root_paths.get(root_id) == Some(&watcher.path));
             last_scanned.retain(|root_id, _| active_ids.contains(root_id));
 
             for root in active_roots.iter() {
@@ -120,11 +142,6 @@ impl<S: Storage, N: Network> Client<S, N> {
                     }
                 }
             }
-
-            let root_paths: HashMap<Uuid, PathBuf> = active_roots
-                .iter()
-                .map(|root| (root.root_id, root.path.clone()))
-                .collect();
 
             for root_id in active_ids.iter() {
                 if !last_scanned.contains_key(root_id) {
@@ -209,6 +226,10 @@ impl<S: Storage, N: Network> Client<S, N> {
                 }
                 _ = root_refresh.tick() => {
                     // Wake loop so new roots are discovered quickly even without filesystem events.
+                }
+                _ = wake.notified() => {
+                    // Stop requested; the check at the top of the loop exits without scanning.
+                    continue;
                 }
             }
 
@@ -1317,7 +1338,8 @@ impl<S: Storage, N: Network> Client<S, N> {
             return Ok(());
         }
 
-        if Self::path_has_encrypted_suffix(&canonical_candidate) {
+        // Any other name goes through: the contents decide whether it is ciphertext.
+        if ciphertext::classify(&canonical_candidate) == CiphertextKind::FolderRecord {
             return Ok(());
         }
 

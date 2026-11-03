@@ -1,3 +1,4 @@
+// Tests the client's OPAQUE registration/login flows and LocalFsStorage persistence (identity keys, epoch state, transactions) through the public hybridcipher_client API.
 use hybridcipher_client::{
     auth::{LoginFlow, RegistrationFlow},
     network::{MockNetwork, Network},
@@ -146,6 +147,7 @@ async fn test_storage_operations() {
         is_active: true,
         file_count: 0,
         version: 1,
+        key_source: hybridcipher_client::epoch_key_source::EpochKeySource::Welcome,
     };
 
     storage
@@ -263,6 +265,7 @@ async fn test_storage_transaction() {
         is_active: false,
         file_count: 42,
         version: 1,
+        key_source: hybridcipher_client::epoch_key_source::EpochKeySource::Welcome,
     };
 
     tx.store_epoch_state(100, &epoch_data).await.unwrap();

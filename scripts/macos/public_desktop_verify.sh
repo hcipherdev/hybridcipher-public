@@ -9,6 +9,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Loading the shared routines does not run signed release setup or read .env.local.
-source "$SCRIPT_DIR/desktop_release_pkg.sh"
+# The shared build routines contain no signed release setup and never read the release env file.
+source "$SCRIPT_DIR/desktop_build_common.sh"
 public_verify_main "$@"

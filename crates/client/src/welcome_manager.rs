@@ -6,6 +6,7 @@ use crate::{
     errors::ClientError,
     invitation::{InvitationKeyPair, JoinCard},
     storage::Storage,
+    welcome_signers::SignerIntroduction,
 };
 use chrono::{serde::ts_seconds, serde::ts_seconds_option, DateTime, Utc};
 use hybridcipher_crypto::epoch_id::EpochIdMapper;
@@ -110,6 +111,11 @@ pub struct EpochSecrets {
 
     /// When this epoch becomes active
     pub active_at: DateTime<Utc>,
+
+    /// Introductions of keys allowed to sign this group's Welcomes, forwarded by the
+    /// sender (see `welcome_signers`). Compact payloads carry none.
+    #[serde(default)]
+    pub signer_introductions: Vec<SignerIntroduction>,
 }
 
 /// Group member information in Welcome messages
@@ -254,6 +260,18 @@ impl<S: Storage> WelcomeManager<S> {
         }
 
         self.encrypt_for_recipient(epoch_key, device_public_key)
+    }
+
+    /// Encrypt full epoch secrets (key plus signer introductions) for a device.
+    pub fn encrypt_epoch_secrets_for_device(
+        &self,
+        secrets: &EpochSecrets,
+        device_public_key: &HybridPublicKey,
+    ) -> Result<Vec<u8>, ClientError> {
+        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(secrets).map_err(|e| {
+            ClientError::SerializationError(format!("Failed to serialize epoch secrets: {}", e))
+        })?);
+        self.encrypt_for_recipient(&bytes, device_public_key)
     }
 
     /// Encrypt epoch secrets for a recipient using hybrid encryption
@@ -504,6 +522,7 @@ impl<S: Storage> WelcomeManager<S> {
                         epoch_id: epoch_id_u64,
                         group_members: Vec::new(),
                         active_at: server_welcome.created_at,
+                        signer_introductions: Vec::new(),
                     }
                 } else {
                     return Err(ClientError::SerializationError(format!(
@@ -807,6 +826,7 @@ mod tests {
             epoch_id: 1,
             group_members: vec![],
             active_at: Utc::now(),
+            signer_introductions: Vec::new(),
         };
 
         // Create join card

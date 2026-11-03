@@ -1,8 +1,7 @@
 pub mod api;
 pub use api::{
-    ApiMigrationProgress, ApiRekeyError, CutoverRequest, CutoverResponsePayload,
-    EncryptedWelcomeMessage, EpochChangeReason, RekeyDescriptorList, RekeyDescriptorSummary,
-    RekeyFallbackRequestPayload, RekeyFallbackResponsePayload, RekeyHeartbeatRequestPayload,
+    ApiMigrationProgress, ApiRekeyError, EncryptedWelcomeMessage, EpochChangeReason,
+    RekeyDescriptorList, RekeyDescriptorSummary, RekeyHeartbeatRequestPayload,
     RekeyInitiateRequest, RekeyProgressState, RekeyProgressUpdateRequest, RekeyResponsePayload,
     RekeyStatus, RekeyStatusPayload,
 };

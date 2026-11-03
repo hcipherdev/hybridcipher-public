@@ -7,9 +7,20 @@ use serde_json;
 
 use crate::error::CliError;
 
+/// Key id trusted only by unit tests; never present in `transparency_keys.json`.
+#[cfg(test)]
+pub(crate) const TEST_TRANSPARENCY_KEY_ID: &str = "transparency-log-test-key";
+
 static KNOWN_TRANSPARENCY_KEYS: Lazy<HashMap<String, [u8; 32]>> = Lazy::new(|| {
     let raw = include_str!("transparency_keys.json");
-    let entries: HashMap<String, String> = serde_json::from_str(raw).unwrap_or_default();
+    #[allow(unused_mut)]
+    let mut entries: HashMap<String, String> = serde_json::from_str(raw).unwrap_or_default();
+    // Public key of the RFC 8032 Ed25519 test vector 1, whose private key is public.
+    #[cfg(test)]
+    entries.insert(
+        TEST_TRANSPARENCY_KEY_ID.to_string(),
+        "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_string(),
+    );
     entries
         .into_iter()
         .filter_map(|(key_id, b64)| {
@@ -51,4 +62,25 @@ pub fn all_known_transparency_keys() -> Vec<(String, String)> {
         .iter()
         .map(|(key_id, bytes)| (key_id.clone(), BASE64.encode(bytes)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiled_key_list_trusts_only_production_keys() {
+        let entries: HashMap<String, String> =
+            serde_json::from_str(include_str!("transparency_keys.json"))
+                .expect("transparency_keys.json is valid JSON");
+        assert!(!entries.is_empty());
+        for key_id in entries.keys() {
+            let lowered = key_id.to_ascii_lowercase();
+            assert!(
+                !lowered.contains("dev") && !lowered.contains("test"),
+                "non-production transparency key '{key_id}' in transparency_keys.json"
+            );
+        }
+        assert!(verifying_key_for("transparency-log-dev-key").is_none());
+    }
 }

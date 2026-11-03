@@ -15,6 +15,10 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use filetime::{set_file_times, FileTime};
 use hybridcipher_client::{
     config_loader::config_file_candidates,
+    file::ciphertext::{
+        self, CiphertextKind, FOLDER_RECORD_FILE_NAME as DIRECTORY_METADATA_FILE_NAME,
+    },
+    file::durability::{self, OutputDurability},
     file::encrypt::{
         chunked_encrypted_size, normalize_file_identifier, write_encrypted_file, MacOsFileMetadata,
         PlatformFileMetadata, PlatformXattr, SerializedEncryptedHeader, SparseExtent,
@@ -85,6 +89,9 @@ const TEMP_FILE_GRACE_SECS: u64 = 30;
 const SPARSE_SKIP_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 // New non-empty sync-mount writes use the authenticated chunked format by default.
 const STREAM_THRESHOLD_BYTES: u64 = 1;
+/// How often a long sync saves the files it has done, so quitting midway
+/// does not send the next start back to the first file.
+const SYNC_BASELINE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 const STREAM_CHUNK_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const STREAM_STABILITY_AGE_SECS: u64 = 5;
 const STARTUP_LOCAL_DELETE_MAX_ACTIONS: usize = 20;
@@ -94,7 +101,6 @@ const LOW_SPACE_WARNING_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 const LOW_SPACE_JOURNAL_RESERVE_BYTES: u64 = 256 * 1024;
 const LOW_SPACE_ATOMIC_WRITE_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
 const LOW_SPACE_DIRECTORY_CREATE_BYTES: u64 = 4096;
-const DIRECTORY_METADATA_FILE_NAME: &str = ".hybridcipher_dir.encrypted";
 const MAX_OPEN_UNLINKED_PATHS_IN_STATUS: usize = 16;
 const MAX_CONFLICT_PATHS_IN_STATUS: usize = 16;
 const MAX_RECOVERED_PENDING_PATHS_IN_STATUS: usize = 16;
@@ -227,6 +233,8 @@ pub enum MountSyncError {
     LegacyCompatibilityRequired,
     #[error("Encrypted file integrity verification failed: {0}")]
     FileIntegrity(String),
+    #[error("This device does not have key version {epoch_id} for this file")]
+    KeyUnavailable { epoch_id: u64 },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,7 +365,7 @@ impl MountSafetyReason {
                 sample_paths,
             } => {
                 let mut message = format!(
-                    "{count} transactional path(s) are blocked because sync mount does not provide atomic-set guarantees for databases, packages, or bundle-style formats."
+                    "{count} transactional path(s) changed locally and cannot be synced because sync mount does not provide atomic-set guarantees for databases, packages, or bundle-style formats."
                 );
                 if let Some(path) = sample_paths.first() {
                     message.push_str(&format!(" Example: {path}"));
@@ -415,6 +423,8 @@ impl MountSafetyReason {
 pub enum ProviderFileErrorCode {
     LegacyConsentRequired,
     IntegrityFailure,
+    /// The file uses a key version this device was never given.
+    KeyUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +480,15 @@ pub struct MountSyncRuntimeStatus {
     pub preflight_warnings: Vec<String>,
     pub last_error: Option<String>,
     pub updated_at: DateTime<Utc>,
+    /// Set while a mount that is already open decrypts its files for the first time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparing_files: Option<FileCountProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileCountProgress {
+    pub processed: usize,
+    pub total: usize,
 }
 
 impl Default for MountSyncRuntimeStatus {
@@ -499,6 +518,7 @@ impl Default for MountSyncRuntimeStatus {
             preflight_warnings: Vec::new(),
             last_error: None,
             updated_at: Utc::now(),
+            preparing_files: None,
         }
     }
 }
@@ -730,6 +750,9 @@ impl From<ClientError> for MountSyncError {
             ClientError::PathExcluded(path) => MountSyncError::PathExcluded(path),
             ClientError::LegacyCompatibilityRequired => MountSyncError::LegacyCompatibilityRequired,
             ClientError::FileIntegrity(reason) => MountSyncError::FileIntegrity(reason),
+            ClientError::EpochKeyUnavailable { epoch_id } => {
+                MountSyncError::KeyUnavailable { epoch_id }
+            }
             other => MountSyncError::Crypto(other.to_string()),
         }
     }
@@ -756,6 +779,19 @@ pub trait MountCrypto: Send + Sync {
         output_path: &Path,
         metadata: &EncryptedFileMetadata,
     ) -> Result<(), MountSyncError>;
+
+    /// As [`Self::decrypt_file_streaming`], but the output is only handed to the
+    /// drive, not waited on: the caller makes it durable with
+    /// `hybridcipher_client::file::durability::barrier` before relying on it.
+    async fn decrypt_file_streaming_deferred(
+        &self,
+        encrypted_path: &Path,
+        output_path: &Path,
+        metadata: &EncryptedFileMetadata,
+    ) -> Result<(), MountSyncError> {
+        self.decrypt_file_streaming(encrypted_path, output_path, metadata)
+            .await
+    }
 
     /// Decrypt exactly one logical plaintext range without materializing the
     /// complete file. Implementations must authenticate every encrypted chunk
@@ -1026,8 +1062,20 @@ fn apply_mount_config_from_str(contents: &str, source: &str, config: &mut MountS
 enum ScanHealth {
     #[default]
     Healthy,
-    #[allow(dead_code)]
     Unhealthy { reason: String },
+}
+
+/// What a tracked file missing from the mount means.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeleteInference {
+    /// The user deleted it: the mount is a folder people work in directly.
+    #[default]
+    Inferred,
+    /// The mount lost it, unless its removal was asked for with
+    /// [`SyncTracker::authorize_mount_deletion`]. For mounts only this app writes,
+    /// such as the macOS File Provider cache, where a missing file is never by
+    /// itself a sign the user wanted it gone; it is decrypted again instead.
+    ExplicitOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -1039,6 +1087,8 @@ struct PendingDeletion {
     first_missing_time: Instant,
     consecutive_missing_scans: u32,
     had_healthy_scan: bool,
+    /// The removal was asked for, not only inferred; see [`DeleteInference`].
+    requested: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1047,6 +1097,8 @@ struct PendingDeletionRecord {
     mount_path: PathBuf,
     consecutive_missing_scans: u32,
     had_healthy_scan: bool,
+    #[serde(default)]
+    requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1174,6 +1226,9 @@ struct SyncBaselineHashRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RetentionMetadata {
     deleted_at: DateTime<Utc>,
+    /// Where the file was, so it can be put back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1237,6 +1292,7 @@ impl SpaceWarningState {
 enum DecryptOutcome {
     Ready(PathBuf),
     DeferredLowSpace(PathBuf),
+    DeferredLegacyCompatibility(PathBuf),
 }
 
 fn normalize_relative_path(relative: &Path) -> String {
@@ -1302,18 +1358,87 @@ fn pending_writeback_default_timestamp() -> DateTime<Utc> {
     Utc::now()
 }
 
+/// Picks the mount name for a decrypted file. Outside Windows, the original name
+/// is kept when this filesystem allows it and it already matches the encrypted
+/// filename, so the mount path still maps back to the same encrypted path.
+fn mount_file_name(encrypted_path: &Path, raw_name: &str, file_id: &str) -> (String, bool) {
+    #[cfg(not(windows))]
+    {
+        let stored_name = encrypted_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(strip_encrypted_suffix);
+        if stored_name.as_deref() == Some(raw_name) && validate_mount_name(raw_name).is_ok() {
+            return (raw_name.to_string(), false);
+        }
+    }
+    #[cfg(windows)]
+    let _ = encrypted_path;
+    sanitize_mount_file_name(raw_name, file_id)
+}
+
+/// Rejects names this platform cannot hold safely. Windows also forbids its
+/// reserved characters, device names and trailing dots or spaces.
+fn validate_mount_name(name: &str) -> Result<(), MountSyncError> {
+    #[cfg(windows)]
+    {
+        hybridcipher_client::file::safe_restore::validate_name(name)
+            .map_err(|e| MountSyncError::Format(e.to_string()))
+    }
+    #[cfg(not(windows))]
+    {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.chars().any(char::is_control)
+        {
+            return Err(MountSyncError::Format("Unsafe restored filename".into()));
+        }
+        Ok(())
+    }
+}
+
 fn sanitize_mount_file_name(name: &str, file_id: &str) -> (String, bool) {
-    let mut sanitized = name.replace('/', "_");
-    let mut changed = sanitized != name;
+    let mut sanitized = String::with_capacity(name.len());
+    let mut changed = false;
+    for character in name.chars() {
+        if character.is_control() || "\\/:<>\"|?*".contains(character) {
+            sanitized.push('_');
+            changed = true;
+        } else {
+            sanitized.push(character);
+        }
+    }
+
+    while sanitized.ends_with(['.', ' ']) {
+        sanitized.pop();
+        changed = true;
+    }
 
     if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
         sanitized = "unnamed".to_string();
         changed = true;
     }
 
+    if hybridcipher_client::file::safe_restore::validate_name(&sanitized).is_err() {
+        sanitized.insert(0, '_');
+        changed = true;
+    }
+
     let max_component_len = 240usize;
     if sanitized.len() > max_component_len {
-        sanitized = sanitized_safe_name(&sanitized, file_id);
+        let safe_file_id: String = file_id
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .take(12)
+            .collect();
+        let safe_file_id = if safe_file_id.is_empty() {
+            "file"
+        } else {
+            &safe_file_id
+        };
+        sanitized = sanitized_safe_name(&sanitized, safe_file_id);
         changed = true;
     }
 
@@ -1348,10 +1473,6 @@ fn is_temp_like_name(name: &str) -> bool {
         || lower.ends_with(".temp")
         || lower.ends_with(".part")
         || lower.ends_with('~')
-}
-
-fn is_directory_metadata_file(path: &Path) -> bool {
-    path.file_name().and_then(|value| value.to_str()) == Some(DIRECTORY_METADATA_FILE_NAME)
 }
 
 fn encrypted_directory_metadata_path_for(
@@ -1427,9 +1548,7 @@ fn directory_has_existing_encrypted_state(
                 stack.push(path);
                 continue;
             }
-            if is_directory_metadata_file(&path)
-                || path.extension().and_then(|value| value.to_str()) == Some("encrypted")
-            {
+            if ciphertext::classify(&path) != CiphertextKind::NotEncrypted {
                 return true;
             }
         }
@@ -1515,6 +1634,31 @@ fn should_cleanup_encrypted_temp(metadata: &fs::Metadata) -> bool {
             .unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// Encrypted files under `encrypted_root`, counted the way `sync` walks them.
+fn count_encrypted_files(encrypted_root: &Path) -> usize {
+    let mut count = 0;
+    let mut stack = vec![encrypted_root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) != Some(ENCRYPTED_TMP_DIR_NAME) {
+                    stack.push(path);
+                }
+            } else if ciphertext::classify(&path) == CiphertextKind::File {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 fn cleanup_encrypted_tmp_dir(path: &Path) {
@@ -2381,6 +2525,16 @@ fn clear_local_only_recovery_metadata(path: &Path) -> Result<(), MountSyncError>
     clear_local_only_reason(path)
 }
 
+/// A database/package path excluded from sync. It only blocks unmount when its
+/// plaintext no longer matches the encrypted copy, because only then would
+/// unmounting discard local changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnsupportedTransactionalPath {
+    reason: String,
+    display_path: String,
+    locally_modified: bool,
+}
+
 fn sample_paths<I>(paths: I, limit: usize) -> Vec<String>
 where
     I: IntoIterator<Item = PathBuf>,
@@ -2557,6 +2711,7 @@ fn is_low_space_error(err: &MountSyncError) -> bool {
         | MountSyncError::RangeUnsupported(_)
         | MountSyncError::LegacyCompatibilityRequired
         | MountSyncError::FileIntegrity(_)
+        | MountSyncError::KeyUnavailable { .. }
         | MountSyncError::InvalidPath(_) => false,
     }
 }
@@ -2614,15 +2769,66 @@ fn volume_below_reserve(path: &Path, reserve_bytes: u64) -> bool {
 }
 
 fn available_space_for_path(path: &Path) -> Option<u64> {
+    volume_space_for(&canonical_existing_ancestor(path)?, &list_volume_space())
+}
+
+fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let existing_path = existing_ancestor(path)?;
-    let canonical = fs::canonicalize(&existing_path).unwrap_or(existing_path);
-    let disks = Disks::new_with_refreshed_list();
-    disks
+    Some(fs::canonicalize(&existing_path).unwrap_or(existing_path))
+}
+
+/// Every mounted volume with its free space. Each call asks the system about
+/// every volume, which costs milliseconds.
+fn list_volume_space() -> Vec<(PathBuf, u64)> {
+    Disks::new_with_refreshed_list()
         .list()
         .iter()
-        .filter(|disk| canonical.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().as_os_str().len())
-        .map(|disk| disk.available_space())
+        .map(|disk| (disk.mount_point().to_path_buf(), disk.available_space()))
+        .collect()
+}
+
+fn volume_space_for(canonical: &Path, volumes: &[(PathBuf, u64)]) -> Option<u64> {
+    volumes
+        .iter()
+        .filter(|(mount_point, _)| canonical.starts_with(mount_point))
+        .max_by_key(|(mount_point, _)| mount_point.as_os_str().len())
+        .map(|(_, available)| *available)
+}
+
+/// How long a volume listing answers space checks before it is taken again.
+const SPACE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Free space per volume, reused between files: a sync checks the space before
+/// every file it writes, and listing the volumes each time dominated the sync.
+/// What earlier checks asked for is subtracted, and the volumes are listed
+/// again once the estimate comes within twice a request.
+#[derive(Default)]
+struct SpaceProbe {
+    volumes: Vec<(PathBuf, u64)>,
+    measured_at: Option<Instant>,
+    requested_since: u64,
+}
+
+impl SpaceProbe {
+    fn available(&mut self, path: &Path, budget: u64, requested: u64) -> Option<u64> {
+        let canonical = canonical_existing_ancestor(path)?;
+        let fresh = self
+            .measured_at
+            .is_some_and(|measured| measured.elapsed() < SPACE_PROBE_INTERVAL);
+        if fresh {
+            if let Some(available) = volume_space_for(&canonical, &self.volumes) {
+                let estimate = available.saturating_sub(self.requested_since);
+                if estimate >= budget.saturating_mul(2) {
+                    self.requested_since = self.requested_since.saturating_add(requested);
+                    return Some(estimate);
+                }
+            }
+        }
+        self.volumes = list_volume_space();
+        self.measured_at = Some(Instant::now());
+        self.requested_since = requested;
+        volume_space_for(&canonical, &self.volumes)
+    }
 }
 
 fn existing_ancestor(path: &Path) -> Option<PathBuf> {
@@ -3330,7 +3536,7 @@ pub struct SyncTracker {
     // Coverage metadata writes that must be retried before deletion is allowed
     pending_metadata: HashMap<PathBuf, FileMetadataData>,
     // Local paths blocked because sync mount cannot safely publish them as atomic sets
-    unsupported_transactional_paths: HashMap<PathBuf, String>,
+    unsupported_transactional_paths: HashMap<PathBuf, UnsupportedTransactionalPath>,
     // Local paths blocked because sync mount does not preserve hard-link semantics
     unsupported_hard_link_paths: HashMap<PathBuf, String>,
     // Collision keys for case-insensitive and Unicode-normalized mount paths
@@ -3357,6 +3563,8 @@ pub struct SyncTracker {
     pending_metadata_path: Option<PathBuf>,
     pending_metadata_dirty: bool,
     sync_baseline_path: Option<PathBuf>,
+    /// Overrides `SYNC_BASELINE_CHECKPOINT_INTERVAL`, for tests.
+    sync_baseline_checkpoint_interval: Option<Duration>,
     conflict_registry_path: Option<PathBuf>,
     conflict_registry_dirty: bool,
     recovery_registry_path: Option<PathBuf>,
@@ -3388,6 +3596,13 @@ pub struct SyncTracker {
     suppress_deletion_processing: bool,
     // Conflict policy for reconciliation
     conflict_policy: ConflictPolicy,
+    space_probe: std::sync::Mutex<SpaceProbe>,
+    /// A cache file written without waiting for the disk since the last barrier.
+    deferred_cache_write: std::sync::Mutex<Option<PathBuf>>,
+    delete_inference: DeleteInference,
+    /// Mount paths, files or folders, whose removal was asked for and not yet
+    /// carried out; only read under [`DeleteInference::ExplicitOnly`].
+    authorized_mount_deletions: HashSet<PathBuf>,
 }
 
 impl SyncTracker {
@@ -3443,6 +3658,11 @@ impl SyncTracker {
         if let Err(err) = self.load_pending_metadata() {
             warn!("Failed to load pending metadata: {}", err);
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_sync_baseline_checkpoint_interval(&mut self, interval: Duration) {
+        self.sync_baseline_checkpoint_interval = Some(interval);
     }
 
     pub fn set_sync_baseline_path(&mut self, path: PathBuf) {
@@ -3616,6 +3836,68 @@ impl SyncTracker {
     pub fn exit_startup_rehydrate_mode(&mut self) {
         self.suppress_deletion_inference = false;
         self.suppress_deletion_processing = false;
+    }
+
+    pub fn set_delete_inference(&mut self, delete_inference: DeleteInference) {
+        self.delete_inference = delete_inference;
+    }
+
+    /// Let the next sync carry a removal from the mount over to the ciphertext:
+    /// the file at `mount_path`, or everything under it for a folder. Needed
+    /// under [`DeleteInference::ExplicitOnly`], where a missing file is
+    /// otherwise decrypted again.
+    pub fn authorize_mount_deletion(&mut self, mount_path: &Path) {
+        self.authorized_mount_deletions
+            .insert(mount_path.to_path_buf());
+    }
+
+    fn mount_deletion_allowed(&self, mount_path: &Path) -> bool {
+        self.delete_inference == DeleteInference::Inferred
+            || self
+                .authorized_mount_deletions
+                .iter()
+                .any(|authorized| mount_path.starts_with(authorized))
+    }
+
+    fn pending_deletion_allowed(&self, pending: &PendingDeletion) -> bool {
+        self.delete_inference == DeleteInference::Inferred || pending.requested
+    }
+
+    /// Drop authorizations that are used up: nothing decrypted or pending is left
+    /// under them, or the path is back in the mount.
+    fn prune_mount_deletion_authorizations(&mut self) {
+        if self.authorized_mount_deletions.is_empty() {
+            return;
+        }
+        let authorized = std::mem::take(&mut self.authorized_mount_deletions);
+        self.authorized_mount_deletions = authorized
+            .into_iter()
+            .filter(|path| {
+                !path.exists()
+                    && (self.decrypted_signatures.keys().any(|p| p.starts_with(path))
+                        || self
+                            .decrypted_directory_signatures
+                            .keys()
+                            .any(|p| p.starts_with(path))
+                        || self
+                            .pending_deletions
+                            .values()
+                            .any(|pending| pending.mount_path.starts_with(path)))
+            })
+            .collect();
+    }
+
+    /// Forget that `mount_path` was decrypted, so the next pass decrypts it again
+    /// rather than reading its absence as a delete.
+    fn forget_lost_mount_file(&mut self, mount_path: &Path, encrypted_path: &Path) {
+        self.clear_decrypted_tracking(mount_path);
+        self.encrypted_signatures.remove(encrypted_path);
+        self.path_mapping.retain(|_enc, dec| dec != mount_path);
+        self.file_id_to_mount_path
+            .retain(|_file_id, tracked| tracked != mount_path);
+        if self.pending_deletions.remove(encrypted_path).is_some() {
+            self.pending_deletions_dirty = true;
+        }
     }
 
     /// Process pending local creates (encrypt files created while unmounted)
@@ -4005,7 +4287,11 @@ impl SyncTracker {
         if !self.pending_open_unlinked.is_empty() {
             return false;
         }
-        if !self.unsupported_transactional_paths.is_empty() {
+        if self
+            .unsupported_transactional_paths
+            .values()
+            .any(|entry| entry.locally_modified)
+        {
             return false;
         }
         if !self.unsupported_hard_link_paths.is_empty() {
@@ -4245,10 +4531,11 @@ impl SyncTracker {
                 sample_paths: sample_paths(self.pending_open_unlinked.keys().cloned(), 3),
             });
         }
-        if !self.unsupported_transactional_paths.is_empty() {
+        let modified_transactional_paths = self.modified_transactional_display_paths();
+        if !modified_transactional_paths.is_empty() {
             unsafe_reasons.push(MountSafetyReason::TransactionalBlocked {
-                count: self.unsupported_transactional_paths.len(),
-                sample_paths: sample_paths(self.unsupported_transactional_paths.keys().cloned(), 3),
+                count: modified_transactional_paths.len(),
+                sample_paths: modified_transactional_paths.iter().take(3).cloned().collect(),
             });
         }
         if !self.unsupported_hard_link_paths.is_empty() {
@@ -4278,6 +4565,7 @@ impl SyncTracker {
         preflight_warnings.extend(open_unlinked_warnings);
         preflight_warnings.extend(hard_link_warnings);
         preflight_warnings.extend(transactional_warnings);
+        preflight_warnings.extend(self.unchanged_transactional_notices());
         preflight_warnings.extend(recovery_copy_warnings);
         if let Some(reason) = &self.write_access_denied {
             preflight_warnings.push(format!("Team mount is read-only: {reason}"));
@@ -4315,6 +4603,7 @@ impl SyncTracker {
             affected_file_count: pending_writeback_count,
             pending_operation_counts: Default::default(),
             pending_operations: Vec::new(),
+            preparing_files: None,
         }
     }
 
@@ -4346,7 +4635,42 @@ impl SyncTracker {
         reserve_bytes: u64,
         operation: &str,
     ) -> Result<(), MountSyncError> {
-        ensure_space_budget(path, required_bytes, reserve_bytes, operation)
+        let budget = required_bytes.saturating_add(reserve_bytes);
+        let available = match self.space_probe.lock() {
+            Ok(mut probe) => probe.available(path, budget, required_bytes),
+            Err(_) => available_space_for_path(path),
+        };
+        match available {
+            Some(available) if available < budget => Err(low_space_budget_error(
+                operation,
+                path,
+                required_bytes,
+                reserve_bytes,
+                available,
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn note_deferred_cache_write(&self, path: &Path) {
+        if let Ok(mut pending) = self.deferred_cache_write.lock() {
+            pending.get_or_insert_with(|| path.to_path_buf());
+        }
+    }
+
+    fn flush_deferred_cache_writes(&self) -> Result<(), MountSyncError> {
+        let Ok(mut pending) = self.deferred_cache_write.lock() else {
+            return Ok(());
+        };
+        let Some(path) = pending.as_ref() else {
+            return Ok(());
+        };
+        // One full sync covers everything already handed to the drive; any file
+        // or folder on the volume will do once the first one is gone.
+        let target = existing_ancestor(path).unwrap_or_else(|| path.clone());
+        durability::barrier(&target)?;
+        *pending = None;
+        Ok(())
     }
 
     fn remember_decrypted_metadata_hash(
@@ -4377,24 +4701,121 @@ impl SyncTracker {
         }
     }
 
-    fn record_unsupported_transactional_path(&mut self, path: &Path, reason: &str) {
-        let reason_string = reason.to_string();
+    fn record_unsupported_transactional_path(
+        &mut self,
+        mount_root: &Path,
+        path: &Path,
+        reason: &str,
+        locally_modified: bool,
+    ) {
+        let display_path = path
+            .strip_prefix(mount_root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let entry = UnsupportedTransactionalPath {
+            reason: reason.to_string(),
+            display_path,
+            locally_modified,
+        };
         let changed = self
             .unsupported_transactional_paths
             .get(path)
-            .map(|existing| existing != &reason_string)
+            .map(|existing| existing != &entry)
             .unwrap_or(true);
 
         self.unsupported_transactional_paths
-            .insert(path.to_path_buf(), reason_string);
+            .insert(path.to_path_buf(), entry);
 
         if changed {
-            warn!(
-                "Blocking transactional-format sync for {}: {}",
-                path.display(),
-                reason
-            );
+            if locally_modified {
+                warn!(
+                    "Blocking transactional-format sync for locally modified {}: {}",
+                    path.display(),
+                    reason
+                );
+            } else {
+                debug!(
+                    "Excluding unchanged transactional-format path {} from sync: {}",
+                    path.display(),
+                    reason
+                );
+            }
         }
+    }
+
+    /// Whether a transactional-format path differs from what the encrypted copy
+    /// holds. Unlike `is_local_mount_path_dirty_with_signature`, a mismatch never
+    /// advances the stored baseline, so a local edit stays visible across scans
+    /// and restarts until it is resolved.
+    fn transactional_path_locally_modified(
+        &mut self,
+        path: &Path,
+        signature: FileSignature,
+        encrypted_exists: bool,
+    ) -> bool {
+        if !encrypted_exists {
+            return true;
+        }
+        let Some(stored) = self.decrypted_signatures.get(path).copied() else {
+            return true;
+        };
+        if stored == signature {
+            return false;
+        }
+        if !stored.ctime_only_change(&signature) {
+            return true;
+        }
+
+        let Some(baseline_hash) = self.decrypted_hashes.get(path).copied() else {
+            // Size and mtime still match and there is no content baseline to
+            // compare against; treat it like the scan path does for large files.
+            return false;
+        };
+        match hash_file(path) {
+            Ok(current_hash) => current_hash != baseline_hash,
+            Err(err) => {
+                warn!(
+                    "Failed to hash transactional path {} for change check: {}",
+                    path.display(),
+                    err
+                );
+                true
+            }
+        }
+    }
+
+    fn modified_transactional_display_paths(&self) -> Vec<String> {
+        let mut paths = self
+            .unsupported_transactional_paths
+            .values()
+            .filter(|entry| entry.locally_modified)
+            .map(|entry| entry.display_path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn unchanged_transactional_notices(&self) -> Vec<String> {
+        let mut paths = self
+            .unsupported_transactional_paths
+            .values()
+            .filter(|entry| !entry.locally_modified)
+            .map(|entry| entry.display_path.clone())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        paths.sort();
+
+        let mut notices = vec![format!(
+            "{} unchanged transactional path(s) are excluded from sync; edits made while mounted will not be synced",
+            paths.len()
+        )];
+        for path in paths.into_iter().take(3) {
+            notices.push(format!("Transactional path excluded from sync: {path}"));
+        }
+        notices
     }
 
     fn record_unsupported_hard_link_path(
@@ -4475,18 +4896,19 @@ impl SyncTracker {
     }
 
     fn transactional_format_warnings(&self) -> Vec<String> {
-        if self.unsupported_transactional_paths.is_empty() {
+        let paths = self.modified_transactional_display_paths();
+        if paths.is_empty() {
             return Vec::new();
         }
 
         let mut warnings = Vec::new();
         warnings.push(format!(
-            "{} transactional path(s) blocked; sync mount does not provide atomic-set guarantees for databases, packages, or bundle-style formats",
-            self.unsupported_transactional_paths.len()
+            "{} transactional path(s) blocked; local changes cannot be synced because sync mount does not provide atomic-set guarantees for databases, packages, or bundle-style formats",
+            paths.len()
         ));
 
-        for path in self.unsupported_transactional_paths.keys().take(3) {
-            warnings.push(format!("Transactional sync blocked: {}", path.display()));
+        for path in paths.into_iter().take(3) {
+            warnings.push(format!("Transactional sync blocked: {path}"));
         }
 
         warnings
@@ -5923,10 +6345,7 @@ impl SyncTracker {
                     continue;
                 }
 
-                if !metadata.is_file()
-                    || path.extension().and_then(|ext| ext.to_str()) != Some("encrypted")
-                    || is_directory_metadata_file(&path)
-                {
+                if !metadata.is_file() || ciphertext::classify(&path) != CiphertextKind::File {
                     continue;
                 }
 
@@ -6517,6 +6936,20 @@ impl SyncTracker {
         encrypted_root: &Path,
         mount_root: &Path,
     ) -> Result<(), MountSyncError> {
+        self.sync_with_progress(crypto, encrypted_root, mount_root, None)
+            .await
+    }
+
+    /// `sync`, reporting `(files done, files in total)` as encrypted files are
+    /// brought into the mounted view, so a first sync of a large folder shows
+    /// how far along it is.
+    pub async fn sync_with_progress<C: MountCrypto + ?Sized>(
+        &mut self,
+        crypto: &C,
+        encrypted_root: &Path,
+        mount_root: &Path,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> Result<(), MountSyncError> {
         let denied = crypto
             .check_write_access()
             .await
@@ -6581,7 +7014,17 @@ impl SyncTracker {
         }
 
         // Health check: verify mount is accessible and healthy
-        self.scan_health = self.check_mount_health(mount_root)?;
+        let health = self.check_mount_health(mount_root)?;
+        if let ScanHealth::Unhealthy { reason } = &health {
+            if matches!(self.scan_health, ScanHealth::Healthy) {
+                warn!(
+                    "Holding back deletions from {}: {}",
+                    mount_root.display(),
+                    reason
+                );
+            }
+        }
+        self.scan_health = health;
         self.refresh_space_warnings(encrypted_root, mount_root);
         self.enforce_low_space_mount_mode(mount_root)?;
         self.rebuild_mount_collision_index(mount_root);
@@ -6597,6 +7040,15 @@ impl SyncTracker {
         let mut expected_directories: HashSet<PathBuf> = HashSet::new();
         let mut protected_missing_paths: HashSet<PathBuf> = HashSet::new();
         let mut stack = vec![encrypted_root.to_path_buf()];
+        let total_files = progress.map_or(0, |_| count_encrypted_files(encrypted_root));
+        let mut done_files = 0usize;
+        let checkpoint_interval = self
+            .sync_baseline_checkpoint_interval
+            .unwrap_or(SYNC_BASELINE_CHECKPOINT_INTERVAL);
+        let mut last_checkpoint = Instant::now();
+        if let Some(report) = progress {
+            report(0, total_files);
+        }
 
         while let Some(current) = stack.pop() {
             let entries = fs::read_dir(&current)?;
@@ -6615,12 +7067,13 @@ impl SyncTracker {
                     continue;
                 }
 
-                if path.extension().and_then(|e| e.to_str()) != Some("encrypted") {
+                let kind = ciphertext::classify(&path);
+                if kind == CiphertextKind::NotEncrypted {
                     continue;
                 }
 
                 let signature = FileSignature::from_metadata(&metadata);
-                if is_directory_metadata_file(&path) {
+                if kind == CiphertextKind::FolderRecord {
                     match self
                         .decrypt_directory_metadata(
                             crypto,
@@ -6640,17 +7093,38 @@ impl SyncTracker {
                             expected_directories.insert(directory_path.clone());
                             protected_missing_paths.insert(directory_path);
                         }
+                        DecryptOutcome::DeferredLegacyCompatibility(directory_path) => {
+                            expected.insert(directory_path.clone());
+                            expected_directories.insert(directory_path.clone());
+                            protected_missing_paths.insert(directory_path);
+                        }
                     }
                     continue;
                 }
-                match self
+                let outcome = self
                     .decrypt_file(crypto, encrypted_root, mount_root, &path, signature)
-                    .await?
-                {
+                    .await?;
+                if last_checkpoint.elapsed() >= checkpoint_interval {
+                    // Only files already brought in are recorded; the rest are
+                    // still decrypted next time, so a partial save is safe.
+                    if let Err(err) = self.persist_sync_baseline() {
+                        warn!("Failed to checkpoint sync baseline: {}", err);
+                    }
+                    last_checkpoint = Instant::now();
+                }
+                if let Some(report) = progress {
+                    done_files += 1;
+                    report(done_files.min(total_files), total_files);
+                }
+                match outcome {
                     DecryptOutcome::Ready(decrypted_path) => {
                         expected.insert(decrypted_path);
                     }
                     DecryptOutcome::DeferredLowSpace(decrypted_path) => {
+                        expected.insert(decrypted_path.clone());
+                        protected_missing_paths.insert(decrypted_path);
+                    }
+                    DecryptOutcome::DeferredLegacyCompatibility(decrypted_path) => {
                         expected.insert(decrypted_path.clone());
                         protected_missing_paths.insert(decrypted_path);
                     }
@@ -6707,6 +7181,7 @@ impl SyncTracker {
             self.reset_pending_deletion_counts();
             self.reset_pending_orphan_counts();
         }
+        self.prune_mount_deletion_authorizations();
 
         self.refresh_space_warnings(encrypted_root, mount_root);
         self.enforce_low_space_mount_mode(mount_root)?;
@@ -6750,6 +7225,7 @@ impl SyncTracker {
         // Perform a lightweight directory walk to check for IO errors
         let mut stack = vec![mount_root.to_path_buf()];
         let mut checked_count = 0;
+        let mut found_file = false;
         const MAX_HEALTH_CHECK_ENTRIES: usize = 100; // Limit health check depth
 
         while let Some(current) = stack.pop() {
@@ -6770,6 +7246,8 @@ impl SyncTracker {
                                 if let Ok(meta) = e.metadata() {
                                     if meta.is_dir() {
                                         stack.push(e.path());
+                                    } else if meta.is_file() && !self.is_path_excluded(&e.path()) {
+                                        found_file = true;
                                     }
                                 }
                             }
@@ -6787,6 +7265,23 @@ impl SyncTracker {
                     });
                 }
             }
+        }
+
+        // A mount that lost every file it held looks like the user deleted them
+        // all. That is far likelier a mount that was emptied or swapped beneath
+        // us, so no deletion is carried over until files are back.
+        let tracked = self.decrypted_signatures.len();
+        if !found_file
+            && checked_count < MAX_HEALTH_CHECK_ENTRIES
+            && tracked >= STARTUP_LOCAL_DELETE_MAX_ACTIONS
+        {
+            return Ok(ScanHealth::Unhealthy {
+                reason: format!(
+                    "Mount root {} holds none of the {} files it is known to hold",
+                    mount_root.display(),
+                    tracked
+                ),
+            });
         }
 
         Ok(ScanHealth::Healthy)
@@ -6903,6 +7398,14 @@ impl SyncTracker {
         let mut changed = false;
 
         for (encrypted_path, pending) in &self.pending_deletions {
+            if !self.pending_deletion_allowed(pending) {
+                warn!(
+                    "Dropping pending deletion of {} that was never requested",
+                    encrypted_path.display()
+                );
+                to_remove.push(encrypted_path.clone());
+                continue;
+            }
             if !encrypted_path.starts_with(encrypted_root)
                 || !pending.mount_path.starts_with(mount_root)
             {
@@ -7215,6 +7718,7 @@ impl SyncTracker {
                 );
                 let metadata = RetentionMetadata {
                     deleted_at: Utc::now(),
+                    original_path: Some(encrypted_path.to_path_buf()),
                 };
                 if let Ok(data) = serde_json::to_vec_pretty(&metadata) {
                     if let Err(err) = Self::write_atomic_bytes(&retention_meta_path, &data) {
@@ -7238,6 +7742,7 @@ impl SyncTracker {
                 );
                 let metadata = RetentionMetadata {
                     deleted_at: Utc::now(),
+                    original_path: Some(encrypted_path.to_path_buf()),
                 };
                 if let Ok(data) = serde_json::to_vec_pretty(&metadata) {
                     if let Err(err) = Self::write_atomic_bytes(&retention_meta_path, &data) {
@@ -7283,6 +7788,7 @@ impl SyncTracker {
 
         let metadata = RetentionMetadata {
             deleted_at: Utc::now(),
+            original_path: Some(mount_path.to_path_buf()),
         };
         if let Ok(data) = serde_json::to_vec_pretty(&metadata) {
             if let Err(err) = Self::write_atomic_bytes(&retention_meta_path, &data) {
@@ -7536,6 +8042,19 @@ impl SyncTracker {
         Ok(DecryptOutcome::DeferredLowSpace(target.to_path_buf()))
     }
 
+    fn defer_legacy_file(
+        &mut self,
+        encrypted_path: &Path,
+        target: &Path,
+        signature: FileSignature,
+    ) -> DecryptOutcome {
+        self.encrypted_signatures
+            .insert(encrypted_path.to_path_buf(), signature);
+        self.path_mapping
+            .insert(encrypted_path.to_path_buf(), target.to_path_buf());
+        DecryptOutcome::DeferredLegacyCompatibility(target.to_path_buf())
+    }
+
     async fn decrypt_file<C: MountCrypto + ?Sized>(
         &mut self,
         crypto: &C,
@@ -7562,6 +8081,19 @@ impl SyncTracker {
                 return Ok(DecryptOutcome::Ready(tracked.clone()));
             }
         }
+        if let Some(pending) = self
+            .pending_deletions
+            .get(encrypted_path)
+            .filter(|pending| !self.pending_deletion_allowed(pending))
+        {
+            warn!(
+                "Dropping pending deletion of {} that was never requested; restoring {}",
+                encrypted_path.display(),
+                pending.mount_path.display()
+            );
+            let mount_path = pending.mount_path.clone();
+            self.forget_lost_mount_file(&mount_path, encrypted_path);
+        }
         if let Some(pending) = self.pending_deletions.get(encrypted_path) {
             debug!(
                 "Encrypted file {} is still pending deletion; skipping plaintext restore to {}",
@@ -7574,22 +8106,17 @@ impl SyncTracker {
                 .insert(encrypted_path.to_path_buf(), signature);
             return Ok(DecryptOutcome::Ready(pending.mount_path.clone()));
         }
-        let mut target =
-            decrypted_target_path(encrypted_root, encrypted_path, mount_root, &parsed)?;
-        let raw_name = target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("decrypted")
-            .to_string();
-        let mut original_name: Option<String> = None;
+        let raw_name = decrypted_file_name(encrypted_path, &parsed);
+        let (sanitized_name, name_changed) = mount_file_name(encrypted_path, &raw_name, file_id);
+        let mut target = decrypted_target_path_with_name(
+            encrypted_root,
+            encrypted_path,
+            mount_root,
+            &sanitized_name,
+        )?;
+        let mut original_name = name_changed.then(|| raw_name.clone());
         if let Some(ref tracked) = tracked_mount_path {
             target = tracked.clone();
-        } else {
-            let (sanitized_name, changed) = sanitize_mount_file_name(&raw_name, file_id);
-            if changed {
-                target.set_file_name(&sanitized_name);
-                original_name = Some(raw_name.clone());
-            }
         }
 
         if self.unsupported_hard_link_paths.contains_key(&target) {
@@ -7697,6 +8224,13 @@ impl SyncTracker {
                         file_id,
                         if was_deleted_and_restored { "was deleted and restored" } else { "changed" },
                         tracked_mount_path.display()
+                    );
+                    // Fall through to decrypt below
+                } else if !self.mount_deletion_allowed(tracked_mount_path) {
+                    warn!(
+                        "Mount file {} is missing but its removal was never requested; re-decrypting {}",
+                        tracked_mount_path.display(),
+                        encrypted_path.display()
                     );
                     // Fall through to decrypt below
                 } else {
@@ -7938,12 +8472,15 @@ impl SyncTracker {
         let mut decrypted_hash: Option<[u8; 32]> = None;
         if parsed.metadata.content_chunk_size.is_some() {
             match crypto
-                .decrypt_file_streaming(encrypted_path, &write_target, &parsed.metadata)
+                .decrypt_file_streaming_deferred(encrypted_path, &write_target, &parsed.metadata)
                 .await
             {
-                Ok(()) => {}
+                Ok(()) => self.note_deferred_cache_write(&write_target),
                 Err(err) if is_low_space_error(&err) => {
                     return self.defer_low_space_refresh(encrypted_path, &target, signature, &err);
+                }
+                Err(MountSyncError::LegacyCompatibilityRequired) => {
+                    return Ok(self.defer_legacy_file(encrypted_path, &target, signature));
                 }
                 Err(err) => return Err(err),
             }
@@ -7953,6 +8490,9 @@ impl SyncTracker {
                 Err(err) if is_low_space_error(&err) => {
                     return self.defer_low_space_refresh(encrypted_path, &target, signature, &err);
                 }
+                Err(MountSyncError::LegacyCompatibilityRequired) => {
+                    return Ok(self.defer_legacy_file(encrypted_path, &target, signature));
+                }
                 Err(err) => return Err(err),
             };
             if !write_conflict {
@@ -7960,12 +8500,15 @@ impl SyncTracker {
                 hash.copy_from_slice(&Sha256::digest(&decrypted));
                 decrypted_hash = Some(hash);
             }
-            if let Err(err) = Self::write_atomic_bytes(&write_target, &decrypted) {
+            if let Err(err) =
+                Self::write_atomic_bytes_with(&write_target, &decrypted, OutputDurability::Deferred)
+            {
                 if is_low_space_error(&err) {
                     return self.defer_low_space_refresh(encrypted_path, &target, signature, &err);
                 }
                 return Err(err);
             }
+            self.note_deferred_cache_write(&write_target);
         }
 
         if let Some(platform_metadata) = parsed.metadata.platform_metadata.as_ref() {
@@ -8318,9 +8861,20 @@ impl SyncTracker {
                 }
 
                 if let Some(reason) = transactional_format_reason(mount_root, &path) {
-                    self.record_unsupported_transactional_path(&path, &reason);
-                    self.decrypted_signatures.insert(path.clone(), signature);
-                    self.refresh_decrypted_metadata_hash(&path);
+                    let locally_modified =
+                        self.transactional_path_locally_modified(&path, signature, encrypted_exists);
+                    self.record_unsupported_transactional_path(
+                        mount_root,
+                        &path,
+                        &reason,
+                        locally_modified,
+                    );
+                    // Keep the decrypted baseline for an edited file that has an
+                    // encrypted copy, so the edit is not mistaken for synced state.
+                    if !locally_modified || !encrypted_exists {
+                        self.decrypted_signatures.insert(path.clone(), signature);
+                        self.refresh_decrypted_metadata_hash(&path);
+                    }
                     self.pending_stable.remove(&path);
                     self.clear_pending_writeback(&path);
                     continue;
@@ -8777,6 +9331,16 @@ impl SyncTracker {
                         }
                     }
 
+                    if !self.mount_deletion_allowed(&tracked_path) {
+                        warn!(
+                            "Mount file {} is missing but its removal was never requested; keeping {} and decrypting it again",
+                            tracked_path.display(),
+                            encrypted_path.display()
+                        );
+                        self.forget_lost_mount_file(&tracked_path, &encrypted_path);
+                        continue;
+                    }
+
                     // Check if already pending deletion (using encrypted_path as key)
                     if let Some(pending) = self.pending_deletions.get_mut(&encrypted_path) {
                         // Already pending - increment will happen in rapid verification scans
@@ -8799,6 +9363,8 @@ impl SyncTracker {
                                 first_missing_time: Instant::now(),
                                 consecutive_missing_scans: 1, // First detection
                                 had_healthy_scan: matches!(self.scan_health, ScanHealth::Healthy),
+                                requested: self.delete_inference
+                                    == DeleteInference::ExplicitOnly,
                             },
                         );
                         self.pending_deletions_dirty = true;
@@ -8836,6 +9402,16 @@ impl SyncTracker {
                     mount_root,
                     &tracked_path,
                 )?;
+                if !self.mount_deletion_allowed(&tracked_path) {
+                    warn!(
+                        "Mount folder {} is missing but its removal was never requested; keeping {}",
+                        tracked_path.display(),
+                        encrypted_path.display()
+                    );
+                    self.clear_decrypted_directory_tracking(&tracked_path);
+                    self.encrypted_directory_signatures.remove(&encrypted_path);
+                    continue;
+                }
                 match fs::remove_file(&encrypted_path) {
                     Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -9883,6 +10459,7 @@ impl SyncTracker {
                     first_missing_time: Instant::now(),
                     consecutive_missing_scans: record.consecutive_missing_scans,
                     had_healthy_scan: record.had_healthy_scan,
+                    requested: record.requested,
                 },
             );
         }
@@ -9923,6 +10500,7 @@ impl SyncTracker {
                 mount_path: pending.mount_path.clone(),
                 consecutive_missing_scans: pending.consecutive_missing_scans,
                 had_healthy_scan: pending.had_healthy_scan,
+                requested: pending.requested,
             })
             .collect();
 
@@ -10376,6 +10954,10 @@ impl SyncTracker {
             Some(path) => path,
             None => return Ok(()),
         };
+        // The baseline vouches for the plaintext it lists, so whatever was only
+        // handed to the drive is made durable first. Otherwise a file cut short
+        // by a crash would look like a local edit and be encrypted back.
+        self.flush_deferred_cache_writes()?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -10497,6 +11079,14 @@ impl SyncTracker {
     }
 
     fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), MountSyncError> {
+        Self::write_atomic_bytes_with(path, bytes, OutputDurability::Full)
+    }
+
+    fn write_atomic_bytes_with(
+        path: &Path,
+        bytes: &[u8],
+        durability: OutputDurability,
+    ) -> Result<(), MountSyncError> {
         let parent = path.parent().ok_or_else(|| {
             MountSyncError::Format(format!("Path {} has no parent directory", path.display()))
         })?;
@@ -10510,7 +11100,7 @@ impl SyncTracker {
         {
             let mut file = fs::File::create(&tmp_path)?;
             file.write_all(bytes)?;
-            let _ = file.sync_all();
+            let _ = durability.apply(&file);
         }
 
         #[cfg(target_os = "windows")]
@@ -10525,8 +11115,10 @@ impl SyncTracker {
             return Err(MountSyncError::Io(err));
         }
 
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
+        if durability == OutputDurability::Full {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
         }
 
         Ok(())
@@ -10768,13 +11360,21 @@ pub fn decrypted_target_path(
     mount_root: &Path,
     parsed: &ParsedEncryptedFile,
 ) -> Result<PathBuf, MountSyncError> {
+    let name = decrypted_file_name(encrypted_path, parsed);
+    decrypted_target_path_with_name(encrypted_root, encrypted_path, mount_root, &name)
+}
+
+fn decrypted_target_path_with_name(
+    encrypted_root: &Path,
+    encrypted_path: &Path,
+    mount_root: &Path,
+    name: &str,
+) -> Result<PathBuf, MountSyncError> {
     let relative = encrypted_path.strip_prefix(encrypted_root).map_err(|_| {
         MountSyncError::Format("Encrypted file is outside the selected root".into())
     })?;
     let mut target = mount_root.join(relative);
-    let name = decrypted_file_name(encrypted_path, parsed);
-    hybridcipher_client::file::safe_restore::validate_name(&name)
-        .map_err(|e| MountSyncError::Format(e.to_string()))?;
+    validate_mount_name(name)?;
     target.set_file_name(name);
     Ok(target)
 }
@@ -10791,7 +11391,9 @@ fn decrypted_file_name(encrypted_path: &Path, parsed: &ParsedEncryptedFile) -> S
 }
 
 fn strip_encrypted_suffix(name: &str) -> String {
-    name.trim_end_matches(".encrypted").to_string()
+    ciphertext::strip_encrypted_suffix(name)
+        .unwrap_or(name)
+        .to_string()
 }
 
 #[derive(Debug)]
@@ -11109,6 +11711,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     include!("../tests/licensing/test_mount_expiry.rs");
+    include!("../tests/sync/test_sync_progress.rs");
+    include!("../tests/sync/test_space_probe.rs");
+    include!("../tests/sync/test_empty_mount_health.rs");
+    include!("../tests/sync/test_baseline_checkpoint.rs");
 
     #[test]
     fn encrypted_parsers_reject_forged_versions_sizes_chunks_and_sparse_layouts() {
@@ -11169,6 +11775,9 @@ mod tests {
     struct MockCrypto;
     struct LowSpaceEncryptCrypto;
     struct MixedDecryptCrypto;
+    struct LegacyDeferralCrypto {
+        allow_legacy: std::sync::atomic::AtomicBool,
+    }
     struct RoundTripMetadataCrypto {
         plaintext: Vec<u8>,
     }
@@ -11292,9 +11901,7 @@ mod tests {
             "**/.obsidian/**".to_string(),
         ]);
 
-        let absolute_dir = PathBuf::from(
-            "/Users/test/Library/CloudStorage/Dropbox/Hybridcipher_development/.obsidian",
-        );
+        let absolute_dir = PathBuf::from("/Users/test/Documents/notes/vault/.obsidian");
         let absolute_file = absolute_dir.join("workspace.json");
 
         assert!(tracker.is_path_excluded(&absolute_dir));
@@ -11418,9 +12025,8 @@ mod tests {
             output_path: &Path,
             _metadata: &EncryptedFileMetadata,
         ) -> Result<(), MountSyncError> {
-            Err(MountSyncError::Crypto(
-                "streaming decrypt not used in test".to_string(),
-            ))
+            fs::write(output_path, &self.plaintext)?;
+            Ok(())
         }
 
         async fn encrypt_file(
@@ -11536,6 +12142,71 @@ mod tests {
             sparse_metadata: None,
         };
         write_encrypted_file(path, &header, &[0xAB; 32])
+            .map_err(|err| MountSyncError::Format(err.to_string()))
+    }
+
+    fn write_test_current_encrypted_file(
+        path: &Path,
+        file_id: &str,
+        relative_path: &str,
+        original_name: Option<&str>,
+    ) -> Result<(), MountSyncError> {
+        let wrapped_file_key = vec![5; 32];
+        let key_wrap_nonce = vec![6; 24];
+        let key_wrap_aad_hash = vec![7; 32];
+        let content_nonce = vec![8; 24];
+        let encrypted_size =
+            chunked_encrypted_size(4, 4).map_err(|err| MountSyncError::Format(err.to_string()))?;
+        let header = SerializedEncryptedHeader {
+            file_id,
+            file_path: relative_path,
+            group_id: None,
+            epoch_id: 1,
+            header_version: 3,
+            wrapped_file_key: &wrapped_file_key,
+            key_wrap_nonce: &key_wrap_nonce,
+            key_wrap_aad_hash: &key_wrap_aad_hash,
+            content_nonce: &content_nonce,
+            content_chunk_size: Some(4),
+            original_size: 4,
+            encrypted_size,
+            encrypted_at: Utc::now(),
+            original_name,
+            platform_metadata: None,
+            sparse_metadata: None,
+        };
+        write_encrypted_file(path, &header, &[0xCD; 20])
+            .map_err(|err| MountSyncError::Format(err.to_string()))
+    }
+
+    fn write_test_legacy_chunked_encrypted_file(
+        path: &Path,
+        file_id: &str,
+        relative_path: &str,
+    ) -> Result<(), MountSyncError> {
+        let wrapped_file_key = vec![1; 32];
+        let key_wrap_nonce = vec![2; 24];
+        let key_wrap_aad_hash = vec![3; 32];
+        let content_nonce = vec![4; 24];
+        let header = SerializedEncryptedHeader {
+            file_id,
+            file_path: relative_path,
+            group_id: None,
+            epoch_id: 1,
+            header_version: 1,
+            wrapped_file_key: &wrapped_file_key,
+            key_wrap_nonce: &key_wrap_nonce,
+            key_wrap_aad_hash: &key_wrap_aad_hash,
+            content_nonce: &content_nonce,
+            content_chunk_size: Some(4),
+            original_size: 4,
+            encrypted_size: 20,
+            encrypted_at: Utc::now(),
+            original_name: None,
+            platform_metadata: None,
+            sparse_metadata: None,
+        };
+        write_encrypted_file(path, &header, &[0xAB; 20])
             .map_err(|err| MountSyncError::Format(err.to_string()))
     }
 
@@ -13519,6 +14190,84 @@ mod tests {
         assert!(!tracker.can_cleanup_mountpoint());
     }
 
+    #[tokio::test]
+    async fn unchanged_transactional_file_does_not_block_cleanup_until_edited() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+
+        let mount_path = mount_root.join("app.db");
+        fs::write(&mount_path, b"sqlite payload").unwrap();
+        let encrypted_path = encrypted_path_for(&encrypted_root, &mount_root, &mount_path).unwrap();
+        fs::write(&encrypted_path, b"encrypted payload").unwrap();
+
+        let mut tracker = mock_tracker();
+        let encrypted_signature = FileSignature::from_metadata(&fs::metadata(&encrypted_path).unwrap());
+        let decrypted_signature = FileSignature::from_metadata(&fs::metadata(&mount_path).unwrap());
+        tracker.seed_file(
+            encrypted_path.clone(),
+            mount_path.clone(),
+            encrypted_signature,
+            decrypted_signature,
+        );
+
+        let mut expected = HashSet::new();
+        tracker
+            .sync_decrypted_changes(
+                &MockCrypto,
+                &encrypted_root,
+                &mount_root,
+                &mut expected,
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+
+        let entry = tracker
+            .unsupported_transactional_paths
+            .get(&mount_path)
+            .expect("unchanged database is still tracked as excluded from sync");
+        assert!(!entry.locally_modified);
+        assert_eq!(entry.display_path, "app.db");
+        assert!(tracker.can_cleanup_mountpoint());
+        let status = tracker.runtime_status();
+        assert!(!status
+            .unsafe_reasons
+            .iter()
+            .any(|reason| matches!(reason, MountSafetyReason::TransactionalBlocked { .. })));
+        assert!(status
+            .preflight_warnings
+            .iter()
+            .any(|warning| warning.contains("Transactional path excluded from sync: app.db")));
+
+        fs::write(&mount_path, b"sqlite payload with local edits").unwrap();
+        for _ in 0..2 {
+            let mut expected = HashSet::new();
+            tracker
+                .sync_decrypted_changes(
+                    &MockCrypto,
+                    &encrypted_root,
+                    &mount_root,
+                    &mut expected,
+                    &HashSet::new(),
+                )
+                .await
+                .unwrap();
+
+            assert!(tracker.unsupported_transactional_paths[&mount_path].locally_modified);
+            assert!(!tracker.can_cleanup_mountpoint());
+            let status = tracker.runtime_status();
+            assert!(status.unsafe_reasons.iter().any(|reason| matches!(
+                reason,
+                MountSafetyReason::TransactionalBlocked { count: 1, sample_paths }
+                    if sample_paths == &vec!["app.db".to_string()]
+            )));
+        }
+        assert_eq!(fs::read(&encrypted_path).unwrap(), b"encrypted payload");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn hard_linked_file_is_blocked_from_sync_and_cleanup() {
@@ -13545,9 +14294,10 @@ mod tests {
         let encrypted_path = encrypted_root.join("document.txt.encrypted");
         let parsed_before = parse_encrypted_file(&encrypted_path).unwrap();
         assert_eq!(
-            parsed_before.metadata.encrypted_content,
-            Sha256::digest(b"original").to_vec()
+            parsed_before.metadata.content_size,
+            b"original".len() as u64
         );
+        let encrypted_before = fs::read(&encrypted_path).unwrap();
 
         fs::hard_link(&mount_path, &alias_path).unwrap();
         fs::write(&alias_path, b"changed via hard link").unwrap();
@@ -13572,13 +14322,8 @@ mod tests {
             0
         );
         assert!(!encrypted_root.join("document-copy.txt.encrypted").exists());
-        assert_eq!(
-            parse_encrypted_file(&encrypted_path)
-                .unwrap()
-                .metadata
-                .encrypted_content,
-            Sha256::digest(b"original").to_vec()
-        );
+        // The write through the hard link must not have been encrypted.
+        assert_eq!(fs::read(&encrypted_path).unwrap(), encrypted_before);
         assert!(!tracker.can_cleanup_mountpoint());
 
         let status = tracker.runtime_status();
@@ -13758,6 +14503,7 @@ mod tests {
                 first_missing_time: Instant::now(),
                 consecutive_missing_scans: 1,
                 had_healthy_scan: true,
+                requested: false,
             },
         );
         tracker.pending_deletion_path = Some(journal_path.clone());
@@ -13811,6 +14557,7 @@ mod tests {
                 first_missing_time: Instant::now(),
                 consecutive_missing_scans: 1,
                 had_healthy_scan: true,
+                requested: false,
             },
         );
 
@@ -13905,6 +14652,7 @@ mod tests {
                 first_missing_time: Instant::now(),
                 consecutive_missing_scans: 1,
                 had_healthy_scan: true,
+                requested: false,
             },
         );
 
@@ -14112,6 +14860,7 @@ mod tests {
             &metadata_path,
             serde_json::to_vec_pretty(&RetentionMetadata {
                 deleted_at: Utc::now() + chrono::Duration::days(1),
+                original_path: None,
             })
             .unwrap(),
         )
@@ -14316,5 +15065,215 @@ mod tests {
         ) -> Result<(), MountSyncError> {
             Ok(())
         }
+    }
+
+    #[async_trait]
+    impl MountCrypto for LegacyDeferralCrypto {
+        async fn decrypt_file(
+            &self,
+            _encrypted_path: &Path,
+            metadata: &EncryptedFileMetadata,
+        ) -> Result<Vec<u8>, MountSyncError> {
+            if metadata.header_version.unwrap_or_default() < 3
+                && !self.allow_legacy.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(MountSyncError::LegacyCompatibilityRequired);
+            }
+            Ok(b"legacy plaintext".to_vec())
+        }
+
+        async fn decrypt_file_streaming(
+            &self,
+            _encrypted_path: &Path,
+            output_path: &Path,
+            metadata: &EncryptedFileMetadata,
+        ) -> Result<(), MountSyncError> {
+            let plaintext = if metadata.header_version.unwrap_or_default() < 3 {
+                if !self.allow_legacy.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(MountSyncError::LegacyCompatibilityRequired);
+                }
+                b"legacy plaintext".as_slice()
+            } else {
+                b"current plaintext".as_slice()
+            };
+            fs::write(output_path, plaintext)?;
+            Ok(())
+        }
+
+        async fn encrypt_file(
+            &self,
+            relative_path: &str,
+            plaintext: &[u8],
+        ) -> Result<EncryptedFileMetadata, MountSyncError> {
+            Ok(mock_metadata(relative_path, plaintext))
+        }
+
+        async fn encrypt_file_with_id(
+            &self,
+            relative_path: &str,
+            plaintext: &[u8],
+            file_id: &str,
+        ) -> Result<EncryptedFileMetadata, MountSyncError> {
+            let mut metadata = mock_metadata(relative_path, plaintext);
+            metadata.file_id = file_id.to_string();
+            Ok(metadata)
+        }
+
+        async fn encrypt_file_streaming(
+            &self,
+            relative_path: &str,
+            plaintext_path: &Path,
+            output_path: &Path,
+            original_name: Option<&str>,
+            platform_metadata: Option<&PlatformFileMetadata>,
+            chunk_size: usize,
+        ) -> Result<StreamingEncryptedFile, MountSyncError> {
+            mock_streaming_encryption(
+                relative_path,
+                plaintext_path,
+                output_path,
+                original_name,
+                platform_metadata,
+                None,
+                chunk_size,
+            )
+        }
+
+        async fn encrypt_file_streaming_with_id(
+            &self,
+            relative_path: &str,
+            plaintext_path: &Path,
+            output_path: &Path,
+            original_name: Option<&str>,
+            platform_metadata: Option<&PlatformFileMetadata>,
+            file_id: &str,
+            chunk_size: usize,
+        ) -> Result<StreamingEncryptedFile, MountSyncError> {
+            mock_streaming_encryption(
+                relative_path,
+                plaintext_path,
+                output_path,
+                original_name,
+                platform_metadata,
+                Some(file_id),
+                chunk_size,
+            )
+        }
+
+        async fn coverage_store_metadata(
+            &self,
+            _metadata: FileMetadataData,
+        ) -> Result<(), MountSyncError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_consent_defers_only_legacy_files_and_retries_after_enablement() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+        write_test_legacy_chunked_encrypted_file(
+            &encrypted_root.join("legacy.txt.encrypted"),
+            "legacy-file-id",
+            "legacy.txt",
+        )
+        .unwrap();
+        write_test_current_encrypted_file(
+            &encrypted_root.join("current.txt.encrypted"),
+            "current-file-id",
+            "current.txt",
+            None,
+        )
+        .unwrap();
+
+        let crypto = LegacyDeferralCrypto {
+            allow_legacy: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut tracker = mock_tracker();
+        tracker
+            .sync(&crypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+
+        assert!(!mount_root.join("legacy.txt").exists());
+        assert_eq!(
+            fs::read(mount_root.join("current.txt")).unwrap(),
+            b"current plaintext"
+        );
+        assert!(matches!(tracker.scan_health, ScanHealth::Healthy));
+        assert_eq!(tracker.runtime_status().last_error, None);
+
+        crypto
+            .allow_legacy
+            .store(true, std::sync::atomic::Ordering::Release);
+        tracker
+            .sync(&crypto, &encrypted_root, &mount_root)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(mount_root.join("legacy.txt")).unwrap(),
+            b"legacy plaintext"
+        );
+        assert_eq!(
+            fs::read(mount_root.join("current.txt")).unwrap(),
+            b"current plaintext"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn mount_keeps_original_name_only_when_it_matches_encrypted_file() {
+        let temp = TempDir::new().unwrap();
+        let encrypted_root = temp.path().join("encrypted");
+        let mount_root = temp.path().join("mount");
+        fs::create_dir_all(&encrypted_root).unwrap();
+        fs::create_dir_all(&mount_root).unwrap();
+        write_test_current_encrypted_file(
+            &encrypted_root.join("why?.md.encrypted"),
+            "native-file-id",
+            "why?.md",
+            Some("why?.md"),
+        )
+        .unwrap();
+        // Stored under a Windows-sanitized name; the mount must follow the
+        // encrypted filename or writes would land in a second encrypted file.
+        write_test_current_encrypted_file(
+            &encrypted_root.join("read only_.md.encrypted"),
+            "sanitized-file-id",
+            "read only_.md",
+            Some("read only?.md"),
+        )
+        .unwrap();
+
+        let crypto = LegacyDeferralCrypto {
+            allow_legacy: std::sync::atomic::AtomicBool::new(true),
+        };
+        let mut tracker = mock_tracker();
+        for _ in 0..2 {
+            tracker
+                .sync(&crypto, &encrypted_root, &mount_root)
+                .await
+                .unwrap();
+        }
+
+        let mut mount_names: Vec<String> = fs::read_dir(&mount_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        mount_names.sort();
+        assert_eq!(mount_names, ["read only_.md", "why?.md"]);
+        let mut encrypted_names: Vec<String> = fs::read_dir(&encrypted_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".encrypted"))
+            .collect();
+        encrypted_names.sort();
+        assert_eq!(
+            encrypted_names,
+            ["read only_.md.encrypted", "why?.md.encrypted"]
+        );
     }
 }

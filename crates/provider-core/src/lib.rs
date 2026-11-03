@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hybridcipher_client::{
+    file::ciphertext::{
+        self, CiphertextKind, FOLDER_RECORD_FILE_NAME as DIRECTORY_METADATA_FILE_NAME,
+    },
     network::MockNetwork,
     storage::LocalFsStorage,
     storage::{AccessControlData, FileMetadataData},
@@ -27,9 +30,15 @@ mod compatibility;
 pub mod compatibility_fixtures;
 #[cfg(test)]
 mod compatibility_tests;
+mod legacy_upgrade;
 pub use compatibility::{VaultCompatibility, VaultCompatibilityStatus};
 pub use hybridcipher_client::file::content_manifest::LegacyReadPolicy;
+use hybridcipher_client::file::durability::OutputDurability;
 pub use hybridcipher_mount_sync::readonly::ReadOnlyMount;
+pub use legacy_upgrade::{
+    legacy_file_summaries, upgrade_legacy_entries, upgrade_legacy_file, LegacyFileSummary,
+    LegacyUpgradeContext, LegacyUpgradeFailure, LegacyUpgradeReport,
+};
 
 pub use hybridcipher_mount_sync::{
     LowSpaceMode, MountConflictRecord, MountRecoveryCopyRecord, MountSafetyReason,
@@ -37,7 +46,6 @@ pub use hybridcipher_mount_sync::{
 };
 
 const IDENTITY_VERSION: u16 = 1;
-const DIRECTORY_METADATA_FILE_NAME: &str = ".hybridcipher_dir.encrypted";
 const PROVIDER_STREAM_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
 const ENCRYPTED_TMP_DIR_NAME: &str = ".hybridcipher-tmp";
 
@@ -85,6 +93,16 @@ impl ProviderCoreError {
     }
     pub fn is_integrity_failure(&self) -> bool {
         matches!(self, Self::Crypto(MountSyncError::FileIntegrity(_)))
+    }
+    pub fn is_key_unavailable(&self) -> bool {
+        self.unavailable_key_version().is_some()
+    }
+    /// Key version a file needs that this device was never given.
+    pub fn unavailable_key_version(&self) -> Option<u64> {
+        match self {
+            Self::Crypto(MountSyncError::KeyUnavailable { epoch_id }) => Some(*epoch_id),
+            _ => None,
+        }
     }
     pub fn is_path_excluded(&self) -> bool {
         matches!(self, Self::Crypto(MountSyncError::PathExcluded(_)))
@@ -335,6 +353,12 @@ pub struct ProviderEntry {
 }
 
 impl ProviderEntry {
+    pub fn requires_legacy_compatibility(&self) -> bool {
+        self.metadata
+            .as_ref()
+            .is_some_and(hybridcipher_client::file::content_manifest::requires_legacy_compatibility)
+    }
+
     pub fn content_version(&self) -> Option<ProviderContentVersion> {
         self.metadata
             .as_ref()
@@ -588,11 +612,8 @@ impl EncryptedInventory {
                 continue;
             }
 
-            if !file_type.is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("encrypted")
-                || path.file_name().and_then(|value| value.to_str())
-                    == Some(DIRECTORY_METADATA_FILE_NAME)
-            {
+            // Folder records are read with their directory, not listed as files.
+            if !file_type.is_file() || ciphertext::classify(&path) != CiphertextKind::File {
                 continue;
             }
 
@@ -633,6 +654,26 @@ pub trait ProviderBridge: Send + Sync {
     }
     fn is_path_excluded(&self, _encrypted_root: &Path, _relative_path: &Path) -> bool {
         false
+    }
+
+    /// Rewrites older-format files in the current format after the folder's legacy
+    /// access was enabled. `relative_paths` limits the run; `None` upgrades all.
+    async fn upgrade_legacy_files(
+        &self,
+        root_id: Uuid,
+        encrypted_root: &Path,
+        relative_paths: Option<&[String]>,
+        plaintext_staging_dir: &Path,
+    ) -> Result<LegacyUpgradeReport> {
+        let _ = (
+            root_id,
+            encrypted_root,
+            relative_paths,
+            plaintext_staging_dir,
+        );
+        Err(ProviderCoreError::MutationUnsupported(
+            "older file upgrade".into(),
+        ))
     }
 
     async fn inventory(&self, root_id: Uuid, encrypted_root: &Path) -> Result<Vec<ProviderEntry>>;
@@ -955,6 +996,16 @@ impl ClientMountCrypto {
             group_id: Some(group_id),
         })
     }
+
+    pub async fn for_root_with_compatibility(
+        client: Arc<LocalProviderClient>,
+        root_id: Uuid,
+        compatibility: Arc<VaultCompatibility>,
+    ) -> std::result::Result<Self, MountSyncError> {
+        let mut crypto = Self::for_root(client, root_id).await?;
+        crypto.compatibility = Some(compatibility);
+        Ok(crypto)
+    }
 }
 
 #[async_trait]
@@ -975,21 +1026,25 @@ impl MountCrypto for ClientMountCrypto {
         _encrypted_path: &Path,
         metadata: &EncryptedFileMetadata,
     ) -> std::result::Result<Vec<u8>, MountSyncError> {
-        if self
+        let result = if self
             .compatibility
             .as_ref()
             .is_some_and(|p| p.policy() == LegacyReadPolicy::AllowLegacyUnverified)
         {
-            return self
-                .client
+            self.client
                 .recover_legacy_file_unverified(metadata)
                 .await
-                .map_err(MountSyncError::from);
+                .map_err(MountSyncError::from)
+        } else {
+            self.client
+                .decrypt_file(metadata)
+                .await
+                .map_err(MountSyncError::from)
+        };
+        if let Some(policy) = &self.compatibility {
+            policy.record_read_result(&result);
         }
-        self.client
-            .decrypt_file(metadata)
-            .await
-            .map_err(MountSyncError::from)
+        result
     }
 
     async fn decrypt_file_streaming(
@@ -998,7 +1053,8 @@ impl MountCrypto for ClientMountCrypto {
         output_path: &Path,
         metadata: &EncryptedFileMetadata,
     ) -> std::result::Result<(), MountSyncError> {
-        self.client
+        let result = self
+            .client
             .decrypt_file_streaming_to_path_with_policy(
                 encrypted_path,
                 metadata,
@@ -1008,7 +1064,36 @@ impl MountCrypto for ClientMountCrypto {
                     .map_or(LegacyReadPolicy::Strict, |policy| policy.policy()),
             )
             .await
-            .map_err(MountSyncError::from)
+            .map_err(MountSyncError::from);
+        if let Some(policy) = &self.compatibility {
+            policy.record_read_result(&result);
+        }
+        result
+    }
+
+    async fn decrypt_file_streaming_deferred(
+        &self,
+        encrypted_path: &Path,
+        output_path: &Path,
+        metadata: &EncryptedFileMetadata,
+    ) -> std::result::Result<(), MountSyncError> {
+        let result = self
+            .client
+            .decrypt_file_streaming_to_path_with_options(
+                encrypted_path,
+                metadata,
+                output_path,
+                self.compatibility
+                    .as_ref()
+                    .map_or(LegacyReadPolicy::Strict, |policy| policy.policy()),
+                OutputDurability::Deferred,
+            )
+            .await
+            .map_err(MountSyncError::from);
+        if let Some(policy) = &self.compatibility {
+            policy.record_read_result(&result);
+        }
+        result
     }
 
     async fn decrypt_file_range(
@@ -1184,6 +1269,37 @@ impl ProviderBridge for LocalProviderBridge {
     }
     fn is_path_excluded(&self, encrypted_root: &Path, relative_path: &Path) -> bool {
         self.path_or_ancestor_is_excluded(encrypted_root, relative_path)
+    }
+
+    async fn upgrade_legacy_files(
+        &self,
+        root_id: Uuid,
+        encrypted_root: &Path,
+        relative_paths: Option<&[String]>,
+        plaintext_staging_dir: &Path,
+    ) -> Result<LegacyUpgradeReport> {
+        let compatibility = self
+            .compatibility
+            .as_deref()
+            .ok_or_else(|| ProviderCoreError::MutationUnsupported("vault compatibility".into()))?;
+        let entries = self.inventory(root_id, encrypted_root).await?;
+        let context = LegacyUpgradeContext {
+            crypto: self.crypto.as_ref(),
+            compatibility,
+            root_id,
+            encrypted_root,
+            plaintext_staging_dir,
+        };
+        let report = upgrade_legacy_entries(
+            &context,
+            &entries,
+            relative_paths,
+            &std::collections::HashSet::new(),
+        )
+        .await?;
+        // Re-scan so the folder's older-file count reflects the upgrade.
+        self.inventory(root_id, encrypted_root).await?;
+        Ok(report)
     }
 
     async fn inventory(&self, root_id: Uuid, encrypted_root: &Path) -> Result<Vec<ProviderEntry>> {
@@ -1650,7 +1766,9 @@ fn encrypted_relative_path(root: &Path, path: &Path) -> Result<String> {
 }
 
 fn encrypted_path_for_identity(root: &Path, identity: &FileIdentityV1) -> Result<PathBuf> {
-    let relative_path = PathBuf::from(identity.relative_path.replace('/', "\\"));
+    // Rust's Windows path parser also accepts `/`, while `\` is an ordinary
+    // filename character on Unix. Keep provider-relative paths portable.
+    let relative_path = PathBuf::from(&identity.relative_path);
     Ok(match identity.kind {
         ProviderEntryKind::Directory => root.join(relative_path),
         ProviderEntryKind::File => {
@@ -1833,7 +1951,7 @@ async fn writeback_plaintext_file_checked(
     let encrypted_path = encrypted_path_for(
         encrypted_root,
         Path::new(""),
-        &PathBuf::from(normalized_relative_path.replace('/', "\\")),
+        &PathBuf::from(&normalized_relative_path),
     )?;
     let before = content_version_at_path(encrypted_root, &encrypted_path)?;
     validate_expected_content_version(
@@ -2039,11 +2157,12 @@ fn decrypted_relative_path(
             })?;
     let mut relative = relative.to_path_buf();
     let decrypted_name = parsed.original_name.clone().unwrap_or_else(|| {
-        encrypted_path
+        let name = encrypted_path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("file")
-            .trim_end_matches(".encrypted")
+            .unwrap_or("file");
+        ciphertext::strip_encrypted_suffix(name)
+            .unwrap_or(name)
             .to_string()
     });
     relative.set_file_name(decrypted_name);

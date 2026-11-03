@@ -84,6 +84,9 @@ pub enum DeviceSubcommand {
     /// List all registered devices for this account
     #[command(name = "list")]
     List,
+    /// Explicitly reconfirm an eligible existing device with password and MFA or email OTP
+    #[command(name = "confirm-trust")]
+    ConfirmTrust,
     /// Remove a specific device by identifier
     #[command(name = "remove")]
     Remove {
@@ -299,6 +302,10 @@ pub enum Commands {
         /// Require second-party verification before issuing Welcome messages
         #[arg(long)]
         verified: bool,
+        /// Store the Welcome messages with this pending Team invitation instead of adding the
+        /// person now; they join the group when they accept it
+        #[arg(long, value_name = "INVITATION_ID")]
+        for_invitation: Option<uuid::Uuid>,
     },
 
     /// Remove a member from the group
@@ -409,6 +416,16 @@ pub enum Commands {
         #[cfg_attr(feature = "individual-edition", arg(hide = true))]
         #[arg(value_name = "GROUP_ID")]
         group_id: Option<String>,
+    },
+
+    /// Send keys to your own devices that need them and that this account verified itself
+    RepairOwnDevices {
+        /// Only this device of yours
+        #[arg(long = "device")]
+        device_id: Option<String>,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
     },
 
     /// List devices pending approval for the active group
@@ -643,24 +660,32 @@ pub enum MfaCommand {
     Disable,
 }
 
-/// Rekey management subcommands for two-phase migration
+/// Rekey management subcommands: a rotation finishes as it starts and cannot be cancelled
 #[derive(Subcommand)]
 pub enum RekeyCommands {
     /// Start a new rekey operation for the active group
     #[cfg_attr(feature = "individual-edition", command(hide = true))]
     Start {
-        /// Override the activation delay (e.g. 'immediate', '5m', '120s')
-        #[arg(long, value_name = "DURATION")]
-        activation_delay: Option<String>,
         /// Force start by skipping devices without valid join cards (they will not receive the new epoch key)
         #[arg(long)]
         force: bool,
         /// Path to a JSON file containing encrypted Welcome payloads for the new epoch
         #[arg(long, value_name = "FILE")]
         welcome_file: Option<std::path::PathBuf>,
-        /// Local coverage migration behavior after rekey start: prompt, now, or defer
+        /// Move this device's files to the new key after the rotation: prompt, now, or defer
         #[arg(long, value_name = "MODE", default_value = "prompt")]
         local_migration: String,
+        /// Skip the confirmation after the impact summary (the caller already confirmed)
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// List the devices a rotation started now would stop on or skip, without starting one
+    #[cfg_attr(feature = "individual-edition", command(hide = true))]
+    Preflight {
+        /// Print the result as JSON (used by the desktop app)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show current rekey status (optionally streaming updates)
@@ -669,28 +694,6 @@ pub enum RekeyCommands {
         /// Continuously stream the live migration dashboard
         #[arg(short, long)]
         watch: bool,
-    },
-
-    /// Force cutover to the new epoch
-    #[cfg_attr(feature = "individual-edition", command(hide = true))]
-    Cutover {
-        /// Require an administrator signature to bypass safety checks
-        #[arg(long)]
-        force: bool,
-        /// Immediately purge legacy epoch data after cutover
-        #[arg(long)]
-        immediate_cleanup: bool,
-    },
-
-    /// Cancel the active rekey operation and revert to the previous epoch
-    #[cfg_attr(feature = "individual-edition", command(hide = true))]
-    Fallback {
-        /// Optional reason recorded alongside the cancellation
-        #[arg(long, value_name = "TEXT")]
-        reason: Option<String>,
-        /// Skip the interactive confirmation prompt
-        #[arg(long)]
-        yes: bool,
     },
 }
 
@@ -864,6 +867,13 @@ pub enum CoverageCommands {
         skip_transparency: bool,
     },
 
+    /// Show which key this device's protected files are on and which key versions it holds (names no files)
+    KeyState {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show files pending migration
     #[cfg_attr(feature = "individual-edition", command(hide = true))]
     Pending {
@@ -925,8 +935,6 @@ fn individual_edition_restricted_command(command: &Commands) -> Option<&'static 
         Commands::Rekey(rekey_cmd) => match rekey_cmd {
             RekeyCommands::Start { .. } => Some("rekey start"),
             RekeyCommands::Status { .. } => Some("rekey status"),
-            RekeyCommands::Cutover { .. } => Some("rekey cutover"),
-            RekeyCommands::Fallback { .. } => Some("rekey fallback"),
         },
         _ => None,
     }
@@ -958,11 +966,7 @@ fn team_write_command_name(command: &Commands) -> Option<&'static str> {
         Commands::AddMember { .. } => Some("add-member"),
         Commands::RemoveMember { .. } => Some("remove-member"),
         Commands::GenerateWelcome { .. } => Some("generate-welcome"),
-        Commands::Rekey(
-            RekeyCommands::Start { .. }
-            | RekeyCommands::Cutover { .. }
-            | RekeyCommands::Fallback { .. },
-        ) => Some("rekey"),
+        Commands::Rekey(RekeyCommands::Start { .. }) => Some("rekey"),
         Commands::Team {
             command:
                 team::TeamCommand::Invite { .. }
@@ -1122,9 +1126,11 @@ pub async fn handle_command(
         }
 
         // Member management commands
-        Commands::AddMember { user_id, verified } => {
-            members::handle_add_member(user_id, verified, session_manager).await
-        }
+        Commands::AddMember {
+            user_id,
+            verified,
+            for_invitation,
+        } => members::handle_add_member(user_id, verified, for_invitation, session_manager).await,
         Commands::RemoveMember {
             user_id,
             force,
@@ -1164,6 +1170,9 @@ pub async fn handle_command(
             device_id,
             group_id,
         } => welcome::handle_issue_welcome(device_id, group_id, session_manager).await,
+        Commands::RepairOwnDevices { device_id, json } => {
+            welcome::handle_repair_own_devices(device_id, json, session_manager).await
+        }
         Commands::PendingDevices => welcome::handle_pending_devices(session_manager).await,
         Commands::UnverifiedDevices {
             group_id,
@@ -1230,7 +1239,7 @@ async fn handle_health_check(session_manager: &SessionManager) -> Result<(), Cli
     println!("HTTP Status: {}", status);
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("health_check")?;
+        session_manager.invalidate_session("health_check").await?;
         return Err(CliError::authentication(
             "Authentication token rejected. Please login again.".to_string(),
         ));
@@ -1353,15 +1362,16 @@ mod tests {
             individual_edition_restricted_command(&Commands::AddMember {
                 user_id: "user@example.com".to_string(),
                 verified: false,
+                for_invitation: None,
             }),
             Some("add-member")
         );
         assert_eq!(
             individual_edition_restricted_command(&Commands::Rekey(RekeyCommands::Start {
-                activation_delay: None,
                 force: false,
                 welcome_file: None,
                 local_migration: "prompt".to_string(),
+                yes: false,
             })),
             Some("rekey start")
         );

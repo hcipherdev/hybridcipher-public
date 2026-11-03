@@ -1,11 +1,180 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
+
+/// A connected request stream on either side: a Unix socket, or a Windows named pipe.
+trait IpcStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> IpcStream for T {}
+
+/// Connect to the desktop's coverage service at `socket_path`: the socket itself on Unix; on
+/// Windows that path is a marker file and the service listens on a named pipe derived from it.
+async fn connect_endpoint(socket_path: &Path) -> Result<impl IpcStream, CoverageIpcError> {
+    #[cfg(unix)]
+    {
+        Ok(UnixStream::connect(socket_path).await?)
+    }
+    #[cfg(windows)]
+    {
+        windows_pipe::connect(socket_path).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = socket_path;
+        Err::<tokio::io::DuplexStream, _>(CoverageIpcError::Unsupported)
+    }
+}
+
+/// Windows has no Unix sockets here, so the service listens on a named pipe whose name is
+/// derived from the marker path (the CLI finds it the same way). Only the current user can open
+/// it, and only from this machine.
+#[cfg(windows)]
+mod windows_pipe {
+    use super::CoverageIpcError;
+    use sha2::{Digest, Sha256};
+    use std::io;
+    use std::path::Path;
+    use std::ptr::null_mut;
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+    };
+    use winapi::shared::sddl::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
+    use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
+    use winapi::um::securitybaseapi::GetTokenInformation;
+    use winapi::um::winbase::LocalFree;
+    use winapi::um::winnt::{TokenUser, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER};
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const BUSY_RETRIES: u32 = 40;
+
+    pub(super) fn pipe_name(socket_path: &Path) -> String {
+        let digest = Sha256::digest(socket_path.to_string_lossy().as_bytes());
+        format!(
+            r"\\.\pipe\hybridcipher-coverage-{}",
+            &hex::encode(digest)[..16]
+        )
+    }
+
+    pub(super) async fn connect(socket_path: &Path) -> Result<NamedPipeClient, CoverageIpcError> {
+        let name = pipe_name(socket_path);
+        let mut retries = 0;
+        loop {
+            match ClientOptions::new().open(&name) {
+                Ok(client) => return Ok(client),
+                // Every instance is serving someone; the server opens the next one shortly.
+                Err(err)
+                    if err.raw_os_error() == Some(ERROR_PIPE_BUSY) && retries < BUSY_RETRIES =>
+                {
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    /// A listening instance of `name`. The first one fails if any process already owns the name,
+    /// so another program cannot sit on the pipe ahead of the app.
+    pub(super) fn listen(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+        let security = UserOnlySecurity::new()?;
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(first)
+            .reject_remote_clients(true);
+        // SAFETY: the attributes and the descriptor they point to live until this call returns.
+        unsafe { options.create_with_security_attributes_raw(name, security.as_ptr()) }
+    }
+
+    /// Security attributes whose DACL grants access to the current user only.
+    struct UserOnlySecurity {
+        attributes: SECURITY_ATTRIBUTES,
+        descriptor: PSECURITY_DESCRIPTOR,
+    }
+
+    impl UserOnlySecurity {
+        fn new() -> io::Result<Self> {
+            let sddl: Vec<u16> = format!("D:P(A;;GA;;;{})", current_user_sid()?)
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+            // SAFETY: `sddl` is NUL-terminated and `descriptor` receives a LocalAlloc'd pointer.
+            let converted = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1 as u32,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            };
+            if converted == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                attributes: SECURITY_ATTRIBUTES {
+                    nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: descriptor,
+                    bInheritHandle: 0,
+                },
+                descriptor,
+            })
+        }
+
+        fn as_ptr(&self) -> *mut std::ffi::c_void {
+            &self.attributes as *const SECURITY_ATTRIBUTES as *mut std::ffi::c_void
+        }
+    }
+
+    impl Drop for UserOnlySecurity {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor came from ConvertStringSecurityDescriptorToSecurityDescriptorW.
+            unsafe { LocalFree(self.descriptor as _) };
+        }
+    }
+
+    fn current_user_sid() -> io::Result<String> {
+        // SAFETY: plain Win32 calls on this process's own token; every buffer is sized by the
+        // call that fills it and every handle or allocation is released before returning.
+        unsafe {
+            let mut token = null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut needed = 0u32;
+            GetTokenInformation(token, TokenUser, null_mut(), 0, &mut needed);
+            // u64 storage keeps TOKEN_USER's pointer field aligned.
+            let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+            let filled = GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr() as *mut _,
+                needed,
+                &mut needed,
+            );
+            CloseHandle(token);
+            if filled == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+            let mut wide = null_mut();
+            if ConvertSidToStringSidW(user.User.Sid, &mut wide) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let len = (0..).take_while(|&i| *wide.add(i) != 0).count();
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
+            LocalFree(wide as _);
+            Ok(sid)
+        }
+    }
+}
 
 use crate::coverage::CoverageRoot;
 use crate::errors::ClientError;
@@ -14,7 +183,7 @@ use crate::state::client::{
     Client, CoverageAdoptResult, CoverageFileRecord, CoverageGuardSummary,
     CoverageMarkerRecoveryResult, CoverageMigrationProgress, CoveragePendingFile,
     CoverageProofArtifact, CoverageRegistryEntry, CoverageRootStats, CoverageScanSummary,
-    CoverageSnapshotArtifact, CoverageSyncSummary, MigrationState,
+    CoverageSnapshotArtifact, CoverageSyncSummary, KeyStateReport, MigrationState,
 };
 use crate::storage::Storage;
 use hybridcipher_messages::transparency::TransparencyConfig;
@@ -30,6 +199,19 @@ pub struct CoverageHydrationSummary {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub errors: Vec<String>,
+}
+
+impl CoverageHydrationSummary {
+    /// Add the counts and messages of a part of the same run.
+    pub(crate) fn absorb(&mut self, part: Self) {
+        self.scanned_files += part.scanned_files;
+        self.already_tracked += part.already_tracked;
+        self.already_encrypted_without_metadata += part.already_encrypted_without_metadata;
+        self.newly_encrypted += part.newly_encrypted;
+        self.skipped_due_to_errors += part.skipped_due_to_errors;
+        self.warnings.extend(part.warnings);
+        self.errors.extend(part.errors);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +348,7 @@ pub enum CoverageIpcRequest {
         file_id: String,
     },
     CoverageTransparencyConfig,
+    CoverageKeyState,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -198,6 +381,7 @@ pub enum CoverageIpcResponse {
     CoverageSnapshotArtifact(CoverageSnapshotArtifact),
     CoverageFileProof(CoverageProofArtifact),
     CoverageTransparencyConfig(Option<TransparencyConfig>),
+    CoverageKeyState(KeyStateReport),
     Error(String),
 }
 
@@ -321,6 +505,12 @@ pub trait CoverageIpcHandler: Send + Sync {
         file_id: &str,
     ) -> Result<CoverageProofArtifact, ClientError>;
     async fn coverage_transparency_config(&self) -> Option<TransparencyConfig>;
+    /// Older handlers that predate the report say so instead of failing to build.
+    async fn key_state_report(&self) -> Result<KeyStateReport, ClientError> {
+        Err(ClientError::InvalidState(
+            "This HybridCipher app cannot report key state; update it".into(),
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -528,6 +718,10 @@ where
     async fn coverage_transparency_config(&self) -> Option<TransparencyConfig> {
         crate::coverage::current_transparency_config()
     }
+
+    async fn key_state_report(&self) -> Result<KeyStateReport, ClientError> {
+        Client::key_state_report(self).await
+    }
 }
 
 pub struct CoverageIpcClient {
@@ -582,7 +776,6 @@ impl CoverageIpcClient {
         }
     }
 
-    #[cfg(unix)]
     pub async fn coverage_rescan_with_progress<F>(
         &self,
         root: Option<PathBuf>,
@@ -591,7 +784,7 @@ impl CoverageIpcClient {
     where
         F: FnMut(CoverageScanProgressEvent),
     {
-        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        let mut stream = connect_endpoint(&self.socket_path).await?;
         let payload = serde_json::to_vec(&CoverageIpcRequest::CoverageRescanWithProgress { root })?;
         stream.write_all(&payload).await?;
         stream.write_all(b"\n").await?;
@@ -628,18 +821,6 @@ impl CoverageIpcClient {
         Err(CoverageIpcError::Remote(
             "empty response from coverage IPC server".to_string(),
         ))
-    }
-
-    #[cfg(not(unix))]
-    pub async fn coverage_rescan_with_progress<F>(
-        &self,
-        _root: Option<PathBuf>,
-        _on_progress: F,
-    ) -> Result<CoverageScanSummary, CoverageIpcError>
-    where
-        F: FnMut(CoverageScanProgressEvent),
-    {
-        Err(CoverageIpcError::Unsupported)
     }
 
     pub async fn coverage_file_records(
@@ -731,7 +912,6 @@ impl CoverageIpcClient {
         }
     }
 
-    #[cfg(unix)]
     pub async fn coverage_enroll_and_hydrate_with_progress<F>(
         &self,
         path: PathBuf,
@@ -740,7 +920,7 @@ impl CoverageIpcClient {
     where
         F: FnMut(CoverageEnrollProgress),
     {
-        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        let mut stream = connect_endpoint(&self.socket_path).await?;
         let payload =
             serde_json::to_vec(&CoverageIpcRequest::CoverageEnrollAndHydrateWithProgress { path })?;
         stream.write_all(&payload).await?;
@@ -780,18 +960,6 @@ impl CoverageIpcClient {
         ))
     }
 
-    #[cfg(not(unix))]
-    pub async fn coverage_enroll_and_hydrate_with_progress<F>(
-        &self,
-        _path: PathBuf,
-        _on_progress: F,
-    ) -> Result<CoverageEnrollOutcome, CoverageIpcError>
-    where
-        F: FnMut(CoverageEnrollProgress),
-    {
-        Err(CoverageIpcError::Unsupported)
-    }
-
     pub async fn coverage_unenroll_and_decrypt(
         &self,
         path: PathBuf,
@@ -808,7 +976,6 @@ impl CoverageIpcClient {
         }
     }
 
-    #[cfg(unix)]
     pub async fn coverage_unenroll_and_decrypt_with_progress<F>(
         &self,
         path: PathBuf,
@@ -817,7 +984,7 @@ impl CoverageIpcClient {
     where
         F: FnMut(CoverageDecryptProgress),
     {
-        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        let mut stream = connect_endpoint(&self.socket_path).await?;
         let payload = serde_json::to_vec(
             &CoverageIpcRequest::CoverageUnenrollAndDecryptWithProgress { path },
         )?;
@@ -856,18 +1023,6 @@ impl CoverageIpcClient {
         Err(CoverageIpcError::Remote(
             "empty response from coverage IPC server".to_string(),
         ))
-    }
-
-    #[cfg(not(unix))]
-    pub async fn coverage_unenroll_and_decrypt_with_progress<F>(
-        &self,
-        _path: PathBuf,
-        _on_progress: F,
-    ) -> Result<CoverageUnenrollOutcome, CoverageIpcError>
-    where
-        F: FnMut(CoverageDecryptProgress),
-    {
-        Err(CoverageIpcError::Unsupported)
     }
 
     pub async fn coverage_adopt_path(
@@ -921,7 +1076,6 @@ impl CoverageIpcClient {
         }
     }
 
-    #[cfg(unix)]
     pub async fn coverage_migrate_orphans_with_progress<F>(
         &self,
         file: Option<PathBuf>,
@@ -932,7 +1086,7 @@ impl CoverageIpcClient {
     where
         F: FnMut(CoverageMigrationProgress),
     {
-        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        let mut stream = connect_endpoint(&self.socket_path).await?;
         let payload =
             serde_json::to_vec(&CoverageIpcRequest::CoverageMigrateOrphansWithProgress {
                 file,
@@ -973,20 +1127,6 @@ impl CoverageIpcClient {
         last_progress.ok_or_else(|| {
             CoverageIpcError::Remote("empty response from coverage IPC server".to_string())
         })
-    }
-
-    #[cfg(not(unix))]
-    pub async fn coverage_migrate_orphans_with_progress<F>(
-        &self,
-        _file: Option<PathBuf>,
-        _root: Option<PathBuf>,
-        _all: bool,
-        _on_progress: F,
-    ) -> Result<CoverageMigrationProgress, CoverageIpcError>
-    where
-        F: FnMut(CoverageMigrationProgress),
-    {
-        Err(CoverageIpcError::Unsupported)
     }
 
     pub async fn coverage_prune_orphan_file(
@@ -1184,12 +1324,21 @@ impl CoverageIpcClient {
         }
     }
 
-    #[cfg(unix)]
+    pub async fn key_state_report(&self) -> Result<KeyStateReport, CoverageIpcError> {
+        match self.send_request(CoverageIpcRequest::CoverageKeyState).await? {
+            CoverageIpcResponse::CoverageKeyState(report) => Ok(report),
+            CoverageIpcResponse::Error(err) => Err(CoverageIpcError::Remote(err)),
+            other => Err(CoverageIpcError::Remote(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
     async fn send_request(
         &self,
         request: CoverageIpcRequest,
     ) -> Result<CoverageIpcResponse, CoverageIpcError> {
-        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        let mut stream = connect_endpoint(&self.socket_path).await?;
         let payload = serde_json::to_vec(&request)?;
         stream.write_all(&payload).await?;
         stream.write_all(b"\n").await?;
@@ -1204,14 +1353,6 @@ impl CoverageIpcClient {
             ));
         }
         Ok(serde_json::from_str(&line)?)
-    }
-
-    #[cfg(not(unix))]
-    async fn send_request(
-        &self,
-        _request: CoverageIpcRequest,
-    ) -> Result<CoverageIpcResponse, CoverageIpcError> {
-        Err(CoverageIpcError::Unsupported)
     }
 }
 
@@ -1274,7 +1415,53 @@ impl CoverageIpcServer {
         })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub async fn start(
+        socket_path: PathBuf,
+        handler: Arc<dyn CoverageIpcHandler>,
+    ) -> Result<Self, CoverageIpcError> {
+        if let Some(parent) = socket_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let name = windows_pipe::pipe_name(&socket_path);
+        let mut listener = windows_pipe::listen(&name, true)?;
+        // The marker lets the CLI find the service with the same existence check as on Unix.
+        tokio::fs::write(&socket_path, name.as_bytes()).await?;
+
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let socket_clone = socket_path.clone();
+        let join_handle = tokio::spawn(async move {
+            loop {
+                let connected = tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    connected = listener.connect() => connected,
+                };
+                // Listen on a fresh instance before serving this one, so callers never find
+                // the pipe missing in between.
+                let next = match windows_pipe::listen(&name, false) {
+                    Ok(next) => next,
+                    Err(_) => break,
+                };
+                let stream = std::mem::replace(&mut listener, next);
+                if connected.is_err() {
+                    continue;
+                }
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, handler).await;
+                });
+            }
+            let _ = tokio::fs::remove_file(&socket_clone).await;
+        });
+
+        Ok(Self {
+            shutdown: Some(shutdown_tx),
+            join_handle,
+            socket_path,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub async fn start(
         _socket_path: PathBuf,
         _handler: Arc<dyn CoverageIpcHandler>,
@@ -1294,9 +1481,8 @@ impl CoverageIpcServer {
     }
 }
 
-#[cfg(unix)]
-async fn handle_connection(
-    stream: UnixStream,
+async fn handle_connection<S: IpcStream>(
+    stream: S,
     handler: Arc<dyn CoverageIpcHandler>,
 ) -> Result<(), CoverageIpcError> {
     let mut reader = BufReader::new(stream);
@@ -1453,13 +1639,16 @@ async fn handle_connection(
                 handler.coverage_transparency_config().await,
             )
         }
+        CoverageIpcRequest::CoverageKeyState => match handler.key_state_report().await {
+            Ok(report) => CoverageIpcResponse::CoverageKeyState(report),
+            Err(err) => CoverageIpcResponse::Error(err.to_string()),
+        },
     };
     write_response_line(&mut stream, &response).await
 }
 
-#[cfg(unix)]
-async fn stream_migrate_orphans_with_progress(
-    mut stream: UnixStream,
+async fn stream_migrate_orphans_with_progress<S: IpcStream>(
+    mut stream: S,
     handler: Arc<dyn CoverageIpcHandler>,
     file: Option<PathBuf>,
     root: Option<PathBuf>,
@@ -1511,9 +1700,8 @@ async fn stream_migrate_orphans_with_progress(
     Ok(())
 }
 
-#[cfg(unix)]
-async fn stream_unenroll_and_decrypt_with_progress(
-    mut stream: UnixStream,
+async fn stream_unenroll_and_decrypt_with_progress<S: IpcStream>(
+    mut stream: S,
     handler: Arc<dyn CoverageIpcHandler>,
     path: PathBuf,
 ) -> Result<(), CoverageIpcError> {
@@ -1562,9 +1750,8 @@ async fn stream_unenroll_and_decrypt_with_progress(
     Ok(())
 }
 
-#[cfg(unix)]
-async fn stream_enroll_and_hydrate_with_progress(
-    mut stream: UnixStream,
+async fn stream_enroll_and_hydrate_with_progress<S: IpcStream>(
+    mut stream: S,
     handler: Arc<dyn CoverageIpcHandler>,
     path: PathBuf,
 ) -> Result<(), CoverageIpcError> {
@@ -1613,9 +1800,8 @@ async fn stream_enroll_and_hydrate_with_progress(
     Ok(())
 }
 
-#[cfg(unix)]
-async fn stream_rescan_with_progress(
-    mut stream: UnixStream,
+async fn stream_rescan_with_progress<S: IpcStream>(
+    mut stream: S,
     handler: Arc<dyn CoverageIpcHandler>,
     root: Option<PathBuf>,
 ) -> Result<(), CoverageIpcError> {
@@ -1664,9 +1850,8 @@ async fn stream_rescan_with_progress(
     Ok(())
 }
 
-#[cfg(unix)]
-async fn write_response_line(
-    stream: &mut UnixStream,
+async fn write_response_line<S: IpcStream>(
+    stream: &mut S,
     response: &CoverageIpcResponse,
 ) -> Result<(), CoverageIpcError> {
     let payload = serde_json::to_vec(response)?;
@@ -1675,3 +1860,7 @@ async fn write_response_line(
     stream.flush().await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/ipc/test_coverage_ipc_transport.rs"]
+mod coverage_ipc_transport_tests;

@@ -25,6 +25,7 @@ use hybridcipher_crypto::signatures::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_yaml;
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
@@ -71,6 +72,9 @@ pub enum PinCommands {
         #[arg(long)]
         notes: Option<String>,
     },
+
+    /// Share the devices this device verified with your other devices (signed; the server only relays)
+    PublishAttestations,
 
     /// List pinned keys for the active group
     #[cfg_attr(
@@ -308,7 +312,7 @@ pub async fn handle_pin_command(
                 }
             };
 
-            handle_pin_add(
+            let pinned = handle_pin_add(
                 user_id,
                 device_id,
                 join_card,
@@ -319,7 +323,9 @@ pub async fn handle_pin_command(
                 notes,
                 session_manager,
             )
-            .await
+            .await?;
+            share_new_verification(session_manager, &pinned).await;
+            Ok(())
         }
         PinCommands::List {
             verbose,
@@ -327,6 +333,7 @@ pub async fn handle_pin_command(
             user,
             all_group,
         } => handle_pin_list(verbose, format, user, all_group, session_manager).await,
+        PinCommands::PublishAttestations => handle_pin_publish_attestations(session_manager).await,
         PinCommands::Remove {
             user_id,
             device_id,
@@ -454,7 +461,7 @@ async fn handle_pin_add(
     safety_number: Option<String>,
     notes: Option<String>,
     session_manager: &SessionManager,
-) -> Result<(), CliError> {
+) -> Result<PinnedKey, CliError> {
     let user_identifier = user_id;
 
     println!(
@@ -467,6 +474,9 @@ async fn handle_pin_add(
 
     let mut resolved_user_id = user_identifier.clone();
     let mut join_card_override: Option<ClientJoinCard> = None;
+    // A card fetched from the server is cached only once its key is verified below: the cache
+    // restores pins without asking, so an unverified card there would later count as verified.
+    let mut server_card_json: Option<String> = None;
 
     if resolved_user_id.contains('@') {
         match session_manager
@@ -510,11 +520,10 @@ async fn handle_pin_add(
             .fetch_join_cards_for_user_id(&parsed_user_id)
             .await?;
         if let Some(card) = cards.into_iter().find(|card| card.device_id == device_id) {
-            let canonical_json = serde_json::to_string_pretty(&card)
-                .map_err(|e| CliError::format(format!("Failed to serialize join card: {}", e)))?;
-            if let Err(err) = session_manager.cache_join_card(&resolved_user_id, &canonical_json) {
-                ui::warning(&format!("Failed to cache join card locally: {}", err));
-            }
+            server_card_json = Some(
+                serde_json::to_string_pretty(&card)
+                    .map_err(|e| CliError::format(format!("Failed to serialize join card: {}", e)))?,
+            );
             println!("ℹ️  Loaded join card from server directory");
             card
         } else {
@@ -574,9 +583,15 @@ async fn handle_pin_add(
 
         let mut input = String::new();
         if crate::ui::desktop::enabled() {
-            input = crate::ui::desktop::request("text", "Enter the HybridCipher pinning URL from the other device", None)?;
+            input = crate::ui::desktop::request(
+                "text",
+                "Enter the HybridCipher pinning URL from the other device",
+                None,
+            )?;
         } else {
-            io::stdin().read_line(&mut input).map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+            io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
         }
 
         let url = input.trim();
@@ -653,9 +668,19 @@ async fn handle_pin_add(
 
         let mut confirm = String::new();
         if crate::ui::desktop::enabled() {
-            confirm = if crate::ui::desktop::confirmation("Does this fingerprint match the requesting device?", false)? { "y" } else { "n" }.into();
+            confirm = if crate::ui::desktop::confirmation(
+                "Does this fingerprint match the requesting device?",
+                false,
+            )? {
+                "y"
+            } else {
+                "n"
+            }
+            .into();
         } else {
-            io::stdin().read_line(&mut confirm).map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+            io::stdin()
+                .read_line(&mut confirm)
+                .map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
         }
 
         match confirm.trim().to_ascii_lowercase().as_str() {
@@ -682,6 +707,11 @@ async fn handle_pin_add(
         )
         .await
         .map_err(|e| CliError::PinningFailed(format!("Failed to pin key: {}", e)))?;
+    if let Some(canonical_json) = server_card_json {
+        if let Err(err) = session_manager.cache_join_card(&resolved_user_id, &canonical_json) {
+            ui::warning(&format!("Failed to cache join card locally: {}", err));
+        }
+    }
 
     let display_user = if user_identifier.contains('@') {
         format!("{} ({})", user_identifier, resolved_user_id)
@@ -706,7 +736,7 @@ async fn handle_pin_add(
     )
     .await;
 
-    Ok(())
+    Ok(pinned)
 }
 
 /// List all pinned keys
@@ -1216,9 +1246,16 @@ async fn handle_pin_remove(
 
         let mut confirm = String::new();
         if crate::ui::desktop::enabled() {
-            confirm = if crate::ui::desktop::confirmation("Remove this pinned key?", false)? { "y" } else { "n" }.into();
+            confirm = if crate::ui::desktop::confirmation("Remove this pinned key?", false)? {
+                "y"
+            } else {
+                "n"
+            }
+            .into();
         } else {
-            io::stdin().read_line(&mut confirm).map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
+            io::stdin()
+                .read_line(&mut confirm)
+                .map_err(|e| CliError::Io(format!("Failed to read input: {}", e)))?;
         }
 
         if confirm.trim().to_lowercase() != "y" && confirm.trim().to_lowercase() != "yes" {
@@ -1310,9 +1347,31 @@ async fn handle_pin_verify(
         .await
     {
         Ok(Some(pin)) => pin,
+        // No pin yet (never pinned, or lost): with a fingerprint or safety number, pin the key
+        // the server's join card names only if it matches, exactly as `pin add` does.
+        Ok(None) if fingerprint.is_some() || safety_number.is_some() => {
+            println!("ℹ️  No pin yet; checking the device's join card against the value you gave");
+            let method = if safety_number.is_some() {
+                PinMethodArg::SafetyNumber
+            } else {
+                PinMethodArg::Manual
+            };
+            handle_pin_add(
+                user_id.clone(),
+                device_id.clone(),
+                None,
+                method,
+                false,
+                fingerprint.clone(),
+                safety_number.clone(),
+                None,
+                session_manager,
+            )
+            .await?
+        }
         Ok(None) => {
             return Err(CliError::not_found(format!(
-                "No pinned key found for {} ({})",
+                "No pinned key found for {} ({}). Give its fingerprint with --fingerprint to pin and verify it.",
                 display_user, device_id
             )))
         }
@@ -1384,7 +1443,7 @@ async fn handle_pin_verify(
         let normalized_actual = pinned_key.fingerprint.replace(' ', "").to_lowercase();
 
         if normalized_expected == normalized_actual {
-            println!("✅ Fingerprint verification: PASSED");
+            println!("Fingerprint matches the pinned key.");
             verification_performed = true;
             verification_method_for_update = Some(PinningMethod::Manual);
         } else {
@@ -1405,7 +1464,7 @@ async fn handle_pin_verify(
         let normalized_actual = actual_safety.replace(' ', "");
 
         if normalized_expected == normalized_actual {
-            println!("✅ Safety number verification: PASSED");
+            println!("Safety number matches the pinned key.");
             verification_performed = true;
             verification_method_for_update = Some(PinningMethod::SafetyNumber);
         } else {
@@ -1419,9 +1478,20 @@ async fn handle_pin_verify(
     }
 
     if fingerprint.is_none() && safety_number.is_none() {
-        println!(
-            "ℹ️  Use --fingerprint or --safety-number flags to verify against specific values"
-        );
+        return Err(CliError::invalid_input(
+            "Supply --fingerprint or --safety-number to verify this device.".to_string(),
+        ));
+    }
+
+    if verification_performed {
+        super::auth::ensure_device_management_trust(session_manager).await?;
+        println!("Recording the verification on the server...");
+        submit_device_fingerprint_attestation(
+            session_manager,
+            &pinned_key,
+            session_manager.current_group_id().await?,
+        )
+        .await?;
     }
 
     if verification_performed && !pinned_key.verified {
@@ -1458,50 +1528,25 @@ async fn handle_pin_verify(
         }
     }
 
-    if pinned_key.verified {
-        let should_resolve = if pin_config.require_second_party_verification {
-            match session_manager
-                .get_second_party_status(&resolved_user_id, &device_id)
-                .await
-            {
-                Ok(Some((status, _))) => status.eq_ignore_ascii_case("verified"),
-                _ => false,
-            }
-        } else {
-            true
-        };
-
-        if should_resolve {
-            let reason = if pin_config.require_second_party_verification {
-                "pin_and_second_party_verified"
-            } else {
-                "pin_verified"
-            };
-            match session_manager
-                .resolve_unverified_device(&resolved_user_id, &device_id, None, Some(reason))
-                .await
-            {
-                Ok(result) => {
-                    if let Ok(user_uuid) = Uuid::parse_str(&resolved_user_id) {
-                        for group_id in result.groups {
-                            let _ = members::clear_unverified_device_cache(
-                                session_manager,
-                                group_id,
-                                user_uuid,
-                                &device_id,
-                            )
-                            .await;
-                        }
-                    }
-                }
-                Err(err) => {
-                    ui::warning(&format!(
-                        "Pinned key verified, but failed to clear unverified device entry: {}",
-                        err
-                    ));
-                }
-            }
+    // The signed attestation resolves server audit entries. Clear only the
+    // matching local group cache after that authorization succeeded.
+    if verification_performed {
+        if let (Some(group_id), Ok(user_uuid)) = (
+            session_manager.current_group_id().await?,
+            Uuid::parse_str(&resolved_user_id),
+        ) {
+            let _ = members::clear_unverified_device_cache(
+                session_manager,
+                group_id,
+                user_uuid,
+                &device_id,
+            )
+            .await;
         }
+    }
+
+    if verification_performed && pinned_key.verified {
+        share_new_verification(session_manager, &pinned_key).await;
     }
 
     println!("✅ Pin verification completed successfully");
@@ -1517,6 +1562,162 @@ async fn handle_pin_verify(
     )
     .await;
 
+    Ok(())
+}
+
+/// Sign and publish that this device verified `pin`, so this account's other devices can accept
+/// the verification. Only verifications made here directly are shared (never ones this device
+/// accepted from another device), so trust never travels more than one hop.
+async fn publish_pin_attestation(
+    session_manager: &SessionManager,
+    pin: &PinnedKey,
+) -> Result<bool, CliError> {
+    let session = session_manager.require_auth()?;
+    let direct = pin.verified
+        && matches!(
+            pin.verification_method,
+            PinningMethod::Manual | PinningMethod::SafetyNumber | PinningMethod::QrCode
+        );
+    if !direct || pin.device_id == session.device_id {
+        return Ok(false);
+    }
+    let identity = session_manager.get_or_create_device_keypair().await?;
+    let attestation = hybridcipher_messages::pin_attestation::PinAttestation::sign(
+        &identity,
+        &session.user_id,
+        &session.device_id,
+        &pin.user_id,
+        &pin.device_id,
+        &pin.identity_public_key,
+        pin.verified_at.unwrap_or(pin.pinned_at),
+    )
+    .map_err(|err| CliError::internal(format!("Could not sign the verification: {}", err)))?;
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/pin-attestations",
+            hybridcipher_client::device_actions::api_base(&session.server_url)
+        ))
+        .bearer_auth(&session.token)
+        .json(&serde_json::json!({ "attestation": attestation }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| CliError::network_from(&error))?;
+    if response.status().is_success() {
+        return Ok(true);
+    }
+    Err(CliError::internal(format!(
+        "The server did not accept the verification ({})",
+        response.status()
+    )))
+}
+
+/// Share a verification just made here at once, so a rotation started on another of your
+/// devices does not wait for that device's periodic catch-up. Failure only warns: the pin
+/// itself is already saved, and the catch-up retries.
+async fn share_new_verification(session_manager: &SessionManager, pin: &PinnedKey) {
+    match publish_pin_attestation(session_manager, pin).await {
+        Ok(true) => println!("🔗 Shared this verification with your other devices"),
+        Ok(false) => {}
+        Err(err) => ui::warning(&format!(
+            "Your other devices will not see this verification yet: {}",
+            err
+        )),
+    }
+}
+
+/// Publish attestations for every device this device verified directly. Pins of devices the
+/// server no longer knows (or knows under another key) are refused by it and skipped here.
+async fn handle_pin_publish_attestations(session_manager: &SessionManager) -> Result<(), CliError> {
+    let (_, storage, config) = pinning_store_for_session(session_manager).await?;
+    let pins = load_all_pinned_keys(&storage, &config).await?;
+    let (mut shared, mut skipped) = (0usize, 0usize);
+    for pin in &pins {
+        match publish_pin_attestation(session_manager, pin).await {
+            Ok(true) => shared += 1,
+            Ok(false) => {}
+            Err(err) => {
+                skipped += 1;
+                ui::dim(&format!("  {} (user {}): {}", pin.device_id, pin.user_id, err));
+            }
+        }
+    }
+    ui::success(&format!(
+        "Shared {} verification(s) with your other devices; {} skipped.",
+        shared, skipped
+    ));
+    Ok(())
+}
+
+/// Persist only actual fingerprint verification from an authorized device.
+/// Background callers never prompt for or silently bootstrap management trust.
+async fn submit_device_fingerprint_attestation(
+    session_manager: &SessionManager,
+    pinned_key: &PinnedKey,
+    group_id: Option<Uuid>,
+) -> Result<(), CliError> {
+    let session = session_manager.require_auth()?;
+    if session.device_id == pinned_key.device_id {
+        return Err(CliError::authentication(
+            "Verify this device from a distinct trusted device.",
+        ));
+    }
+    let context = hybridcipher_client::device_actions::DeviceActionContext {
+        server_url: &session.server_url,
+        token: &session.token,
+        user_id: &session.user_id,
+        device_id: &session.device_id,
+    };
+    let trust = hybridcipher_client::device_actions::fetch_device_trust(&context)
+        .await
+        .map_err(CliError::authentication)?;
+    if !trust.can_verify_devices {
+        return Err(CliError::authentication(
+            trust.blocking_reason.unwrap_or_else(|| {
+                "Confirm this device's management trust before verifying another device.".into()
+            }),
+        ));
+    }
+    let request = hybridcipher_messages::device_actions::DeviceFingerprintVerificationRequest {
+        fingerprint: pinned_key.fingerprint.clone(),
+        group_id: group_id.map(|id| id.to_string()),
+    };
+    let payload = serde_json::to_value(&request)
+        .map_err(|error| CliError::configuration(error.to_string()))?;
+    let identity = session_manager.get_or_create_device_keypair().await?;
+    let proof = hybridcipher_client::device_actions::signed_device_action(
+        &identity,
+        &context,
+        hybridcipher_messages::device_actions::DeviceAction::VerifyFingerprint,
+        &pinned_key.device_id,
+        Some(&hex::encode(sha2::Sha256::digest(
+            pinned_key.identity_public_key,
+        ))),
+        &payload,
+    )
+    .await
+    .map_err(CliError::authentication)?;
+    let response = proof
+        .apply(
+            reqwest::Client::new()
+                .post(format!(
+                    "{}/auth/device/{}/verify-fingerprint",
+                    hybridcipher_client::device_actions::api_base(&session.server_url),
+                    pinned_key.device_id
+                ))
+                .bearer_auth(&session.token)
+                .json(&request),
+        )
+        .send()
+        .await
+        .map_err(|error| CliError::network_from(&error))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = response.text().await.unwrap_or_default();
+        return Err(CliError::authentication(format!(
+            "Device verification rejected ({status}): {message}"
+        )));
+    }
     Ok(())
 }
 
@@ -2363,7 +2564,7 @@ async fn handle_second_party_enqueue(
         .map_err(|e| CliError::network(format!("Failed to enqueue second-party job: {}", e)))?;
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("second_party_enqueue")?;
+        session_manager.invalidate_session("second_party_enqueue").await?;
         return Err(CliError::NotAuthenticated(
             "Session expired. Please login again.".into(),
         ));
@@ -2599,7 +2800,7 @@ async fn run_second_party_worker(
             .map_err(|e| CliError::network(format!("Failed to poll verifier queue: {}", e)))?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            session_manager.invalidate_session("second_party_worker_poll")?;
+            session_manager.invalidate_session("second_party_worker_poll").await?;
             return Err(CliError::NotAuthenticated(
                 "Session expired. Please login again.".into(),
             ));
@@ -2791,7 +2992,7 @@ async fn run_second_party_worker(
             continue;
         }
 
-        let observed_fp = observed_pin.fingerprint;
+        let observed_fp = observed_pin.fingerprint.clone();
 
         let issued_at = Utc::now();
         let message = format!(
@@ -2839,7 +3040,7 @@ async fn run_second_party_worker(
             .map_err(|e| CliError::network(format!("Failed to send confirmation: {}", e)))?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            session_manager.invalidate_session("second_party_worker_confirm")?;
+            session_manager.invalidate_session("second_party_worker_confirm").await?;
             return Err(CliError::NotAuthenticated(
                 "Session expired. Please login again.".into(),
             ));
@@ -2886,32 +3087,42 @@ async fn run_second_party_worker(
             ));
 
             if status.eq_ignore_ascii_case("verified") {
-                let group_id = token.group_id.map(|id| id.to_string());
-                match session_manager
-                    .resolve_unverified_device(
-                        &token.target_user_id.to_string(),
-                        &token.target_device_id,
-                        group_id.as_deref(),
-                        Some("second_party_verified"),
+                // A report cannot replace out-of-band verification. Only a
+                // previously verified pin can supply the signed attestation.
+                let manual_evidence = observed_pin.verified_at.is_some()
+                    && matches!(
+                        observed_pin.verification_method,
+                        PinningMethod::Manual | PinningMethod::SafetyNumber | PinningMethod::QrCode
+                    )
+                    && observed_pin.fingerprint.replace(' ', "").to_lowercase()
+                        == token.expected_fingerprint.replace(' ', "").to_lowercase();
+                if !manual_evidence {
+                    ui::warning("Second-party report complete. Verify the fingerprint from a trusted device before clearing its unverified state.");
+                } else {
+                    match submit_device_fingerprint_attestation(
+                        session_manager,
+                        &observed_pin,
+                        token.group_id,
                     )
                     .await
-                {
-                    Ok(result) => {
-                        for group_id in result.groups {
-                            let _ = members::clear_unverified_device_cache(
-                                session_manager,
-                                group_id,
-                                token.target_user_id,
-                                &token.target_device_id,
-                            )
-                            .await;
+                    {
+                        Ok(()) => {
+                            if let Some(group_id) = token.group_id {
+                                let _ = members::clear_unverified_device_cache(
+                                    session_manager,
+                                    group_id,
+                                    token.target_user_id,
+                                    &token.target_device_id,
+                                )
+                                .await;
+                            }
                         }
-                    }
-                    Err(err) => {
-                        ui::warning(&format!(
-                            "Second-party verification complete, but failed to clear unverified entry: {}",
-                            err
-                        ));
+                        Err(err) => {
+                            ui::warning(&format!(
+                                "Second-party verification complete, but signed device verification failed: {}",
+                                err
+                            ));
+                        }
                     }
                 }
             }
@@ -3112,7 +3323,7 @@ async fn record_pin_audit(
                     .await
                 {
                     Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                        if let Err(err) = session_manager.invalidate_session("pin_audit_forward") {
+                        if let Err(err) = session_manager.invalidate_session("pin_audit_forward").await {
                             tracing::warn!(
                                 "Failed to invalidate session after pin audit rejection: {}",
                                 err
@@ -3367,6 +3578,29 @@ async fn persist_pinning_config(
         .map_err(|e| CliError::storage(format!("Failed to persist pinning configuration: {}", e)))
 }
 
+/// Read one stored pin entry. An entry that is still encrypted means the local data is locked:
+/// that is an error, never a reason to drop it. Anything else unreadable is skipped and kept on
+/// disk, since a pin is a security record and cannot be recreated from what remains.
+fn parse_pin_entry(key: &str, raw: &str) -> Result<Option<PinnedKey>, CliError> {
+    if raw.trim().is_empty() {
+        warn!("Pinned key entry '{}' is empty; skipping", key);
+        return Ok(None);
+    }
+    match serde_json::from_str::<PinnedKey>(raw) {
+        Ok(pin) => Ok(Some(pin)),
+        Err(_) if raw.contains(hybridcipher_crypto::account_protection::PROTECTED_DATA_MAGIC) => {
+            Err(CliError::decryption(format!(
+            "Pinned key entry '{}' is still encrypted; this device's local data is locked",
+            key
+        )))
+        }
+        Err(err) => {
+            warn!("Pinned key entry '{}' is unreadable ({}); skipping it", key, err);
+            Ok(None)
+        }
+    }
+}
+
 async fn load_all_pinned_keys(
     storage: &UserStorage,
     config: &PinningConfig,
@@ -3393,21 +3627,8 @@ async fn load_all_pinned_keys(
                 None => continue,
             };
 
-        if raw.trim().is_empty() {
-            let _ = storage.delete_config(&key).await;
+        let Some(parsed) = parse_pin_entry(&key, &raw)? else {
             continue;
-        }
-
-        let parsed: PinnedKey = match serde_json::from_str(&raw) {
-            Ok(pin) => pin,
-            Err(err) => {
-                warn!("Pinned key entry '{}' is invalid JSON: {}", key, err);
-                // Tombstone invalid entries so they do not repeatedly warn.
-                if let Err(e) = storage.delete_config(&key).await {
-                    warn!("Failed to clean invalid pin '{}': {}", key, e);
-                }
-                continue;
-            }
         };
 
         let key_tuple = (parsed.user_id.clone(), parsed.device_id.clone());
@@ -3473,18 +3694,8 @@ async fn find_expired_pins(
                 None => continue,
             };
 
-        if raw.trim().is_empty() {
-            let _ = storage.delete_config(&key).await;
+        let Some(parsed) = parse_pin_entry(&key, &raw)? else {
             continue;
-        }
-
-        let parsed: PinnedKey = match serde_json::from_str(&raw) {
-            Ok(pin) => pin,
-            Err(err) => {
-                warn!("Pinned key entry '{}' is invalid JSON: {}", key, err);
-                let _ = storage.delete_config(&key).await;
-                continue;
-            }
         };
 
         let key_tuple = (parsed.user_id.clone(), parsed.device_id.clone());
@@ -3522,9 +3733,15 @@ async fn prune_expired_pins(
 async fn pinning_store_for_session(
     session_manager: &SessionManager,
 ) -> Result<(PinningStore<UserStorage>, UserStorage, PinningConfig), CliError> {
+    // Pins are encrypted: without the key every entry reads as unreadable.
+    session_manager.unlock_local_state()?;
     let storage = session_manager.current_storage()?;
     let config = load_pinning_config_for_storage(&storage).await?;
     let store = PinningStore::new(storage.clone(), config.clone());
     let _ = prune_expired_pins(&storage, &config).await?;
     Ok((store, storage, config))
 }
+
+#[cfg(test)]
+#[path = "../../tests/device_security/test_pin_store_locked.rs"]
+mod pin_store_locked_tests;

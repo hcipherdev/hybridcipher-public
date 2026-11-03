@@ -1,4 +1,4 @@
-// Tests app.js Team license, directory, and durable request review workflows.
+// Tests app.js Team license settings and the offline request review shown on Members & devices.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -31,35 +31,16 @@ test('Personal displays activation and Team expiry retains read-only workspace c
     const { app, document } = setup(async () => {});
     app.teamLicenseStatus = { workspace: 'personal' };
     app.renderTeamLicenseSettings();
+    assert.equal(document.getElementById('settingsOpenTeamBtn').textContent, 'Activate Team');
+    assert.equal(document.getElementById('settingsOpenTeamBtn').classList.hidden, false);
     assert.equal(document.getElementById('teamActivationForm').classList.hidden, false);
-    assert.equal(document.getElementById('teamDirectoryPanel').classList.hidden, true);
-    app.teamLicenseStatus = { workspace: 'team', can_write: false, online: false };
+    app.teamLicenseStatus = { workspace: 'team', organization: { id: 'existing-team' }, can_write: false, online: false };
     app.renderTeamLicenseSettings();
+    // Entitled accounts switch from the header selector, so Settings drops its Team entry.
+    assert.equal(document.getElementById('settingsOpenTeamBtn').classList.hidden, true);
     assert.equal(document.getElementById('teamLicenseState').textContent, 'Read-only');
     assert.equal(document.getElementById('teamExportExistingBtn').classList.hidden, false);
-    assert.equal(document.getElementById('teamInviteForm').classList.hidden, true);
     assert.match(document.getElementById('teamLicenseNote').textContent, /pending edits are preserved/);
-});
-
-test('directory excludes owners and expired invitations from removable seats and hides actions on revocation', async () => {
-    const directory = { role: 'owner', online: true,
-        members: [{ user_id: 'owner', email: 'owner@example.com', role: 'owner' }, { user_id: 'member', email: '<member>@example.com', role: 'member' }],
-        invitations: [{ id: 'fresh', email: 'fresh@example.com', status: 'pending', expires_at: new Date(Date.now() + 60_000).toISOString() },
-            { id: 'old', email: 'old@example.com', status: 'pending', expires_at: '2000-01-01T00:00:00Z' }],
-    };
-    const { app, document } = setup(async name => { assert.equal(name, 'get_team_directory'); return directory; });
-    app.teamLicenseStatus = { workspace: 'team', can_write: true };
-    await app.refreshTeamDirectory();
-    let html = document.getElementById('teamDirectoryList').innerHTML;
-    assert.ok(html.includes('data-team-directory-id="member"'));
-    assert.ok(!html.includes('data-team-directory-id="owner"'));
-    assert.ok(!html.includes('old@example.com'));
-    assert.ok(html.includes('&lt;member>'));
-    app.teamLicenseStatus.can_write = false;
-    await app.refreshTeamDirectory();
-    html = document.getElementById('teamDirectoryList').innerHTML;
-    assert.ok(!html.includes('<button'));
-    assert.ok(html.includes('owner@example.com'));
 });
 
 test('group setup remains reviewable and cannot be cleared before encryption succeeds', async () => {
@@ -71,9 +52,10 @@ test('group setup remains reviewable and cannot be cleared before encryption suc
     const { app, document } = setup(async name => { assert.equal(name, 'sync_team_admin_requests'); return requests; });
     app.teamLicenseStatus = { workspace: 'team' };
     await app.refreshPendingTeamRequests(true);
-    const html = document.getElementById('teamPendingRequestsList').innerHTML;
+    const html = document.getElementById('membersPendingRequestsList').innerHTML;
+    assert.equal(document.getElementById('membersPendingRequests').classList.hidden, false);
     assert.ok(!html.includes('data-dismiss-team-request="pending-keys"'));
     assert.ok(html.includes('data-dismiss-team-request="ready"'));
-    assert.ok(html.includes('Group ready: group-2'));
+    assert.ok(html.includes('Create group: Ready'));
     assert.ok(html.includes('Server rejected request: 409'));
 });

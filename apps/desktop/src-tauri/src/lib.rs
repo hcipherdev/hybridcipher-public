@@ -11,6 +11,7 @@ pub mod individual_views;
 pub mod key_bundle;
 pub mod legal;
 pub mod local_client;
+pub mod local_vault;
 #[cfg(target_os = "macos")]
 pub mod macos_file_provider_native;
 pub mod mount;

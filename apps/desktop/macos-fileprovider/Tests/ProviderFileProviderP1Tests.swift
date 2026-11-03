@@ -117,6 +117,9 @@ struct ProviderFileProviderP1TestRunner {
         testTrashEnumeratorSkipsBridgeListing()
         testEnumeratorMapsChangesAndAdvancesSyncAnchor()
         testEnumeratorMapsBridgeConnectionFailureToFileProviderError()
+        testRetryLaterResponseMapsToServerUnreachable()
+        testSocketAddressCarriesPathsPastSunPath()
+        try testBridgeClientConnectsToSocketPastSunPath()
     }
 
     static func testSnapshotDecodesVersionBytesFromJsonArrays() {
@@ -381,5 +384,100 @@ struct ProviderFileProviderP1TestRunner {
             error?.code == NSFileProviderError.Code.serverUnreachable.rawValue,
             "bridge connection failures should map to serverUnreachable"
         )
+    }
+
+    /// The host refuses changes while a folder is first prepared; the system should
+    /// retry them later instead of reporting the item as unsyncable.
+    static func testRetryLaterResponseMapsToServerUnreachable() {
+        let json = #"{"ok":false,"message":"HybridCipher is still preparing this folder","retry_later":true}"#
+        guard let response = try? JSONDecoder().decode(ProviderSocketResponse.self, from: Data(json.utf8)) else {
+            require(false, "a retry-later response should decode")
+            return
+        }
+        require(response.retryLater == true, "retry_later should decode")
+        let error = providerCompatibleError(ProviderBridgeError.busy(response.message ?? "")) as NSError
+        require(error.domain == NSFileProviderErrorDomain, "busy should map to NSFileProviderErrorDomain")
+        require(
+            error.code == NSFileProviderError.Code.serverUnreachable.rawValue,
+            "busy should map to serverUnreachable so the system retries"
+        )
+    }
+
+    /// A long user name puts the container socket past the 104-byte `sun_path`.
+    static func longSocketDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hc-\(UUID().uuidString.prefix(8))")
+            .appendingPathComponent("Users/a-person-with-a-really-long-account-name/Library/Group Containers")
+            .appendingPathComponent("G2L88C9692.group.com.hybridcipher.macOS")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    static func testSocketAddressCarriesPathsPastSunPath() {
+        let path = "/" + String(repeating: "d", count: 150) + "/00741c18f05f45f2.sock"
+        guard let address = try? ProviderBridgeClient.socketAddress(path: path) else {
+            require(false, "a 172-byte socket path should fit the kernel's 255-byte address")
+            return
+        }
+        let offset = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
+        require(Int(address[0]) == address.count, "sun_len should cover the whole address")
+        require(address[1] == UInt8(AF_UNIX), "the family should be AF_UNIX")
+        require(Array(address[offset..<(address.count - 1)]) == Array(path.utf8), "the full path should follow the header")
+        require(address.last == 0, "the path should end with a NUL")
+
+        let tooLong = "/" + String(repeating: "d", count: ProviderBridgeClient.maxSocketPathLength)
+        do {
+            _ = try ProviderBridgeClient.socketAddress(path: tooLong)
+            require(false, "a path past the kernel's limit should be refused")
+        } catch ProviderBridgeError.socketPathTooLong {
+        } catch {
+            require(false, "an over-long path should report socketPathTooLong, got \(error)")
+        }
+    }
+
+    static func testBridgeClientConnectsToSocketPastSunPath() throws {
+        let directory = try longSocketDirectory()
+        defer { try? FileManager.default.removeItem(at: directory.deletingLastPathComponent().deletingLastPathComponent()) }
+        let socketURL = directory.appendingPathComponent("00741c18f05f45f2.sock")
+        require(socketURL.path.utf8.count > 104, "the test needs a path past sun_path")
+
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        require(listener >= 0, "listener socket")
+        let address = try ProviderBridgeClient.socketAddress(path: socketURL.path)
+        let bound = address.withUnsafeBytes { buffer in
+            Darwin.bind(listener, buffer.baseAddress!.assumingMemoryBound(to: sockaddr.self), socklen_t(buffer.count))
+        }
+        require(bound == 0, "bind past sun_path failed: \(String(cString: strerror(errno)))")
+        require(listen(listener, 4) == 0, "listen")
+        defer { close(listener) }
+
+        let served = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            let connection = accept(listener, nil, nil)
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while read(connection, &buffer, buffer.count) > 0 {}
+            let reply = Array("{\"ok\":true}\n".utf8)
+            _ = write(connection, reply, reply.count)
+            close(connection)
+            served.signal()
+        }
+
+        let client = try ProviderBridgeClient(rootId: UUID(), socketURL: socketURL)
+        let finished = DispatchSemaphore(value: 0)
+        var outcome: Result<ProviderSocketResponse, Error>?
+        Task {
+            do { outcome = .success(try await client.status()) } catch { outcome = .failure(error) }
+            finished.signal()
+        }
+        require(finished.wait(timeout: .now() + 10) == .success, "status request should finish")
+        require(served.wait(timeout: .now() + 5) == .success, "the listener should have served the request")
+        switch outcome {
+        case .success(let response)?:
+            require(response.ok, "status should succeed over a socket past sun_path")
+        case .failure(let error)?:
+            require(false, "connect past sun_path failed: \(error)")
+        case nil:
+            require(false, "no outcome")
+        }
     }
 }

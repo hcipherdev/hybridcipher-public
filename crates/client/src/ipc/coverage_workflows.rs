@@ -1,6 +1,9 @@
 use crate::coverage::{CoverageRoot, CoverageRootKind};
 use crate::errors::{ClientError, ErrorCode};
 use crate::file::{
+    ciphertext::{self, CiphertextKind, ContentKind},
+    content_manifest::LegacyReadPolicy,
+    durability::{self, OutputDurability},
     encrypt::{
         chunked_encrypted_size, read_encrypted_header, SparseFileMetadata, MAX_CONTENT_CHUNK_SIZE,
         MAX_IN_MEMORY_PLAINTEXT_BYTES,
@@ -13,7 +16,7 @@ use crate::ipc::coverage::{
     CoverageHydrationSummary, CoverageUnenrollOutcome,
 };
 use crate::network::Network;
-use crate::state::client::{Client, CoverageScanProgress};
+use crate::state::client::{Client, CoverageScanProgress, PlainNamedContents};
 use crate::storage::{AccessControlData, FileMetadataData, Storage};
 use crate::EncryptedFileMetadata;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -22,7 +25,6 @@ use filetime::{set_file_mtime, set_file_times, FileTime};
 use log::warn;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, ErrorKind, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -31,9 +33,6 @@ use std::time::SystemTime;
 use tokio::fs as async_fs;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-
-const METADATA_SCAN_LIMIT: usize = 64 * 1024;
-const ENCRYPTED_FILE_SEPARATOR: &str = "\n---ENCRYPTED_DATA---\n";
 
 #[derive(Debug)]
 struct EncryptFileOutcome {
@@ -57,16 +56,6 @@ struct EncryptFileOutcome {
 struct ParsedEncryptedFile {
     metadata: EncryptedFileMetadata,
     original_name: Option<String>,
-}
-
-#[derive(Debug)]
-struct ExistingEncryptionMetadata {
-    #[allow(dead_code)]
-    file_id: String,
-    #[allow(dead_code)]
-    group_id: Option<Uuid>,
-    #[allow(dead_code)]
-    epoch_id: u64,
 }
 
 pub async fn enroll_and_hydrate<S, N>(
@@ -229,9 +218,13 @@ where
         } else {
             0
         };
-        let root = client.coverage_unenroll_root(&root.path).await?;
+        let unenrolled = client.coverage_unenroll_root(&root.path).await?;
+        // Folder records only describe an enrolled folder, so they go once it is unenrolled.
+        if root.kind == CoverageRootKind::Folder {
+            remove_directory_metadata_sidecars(&root.path);
+        }
         Ok(CoverageUnenrollOutcome {
-            root,
+            root: unenrolled,
             decrypted_files,
         })
     }
@@ -368,7 +361,9 @@ where
 
                     if file_type.is_dir() {
                         stack.push(path);
-                    } else if file_type.is_file() {
+                    } else if file_type.is_file()
+                        && ciphertext::classify(&path) != CiphertextKind::FolderRecord
+                    {
                         count += 1;
                     }
                 }
@@ -401,10 +396,12 @@ where
     N: Network,
 {
     let _bulk_guard = client.begin_coverage_bulk_operation().await;
+    let started = std::time::Instant::now();
     let mut summary = CoverageHydrationSummary::default();
     let total_files = count_enrollment_candidates(client, root);
     let mut last_reported = 0usize;
     let mut processed_since_sync = 0usize;
+    let mut scheduled = 0usize;
 
     match root.kind {
         CoverageRootKind::SingleFile => {
@@ -423,7 +420,7 @@ where
                 return Ok(summary);
             }
 
-            process_candidate_file(client, &root.path, &mut summary, true).await?;
+            process_candidate_file(client, &root.path, &mut summary, true, true).await?;
             maybe_send_enroll_progress(
                 &mut on_progress,
                 total_files,
@@ -447,7 +444,12 @@ where
                     }
                 };
 
-                for entry in read_dir {
+                // List the folder before touching it: encrypting writes `.encrypted`
+                // files beside the originals, and a live listing can return those too,
+                // which would scan each file twice and outrun the count taken above.
+                let listed: Vec<_> = read_dir.collect();
+                let mut files = Vec::new();
+                for entry in listed {
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(err) => {
@@ -483,25 +485,75 @@ where
 
                     if file_type.is_dir() {
                         stack.push(path);
-                    } else if file_type.is_file() {
-                        let remaining_before = total_files.saturating_sub(summary.scanned_files);
-                        let sync_cadence = dynamic_enroll_cadence(remaining_before);
-                        let should_sync =
-                            processed_since_sync + 1 >= sync_cadence || remaining_before <= 1;
-                        process_candidate_file(client, &path, &mut summary, should_sync).await?;
-                        if should_sync {
-                            processed_since_sync = 0;
-                        } else {
-                            processed_since_sync = processed_since_sync.saturating_add(1);
-                        }
-                        maybe_send_enroll_progress(
-                            &mut on_progress,
-                            total_files,
-                            &summary,
-                            &mut last_reported,
-                            false,
-                        );
+                    } else if file_type.is_file()
+                        && ciphertext::classify(&path) != CiphertextKind::FolderRecord
+                    {
+                        files.push(path);
                     }
+                }
+
+                // The folder's own modified time is kept once around all of its files,
+                // since files encrypted side by side would each see the others' changes.
+                let folder_mtime = capture_directory_mtime(&current);
+                let mut in_flight = tokio::task::JoinSet::new();
+                let mut failure = None;
+                for path in files {
+                    let remaining_before = total_files.saturating_sub(scheduled);
+                    // Files added during the run outrun the count; keep syncing at the
+                    // usual pace then, not after every file.
+                    let sync_cadence = if remaining_before == 0 {
+                        dynamic_enroll_cadence(usize::MAX)
+                    } else {
+                        dynamic_enroll_cadence(remaining_before)
+                    };
+                    let should_sync =
+                        processed_since_sync + 1 >= sync_cadence || remaining_before == 1;
+                    if should_sync {
+                        processed_since_sync = 0;
+                    } else {
+                        processed_since_sync = processed_since_sync.saturating_add(1);
+                    }
+                    scheduled += 1;
+
+                    while in_flight.len() >= ENROLL_PARALLEL_FILES {
+                        if let Some(joined) = in_flight.join_next().await {
+                            absorb_hydrated_file(&mut summary, joined, &mut failure);
+                            maybe_send_enroll_progress(
+                                &mut on_progress,
+                                total_files,
+                                &summary,
+                                &mut last_reported,
+                                false,
+                            );
+                        }
+                    }
+                    if failure.is_some() {
+                        break;
+                    }
+                    let client = client.clone();
+                    in_flight.spawn(async move {
+                        let mut part = CoverageHydrationSummary::default();
+                        let result =
+                            process_candidate_file(&client, &path, &mut part, should_sync, false)
+                                .await;
+                        (part, result)
+                    });
+                }
+                // Let every started file finish, even after a failure, so none is left
+                // between its ciphertext being written and its plaintext removed.
+                while let Some(joined) = in_flight.join_next().await {
+                    absorb_hydrated_file(&mut summary, joined, &mut failure);
+                    maybe_send_enroll_progress(
+                        &mut on_progress,
+                        total_files,
+                        &summary,
+                        &mut last_reported,
+                        false,
+                    );
+                }
+                preserve_directory_mtime(&current, folder_mtime);
+                if let Some(err) = failure {
+                    return Err(err);
                 }
             }
         }
@@ -515,7 +567,45 @@ where
         true,
     );
 
+    let seconds = started.elapsed().as_secs_f64();
+    log::info!(
+        "Encrypted {} of {} files in {:.1} s ({:.0} files/s); {} skipped",
+        summary.newly_encrypted,
+        summary.scanned_files,
+        seconds,
+        summary.scanned_files as f64 / seconds.max(0.001),
+        summary.skipped_due_to_errors
+    );
+
     Ok(summary)
+}
+
+/// Files of one folder encrypted at the same time. Each does its own reads,
+/// encryption and writes; the summary and progress stay with the walk.
+const ENROLL_PARALLEL_FILES: usize = 4;
+
+type HydratedFile =
+    Result<(CoverageHydrationSummary, Result<(), ClientError>), tokio::task::JoinError>;
+
+fn absorb_hydrated_file(
+    summary: &mut CoverageHydrationSummary,
+    joined: HydratedFile,
+    failure: &mut Option<ClientError>,
+) {
+    match joined {
+        Ok((part, result)) => {
+            summary.absorb(part);
+            if let Err(err) = result {
+                failure.get_or_insert(err);
+            }
+        }
+        Err(err) => {
+            failure.get_or_insert(ClientError::InvalidState(format!(
+                "Protecting a file stopped unexpectedly: {}",
+                err
+            )));
+        }
+    }
 }
 
 fn maybe_send_enroll_progress(
@@ -555,6 +645,7 @@ async fn process_candidate_file<S, N>(
     file_path: &Path,
     summary: &mut CoverageHydrationSummary,
     sync_to_disk: bool,
+    restore_parent_mtime: bool,
 ) -> Result<(), ClientError>
 where
     S: Storage,
@@ -568,9 +659,16 @@ where
         return Ok(());
     }
 
+    let kind = ciphertext::classify(file_path);
+    // A folder record is the folder's own ID and details, not a file to encrypt or track.
+    if kind == CiphertextKind::FolderRecord {
+        return Ok(());
+    }
+
     summary.scanned_files += 1;
 
-    match client.coverage_has_metadata_for_path(file_path).await {
+    // Paths come from walking the canonical root without following links.
+    match client.coverage_has_metadata_for_canonical(file_path).await {
         Ok(true) => {
             summary.already_tracked += 1;
             return Ok(());
@@ -587,25 +685,34 @@ where
         }
     }
 
-    if extension_is_encrypted(file_path) {
-        summary.already_encrypted_without_metadata += 1;
-        summary.warnings.push(format!(
-            "{} already looks encrypted but metadata is missing; run 'hybridcipher recovery fetch' if this device was reprovisioned.",
-            file_path.display()
-        ));
-        return Ok(());
+    // A `.encrypted` name is only trusted when a header backs it up. Only the
+    // header is read, so ciphertext that is left alone is never loaded.
+    if kind == CiphertextKind::File {
+        match ciphertext::inspect_path(file_path) {
+            Ok(ContentKind::NotCiphertext) => {}
+            Ok(_) => {
+                summary.already_encrypted_without_metadata += 1;
+                summary.warnings.push(format!(
+                    "{} already looks encrypted but metadata is missing; run 'hybridcipher recovery fetch' if this device was reprovisioned.",
+                    file_path.display()
+                ));
+                return Ok(());
+            }
+            Err(err) => {
+                summary.errors.push(format!(
+                    "Failed to inspect {} for HybridCipher metadata: {}",
+                    file_path.display(),
+                    err
+                ));
+                summary.skipped_due_to_errors += 1;
+                return Ok(());
+            }
+        }
     }
 
-    match detect_existing_encryption_metadata(file_path) {
-        Ok(Some(_)) => {
-            summary.already_encrypted_without_metadata += 1;
-            summary.warnings.push(format!(
-                "{} contains HybridCipher metadata but no local record; use 'hybridcipher recovery fetch' to restore coverage.",
-                file_path.display()
-            ));
-            return Ok(());
-        }
-        Ok(None) => {}
+    // Read once: the same bytes are checked for an existing header and encrypted.
+    let plaintext = match async_fs::read(file_path).await {
+        Ok(bytes) => bytes,
         Err(err) => {
             summary.errors.push(format!(
                 "Failed to inspect {} for HybridCipher metadata: {}",
@@ -615,14 +722,60 @@ where
             summary.skipped_due_to_errors += 1;
             return Ok(());
         }
+    };
+
+    if kind == CiphertextKind::NotEncrypted {
+        match client
+            .check_plain_named_contents(file_path, &plaintext)
+            .await
+        {
+            Ok(PlainNamedContents::Plaintext) => {}
+            Ok(PlainNamedContents::Adopted(path)) => {
+                summary.already_encrypted_without_metadata += 1;
+                summary.warnings.push(format!(
+                    "{} was already HybridCipher ciphertext, so it was renamed to {} instead of being encrypted again; use 'hybridcipher recovery fetch' to restore coverage.",
+                    file_path.display(),
+                    path.display()
+                ));
+                return Ok(());
+            }
+            Ok(PlainNamedContents::NameTaken(target)) => {
+                summary.already_encrypted_without_metadata += 1;
+                summary.warnings.push(format!(
+                    "{} is already HybridCipher ciphertext, but {} exists, so it was left unchanged.",
+                    file_path.display(),
+                    target.display()
+                ));
+                return Ok(());
+            }
+            Ok(PlainNamedContents::Unverified(reason)) => {
+                summary.warnings.push(format!(
+                    "{} has a HybridCipher header that cannot be checked ({}); encrypting it.",
+                    file_path.display(),
+                    reason
+                ));
+            }
+            Err(err) => {
+                summary.errors.push(format!(
+                    "Failed to check {} for existing HybridCipher content: {}",
+                    file_path.display(),
+                    err
+                ));
+                summary.skipped_due_to_errors += 1;
+                return Ok(());
+            }
+        }
     }
 
-    let parent_dir = file_path.parent().map(|dir| dir.to_path_buf());
+    let parent_dir = file_path
+        .parent()
+        .filter(|_| restore_parent_mtime)
+        .map(|dir| dir.to_path_buf());
     let parent_mtime = parent_dir
         .as_ref()
         .and_then(|dir| capture_directory_mtime(dir));
 
-    match encrypt_file_to_path(client, file_path, sync_to_disk).await {
+    match encrypt_file_to_path(client, file_path, plaintext, sync_to_disk).await {
         Ok(outcome) => {
             if let Err(err) = preserve_file_mtime(file_path, &outcome.encrypted_path) {
                 summary.warnings.push(format!(
@@ -714,24 +867,13 @@ where
 async fn encrypt_file_to_path<S, N>(
     client: &Client<S, N>,
     source_path: &Path,
+    plaintext: Vec<u8>,
     sync_to_disk: bool,
 ) -> Result<EncryptFileOutcome, ClientError>
 where
     S: Storage,
     N: Network,
 {
-    let plaintext = async_fs::read(source_path).await.map_err(|err| {
-        storage_error(
-            ErrorCode::StorageRead,
-            format!(
-                "Failed to read {} for encryption: {}",
-                source_path.display(),
-                err
-            ),
-            "coverage_encrypt_read",
-        )
-    })?;
-
     let mut plaintext_hash = [0u8; 32];
     plaintext_hash.copy_from_slice(&Sha256::digest(&plaintext));
 
@@ -824,81 +966,6 @@ where
         content_chunk_size: encrypted.content_chunk_size,
         plaintext_hash,
     })
-}
-
-fn detect_existing_encryption_metadata(
-    file_path: &Path,
-) -> Result<Option<ExistingEncryptionMetadata>, ClientError> {
-    let mut file = fs::File::open(file_path).map_err(|e| {
-        storage_error(
-            ErrorCode::StorageRead,
-            format!(
-                "Failed to open {} for metadata inspection: {}",
-                file_path.display(),
-                e
-            ),
-            "coverage_metadata_open",
-        )
-    })?;
-
-    let mut buffer = Vec::new();
-    file.by_ref()
-        .take(METADATA_SCAN_LIMIT as u64)
-        .read_to_end(&mut buffer)
-        .map_err(|e| {
-            storage_error(
-                ErrorCode::StorageRead,
-                format!(
-                    "Failed to read {} for metadata inspection: {}",
-                    file_path.display(),
-                    e
-                ),
-                "coverage_metadata_read",
-            )
-        })?;
-
-    let separator = ENCRYPTED_FILE_SEPARATOR.as_bytes();
-    if buffer.len() < separator.len() {
-        return Ok(None);
-    }
-
-    let Some(sep_pos) = buffer
-        .windows(separator.len())
-        .position(|window| window == separator)
-    else {
-        return Ok(None);
-    };
-
-    let metadata_bytes = &buffer[..sep_pos];
-    if metadata_bytes.is_empty() {
-        return Ok(None);
-    }
-
-    let json: Value = match serde_json::from_slice(metadata_bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-
-    let file_id = match json.get("file_id").and_then(|v| v.as_str()) {
-        Some(id) => id.to_string(),
-        None => return Ok(None),
-    };
-
-    let epoch_id = match json.get("epoch_id").and_then(|v| v.as_u64()) {
-        Some(id) => id,
-        None => return Ok(None),
-    };
-
-    let group_id = json
-        .get("group_id")
-        .and_then(|v| v.as_str())
-        .and_then(|raw| Uuid::parse_str(raw).ok());
-
-    Ok(Some(ExistingEncryptionMetadata {
-        file_id,
-        group_id,
-        epoch_id,
-    }))
 }
 
 fn parse_encrypted_file(path: &Path) -> Result<ParsedEncryptedFile, ClientError> {
@@ -1194,38 +1261,76 @@ where
     S: Storage,
     N: Network,
 {
-    if path.extension() != Some(OsStr::new("encrypted")) {
+    let Some(output_path) = publish_restored_file(client, path, OutputDurability::Full).await?
+    else {
         return Ok(0);
-    }
-
-    let parsed = parse_encrypted_file(path)?;
-    let output_path = default_decrypted_path(path, parsed.original_name.as_deref())?;
+    };
     let parent_dir = output_path.parent().map(|dir| dir.to_path_buf());
     let parent_mtime = parent_dir
         .as_ref()
         .and_then(|dir| capture_directory_mtime(dir));
 
-    decrypt_parsed_file_to_path(client, path, parsed, Some(output_path)).await?;
-
-    if let Err(err) = async_fs::remove_file(path).await {
-        if err.kind() != ErrorKind::NotFound {
-            return Err(storage_error(
-                ErrorCode::StorageDelete,
-                format!(
-                    "Failed to remove encrypted source {}: {}",
-                    path.display(),
-                    err
-                ),
-                "coverage_decrypt_cleanup",
-            ));
-        }
-    }
+    remove_restored_source(path)?;
 
     if let Some(dir) = parent_dir.as_deref() {
         preserve_directory_mtime(dir, parent_mtime);
     }
 
     Ok(1)
+}
+
+/// Write the authenticated plaintext of one ciphertext beside it, leaving the
+/// ciphertext in place. Returns where the plaintext is, or None for a path that
+/// is not a protected file.
+///
+/// A plaintext already there with exactly the authenticated contents is left as
+/// it is: an interrupted removal published it but had not yet deleted the source.
+async fn publish_restored_file<S, N>(
+    client: &Client<S, N>,
+    path: &Path,
+    durability: OutputDurability,
+) -> Result<Option<PathBuf>, ClientError>
+where
+    S: Storage,
+    N: Network,
+{
+    if ciphertext::classify(path) != CiphertextKind::File {
+        return Ok(None);
+    }
+
+    let parsed = parse_encrypted_file(path)?;
+    let output_path = default_decrypted_path(path, parsed.original_name.as_deref())?;
+    let plaintext = authenticate_parsed_file(client, path, &parsed).await?;
+    let already_restored = fs::symlink_metadata(&output_path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+        && plaintext.matches(&output_path).unwrap_or(false);
+    if !already_restored {
+        plaintext.publish(&output_path, durability)?;
+    }
+    if let Err(err) = preserve_file_mtime(path, &output_path) {
+        warn!(
+            "Failed to preserve mtime for {}: {}",
+            output_path.display(),
+            err
+        );
+    }
+    Ok(Some(output_path))
+}
+
+fn remove_restored_source(path: &Path) -> Result<(), ClientError> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != ErrorKind::NotFound => Err(storage_error(
+            ErrorCode::StorageDelete,
+            format!(
+                "Failed to remove encrypted source {}: {}",
+                path.display(),
+                err
+            ),
+            "coverage_decrypt_cleanup",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Export an authenticated plaintext copy without changing the encrypted
@@ -1240,7 +1345,7 @@ where
     S: Storage,
     N: Network,
 {
-    if encrypted_path.extension() != Some(OsStr::new("encrypted")) {
+    if ciphertext::classify(encrypted_path) != CiphertextKind::File {
         return Err(ClientError::InvalidInput(
             "Expected a .encrypted file".into(),
         ));
@@ -1265,7 +1370,7 @@ where
     S: Storage,
     N: Network,
 {
-    let total = if path.extension() == Some(OsStr::new("encrypted")) {
+    let total = if ciphertext::classify(path) == CiphertextKind::File {
         1
     } else {
         0
@@ -1302,9 +1407,10 @@ async fn decrypt_directory_in_place_with_progress<S, N>(
     mut on_progress: Option<&mut (dyn FnMut(CoverageDecryptProgress) + Send)>,
 ) -> Result<usize, ClientError>
 where
-    S: Storage,
-    N: Network,
+    S: Storage + 'static,
+    N: Network + 'static,
 {
+    let started = std::time::Instant::now();
     let total_encrypted = count_encrypted_files(root)?;
     if total_encrypted > 0 {
         if let Some(callback) = on_progress.as_mut() {
@@ -1333,7 +1439,11 @@ where
             }
         };
 
-        for entry in entries {
+        // List the folder before touching it, so plaintext written beside each
+        // ciphertext does not show up in the same listing.
+        let listed: Vec<_> = entries.collect();
+        let mut files = Vec::new();
+        for entry in listed {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -1353,30 +1463,80 @@ where
             let path = entry.path();
             if file_type.is_dir() {
                 stack.push(path);
-            } else if file_type.is_file() {
-                if path.extension() != Some(OsStr::new("encrypted")) {
-                    continue;
-                }
+            } else if file_type.is_file() && ciphertext::classify(&path) == CiphertextKind::File {
+                files.push(path);
+            }
+        }
 
-                match decrypt_file_in_place(client, &path).await {
-                    Ok(count) => decrypted += count as usize,
-                    Err(err) => {
-                        failed += 1;
-                        warn!("Failed to decrypt {}: {}", path.display(), err);
-                        if first_failure.is_none() {
-                            first_failure = Some(err.to_string());
-                        }
-                    }
+        for batch in files.chunks(RESTORE_BATCH_FILES) {
+            let mut published = Vec::with_capacity(batch.len());
+            let mut record_failure = |path: &Path, err: ClientError| {
+                failed += 1;
+                warn!("Failed to decrypt {}: {}", path.display(), err);
+                if first_failure.is_none() {
+                    first_failure = Some(err.to_string());
                 }
+            };
 
-                if total_encrypted > 0 {
-                    if let Some(callback) = on_progress.as_mut() {
-                        (*callback)(CoverageDecryptProgress {
-                            total_files: total_encrypted,
-                            decrypted_files: decrypted,
-                            failed_files: failed,
-                        });
+            let mut in_flight = tokio::task::JoinSet::new();
+            let mut pending = batch.iter().cloned();
+            loop {
+                while in_flight.len() < ENROLL_PARALLEL_FILES {
+                    let Some(path) = pending.next() else {
+                        break;
+                    };
+                    let client = client.clone();
+                    in_flight.spawn(async move {
+                        let result =
+                            publish_restored_file(&client, &path, OutputDurability::Deferred).await;
+                        (path, result)
+                    });
+                }
+                let Some(joined) = in_flight.join_next().await else {
+                    break;
+                };
+                match joined {
+                    Ok((path, Ok(Some(_)))) => published.push(path),
+                    Ok((_, Ok(None))) => {}
+                    Ok((path, Err(err))) => record_failure(&path, err),
+                    Err(err) => record_failure(
+                        &current,
+                        ClientError::InvalidState(format!("Restore task failed: {err}")),
+                    ),
+                }
+            }
+
+            // The ciphertext is the only other copy, so it goes only once the
+            // plaintext written for it is on disk.
+            if !published.is_empty() {
+                if let Err(err) = durability::barrier(&current) {
+                    for path in &published {
+                        record_failure(
+                            path,
+                            storage_error(
+                                ErrorCode::StorageWrite,
+                                format!("Failed to flush restored files to disk: {err}"),
+                                "coverage_decrypt_write",
+                            ),
+                        );
                     }
+                    published.clear();
+                }
+            }
+            for path in published {
+                match remove_restored_source(&path) {
+                    Ok(()) => decrypted += 1,
+                    Err(err) => record_failure(&path, err),
+                }
+            }
+
+            if total_encrypted > 0 {
+                if let Some(callback) = on_progress.as_mut() {
+                    (*callback)(CoverageDecryptProgress {
+                        total_files: total_encrypted,
+                        decrypted_files: decrypted,
+                        failed_files: failed,
+                    });
                 }
             }
         }
@@ -1385,6 +1545,16 @@ where
     for (dir, mtime) in dir_mtimes {
         preserve_directory_mtime(&dir, mtime);
     }
+
+    let seconds = started.elapsed().as_secs_f64();
+    log::info!(
+        "Restored {} of {} files in {:.1} s ({:.0} files/s); {} failed",
+        decrypted,
+        total_encrypted,
+        seconds,
+        decrypted as f64 / seconds.max(0.001),
+        failed
+    );
 
     if failed > 0 {
         return Err(ClientError::InvalidState(format!(
@@ -1396,9 +1566,44 @@ where
     Ok(decrypted)
 }
 
+/// Files restored before one full flush makes their plaintext durable and
+/// their ciphertexts are deleted.
+const RESTORE_BATCH_FILES: usize = 64;
+
+/// Best effort: a folder record left behind holds no file contents.
+fn remove_directory_metadata_sidecars(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!("Failed to read directory {}: {}", current.display(), err);
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && ciphertext::classify(&path) == CiphertextKind::FolderRecord
+            {
+                let mtime = capture_directory_mtime(&current);
+                if let Err(err) = fs::remove_file(&path) {
+                    warn!("Failed to remove folder record {}: {}", path.display(), err);
+                }
+                preserve_directory_mtime(&current, mtime);
+            }
+        }
+    }
+}
+
 fn count_encrypted_files(root: &Path) -> Result<usize, ClientError> {
     if root.is_file() {
-        return Ok(if root.extension() == Some(OsStr::new("encrypted")) {
+        return Ok(if ciphertext::classify(root) == CiphertextKind::File {
             1
         } else {
             0
@@ -1436,7 +1641,7 @@ fn count_encrypted_files(root: &Path) -> Result<usize, ClientError> {
 
             if file_type.is_dir() {
                 stack.push(path);
-            } else if file_type.is_file() && path.extension() == Some(OsStr::new("encrypted")) {
+            } else if file_type.is_file() && ciphertext::classify(&path) == CiphertextKind::File {
                 total += 1;
             }
         }
@@ -1457,49 +1662,9 @@ where
 {
     let validated_default = default_decrypted_path(source_path, parsed.original_name.as_deref())?;
     let output_path = output_override.unwrap_or(validated_default);
-    let streaming = parsed.metadata.header_version.unwrap_or(1) >= 2
-        && parsed.metadata.content_chunk_size.is_some();
-    if streaming {
-        let private_dir = tempfile::Builder::new()
-            .prefix("hybridcipher-remove-protection-")
-            .tempdir()
-            .map_err(|e| {
-                storage_error(
-                    ErrorCode::StorageWrite,
-                    e.to_string(),
-                    "coverage_decrypt_write",
-                )
-            })?;
-        let private_output = private_dir.path().join("authenticated.plain");
-        client
-            .decrypt_file_streaming_to_path(source_path, &parsed.metadata, &private_output)
-            .await?;
-        crate::file::safe_restore::publish_new(&output_path, &private_output).map_err(|e| {
-            storage_error(
-                ErrorCode::StorageWrite,
-                format!(
-                    "Failed to publish authenticated file {}: {e}",
-                    output_path.display()
-                ),
-                "coverage_decrypt_write",
-            )
-        })?;
-    } else {
-        let decrypted_data = client
-            .decrypt_file(&parsed.metadata)
-            .await
-            .map_err(|e| ClientError::InvalidState(e.to_string()))?;
-        crate::file::safe_restore::write_new(&output_path, &decrypted_data).map_err(|e| {
-            storage_error(
-                ErrorCode::StorageWrite,
-                format!(
-                    "Failed to write decrypted file {}: {e}",
-                    output_path.display()
-                ),
-                "coverage_decrypt_write",
-            )
-        })?;
-    }
+    authenticate_parsed_file(client, source_path, &parsed)
+        .await?
+        .publish(&output_path, OutputDurability::Full)?;
 
     if let Err(err) = preserve_file_mtime(source_path, &output_path) {
         warn!(
@@ -1512,11 +1677,126 @@ where
     Ok(output_path)
 }
 
-fn extension_is_encrypted(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("encrypted"))
-        .unwrap_or(false)
+/// Plaintext that has been fully authenticated but not yet published.
+enum AuthenticatedPlaintext {
+    /// Streamed into a private folder that is removed when this is dropped.
+    Private {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    },
+    InMemory(Vec<u8>),
+}
+
+async fn authenticate_parsed_file<S, N>(
+    client: &Client<S, N>,
+    source_path: &Path,
+    parsed: &ParsedEncryptedFile,
+) -> Result<AuthenticatedPlaintext, ClientError>
+where
+    S: Storage,
+    N: Network,
+{
+    let streaming = parsed.metadata.header_version.unwrap_or(1) >= 2
+        && parsed.metadata.content_chunk_size.is_some();
+    if !streaming {
+        let decrypted_data = client
+            .decrypt_file(&parsed.metadata)
+            .await
+            .map_err(|e| ClientError::InvalidState(e.to_string()))?;
+        return Ok(AuthenticatedPlaintext::InMemory(decrypted_data));
+    }
+    let private_dir = tempfile::Builder::new()
+        .prefix("hybridcipher-remove-protection-")
+        .tempdir()
+        .map_err(|e| {
+            storage_error(
+                ErrorCode::StorageWrite,
+                e.to_string(),
+                "coverage_decrypt_write",
+            )
+        })?;
+    let private_output = private_dir.path().join("authenticated.plain");
+    // Only copied into place and then removed, so it is never synced itself.
+    client
+        .decrypt_file_streaming_to_path_with_options(
+            source_path,
+            &parsed.metadata,
+            &private_output,
+            LegacyReadPolicy::Strict,
+            OutputDurability::Private,
+        )
+        .await?;
+    Ok(AuthenticatedPlaintext::Private {
+        _dir: private_dir,
+        path: private_output,
+    })
+}
+
+impl AuthenticatedPlaintext {
+    fn publish(&self, output_path: &Path, durability: OutputDurability) -> Result<(), ClientError> {
+        match self {
+            Self::Private { path, .. } => {
+                crate::file::safe_restore::publish_new_with(output_path, path, durability).map_err(
+                    |e| {
+                        storage_error(
+                            ErrorCode::StorageWrite,
+                            format!(
+                                "Failed to publish authenticated file {}: {e}",
+                                output_path.display()
+                            ),
+                            "coverage_decrypt_write",
+                        )
+                    },
+                )
+            }
+            Self::InMemory(data) => {
+                crate::file::safe_restore::write_new_with(output_path, data, durability).map_err(
+                    |e| {
+                        storage_error(
+                            ErrorCode::StorageWrite,
+                            format!(
+                                "Failed to write decrypted file {}: {e}",
+                                output_path.display()
+                            ),
+                            "coverage_decrypt_write",
+                        )
+                    },
+                )
+            }
+        }
+    }
+
+    /// Whether the file at `existing` holds exactly this plaintext.
+    fn matches(&self, existing: &Path) -> std::io::Result<bool> {
+        let mut existing = BufReader::new(fs::File::open(existing)?);
+        match self {
+            Self::Private { path, .. } => {
+                if fs::metadata(path)?.len() != existing.get_ref().metadata()?.len() {
+                    return Ok(false);
+                }
+                let mut authenticated = BufReader::new(fs::File::open(path)?);
+                let (mut left, mut right) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+                loop {
+                    let read = authenticated.read(&mut left)?;
+                    if read == 0 {
+                        return Ok(true);
+                    }
+                    existing.read_exact(&mut right[..read])?;
+                    if left[..read] != right[..read] {
+                        return Ok(false);
+                    }
+                }
+            }
+            Self::InMemory(data) => {
+                if existing.get_ref().metadata()?.len() != data.len() as u64 {
+                    return Ok(false);
+                }
+                let mut contents = Vec::with_capacity(data.len());
+                existing.read_to_end(&mut contents)?;
+                Ok(contents == *data)
+            }
+        }
+    }
 }
 
 fn default_encrypted_path(path: &Path) -> PathBuf {
@@ -1532,11 +1812,7 @@ fn default_encrypted_path(path: &Path) -> PathBuf {
 }
 
 fn ensure_encrypted_suffix(candidate: PathBuf, original: &Path) -> PathBuf {
-    let has_suffix = candidate
-        .extension()
-        .map(|ext| ext == "encrypted")
-        .unwrap_or(false);
-    if has_suffix {
+    if ciphertext::classify(&candidate) != CiphertextKind::NotEncrypted {
         return candidate;
     }
 
@@ -1724,7 +2000,7 @@ mod security_regression {
             CoverageRootState::Active
         );
 
-        let separator = ENCRYPTED_FILE_SEPARATOR.as_bytes();
+        let separator = crate::file::encrypt::ENCRYPTED_FILE_SEPARATOR;
         let split = original
             .windows(separator.len())
             .position(|part| part == separator)

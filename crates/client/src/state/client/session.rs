@@ -1,6 +1,14 @@
 use super::*;
 
 impl<S: Storage, N: Network> Client<S, N> {
+    /// Tests get an empty home folder of their own, so they never read or clean up the
+    /// real `~/.hybridcipher` session of whoever runs them.
+    #[cfg(test)]
+    pub(super) fn resolve_home_dir() -> Option<std::path::PathBuf> {
+        Some(test_home::current())
+    }
+
+    #[cfg(not(test))]
     pub(super) fn resolve_home_dir() -> Option<std::path::PathBuf> {
         if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
             return Some(std::path::PathBuf::from(home));
@@ -120,6 +128,11 @@ impl<S: Storage, N: Network> Client<S, N> {
     }
 
     pub(super) async fn load_session_info(&self) -> Result<SessionInfo, ClientError> {
+        if self.is_local_only() {
+            return Err(ClientError::InvalidState(
+                "This vault is held only on this device and has no account session".to_string(),
+            ));
+        }
         // Try to find session file using the new per-user session management
         let session_path = self.find_session_file_path()?;
 
@@ -912,3 +925,21 @@ impl<S: Storage, N: Network> Client<S, N> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_home {
+    use std::path::PathBuf;
+
+    thread_local! {
+        // Each test runs on its own thread, so this is one empty home per test.
+        static HOME: tempfile::TempDir = tempfile::tempdir().expect("test home folder");
+    }
+
+    pub(crate) fn current() -> PathBuf {
+        HOME.with(|home| home.path().to_path_buf())
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/initialization/test_test_home_isolation.rs"]
+mod test_home_isolation_tests;

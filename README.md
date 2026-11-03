@@ -124,7 +124,8 @@ Included here:
   including the Windows Cloud Files provider
 - macOS public rebuild tooling: `scripts/macos/public_desktop_verify.sh`
 - shared macOS build and File Provider validation tooling:
-  `scripts/macos/desktop_release_pkg.sh`, also used by the macOS release workflow
+  `scripts/macos/desktop_build_common.sh`, also used by the signed macOS release
+  build
 - platform version readers: `scripts/macos/app_version.sh` and
   `scripts/winos/app-version.ps1`
 - Windows public rebuild tooling: `scripts/winos/public_desktop_verify.ps1`
@@ -142,6 +143,11 @@ Not included here:
 
 ## Build Locally From Source
 
+Rust must come from `rustup`, which selects the compiler version pinned in
+`rust-toolchain.toml`. Builds from other Rust installations, such as Homebrew's
+`rust`, will not match the published hashes. [Set up Rust](docs/desktop/OPEN_SOURCE_VERIFY.md#set-up-rust) covers new
+installs, switching from Homebrew Rust, and checking the active version.
+
 ### General workspace checks
 
 From the repository root:
@@ -154,29 +160,16 @@ cargo test
 ### macOS prerequisites
 
 - Xcode command line tools
-- Rust stable plus the macOS target you want to build
+- `rustup` (see [Set up Rust](docs/desktop/OPEN_SOURCE_VERIFY.md#set-up-rust))
 - Node.js 18+ with `npm`
 - `python3`
-
-Example target setup:
-
-```bash
-rustup target add aarch64-apple-darwin
-rustup target add x86_64-apple-darwin
-```
 
 ### Windows prerequisites
 
 - Visual Studio Build Tools with the "Desktop development with C++" workload
 - Windows 10 or Windows 11 SDK
-- Rust stable MSVC toolchain (`x86_64-pc-windows-msvc` target)
+- `rustup` with the default MSVC host (see [Set up Rust](docs/desktop/OPEN_SOURCE_VERIFY.md#set-up-rust))
 - Node.js 20+ with `npm`
-
-Example target setup:
-
-```powershell
-rustup target add x86_64-pc-windows-msvc
-```
 
 ### Reproducible unsigned macOS desktop build
 
@@ -192,14 +185,18 @@ Published macOS verification values for the current source snapshot:
 <!-- BEGIN GENERATED VERIFY HASHES -->
 | Source ref | Target | Artifact | SHA-256 |
 | --- | --- | --- | --- |
-| `13822a6122ffc3d61a718e08ae7c6e337b008fcd` | `aarch64-apple-darwin` | `HybridCipher_aarch64.unsigned.app.tar.gz` | `4d8e38f901aeb9e4cd9e261b3db031eac69e4bc7ff0642112bf9b5dfeefb82c8` |
-| `13822a6122ffc3d61a718e08ae7c6e337b008fcd` | `x86_64-apple-darwin` | `HybridCipher_x86_64.unsigned.app.tar.gz` | `fc3ce38927bda05df72dd46fca2426a8d89af7c884dfa15b0231f5c454d10e8a` |
+| `macos-v0.2.0` | `aarch64-apple-darwin` | `HybridCipher_aarch64.unsigned.app.tar.gz` | `0e227a1662c6217263414b02da4baa8d297edf91a82e130ae4e460a0a1f1b6d1` |
+| `macos-v0.2.0` | `x86_64-apple-darwin` | `HybridCipher_x86_64.unsigned.app.tar.gz` | `a1f594f1ed85b43171773c7cedf7abc82e88f3966204434392bce3be1602304e` |
+
+Built with the Team verification keys in `apps/desktop/team-verification-keys.txt` at that source ref.
 <!-- END GENERATED VERIFY HASHES -->
 
 That script:
 
 - installs the desktop frontend dependencies
 - builds the `hybridcipher` CLI for each requested target
+- embeds the published Team verification keys from
+  `apps/desktop/team-verification-keys.txt`
 - stages that CLI into `apps/desktop/src-tauri/resources/bin/`
 - builds the unsigned desktop bundle
 - writes deterministic `.tar.gz` and `.sha256` outputs for comparison
@@ -216,7 +213,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\winos\public_desktop_verify.p
 The script prepares the MSVC environment, builds the bundled CLI, installs the
 locked desktop dependencies, and packages the Tauri desktop app as an unsigned
 NSIS installer. It writes a `.sha256` file beside the generated installer for
-comparison.
+comparison. Like the macOS script, it embeds the published Team verification keys
+from `apps/desktop/team-verification-keys.txt`.
 
 The outputs are written to:
 
@@ -228,7 +226,9 @@ Published Windows verification values for the current source snapshot:
 <!-- BEGIN GENERATED WINDOWS VERIFY HASHES -->
 | Source ref | Target | Artifact | SHA-256 |
 | --- | --- | --- | --- |
-| `b2d1ca7ba9d1181e24bac1b6a5f86aaaeede8577` | `x86_64-pc-windows-msvc` | `HybridCipher_0.1.1_x64-setup.exe` | `2fe3ed240251b89cc95e4bc9dcf52cccc3692a78eb262e76ebccfcb815c91eac` |
+| `windows-v0.2.0` | `x86_64-pc-windows-msvc` | `HybridCipher_0.2.0_x64-setup.exe` | `c12a728373600d9892836ad7e63b2db7e5688e129092e230b8ce67ed86c8d751` |
+
+Built with the Team verification keys in `apps/desktop/team-verification-keys.txt` at that source ref.
 <!-- END GENERATED WINDOWS VERIFY HASHES -->
 
 Read [docs/desktop/OPEN_SOURCE_VERIFY.md](docs/desktop/OPEN_SOURCE_VERIFY.md)
@@ -253,7 +253,7 @@ npx tauri build --target aarch64-apple-darwin
 That manual flow builds the Tauri app and stages its CLI resource. Use
 `scripts/macos/public_desktop_verify.sh` to also build and stage the native File
 Provider runtime, validate the assembled bundle, and produce canonical archives
-and hashes. The verifier shares those routines with `desktop_release_pkg.sh`.
+and hashes. The verifier uses the routines in `desktop_build_common.sh`.
 
 ### Manual Windows desktop build
 

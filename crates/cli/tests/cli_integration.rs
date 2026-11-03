@@ -30,8 +30,9 @@ fn test_rekey_help() {
         .stdout(predicate::str::contains("Rekey management"))
         .stdout(predicate::str::contains("start"))
         .stdout(predicate::str::contains("status"))
-        .stdout(predicate::str::contains("cutover"))
-        .stdout(predicate::str::contains("fallback"));
+        // A rotation finishes as it starts: no separate cutover, and no cancel.
+        .stdout(predicate::str::is_match(r"(?m)^\s+cutover\s").unwrap().not())
+        .stdout(predicate::str::is_match(r"(?m)^\s+fallback\s").unwrap().not());
 }
 
 #[test]

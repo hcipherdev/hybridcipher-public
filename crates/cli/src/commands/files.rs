@@ -13,9 +13,9 @@ use crate::{
     session::SessionManager,
     ui,
 };
+use hybridcipher_client::file::ciphertext::{self, CiphertextKind};
 use std::{
     collections::HashSet,
-    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -753,7 +753,7 @@ fn count_encrypted_files(
                 if client.is_path_excluded(&path) {
                     continue;
                 }
-                if path.extension() == Some(OsStr::new("encrypted")) {
+                if ciphertext::classify(&path) == CiphertextKind::File {
                     count += 1;
                 }
             }
@@ -899,11 +899,20 @@ async fn decrypt_single_file(
     output_override: Option<PathBuf>,
     mode: ProcessingMode,
 ) -> Result<(), CliError> {
-    if file_path.extension() != Some(OsStr::new("encrypted")) {
-        return Err(CliError::format(format!(
-            "\"{}\" is not encrypted; no need to decrypt.",
-            file_path.display()
-        )));
+    match ciphertext::classify(file_path) {
+        CiphertextKind::File => {}
+        CiphertextKind::FolderRecord => {
+            return Err(CliError::format(format!(
+                "\"{}\" is a folder record, not an encrypted file; it has nothing to decrypt.",
+                file_path.display()
+            )));
+        }
+        CiphertextKind::NotEncrypted => {
+            return Err(CliError::format(format!(
+                "\"{}\" is not encrypted; no need to decrypt.",
+                file_path.display()
+            )));
+        }
     }
 
     let parsed = parse_encrypted_file(file_path)?;
@@ -1066,9 +1075,10 @@ async fn decrypt_directory(
                     }
                 }
             } else if file_type.is_file() {
-                if path.extension() != Some(OsStr::new("encrypted")) {
+                // Folder records hold a folder's ID and details, not file contents.
+                if ciphertext::classify(&path) != CiphertextKind::File {
                     if verbose {
-                        ui::info(&format!("Skipping {} (not encrypted)", path.display()));
+                        ui::info(&format!("Skipping {} (not an encrypted file)", path.display()));
                     }
                     continue;
                 }
@@ -1313,13 +1323,13 @@ fn copy_dir_recursive(
 }
 
 fn derive_plain_name_from_encrypted(path: &Path) -> String {
-    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        if stem.ends_with(".encrypted") {
-            stem.trim_end_matches(".encrypted").to_string()
-        } else {
-            stem.to_string()
-        }
-    } else {
-        "decrypted_file".to_string()
+    let name = path.file_name().and_then(|s| s.to_str());
+    match name.and_then(ciphertext::strip_encrypted_suffix) {
+        Some(plain) => plain.to_string(),
+        None => path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("decrypted_file")
+            .to_string(),
     }
 }

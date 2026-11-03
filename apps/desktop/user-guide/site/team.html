@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HybridCipher Team Admin Guide</title>
+<meta name="description" content="Run your team in HybridCipher Desktop: create groups, add and invite people, protect shared folders, approve devices and remove access.">
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="guide.css">
+</head>
+<body>
+<main class="page">
+
+    <header class="intro">
+        <span class="eyebrow">HybridCipher Desktop · Team admin guide</span>
+        <h1>Run your team's shared folders</h1>
+        <p class="lead">
+            Groups decide who can open which files. As an owner or admin, you create groups, add
+            people to them, protect each group's folders, and approve the devices people use.
+        </p>
+        <ul class="facts" aria-label="At a glance">
+            <li>For Team owners and admins</li>
+            <li>About 10 minutes</li>
+            <li>macOS and Windows</li>
+        </ul>
+        <p class="tip">
+            <strong>Before you start.</strong> Sign in with your Team account. Team administration
+            works only on a verified device. If the app asks, verify this device from a device you
+            already trust, or confirm it with your password.
+        </p>
+    </header>
+
+    <section class="player" aria-labelledby="playerTitle">
+        <div class="player-head">
+            <h2 id="playerTitle">Quick walkthrough</h2>
+            <span class="player-count" id="playerCount" aria-live="polite"></span>
+        </div>
+        <div class="screen" id="playerScreen"></div>
+        <p class="subtitle" id="playerSubtitle" aria-live="polite"></p>
+        <div class="controls">
+            <button class="btn" id="playerPrev" type="button">Back</button>
+            <button class="btn btn-primary" id="playerPlay" type="button">Play</button>
+            <button class="btn" id="playerNext" type="button">Next</button>
+            <div class="dots" id="playerDots" role="group" aria-label="Go to step"></div>
+        </div>
+    </section>
+
+    <ol class="steps">
+
+        <li class="step" id="team-overview">
+            <span class="step-num" aria-hidden="true">1</span>
+            <div class="step-body">
+                <h2>Open your Team workspace</h2>
+                <p>
+                    Choose your organization in the workspace menu at the top of the window.
+                    <span class="ui">Team overview</span> shows what is waiting on you under
+                    <span class="ui">To do</span>, and all your groups under <span class="ui">Groups</span>.
+                </p>
+                <p>
+                    The group selected in the sidebar is the one you're working in. Its protected
+                    folders are listed below the groups.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="Choose your organization in the workspace menu to open <b>Team overview</b>.">
+                    <img src="img/team/01-overview.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Team overview for Northwind Studio, with the workspace menu highlighted, a To do list and three groups.">
+                    <figcaption>Team overview: what's waiting on you, and your groups.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="create-group">
+            <span class="step-num" aria-hidden="true">2</span>
+            <div class="step-body">
+                <h2>Create a group</h2>
+                <p>
+                    Make one group for each set of people who share files, such as a department or a
+                    client project.
+                </p>
+                <ol>
+                    <li>Click <span class="ui">New group</span> in the Groups panel, or <span class="ui">+</span> next to Groups in the sidebar.</li>
+                    <li>Enter a name and, if you like, a short description.</li>
+                    <li>Click <span class="ui">Create &amp; initialize</span>. When it says <span class="ui">Group ready</span>, close the window.</li>
+                </ol>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="Click <b>New group</b>, name it, then click <b>Create &amp; initialize</b>.">
+                    <img src="img/team/02-create-group.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Create Group window with the name Marketing and a description, and the Create and initialize button highlighted.">
+                    <figcaption>The new group appears in the sidebar and is selected.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="add-people">
+            <span class="step-num" aria-hidden="true">3</span>
+            <div class="step-body">
+                <h2>Add people to the group</h2>
+                <p>
+                    Select the group in the sidebar and click <span class="ui">Add person</span>.
+                    Enter their email and click <span class="ui">Add person</span>.
+                </p>
+                <ul>
+                    <li>People already in your Team get access right away.</li>
+                    <li>Anyone else is invited to the Team, which uses one seat. They get access after they join.</li>
+                </ul>
+            </div>
+            <div class="shots two">
+                <figure data-slide data-subtitle="Open the group and click <b>Add person</b>. Team members get access right away.">
+                    <img src="img/team/03-add-person.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Add person window with tom@northwind.example entered and the Add person button highlighted.">
+                    <figcaption>Add someone by email.</figcaption>
+                </figure>
+                <figure data-slide data-subtitle="The <b>People</b> tab shows who can open this group's files.">
+                    <img src="img/team/04-group-people.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Marketing group page with the People tab listing maria and tom, each with access.">
+                    <figcaption>The People tab lists everyone with access.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="invite">
+            <span class="step-num" aria-hidden="true">4</span>
+            <div class="step-body">
+                <h2>Invite someone new to the Team</h2>
+                <p>
+                    Open <span class="ui">Members &amp; devices</span> and click
+                    <span class="ui">Invite to Team</span>. Enter their email and tick the groups
+                    they should join. You can also add groups later.
+                </p>
+                <p>
+                    Click <span class="ui">Invite</span>. The app shows an invitation code once.
+                    Copy it and send it to them securely. They paste it under
+                    <span class="ui">Joining an existing Team?</span> and click <span class="ui">Join Team</span>.
+                </p>
+            </div>
+            <div class="shots two">
+                <figure data-slide data-subtitle="In <b>Members &amp; devices</b>, click <b>Invite to Team</b> and choose their groups.">
+                    <img src="img/team/05-invite.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Invite to Team window with lena@northwind.example entered and the Design group ticked.">
+                    <figcaption>Inviting someone uses one seat.</figcaption>
+                </figure>
+                <figure data-slide data-subtitle="Copy the <b>invitation code</b> and send it to them. It is shown only once.">
+                    <img src="img/team/06-invite-code.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Invite to Team window showing a one-time invitation code, highlighted.">
+                    <figcaption>The code is shown only once.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="protect-folder">
+            <span class="step-num" aria-hidden="true">5</span>
+            <div class="step-body">
+                <h2>Protect the group's shared folder</h2>
+                <p>
+                    With the group selected, click <span class="ui">Add Protected Folder</span> in the
+                    sidebar. Choose the folder and click <span class="ui">Proceed</span>.
+                </p>
+                <p>
+                    The folder is protected with the group's keys, so everyone with access to the
+                    group can open its files on their approved devices.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="Select the group, click <b>Add Protected Folder</b>, choose the folder and click <b>Proceed</b>.">
+                    <img src="img/team/07-protect-folder.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Add Protected Folder confirmation for Northwind/Marketing, with the Proceed button highlighted.">
+                    <figcaption>The folder is listed under the group's folders in the sidebar.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="approve-devices">
+            <span class="step-num" aria-hidden="true">6</span>
+            <div class="step-body">
+                <h2>Approve new devices</h2>
+                <p>
+                    When someone signs in on a new computer, it waits for approval and shows up under
+                    <span class="ui">To do</span> on Team overview. Click <span class="ui">Approve</span>
+                    to share the group's keys with that device.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="New devices wait under <b>To do</b>. Click <b>Approve</b> once you know the device is theirs.">
+                    <img src="img/team/08-approve-device.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Team overview To do list with a request to approve Daniel's Mac mini, and the Approve button highlighted.">
+                    <figcaption>The sidebar badge counts what's waiting on you.</figcaption>
+                </figure>
+            </div>
+            <p class="tip">
+                <strong>Check first.</strong> Approve a device only when you know it belongs to that
+                person, for example because they told you they just set up a new computer.
+            </p>
+        </li>
+
+        <li class="step" id="members-devices">
+            <span class="step-num" aria-hidden="true">7</span>
+            <div class="step-body">
+                <h2>Review members and devices</h2>
+                <p>
+                    <span class="ui">Members &amp; devices</span> lists everyone in the Team, the groups
+                    they're in, their devices and open invitations. Use the filters to find what needs
+                    you:
+                </p>
+                <ul>
+                    <li><span class="ui">Needs approval</span>: devices waiting for you.</li>
+                    <li><span class="ui">Unverified</span>: devices whose fingerprint hasn't been checked.</li>
+                    <li><span class="ui">Missed key</span> and <span class="ui">Stale</span>: devices that missed a key update or haven't been used for a while.</li>
+                </ul>
+                <p>
+                    From each member you can <span class="ui">Revoke</span> a lost device, use
+                    <span class="ui">Add to group…</span>, or <span class="ui">Remove from Team</span>.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="<b>Members &amp; devices</b> shows everyone, their groups and devices. Filter to what needs you.">
+                    <img src="img/team/09-members.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Members and devices list for Northwind Studio with filter buttons highlighted and every device marked Trusted.">
+                    <figcaption>Every device here is trusted, and one invitation is open.</figcaption>
+                </figure>
+            </div>
+        </li>
+
+        <li class="step" id="remove-access">
+            <span class="step-num" aria-hidden="true">8</span>
+            <div class="step-body">
+                <h2>Remove someone's access</h2>
+                <p>
+                    Open the group, find the person on the <span class="ui">People</span> tab and click
+                    <span class="ui">Remove access</span>. The group's keys are rotated in the same
+                    step, so they can't open files added from now on.
+                </p>
+            </div>
+            <div class="shots">
+                <figure data-slide data-subtitle="Click <b>Remove access</b>. The group's keys rotate so they can't open new files.">
+                    <img src="img/team/10-remove-access.jpg" width="2560" height="1600" loading="lazy"
+                        alt="Remove access confirmation for priya@northwind.example, explaining that the group keys are rotated, with the Remove access button highlighted.">
+                    <figcaption>Removing access also rotates the group's keys.</figcaption>
+                </figure>
+            </div>
+            <p class="tip">
+                <strong>Leaving the company?</strong> Use <span class="ui">Remove from Team</span> in
+                Members &amp; devices. It frees their seat and takes them out of their groups, but
+                doesn't rotate keys. Rotate each group's keys afterwards from its
+                <span class="ui">Keys &amp; security</span> tab, so they can't open files added from now on.
+            </p>
+        </li>
+    </ol>
+
+    <footer class="next">
+        <h2>Setting up your own computer?</h2>
+        <p>The <a href="personal.html">personal guide</a> covers the recovery kit, protecting a folder and opening it in Finder or File Explorer.</p>
+    </footer>
+</main>
+
+<script src="guide.js"></script>
+</body>
+</html>

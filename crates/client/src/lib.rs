@@ -36,6 +36,7 @@ pub mod compression;
 pub mod config;
 pub mod config_loader;
 pub mod coverage;
+pub mod device_actions;
 pub mod entitlement;
 pub mod epoch;
 pub mod epoch_key_source;
@@ -44,6 +45,7 @@ pub mod file;
 pub mod group;
 pub mod invitation;
 pub mod ipc;
+pub mod local_recovery_kit;
 pub mod local_write_access;
 pub mod logging;
 pub mod metrics;
@@ -53,6 +55,8 @@ pub mod pinning;
 pub mod recovery;
 pub mod rekey;
 pub mod resource_management;
+pub mod saved_code_recovery;
+pub mod saved_code_transport;
 pub mod scalable_groups;
 pub mod security;
 pub mod state;
@@ -60,6 +64,7 @@ pub mod storage;
 pub mod team_requests;
 pub mod transparency;
 pub mod welcome_manager;
+pub mod welcome_signers;
 
 // Public re-exports for external use
 pub use audit::{
@@ -99,9 +104,10 @@ pub use file::{MacOsFileMetadata, PlatformFileMetadata, PlatformXattr};
 pub use hybridcipher_coverage::{CoverageManager, CoverageManagerError, CoverageResult};
 pub use recovery::{get_recovery_manager, CircuitBreaker, ErrorRecoveryManager, RetryPolicy};
 pub use state::client::{
-    ActiveRekeyOperation, Client, CoveragePendingFile, CutoverSummary, DeviceRemovalSummary,
-    EncryptedFileMetadata, GroupInitializationReadiness, LocalRewrapSnapshot, RecoveryCapsulePlain,
-    RecoveryEpochSecret, RekeyErrorEntry, RekeyInitiationOptions, RekeyProgress,
+    ActiveRekeyOperation, Client, CoverageKeyCounts, CoverageMigrationFailure, CoveragePendingFile, DeviceRemovalSummary,
+    EncryptedFileMetadata, GroupInitializationReadiness, KeyReceiptReport, KeyReceiptReports, KeyStateFolder, KeyStateReport, LeftoverKeyFiles, LeftoverKeyMigration, LocalRewrapSnapshot,
+    LocalVaultInfo, RecoveryCapsulePlain, RecoveryEpochSecret, RekeyErrorEntry,
+    RekeyInitiationOptions, RekeyProgress, LOCAL_VAULT_CONFIG_KEY,
 };
 #[cfg(feature = "mount-fs")]
 pub use state::client::{

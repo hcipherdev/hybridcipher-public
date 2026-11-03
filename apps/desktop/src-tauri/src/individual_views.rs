@@ -88,6 +88,9 @@ pub struct RegisteredDeviceRecord {
     pub last_seen: String,
     pub is_current_device: bool,
     pub is_verified: bool,
+    pub is_approved: bool,
+    #[serde(default)]
+    pub fingerprint_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +99,9 @@ pub struct PendingDeviceRecord {
     pub email: String,
     pub device_name: Option<String>,
     pub observed_at: Option<String>,
+    /// Approved device without the current key of some group, rather than a new device.
+    #[serde(default)]
+    pub missing_current_key: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +119,9 @@ pub struct UnverifiedDeviceRecord {
     pub email: String,
     pub device_name: Option<String>,
     pub last_seen: Option<String>,
+    /// The owner has another trusted device holding the group's key and can verify this one.
+    #[serde(default)]
+    pub owner_can_self_approve: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +133,7 @@ pub struct PersonalDevicesOverviewInput {
     pub unverified_devices: Vec<UnverifiedDeviceRecord>,
     pub rename_supported: bool,
     pub revoke_supported: bool,
+    pub device_trust: Option<hybridcipher_messages::device_actions::DeviceTrustStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +147,12 @@ pub struct PersonalDeviceRecord {
     pub last_seen: Option<String>,
     pub is_current_device: bool,
     pub is_verified: bool,
+    /// The fingerprint was checked; giving access can skip straight to sending keys.
+    #[serde(default)]
+    pub fingerprint_verified: bool,
+    /// Approved, but missing the current key of some group.
+    #[serde(default)]
+    pub missing_current_key: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +163,10 @@ pub struct PersonalDevicesOverview {
     pub review_devices: Vec<PersonalDeviceRecord>,
     pub rename_supported: bool,
     pub revoke_supported: bool,
+    pub device_trust: Option<hybridcipher_messages::device_actions::DeviceTrustStatus>,
+    pub can_approve_devices: bool,
+    pub can_verify_devices: bool,
+    pub can_revoke_other_devices: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -599,6 +619,8 @@ fn build_personal_device_record(
         last_seen,
         is_current_device,
         is_verified,
+        fingerprint_verified: false,
+        missing_current_key: false,
     }
 }
 
@@ -614,6 +636,12 @@ pub fn build_personal_devices_overview(
         .pending_devices
         .iter()
         .map(|device| device.device_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let missing_key_ids = input
+        .pending_devices
+        .iter()
+        .filter(|device| device.missing_current_key)
+        .map(|device| device.device_id.clone())
         .collect::<std::collections::HashSet<_>>();
     let stale_ids = input
         .stale_devices
@@ -645,9 +673,9 @@ pub fn build_personal_devices_overview(
     let mut seen_ids = std::collections::HashSet::new();
 
     for device in input.registered_devices {
-        let status = if pending_ids.contains(device.device_id.as_str()) {
+        let status = if pending_ids.contains(device.device_id.as_str()) || !device.is_approved {
             "pending"
-        } else if unverified_ids.contains(device.device_id.as_str()) {
+        } else if unverified_ids.contains(device.device_id.as_str()) || !device.is_verified {
             "unverified"
         } else if stale_ids.contains(device.device_id.as_str()) {
             "stale"
@@ -657,7 +685,7 @@ pub fn build_personal_devices_overview(
 
         let is_current_device = device.is_current_device || device.device_id == current_device_id;
         let unverified_detail = unverified_details.get(&device.device_id);
-        let record = build_personal_device_record(
+        let mut record = build_personal_device_record(
             device.device_id.clone(),
             device
                 .device_name
@@ -677,6 +705,8 @@ pub fn build_personal_devices_overview(
             is_current_device,
             device.is_verified && status != "unverified",
         );
+        record.fingerprint_verified = device.fingerprint_verified;
+        record.missing_current_key = missing_key_ids.contains(&device.device_id);
         seen_ids.insert(device.device_id);
 
         if record.is_current_device {
@@ -695,7 +725,8 @@ pub fn build_personal_devices_overview(
         if !seen_ids.insert(device.device_id.clone()) {
             continue;
         }
-        let record = build_personal_device_record(
+        let missing_current_key = device.missing_current_key;
+        let mut record = build_personal_device_record(
             device.device_id,
             device.device_name,
             None,
@@ -706,6 +737,7 @@ pub fn build_personal_devices_overview(
             is_current_device,
             false,
         );
+        record.missing_current_key = missing_current_key;
         if is_current_device {
             current_device = Some(record);
         } else {
@@ -766,5 +798,22 @@ pub fn build_personal_devices_overview(
         review_devices,
         rename_supported: input.rename_supported,
         revoke_supported: input.revoke_supported,
+        can_approve_devices: input
+            .device_trust
+            .as_ref()
+            .is_some_and(|trust| trust.can_approve_devices),
+        can_verify_devices: input
+            .device_trust
+            .as_ref()
+            .is_some_and(|trust| trust.can_verify_devices),
+        can_revoke_other_devices: input
+            .device_trust
+            .as_ref()
+            .is_some_and(|trust| trust.can_revoke_other_devices),
+        device_trust: input.device_trust,
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/device_security/test_device_trust_views.rs"]
+mod device_trust_tests;

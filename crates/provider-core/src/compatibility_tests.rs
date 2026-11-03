@@ -352,6 +352,40 @@ async fn provider_hydration_rejects_truncation_forged_sizes_and_sparse_relocatio
     assert_eq!(fs::read(&path).unwrap(), original);
 }
 
+#[tokio::test]
+async fn compatibility_consent_does_not_bypass_current_format_integrity_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = dir.path().join("account");
+    let encrypted = dir.path().join("encrypted");
+    let root = Uuid::new_v4();
+    let group = Uuid::new_v4();
+    let client = client(&account, group).await;
+    let policy = Arc::new(VaultCompatibility::load(&account, root).unwrap());
+    policy.set_enabled(true).unwrap();
+    let bridge = local_provider_bridge_with_compatibility(client, policy.clone());
+    let path = fixture(&encrypted, "current.md", 256, 3, false, group);
+    let entry = bridge.inventory(root, &encrypted).await.unwrap().remove(0);
+    let original = fs::read(&path).unwrap();
+    let mut corrupted = original.clone();
+    *corrupted.last_mut().unwrap() ^= 0x01;
+    fs::write(&path, corrupted).unwrap();
+
+    let output = dir.path().join("hydrated.txt");
+    let error = bridge
+        .hydrate_file_to_path(&entry, &output)
+        .await
+        .unwrap_err();
+    assert!(error.is_integrity_failure());
+    assert_eq!(
+        policy.status().last_read_error,
+        Some(ProviderFileErrorCode::IntegrityFailure)
+    );
+    assert!(
+        !output.exists(),
+        "failed integrity verification writes no plaintext"
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn production_bridge_handles_long_protected_paths_and_backups() {
@@ -382,4 +416,61 @@ async fn production_bridge_handles_long_protected_paths_and_backups() {
     let backup = backup_path(&policy, &entry, &original);
     assert!(backup.as_os_str().len() > 260);
     assert_eq!(fs::read(backup).unwrap(), original);
+}
+
+#[tokio::test]
+async fn files_on_a_key_version_this_device_lacks_report_key_unavailable_until_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = dir.path().join("account");
+    let encrypted = dir.path().join("encrypted");
+    let root = Uuid::new_v4();
+    let group = Uuid::new_v4();
+    let client = client(&account, group).await;
+    let policy = Arc::new(VaultCompatibility::load(&account, root).unwrap());
+    let bridge = local_provider_bridge_with_compatibility(client, policy.clone());
+    let readable = fixture(&encrypted, "readable.md", 64, 3, false, group);
+    let missing = fixture(&encrypted, "missing.md", 64, 3, false, group);
+    // The client holds only key version 1; claim version 7, as after rotations this device missed.
+    let original = fs::read(&missing).unwrap();
+    let text = String::from_utf8_lossy(&original);
+    let marker = ["\"epoch_id\":1,", "\"epoch_id\": 1,"]
+        .into_iter()
+        .find(|marker| text.contains(marker))
+        .expect("fixture header records its key version");
+    let header_end = original
+        .windows(marker.len())
+        .position(|window| window == marker.as_bytes())
+        .unwrap();
+    let mut rewritten = original[..header_end].to_vec();
+    rewritten.extend_from_slice(marker.replace('1', "7").as_bytes());
+    rewritten.extend_from_slice(&original[header_end + marker.len()..]);
+    fs::write(&missing, rewritten).unwrap();
+
+    let entries = bridge.inventory(root, &encrypted).await.unwrap();
+    let entry = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.relative_path == name)
+            .unwrap()
+            .clone()
+    };
+    let output = dir.path().join("hydrated.md");
+    let error = bridge
+        .hydrate_file_to_path(&entry("missing.md"), &output)
+        .await
+        .unwrap_err();
+    assert!(error.is_key_unavailable(), "{error}");
+    assert!(error.is_file_unavailable());
+    assert_eq!(
+        policy.status().last_read_error,
+        Some(ProviderFileErrorCode::KeyUnavailable)
+    );
+    assert!(!output.exists(), "an unreadable file writes no plaintext");
+
+    // A file that opens again (key restored or file moved) clears the notice.
+    bridge
+        .hydrate_file_to_path(&entry("readable.md"), &output)
+        .await
+        .unwrap();
+    assert_eq!(policy.status().last_read_error, None);
 }

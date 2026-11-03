@@ -1,5 +1,7 @@
 //! Account-scoped desktop operations; ordinary UI actions never launch shells or PTYs.
 use super::*;
+use crate::state::UserSession;
+use hybridcipher_crypto::epoch_id::EpochIdMapper;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
@@ -30,10 +32,14 @@ pub struct DesktopOperationSnapshot {
     pub result: Option<Value>,
     pub error: Option<DesktopOperationError>,
     pub input_request: Option<DesktopInputRequest>,
+    /// 0–100 while a step can say how far it is (moving files); otherwise the bar just runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<f64>,
 }
 #[derive(Deserialize)]
 pub struct DesktopOperationRequest {
     pub kind: String,
+    pub workspace: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     pub group_id: Option<String>,
@@ -42,6 +48,24 @@ pub struct DesktopOperationRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub expected_account_email: Option<String>,
+    /// Person to add or invite (task-level actions).
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Member to remove: user ID or email.
+    #[serde(default)]
+    pub member: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// Pending Team invitation that should carry this group's access.
+    #[serde(default)]
+    pub invitation_id: Option<String>,
+    /// Rotate group keys after removing a member (default true).
+    #[serde(default)]
+    pub rotate_keys: Option<bool>,
+    /// Rotate keys even if some devices cannot receive the new key; the admin
+    /// confirmed they catch up through device approval.
+    #[serde(default)]
+    pub skip_unreachable: Option<bool>,
 }
 #[derive(Deserialize, Serialize)]
 pub struct DesktopOperationAnswer {
@@ -58,8 +82,12 @@ impl Drop for DesktopOperationAnswer {
 struct Operation {
     snapshot: DesktopOperationSnapshot,
     server: String,
+    device_id: String,
+    auth_generation: u64,
     answers: mpsc::Sender<DesktopOperationAnswer>,
     cancel: watch::Sender<bool>,
+    /// Structured `result` events reported by CLI steps, newest last.
+    results: Vec<Value>,
 }
 static OPERATIONS: Lazy<tokio::sync::Mutex<HashMap<String, Operation>>> =
     Lazy::new(|| tokio::sync::Mutex::new(HashMap::new()));
@@ -92,19 +120,41 @@ fn active(snapshot: &DesktopOperationSnapshot) -> bool {
 fn canonical_server(server: &str) -> &str {
     server.trim_end_matches('/').trim_end_matches("/api/v1")
 }
+fn group_matches_workspace(group: &Value, workspace: &str, organization: Option<&str>) -> bool {
+    match workspace {
+        "personal" => !group["organization_id"].is_string(),
+        "team" => organization.is_some_and(|id| group["organization_id"].as_str() == Some(id)),
+        _ => false,
+    }
+}
 
 async fn authorize_operation(state: &AppState, operation: &Operation) -> Result<(), String> {
     let session = state.session.lock().await;
     let session = session.as_ref().ok_or("Sign in to view this operation")?;
+    validate_operation_session(
+        session,
+        &current_server_url(state, session),
+        state.auth_generation(),
+        operation,
+    )
+}
+fn validate_operation_session(
+    session: &UserSession,
+    server: &str,
+    auth_generation: u64,
+    operation: &Operation,
+) -> Result<(), String> {
     if session.user_id != operation.snapshot.account_id
-        || canonical_server(&current_server_url(state, session))
-            != canonical_server(&operation.server)
+        || session.device_id != operation.device_id
+        || auth_generation != operation.auth_generation
+        || canonical_server(server) != canonical_server(&operation.server)
     {
-        return Err("This operation belongs to another account".into());
+        return Err("This operation belongs to a previous or different login".into());
     }
     Ok(())
 }
 pub(super) async fn cancel_all_desktop_operations(state: &AppState) {
+    super::mount_queue::cancel_for_transition();
     let account = state
         .session
         .lock()
@@ -187,6 +237,36 @@ pub async fn cancel_desktop_operation(
     Ok(op.snapshot.clone())
 }
 
+/// Task-level Team actions implemented in `team_tasks`.
+pub(super) const TASK_KINDS: [&str; 6] = [
+    "add_member",
+    "add_person",
+    "stage_invitation_access",
+    "remove_access",
+    "rotate_keys",
+    "approve_device",
+];
+
+/// Group administrators only; Team groups also need a writable Team license.
+pub(super) async fn authorize_group_administration(
+    state: &AppState,
+    session: &UserSession,
+    group: Uuid,
+) -> Result<Value, String> {
+    let metadata = validate_group_access(state, session, group, true).await?;
+    let role = metadata["role"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(role.as_str(), "admin" | "owner") {
+        return Err("Your role cannot administer this group".into());
+    }
+    if metadata["organization_id"].is_string() {
+        super::license::require_team_write(state).await?;
+    }
+    Ok(metadata)
+}
+
 pub(super) fn validate_cli_args(args: &[String], group: Option<Uuid>) -> Result<(), String> {
     let first = args
         .first()
@@ -202,6 +282,7 @@ pub(super) fn validate_cli_args(args: &[String], group: Option<Uuid>) -> Result<
             | "verify-membership"
             | "process-welcome-messages"
             | "issue-welcome"
+            | "repair-own-devices"
             | "pending-devices"
             | "audit-devices"
             | "unverified-devices"
@@ -316,9 +397,13 @@ pub(super) fn background_cli_args_allowed(args: &[String]) -> bool {
             | "health-check"
             | "pending-devices"
             | "unverified-devices"
+            // Sends keys only to this account's own devices that this account verified.
+            | "repair-own-devices"
     ) || command == "server-trust" && action == "show"
-        || command == "pin" && matches!(action, "list" | "fingerprint" | "show")
-        || command == "rekey" && action == "status"
+        // publish-attestations only shares verifications already made on this device.
+        || command == "pin" && matches!(action, "list" | "fingerprint" | "show" | "publish-attestations")
+        // The rotation's own device checks, run before a rotation without starting one.
+        || command == "rekey" && matches!(action, "status" | "preflight")
         || command == "coverage" && matches!(action, "status" | "audit" | "verify")
 }
 #[tauri::command]
@@ -332,12 +417,13 @@ pub async fn start_desktop_operation(
     } else {
         ensure_authenticated(&state).await?
     };
-    let session = state
-        .session
-        .lock()
-        .await
-        .clone()
-        .ok_or("No account is open")?;
+    let (session, auth_generation) = {
+        let session = state.session.lock().await;
+        (
+            session.clone().ok_or("No account is open")?,
+            state.auth_generation(),
+        )
+    };
     validate_expected_account(request.expected_account_email.as_deref(), &session.email)?;
     let group = request
         .group_id
@@ -386,6 +472,13 @@ pub async fn start_desktop_operation(
                 super::license::require_team_write(&state).await?;
             }
         }
+    } else if TASK_KINDS.contains(&request.kind.as_str()) {
+        // Task-level actions run CLI steps, which need a saved login like other CLI actions.
+        if !session.persistent {
+            return Err("This action needs a saved login. Sign in with Remember me.".into());
+        }
+        let group = group.ok_or("Select a group before starting this action")?;
+        authorize_group_administration(&state, &session, group).await?;
     } else if !matches!(
         request.kind.as_str(),
         "team_setup" | "create_group" | "initialize_group" | "switch_group"
@@ -406,15 +499,17 @@ pub async fn start_desktop_operation(
         result: None,
         error: None,
         input_request: None,
+        progress: None,
     };
-    let (answers_tx, answers_rx) = mpsc::channel(1);
+    let (answers_tx, mut answers_rx) = mpsc::channel(1);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     {
         let mut registry = OPERATIONS.lock().await;
-        if registry
-            .values()
-            .any(|op| op.snapshot.account_id == session.user_id && active(&op.snapshot))
-        {
+        if registry.values().any(|op| {
+            op.snapshot.account_id == session.user_id
+                && op.auth_generation == auth_generation
+                && active(&op.snapshot)
+        }) {
             return Err("Another operation is still running for this account".into());
         }
         if registry.len() >= 64 {
@@ -425,8 +520,11 @@ pub async fn start_desktop_operation(
             Operation {
                 snapshot: snapshot.clone(),
                 server: current_server_url(&state, &session),
+                device_id: session.device_id.clone(),
+                auth_generation,
                 answers: answers_tx,
                 cancel: cancel_tx,
+                results: Vec::new(),
             },
         );
     }
@@ -439,7 +537,18 @@ pub async fn start_desktop_operation(
                 group,
                 &session,
                 &state,
-                answers_rx,
+                &mut answers_rx,
+                &mut cancel_rx,
+            )
+            .await
+        } else if TASK_KINDS.contains(&request.kind.as_str()) {
+            super::team_tasks::run_task_operation(
+                &id,
+                &request,
+                group,
+                &session,
+                &state,
+                &mut answers_rx,
                 &mut cancel_rx,
             )
             .await
@@ -470,9 +579,32 @@ pub async fn start_desktop_operation(
     });
     Ok(snapshot)
 }
-async fn update_phase(id: &str, phase: &str, group: Option<Uuid>) {
+/// Newest structured result of `kind` reported by a CLI step of this operation.
+pub(super) async fn last_task_result(id: &str, kind: &str) -> Option<Value> {
+    OPERATIONS.lock().await.get(id).and_then(|op| {
+        op.results
+            .iter()
+            .rev()
+            .find(|event| event["kind"].as_str() == Some(kind))
+            .map(|event| event["data"].clone())
+    })
+}
+/// How far a step is, as 0–100, from items done out of a total (`None` while the total is unknown).
+pub(super) fn progress_percent(done: usize, total: usize) -> Option<f64> {
+    (total > 0).then(|| (done.min(total) as f64 * 100.0 / total as f64).round())
+}
+
+pub(super) async fn update_progress(id: &str, progress: Option<f64>) {
+    if let Some(op) = OPERATIONS.lock().await.get_mut(id) {
+        op.snapshot.progress = progress;
+    }
+}
+
+pub(super) async fn update_phase(id: &str, phase: &str, group: Option<Uuid>) {
     if let Some(op) = OPERATIONS.lock().await.get_mut(id) {
         op.snapshot.phase = phase.into();
+        // A new step starts without a known progress.
+        op.snapshot.progress = None;
         if let Some(group) = group {
             op.snapshot.group_id = Some(group.to_string());
         }
@@ -490,13 +622,13 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(reader: R, sender: mpsc::Se
         }
     }
 }
-async fn run_cli_operation(
+pub(super) async fn run_cli_operation(
     id: &str,
     args: &[String],
     group: Option<Uuid>,
     session: &crate::state::UserSession,
     state: &AppState,
-    mut answers: mpsc::Receiver<DesktopOperationAnswer>,
+    answers: &mut mpsc::Receiver<DesktopOperationAnswer>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Value, (String, String)> {
     let (binary, _) = locate_cli_binary().map_err(|error| ("cli_unavailable".into(), error))?;
@@ -553,24 +685,32 @@ async fn run_cli_operation(
     while let Some(line) = lines.recv().await {
         record_cli_line(id, line, &secrets).await;
     }
-    let output = OPERATIONS
+    let (output, results) = OPERATIONS
         .lock()
         .await
         .get(id)
-        .map(|op| op.snapshot.output.join("\n"))
+        .map(|op| (op.snapshot.output.join("\n"), op.results.clone()))
         .unwrap_or_default();
     if !status.success() {
-        return Err((
-            "action_failed".into(),
-            if output.is_empty() {
-                "The action failed. Review account and group access before retrying.".into()
-            } else {
-                output
-            },
-        ));
+        // The full transcript stays in the operation output ("Technical details").
+        return Err(("action_failed".into(), summarize_cli_failure(&output)));
     }
     let structured = serde_json::from_str::<Value>(&output).ok();
-    Ok(json!({"exit_status":status.code().unwrap_or(-1),"output":output,"data":structured}))
+    Ok(json!({"exit_status":status.code().unwrap_or(-1),"output":output,"data":structured,"results":results}))
+}
+/// One readable sentence for a failed CLI command: the text of its last `✗ Error:` line.
+fn summarize_cli_failure(output: &str) -> String {
+    let error = output.lines().rev().find_map(|line| {
+        let line = line.trim().trim_start_matches('✗').trim_start();
+        line.strip_prefix("Error:").map(str::trim).filter(|text| !text.is_empty())
+    });
+    match error {
+        Some(text) => text.to_string(),
+        None if output.trim().is_empty() => {
+            "The action failed. Review account and group access before retrying.".into()
+        }
+        None => "The action failed. Open Technical details for the full output.".into(),
+    }
 }
 async fn record_cli_line(id: &str, mut line: String, secrets: &[Zeroizing<String>]) {
     for secret in secrets {
@@ -584,6 +724,12 @@ async fn record_cli_line(id: &str, mut line: String, secrets: &[Zeroizing<String
         .strip_prefix(PROMPT_PREFIX)
         .and_then(|json| serde_json::from_str::<Value>(json).ok())
     {
+        if event.get("event").and_then(Value::as_str) == Some("result") {
+            if op.results.len() < 32 {
+                op.results.push(event);
+            }
+            return;
+        }
         if event.get("event").and_then(Value::as_str) == Some("needs_input") {
             if let Ok(prompt) = serde_json::from_value::<DesktopInputRequest>(event) {
                 if matches!(
@@ -619,11 +765,22 @@ pub struct WorkspaceGroupContext {
     pub readiness: String,
     pub groups: Vec<Value>,
 }
-async fn cached_group_list(
+pub(super) fn group_epoch_uuid(group: &Value) -> Result<Option<Uuid>, String> {
+    match group.get("current_epoch_id") {
+        Some(Value::String(id)) => Uuid::parse_str(id)
+            .map(Some)
+            .map_err(|_| "Invalid current group epoch".into()),
+        Some(Value::Null) | None => Ok(None),
+        _ => Err("Invalid current group epoch".into()),
+    }
+}
+pub(super) async fn cached_group_list(
     state: &AppState,
     session: &crate::state::UserSession,
     refresh: bool,
 ) -> Result<Vec<Value>, String> {
+    let scope = super::personal_workspace::WorkspaceSessionScope::capture(state, session);
+    scope.ensure_current(state).await?;
     let client = state.local_client.client().await?;
     if refresh && session.expires_at > chrono::Utc::now().timestamp() {
         if let Ok(Ok(list)) = tokio::time::timeout(
@@ -633,6 +790,10 @@ async fn cached_group_list(
         .await
         {
             let groups = list.groups.into_iter().map(|group| json!({"id":group.id,"name":group.name,"organization_id":group.organization_id,"role":group.user_role,"current_epoch_id":group.current_epoch})).collect::<Vec<_>>();
+            scope.ensure_current(state).await?;
+            if let Ok(mut watch) = state.group_key_watch.lock() {
+                watch.list_refreshed_at = Some(std::time::Instant::now());
+            }
             client
                 .store_local_config(
                     "desktop_workspace_groups",
@@ -647,27 +808,100 @@ async fn cached_group_list(
         .load_local_config("desktop_workspace_groups")
         .await
         .map_err(|error| error.to_string())?;
+    scope.ensure_current(state).await?;
     Ok(cached
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default())
 }
-async fn validate_group_access(
+/// A group list fetched this recently is reused by the key update check instead of fetching
+/// another one; the app's workspace refresh already fetches it about once a minute.
+const GROUP_LIST_REUSE: std::time::Duration = std::time::Duration::from_secs(55);
+
+/// Each group's current key version from the server's group list. Groups without a key, and
+/// key IDs that do not map to a version (legacy groups), are left out.
+pub(super) fn server_group_key_versions(groups: &[Value]) -> Vec<(Uuid, u64)> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let group_id = Uuid::parse_str(group["id"].as_str()?).ok()?;
+            let epoch_id = group_epoch_uuid(group).ok().flatten()?;
+            let version = EpochIdMapper::uuid_to_u64(epoch_id, group_id.as_bytes())?;
+            Some((group_id, version))
+        })
+        .collect()
+}
+
+/// Whether a group's current key is one this device does not hold yet, and was not reported
+/// before. The app then runs its key check at once instead of waiting for the hourly one, so a
+/// member picks up a rotation within about a minute. Fetches the group list only when no
+/// recent one is cached.
+#[tauri::command]
+pub async fn group_key_update_available(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse<bool>, String> {
+    let _guard = ensure_authenticated(&state).await?;
+    let Some(session) = state.session.lock().await.clone() else {
+        return Ok(CommandResponse::ok(false));
+    };
+    let refresh = state.group_key_watch.lock().map_or(true, |watch| {
+        watch
+            .list_refreshed_at
+            .map_or(true, |at| at.elapsed() >= GROUP_LIST_REUSE)
+    });
+    let groups = match cached_group_list(&state, &session, refresh).await {
+        Ok(groups) => groups,
+        Err(_) => return Ok(CommandResponse::ok(false)),
+    };
+    let client = state.local_client.client().await?;
+    let mut newer = Vec::new();
+    for (group_id, version) in server_group_key_versions(&groups) {
+        if !client.holds_group_key(group_id, version).await {
+            newer.push((group_id, version));
+        }
+    }
+    let mut watch = state
+        .group_key_watch
+        .lock()
+        .map_err(|_| "Group key watch unavailable".to_string())?;
+    let mut announce = false;
+    for key in newer {
+        announce |= watch.announced.insert(key);
+    }
+    Ok(CommandResponse::ok(announce))
+}
+
+#[cfg(test)]
+#[path = "../../tests/operations/test_group_key_updates.rs"]
+mod group_key_updates_tests;
+
+pub(super) async fn validate_group_access(
     state: &AppState,
     session: &crate::state::UserSession,
     id: Uuid,
     refresh: bool,
 ) -> Result<Value, String> {
-    cached_group_list(state, session, refresh)
+    let group = cached_group_list(state, session, refresh)
         .await?
         .into_iter()
-        .find(|group| group["id"].as_str() == Some(&id.to_string()))
-        .ok_or("The selected group is not available to this account".into())
+        .find(|group| group["id"].as_str() == Some(&id.to_string()));
+    if let Some(group) = group {
+        return Ok(group);
+    }
+    // The Personal default is resolved independently of the paginated group list.
+    let personal =
+        super::personal_workspace::personal_workspace_snapshot(state, session, refresh).await?;
+    if personal["state"] == "available" && personal["group"]["id"].as_str() == Some(&id.to_string())
+    {
+        return Ok(personal["group"].clone());
+    }
+    Err("The selected group is not available to this account".into())
 }
 #[tauri::command]
 pub async fn get_workspace_group_context(
     workspace: String,
     selection_sequence: Option<u64>,
     expected_account_email: Option<String>,
+    read_only: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<WorkspaceGroupContext, String> {
     if !matches!(workspace.as_str(), "personal" | "team") {
@@ -681,61 +915,88 @@ pub async fn get_workspace_group_context(
         .clone()
         .ok_or("No account is open")?;
     validate_expected_account(expected_account_email.as_deref(), &session.email)?;
+    let session_scope = super::personal_workspace::WorkspaceSessionScope::capture(&state, &session);
     let selection_key = format!(
         "{}@{}",
         session.user_id,
         canonical_server(&current_server_url(&state, &session))
     );
-    if let Some(sequence) = selection_sequence {
+    let read_only = read_only.unwrap_or(false);
+    if let Some(sequence) = selection_sequence.filter(|_| !read_only) {
         register_workspace_selection(&selection_key, sequence).await?;
     }
     let _selection_guard = WORKSPACE_SELECTION_LOCK.lock().await;
-    let organization = super::license::verified_claims(&session, true)
-        .ok()
-        .flatten()
-        .map(|claims| claims.organization_id);
-    let groups = cached_group_list(&state, &session, true)
-        .await?
-        .into_iter()
-        .filter(|group| {
-            group["organization_id"].is_string() == (workspace == "team")
-                && (workspace != "team"
-                    || organization
-                        .as_deref()
-                        .is_none_or(|id| group["organization_id"].as_str() == Some(id)))
-        })
-        .collect::<Vec<_>>();
+    let organization = if workspace == "team" {
+        Some(
+            super::license::verified_claims(&session, true)?
+                .ok_or("The Team license is unavailable for this workspace")?
+                .organization_id,
+        )
+    } else {
+        None
+    };
+    let personal = if workspace == "personal" {
+        Some(super::personal_workspace::personal_workspace_snapshot(&state, &session, true).await?)
+    } else {
+        None
+    };
+    let groups = if let Some(personal) = &personal {
+        if personal["state"] == "available" {
+            vec![personal["group"].clone()]
+        } else {
+            Vec::new()
+        }
+    } else {
+        cached_group_list(&state, &session, true)
+            .await?
+            .into_iter()
+            .filter(|group| group_matches_workspace(group, &workspace, organization.as_deref()))
+            .collect::<Vec<_>>()
+    };
     let client = state.local_client.client().await?;
     let selected_key = format!("desktop_selected_{}_group", workspace);
-    let selected = client
-        .load_local_config(&selected_key)
-        .await
-        .map_err(|error| error.to_string())?;
-    let active = client.active_group_id_opt().await.map(|id| id.to_string());
-    let group = groups
-        .iter()
-        .find(|group| group["id"].as_str() == selected.as_deref())
-        .or_else(|| {
-            groups
-                .iter()
-                .find(|group| group["id"].as_str() == active.as_deref())
-        })
-        .or_else(|| groups.first());
+    let selected = if workspace == "team" {
+        client
+            .load_local_config(&selected_key)
+            .await
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    let active = if workspace == "team" {
+        client.active_group_id_opt().await.map(|id| id.to_string())
+    } else {
+        None
+    };
+    let group = if workspace == "personal" {
+        groups.first()
+    } else {
+        groups
+            .iter()
+            .find(|group| group["id"].as_str() == selected.as_deref())
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|group| group["id"].as_str() == active.as_deref())
+            })
+            .or_else(|| groups.first())
+    };
     let mut context = WorkspaceGroupContext {
         group_id: None,
         name: None,
         organization_id: None,
         role: None,
-        readiness: "no_groups".into(),
+        readiness: personal
+            .as_ref()
+            .and_then(|value| value["state"].as_str())
+            .filter(|state| *state != "available")
+            .unwrap_or("no_groups")
+            .into(),
         groups: groups.clone(),
     };
-    if let Some(sequence) = selection_sequence {
+    if let Some(sequence) = selection_sequence.filter(|_| !read_only) {
         validate_workspace_selection(&selection_key, sequence).await?;
     }
-    client
-        .store_local_config("desktop_ui_group_id", "")
-        .await
-        .map_err(|error| error.to_string())?;
     if let Some(group) = group {
         context.group_id = group["id"].as_str().map(str::to_string);
         context.name = group["name"].as_str().map(str::to_string);
@@ -743,38 +1004,64 @@ pub async fn get_workspace_group_context(
         context.role = group["role"].as_str().map(|role| role.to_ascii_lowercase());
         let id = Uuid::parse_str(context.group_id.as_deref().unwrap_or_default())
             .map_err(|_| "Invalid cached group")?;
-        let has_keys = client
-            .has_cached_group_key(id)
-            .await
-            .map_err(|error| error.to_string())?;
+        let epoch = group_epoch_uuid(group)?;
+        let mut has_keys = if let Some(epoch) = epoch {
+            client
+                .has_cached_group_epoch_key(id, epoch)
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            false
+        };
+        if !read_only
+            && !has_keys
+            && epoch.is_some()
+            && session.expires_at > chrono::Utc::now().timestamp()
+        {
+            // Reconcile an established namespace; acquiring keys never creates genesis.
+            let _ = client.refresh_committed_group_epoch(id).await;
+            has_keys = client
+                .has_cached_group_epoch_key(id, epoch.unwrap())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        session_scope.ensure_current(&state).await?;
+        if let Some(sequence) = selection_sequence.filter(|_| !read_only) {
+            validate_workspace_selection(&selection_key, sequence).await?;
+        }
         context.readiness = if has_keys {
             "ready"
-        } else if group["current_epoch_id"].is_string() {
+        } else if epoch.is_some() {
             "waiting_for_device_approval"
         } else {
             "uninitialized"
         }
         .into();
-        client
-            .store_local_config("desktop_ui_group_id", &id.to_string())
-            .await
-            .map_err(|error| error.to_string())?;
-        if !has_keys && session.expires_at > chrono::Utc::now().timestamp() {
-            let _ = client.use_group(id).await;
-        }
-        if has_keys {
+        if !read_only {
             client
-                .use_group(id)
+                .store_local_config("desktop_ui_group_id", &id.to_string())
                 .await
                 .map_err(|error| error.to_string())?;
+        }
+        if has_keys && !read_only {
+            client
+                .use_group_at_epoch(id, epoch.unwrap())
+                .await
+                .map_err(|error| error.to_string())?;
+            session_scope.ensure_current(&state).await?;
+            if let Some(sequence) = selection_sequence.filter(|_| !read_only) {
+                validate_workspace_selection(&selection_key, sequence).await?;
+            }
             client
                 .store_local_config("group_id", &id.to_string())
                 .await
                 .map_err(|error| error.to_string())?;
-            client
-                .store_local_config(&selected_key, &id.to_string())
-                .await
-                .map_err(|error| error.to_string())?;
+            if workspace == "team" {
+                client
+                    .store_local_config(&selected_key, &id.to_string())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
         }
     } else if workspace == "team" {
         if let Some(setup) = client
@@ -794,30 +1081,46 @@ pub async fn get_workspace_group_context(
                 context.group_id = Some(id.to_string());
                 context.name = setup["name"].as_str().map(str::to_string);
                 context.organization_id = organization.clone();
-                context.role = Some("admin".into());
+                // Setup metadata identifies the group but cannot establish an
+                // administrator role without membership metadata.
+                context.role = None;
+                let epoch = group_epoch_uuid(&setup)?;
+                let has_keys = if let Some(epoch) = epoch {
+                    client
+                        .has_cached_group_epoch_key(id, epoch)
+                        .await
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                };
                 context.readiness = if setup["readiness"] == "deleted" {
                     "deleted"
-                } else if client
-                    .has_cached_group_key(id)
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
+                } else if has_keys {
                     "ready"
-                } else if setup["readiness"] == "waiting_for_device_approval" {
+                } else if epoch.is_some()
+                    || setup["readiness"] == "waiting_for_device_approval"
+                    || setup["readiness"] == "ready"
+                {
                     "waiting_for_device_approval"
                 } else {
                     "uninitialized"
                 }
                 .into();
+                session_scope.ensure_current(&state).await?;
+                if let Some(sequence) = selection_sequence.filter(|_| !read_only) {
+                    validate_workspace_selection(&selection_key, sequence).await?;
+                }
                 if context.readiness != "deleted" {
-                    client
-                        .store_local_config("desktop_ui_group_id", &id.to_string())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    context.groups.push(json!({"id":id,"name":context.name,"organization_id":context.organization_id,"role":"admin","current_epoch_id":null}));
-                    if context.readiness == "ready" {
+                    context.groups.push(json!({"id":id,"name":context.name,"organization_id":context.organization_id,"role":null,"current_epoch_id":epoch}));
+                    if !read_only {
                         client
-                            .use_group(id)
+                            .store_local_config("desktop_ui_group_id", &id.to_string())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    if context.readiness == "ready" && !read_only {
+                        client
+                            .use_group_at_epoch(id, epoch.unwrap())
                             .await
                             .map_err(|error| error.to_string())?;
                         client
@@ -829,9 +1132,24 @@ pub async fn get_workspace_group_context(
             }
         }
     }
+    session_scope.ensure_current(&state).await?;
+    if let Some(sequence) = selection_sequence.filter(|_| !read_only) {
+        validate_workspace_selection(&selection_key, sequence).await?;
+    }
+    if !read_only && context.group_id.is_none() {
+        client
+            .store_local_config("desktop_ui_group_id", "")
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     Ok(context)
 }
 async fn prepare_group(state: &AppState, group: Uuid) -> Result<String, String> {
+    if super::local_vault::pending_vault_upgrade(state)
+        .is_some_and(|(vault_group, _)| vault_group != group)
+    {
+        return Err(super::local_vault::LOCAL_VAULT_UPGRADE_PENDING.into());
+    }
     let client = state.local_client.client().await?;
     let readiness = client.prepare_group_for_use(group).await.map_err(|error| {
         error
@@ -887,9 +1205,12 @@ async fn run_typed_operation(
 ) -> Result<Value, (String, String)> {
     let run = async {
         if request.kind == "switch_group" {
+            let session_scope =
+                super::personal_workspace::WorkspaceSessionScope::capture(state, session);
+            session_scope.ensure_current(state).await?;
             let _selection_guard = WORKSPACE_SELECTION_LOCK.lock().await;
             let group = group.ok_or("Select a group")?;
-            let metadata = validate_group_access(
+            let mut metadata = validate_group_access(
                 state,
                 session,
                 group,
@@ -902,32 +1223,72 @@ async fn run_typed_operation(
             } else {
                 "personal"
             };
+            if workspace == "personal" {
+                let personal =
+                    super::personal_workspace::personal_workspace_snapshot(state, session, true)
+                        .await?;
+                if personal["state"] != "available"
+                    || personal["personal_default_group_id"].as_str() != Some(&group.to_string())
+                {
+                    return Err("Personal mode always uses the account's Personal default group. Repair Personal setup to change a missing default.".into());
+                }
+                metadata = personal["group"].clone();
+            }
+            session_scope.ensure_current(state).await?;
             client
                 .store_local_config("desktop_ui_group_id", &group.to_string())
                 .await
                 .map_err(|error| error.to_string())?;
-            client
-                .store_local_config(
-                    &format!("desktop_selected_{}_group", workspace),
-                    &group.to_string(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let has_keys = client
-                .has_cached_group_key(group)
-                .await
-                .map_err(|error| error.to_string())?;
+            if workspace == "team" {
+                client
+                    .store_local_config("desktop_selected_team_group", &group.to_string())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            let mut epoch = group_epoch_uuid(&metadata)?;
+            let has_keys = if let Some(epoch) = epoch {
+                client
+                    .has_cached_group_epoch_key(group, epoch)
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                false
+            };
             let readiness = if session.expires_at <= chrono::Utc::now().timestamp() {
                 if !has_keys {
-                    return Err("This device has no cached keys for the selected group".into());
+                    return Err(
+                        "This device has no verified keys for the selected group's current epoch"
+                            .into(),
+                    );
                 }
                 "ready".into()
+            } else if epoch.is_some() {
+                let _ = client.refresh_committed_group_epoch(group).await;
+                if client
+                    .has_cached_group_epoch_key(group, epoch.unwrap())
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    "ready".into()
+                } else {
+                    "waiting_for_device_approval".into()
+                }
+            } else if workspace == "personal" {
+                "uninitialized".into()
             } else {
                 prepare_group(state, group).await?
             };
+            session_scope.ensure_current(state).await?;
+            if readiness == "ready" && epoch.is_none() {
+                metadata = validate_group_access(state, session, group, true).await?;
+                epoch = group_epoch_uuid(&metadata)?;
+                if epoch.is_none() {
+                    return Err("The current group epoch could not be confirmed".into());
+                }
+            }
             if readiness == "ready" {
                 client
-                    .use_group(group)
+                    .use_group_at_epoch(group, epoch.unwrap())
                     .await
                     .map_err(|error| error.to_string())?;
                 client
@@ -938,13 +1299,15 @@ async fn run_typed_operation(
                     .store_local_config("desktop_ui_group_id", &group.to_string())
                     .await
                     .map_err(|error| error.to_string())?;
-                client
-                    .store_local_config(
-                        &format!("desktop_selected_{}_group", workspace),
-                        &group.to_string(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
+                if workspace == "team" {
+                    client
+                        .store_local_config(
+                            &format!("desktop_selected_{}_group", workspace),
+                            &group.to_string(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
             }
             return Ok(json!({"group_id":group,"name":metadata["name"],"readiness":readiness}));
         }
@@ -971,6 +1334,35 @@ async fn run_typed_operation(
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|error| error.to_string())?;
+        if request.kind == "team_setup" {
+            if request.workspace.as_deref() != Some("team") {
+                return Err("Team setup requires an explicit Team workspace context".into());
+            }
+            let response = http
+                .get(api_endpoint(&server, "organizations/me"))
+                .bearer_auth(&session.token)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(
+                    "Connect with an active Team owner account before preparing its workspace"
+                        .into(),
+                );
+            }
+            let organization: Option<super::license::OrganizationStatus> =
+                response.json().await.map_err(|error| error.to_string())?;
+            if !organization.is_some_and(|organization| {
+                organization.id.to_string() == organization_id
+                    && organization.role == "owner"
+                    && organization.license_status == "active"
+            }) {
+                return Err(
+                    "Only the active Team organization owner can prepare its default workspace"
+                        .into(),
+                );
+            }
+        }
         let (target, name) = match request.kind.as_str() {
             "team_setup" => {
                 update_phase(id, "Preparing the Team default group", None).await;

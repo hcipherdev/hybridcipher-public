@@ -1,0 +1,7 @@
+# Pinned so public verification builds use the same compiler as published
+# hashes; rustup installs this toolchain and these targets automatically.
+# Update the version only together with regenerated verification hashes.
+[toolchain]
+channel = "1.99.0"
+profile = "default"
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]

@@ -160,7 +160,11 @@ async fn save_team_state(
         .await
         .clone()
         .ok_or("No account is open")?;
-    if updated.user_id != session.user_id {
+    if updated.user_id != session.user_id
+        || updated.email != session.email
+        || updated.device_id != session.device_id
+        || current_server_url_for_license(&updated) != current_server_url_for_license(session)
+    {
         return Err("Account changed while saving Team access".into());
     }
     updated.team_entitlement = token;
@@ -169,16 +173,43 @@ async fn save_team_state(
     state.persist_refreshed_session(updated).await
 }
 
+fn check_license_request_context(
+    session: &crate::state::UserSession,
+    expected_account_email: Option<&str>,
+    expected_device_id: Option<&str>,
+) -> Result<(), String> {
+    if expected_account_email.is_some_and(|email| email != session.email)
+        || expected_device_id.is_some_and(|device| device != session.device_id)
+    {
+        return Err("The account or device changed. Reopen Team activation from Settings.".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "../../tests/device_security/test_license_request_context.rs"]
+mod request_context_tests;
+
 #[tauri::command]
 pub async fn get_team_license_status(
+    expected_account_email: Option<String>,
+    expected_device_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<TeamLicenseStatus, String> {
+    // Keep this snapshot and every subsequent cache write in the same login.
+    // Existing-data access permits expired Team sessions to inspect their cache.
+    let _guard = ensure_local_data_access(&state).await?;
     let session = state
         .session
         .lock()
         .await
         .clone()
         .ok_or("No account is open")?;
+    check_license_request_context(
+        &session,
+        expected_account_email.as_deref(),
+        expected_device_id.as_deref(),
+    )?;
     if session.expires_at <= chrono::Utc::now().timestamp() {
         return Ok(status_from_cache(
             &state,
@@ -335,10 +366,17 @@ pub async fn get_team_license_status(
 pub async fn redeem_team_code(
     code: String,
     organization_name: String,
+    expected_account_email: Option<String>,
+    expected_device_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<TeamLicenseStatus, String> {
     let _guard = ensure_authenticated(&state).await?;
     let session = current_authenticated_session(&state).await?;
+    check_license_request_context(
+        &session,
+        expected_account_email.as_deref(),
+        expected_device_id.as_deref(),
+    )?;
     let response = reqwest::Client::new()
         .post(api_endpoint(
             &current_server_url(&state, &session),
@@ -379,10 +417,17 @@ pub async fn redeem_team_code(
 #[tauri::command]
 pub async fn accept_team_invitation(
     code: String,
+    expected_account_email: Option<String>,
+    expected_device_id: Option<String>,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     let _guard = ensure_authenticated(&state).await?;
     let session = current_authenticated_session(&state).await?;
+    check_license_request_context(
+        &session,
+        expected_account_email.as_deref(),
+        expected_device_id.as_deref(),
+    )?;
     let response = reqwest::Client::new()
         .post(api_endpoint(
             &current_server_url(&state, &session),
@@ -399,14 +444,76 @@ pub async fn accept_team_invitation(
             response.status()
         ));
     }
-    Ok(())
+    // `groups_joined` and `groups_waiting` say which groups opened at once and which wait for
+    // a group admin's app.
+    response.json().await.map_err(|err| err.to_string())
+}
+
+/// Pending Team invitations addressed to this account's confirmed email, so members can join
+/// without copying an invitation code.
+#[tauri::command]
+pub async fn list_my_team_invitations(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let _guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|err| err.to_string())?
+        .get(api_endpoint(
+            &current_server_url(&state, &session),
+            "organizations/invitations/mine",
+        ))
+        .bearer_auth(&session.token)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Invitations are unavailable: {}", response.status()));
+    }
+    response.json().await.map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn accept_my_team_invitation(
+    invitation_id: String,
+    expected_account_email: Option<String>,
+    expected_device_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let _guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    check_license_request_context(
+        &session,
+        expected_account_email.as_deref(),
+        expected_device_id.as_deref(),
+    )?;
+    let invitation = Uuid::parse_str(invitation_id.trim()).map_err(|_| "Invalid invitation")?;
+    let response = reqwest::Client::new()
+        .post(api_endpoint(
+            &current_server_url(&state, &session),
+            &format!("organizations/invitations/{}/accept", invitation),
+        ))
+        .bearer_auth(&session.token)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Team invitation could not be accepted: {}",
+            response.status()
+        ));
+    }
+    // `groups_joined` and `groups_waiting` say which groups opened at once and which wait for
+    // a group admin's app.
+    response.json().await.map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 pub async fn invite_team_member(
     email: String,
+    group_ids: Option<Vec<Uuid>>,
     state: State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<Value, String> {
     let _guard = ensure_authenticated(&state).await?;
     let session = current_authenticated_session(&state).await?;
     let response = reqwest::Client::new()
@@ -415,19 +522,42 @@ pub async fn invite_team_member(
             "organizations/me/invitations",
         ))
         .bearer_auth(&session.token)
-        .json(&json!({"email": email.trim()}))
+        .json(&json!({"email": email.trim(), "group_ids": group_ids.unwrap_or_default()}))
         .send()
         .await
         .map_err(|err| err.to_string())?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Err("No seat is free, or this person is already in the Team".into());
+    }
     if !response.status().is_success() {
         return Err(format!("Team invitation failed: {}", response.status()));
     }
+    // `invitation_id` lets the app attach group access to the invitation it just made.
     let value: Value = response.json().await.map_err(|err| err.to_string())?;
-    value
-        .get("invitation_code")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or("Server did not return an invitation code".into())
+    if value["invitation_code"].is_string() && value["invitation_id"].is_string() {
+        Ok(value)
+    } else {
+        Err("Server did not return an invitation code".into())
+    }
+}
+
+/// Notes a group for a Team member or a pending invitation, so any admin of the group can
+/// finish the add once the person has a device.
+#[tauri::command]
+pub async fn add_team_group_grant(
+    target: String,
+    target_id: Uuid,
+    group_id: Uuid,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _guard = ensure_authenticated(&state).await?;
+    let session = current_authenticated_session(&state).await?;
+    let path = match target.as_str() {
+        "member" => format!("organizations/me/members/{target_id}/groups"),
+        "invitation" => format!("organizations/me/invitations/{target_id}/groups"),
+        _ => return Err("Choose a member or an invitation".into()),
+    };
+    super::team_tasks::add_group_grant(&state, &session, &path, group_id).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,6 +580,7 @@ pub async fn list_team_admin_requests(
 
 #[tauri::command]
 pub async fn get_team_directory(state: State<'_, AppState>) -> Result<Value, String> {
+    let _guard = ensure_local_data_access(&state).await?;
     let session = state
         .session
         .lock()
@@ -494,6 +625,7 @@ pub async fn get_team_directory(state: State<'_, AppState>) -> Result<Value, Str
         .as_deref()
         .is_some_and(|role| matches!(role, "owner" | "admin"))
     {
+        super::team_tasks::migrate_local_pending_group_adds(&state, &session).await;
         match http
             .get(api_endpoint(
                 &current_server_url(&state, &session),
@@ -507,6 +639,10 @@ pub async fn get_team_directory(state: State<'_, AppState>) -> Result<Value, Str
                 .json::<Vec<Value>>()
                 .await
                 .map_err(|error| error.to_string())?,
+            // An admin on an unverified device sees the directory as a member does.
+            Ok(response) if response.status() == reqwest::StatusCode::PRECONDITION_REQUIRED => {
+                Vec::new()
+            }
             _ => return Ok(cached),
         }
     } else {

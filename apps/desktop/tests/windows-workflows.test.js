@@ -24,8 +24,9 @@ function workflowApp(invoke) {
         section('    async refreshActiveMounts(', '    async maybeShowRecoveryPrompts('),
         section('    async mountFolderFromContext(', '    async pollMountState('),
         section('    parseGeneratedCliArgs(', '    async runCliStatusCommand('),
+        section('    notifyMissingKeyFolders(', '    /** Count the files on this computer'),
     ].join('\n');
-    const app = new (Function('invoke', `return class { ${methods} }`)(invoke))();
+    const app = new (Function('invoke', 'displayEnrolledPathValue', `return class { ${methods} }`)(invoke, path => path))();
     const window = { invoke, document: { getElementById() { return null; } } };
     vm.runInNewContext(fs.readFileSync(new URL('../src/app-team-methods.js', import.meta.url), 'utf8'), { window });
     const dialogs = window.HybridCipherTeamMethods.create({});
@@ -33,6 +34,7 @@ function workflowApp(invoke) {
         currentUser: 'owner@example.com', isLoggedIn: true, workspaceGroupContext: { group_id: 'group-id' },
         workspaceUiModel: () => ({ resolved: true }), cliActionTitle: dialogs.cliActionTitle,
         runDesktopOperation: request => invoke('start_desktop_operation', { request }), refreshAdminDashboard() {},
+        confirmInterruptFolderJob: async () => true,
     });
     return app;
 }
@@ -101,6 +103,31 @@ test('temporary login explains why CLI-only Settings actions are unavailable', a
     assert.equal(await app.runSettingsCliCommand('hybridcipher coverage audit --verify-proofs'), false);
     assert.equal(invoked, 0);
     assert.match(notices[0], /Remember me/);
+});
+
+test('startup releases a backend session it will not use, so the next login is not refused', async () => {
+    for (const [label, info, cliOk] of [
+        ['restore error', { status: 'error', error: 'local keys unavailable' }, true],
+        ['CLI rejection', { status: 'active', email: 'person@example.com', persistent: true }, false],
+    ]) {
+        const calls = [];
+        const app = workflowApp(async name => {
+            calls.push(name);
+            return name === 'logout_user' ? { success: true, data: true } : info;
+        });
+        Object.assign(app, { isLoggedIn: false, showWelcomeScreen() { throw new Error('UI changed'); } });
+        app.verifyCliSession = async () => cliOk;
+        assert.equal(await app.ensureSessionReady({ silent: true }), null, label);
+        assert.equal(calls.filter(name => name === 'logout_user').length, 1, label);
+    }
+});
+
+test('startup without any session does not log out', async () => {
+    const calls = [];
+    const app = workflowApp(async name => { calls.push(name); return { status: 'none' }; });
+    app.isLoggedIn = false;
+    assert.equal(await app.ensureSessionReady({ silent: true }), null);
+    assert.deepEqual(calls, ['get_session_info']);
 });
 
 test('temporary desktop sessions skip CLI health checks', async () => {
@@ -179,13 +206,32 @@ test('degraded and unavailable mounts never open Explorer or start a duplicate m
             return response;
         });
         Object.assign(app, {
-            mountSessions: {}, showNotification() {},
+            mountSessions: {}, showNotification() {}, isFolderMounting: () => false,
             openMountInExplorer: async () => { opened += 1; },
             createMountProgressJob: () => { throw new Error('Duplicate mount started'); },
         });
         assert.equal(await app.mountFolderFromContext({ root_id: 'root', path: 'C:\\source' }), false);
         assert.equal(opened, 0);
     }
+});
+
+test('a mount continuing in background is not started again', async () => {
+    const calls = [];
+    const notifications = [];
+    const app = workflowApp(async name => {
+        calls.push(name);
+        return { success: false };
+    });
+    Object.assign(app, {
+        mountSessions: { root: 'native-mount' },
+        showNotification: message => notifications.push(message),
+        isFolderMounting: rootId => rootId === 'root',
+        createMountProgressJob: () => { throw new Error('Duplicate mount started'); },
+    });
+    assert.equal(await app.mountFolderFromContext({ root_id: 'root', path: 'C:\\source' }), false);
+    assert.deepEqual(calls, []);
+    assert.equal(app.mountSessions.root, 'native-mount');
+    assert.match(notifications[0], /already in progress/i);
 });
 
 test('active mount refresh retains provider diagnostics for the folder detail view', async () => {
@@ -203,6 +249,36 @@ test('active mount refresh retains provider diagnostics for the folder detail vi
     await app.refreshActiveMounts({ suppressRecoveryPrompt: true });
     assert.equal(app.activeMountDetailsByRootId.root.availability, 'degraded');
     assert.deepEqual(app.activeMountDetailsByRootId.root.operationalHealth, diagnostics);
+});
+
+test('active macOS File Provider refresh loads compatibility status for folder details', async () => {
+    const compatibility = {
+        root_id: 'root', enabled: false, legacy_file_count: 2,
+        last_read_error: 'legacy_consent_required', encrypted_backup_directory: '/account/recovery',
+    };
+    const calls = [];
+    const app = workflowApp(async (name, args) => {
+        calls.push({ name, args });
+        if (name === 'list_active_mounts') {
+            return { success: true, data: [{
+                root_id: 'root', mountpoint: '/provider/Hybridcipher_Dev', backend: 'macos-file-provider',
+            }] };
+        }
+        if (name === 'get_vault_compatibility') {
+            return { success: true, data: compatibility };
+        }
+        throw new Error(`Unexpected command: ${name}`);
+    });
+    Object.assign(app, {
+        isLoggedIn: true, activeWorkspaceView: 'terminal',
+        syncSelectedFolderMountUi() {}, updateSidebarMountSummary() {},
+    });
+
+    await app.refreshActiveMounts({ suppressRecoveryPrompt: true });
+
+    assert.deepEqual(calls.map(call => call.name), ['list_active_mounts', 'get_vault_compatibility']);
+    assert.equal(calls[1].args.rootId, 'root');
+    assert.deepEqual(app.activeMountDetailsByRootId.root.compatibility, compatibility);
 });
 
 test('active mount refresh clears the reconciliation timer after sync finishes', async () => {

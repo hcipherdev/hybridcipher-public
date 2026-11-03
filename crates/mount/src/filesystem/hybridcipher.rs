@@ -20,6 +20,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use hybridcipher_client::{
+    file::ciphertext::{self, CiphertextKind},
     file::encrypt::{
         chunked_encrypted_size, read_encrypted_header, write_encrypted_file,
         SerializedEncryptedHeader, SparseFileMetadata, MAX_CONTENT_CHUNK_SIZE,
@@ -1712,8 +1713,11 @@ where
                         );
                     }
                 }
-            } else if file_type.is_file() && name.ends_with(".encrypted") {
-                let decrypted_name = name.trim_end_matches(".encrypted");
+            } else if file_type.is_file()
+                && ciphertext::classify_name(name) == CiphertextKind::File
+            {
+                // Folder records are not listed: they describe a folder, not a file in it.
+                let decrypted_name = ciphertext::strip_encrypted_suffix(name).unwrap_or(name);
                 let normalized_child = normalize_child_path(parent_path, decrypted_name);
                 let metadata = match entry.metadata() {
                     Ok(m) => m,
@@ -2931,7 +2935,9 @@ fn scan_encrypted_file_health_with_summary(
                 if !is_mount_internal_name(&name) {
                     stack.push(path);
                 }
-            } else if file_type.is_file() && name.ends_with(".encrypted") {
+            } else if file_type.is_file()
+                && ciphertext::classify_name(&name) == CiphertextKind::File
+            {
                 encrypted_files.push(path);
             }
         }
@@ -3134,12 +3140,10 @@ fn normalize_encrypted_child_path(encrypted_root: &Path, path: &Path) -> Option<
     if normalized.is_empty() {
         return None;
     }
-    const SUFFIX: &str = ".encrypted";
-    if !normalized.ends_with(SUFFIX) {
+    if ciphertext::classify(path) != CiphertextKind::File {
         return None;
     }
-    let new_len = normalized.len() - SUFFIX.len();
-    normalized.truncate(new_len);
+    let mut normalized = ciphertext::strip_encrypted_suffix(&normalized)?.to_string();
     if normalized.is_empty() {
         normalized.push('/');
     }

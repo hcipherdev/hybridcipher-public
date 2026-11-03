@@ -89,8 +89,11 @@ flate2 = "1.0"
 tempfile = "3.0"
 criterion = "0.5"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["fileapi", "minwinbase", "winbase"] }
+winapi = { version = "0.3", features = ["fileapi", "handleapi", "minwinbase", "processthreadsapi", "sddl", "securitybaseapi", "winbase", "winnt"] }
 
 [[bench]]
 name = "client_auth_bench"

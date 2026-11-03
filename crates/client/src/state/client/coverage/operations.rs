@@ -50,7 +50,7 @@ impl<S: Storage, N: Network> Client<S, N> {
             }
         }
 
-        let (sequence, snapshot_due, snapshot_log) = {
+        let (sequence, snapshot_due) = {
             let mut state = self.state.write().await;
             let ledger = state.coverage_ledgers.entry(group_id).or_default();
 
@@ -60,12 +60,11 @@ impl<S: Storage, N: Network> Client<S, N> {
             let sequence = ledger.sequence;
             let snapshot_due =
                 sequence.saturating_sub(ledger.snapshot_sequence) >= COVERAGE_LOG_SNAPSHOT_INTERVAL;
-            let snapshot_log = if snapshot_due {
-                Some(ledger.log.clone())
-            } else {
-                None
-            };
-            (sequence, snapshot_due, snapshot_log)
+            // Claim the snapshot now, so concurrent updates don't each write one.
+            if snapshot_due {
+                ledger.snapshot_sequence = sequence;
+            }
+            (sequence, snapshot_due)
         };
 
         let delta = CoverageLogDeltaData {
@@ -81,13 +80,22 @@ impl<S: Storage, N: Network> Client<S, N> {
         self.append_coverage_log_delta(group_id, delta).await?;
 
         if snapshot_due {
-            if let Some(log) = snapshot_log {
-                self.persist_coverage_log_snapshot(group_id, log, sequence)
+            let _write = COVERAGE_LOG_SNAPSHOT_LOCK.lock().await;
+            // Write the log as it is now, which includes every update before it.
+            let latest = {
+                let state = self.state.read().await;
+                state
+                    .coverage_ledgers
+                    .get(&group_id)
+                    .map(|ledger| (ledger.log.clone(), ledger.sequence))
+            };
+            if let Some((log, latest_sequence)) = latest {
+                self.persist_coverage_log_snapshot(group_id, log, latest_sequence)
                     .await?;
-            }
-            let mut state = self.state.write().await;
-            if let Some(ledger) = state.coverage_ledgers.get_mut(&group_id) {
-                ledger.snapshot_sequence = sequence;
+                let mut state = self.state.write().await;
+                if let Some(ledger) = state.coverage_ledgers.get_mut(&group_id) {
+                    ledger.snapshot_sequence = ledger.snapshot_sequence.max(latest_sequence);
+                }
             }
         }
 
@@ -312,6 +320,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                 },
             );
         }
+        let _guard = COVERAGE_ROOT_REGISTRY_LOCK.lock().await;
         self.save_root_registry(&registry).await
     }
 
@@ -468,8 +477,24 @@ impl<S: Storage, N: Network> Client<S, N> {
             return Ok(Vec::new());
         }
 
+        let (target_version, has_active_migration) = {
+            let state = self.state.read().await;
+            (
+                state
+                    .migration
+                    .as_ref()
+                    .map(|m| m.to_epoch)
+                    .unwrap_or(state.current_epoch),
+                state.migration.is_some(),
+            )
+        };
+
         let mut summaries = Vec::new();
         for root in root_map.values() {
+            let mut keys = CoverageKeyCounts {
+                target_version,
+                ..CoverageKeyCounts::default()
+            };
             let mut tracked = 0usize;
             let mut tracked_bytes = 0u64;
             let mut orphaned = 0usize;
@@ -485,6 +510,17 @@ impl<S: Storage, N: Network> Client<S, N> {
 
             let entries = self.list_file_index_entries_for_root(root.root_id).await?;
             for entry in entries {
+                if super::super::leftover_key_files::needs_key_migration(
+                    &entry,
+                    target_version,
+                    has_active_migration,
+                ) {
+                    keys.on_other += 1;
+                } else if entry.last_epoch == target_version
+                    && matches!(entry.state, FileCoverageState::Tracked)
+                {
+                    keys.on_target += 1;
+                }
                 match entry.state {
                     FileCoverageState::Tracked => {
                         tracked += 1;
@@ -550,6 +586,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                 coverage_ratio,
                 recent_orphans: orphan_samples,
                 recent_unmanaged: unmanaged_samples,
+                keys,
             });
         }
 
@@ -642,7 +679,8 @@ impl<S: Storage, N: Network> Client<S, N> {
                     continue;
                 }
 
-                if Self::is_directory_metadata_sidecar_relative(&entry.relative_path) {
+                if ciphertext::classify_relative(&entry.relative_path) == CiphertextKind::FolderRecord
+                {
                     removal_candidates.push((root_id, entry.file_uuid));
                     continue;
                 }
@@ -889,12 +927,30 @@ impl<S: Storage, N: Network> Client<S, N> {
         file: Option<PathBuf>,
         filter: Option<PathBuf>,
         all: bool,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<CoverageMigrationProgress, ClientError>
     where
         F: FnMut(CoverageMigrationProgress),
     {
+        self.coverage_migrate_orphans_detailed(file, filter, all, on_progress)
+            .await
+            .map(|(progress, _)| progress)
+    }
+
+    /// As [`Self::coverage_migrate_orphans_with_progress`], also returning what could not be
+    /// moved and why (counted in `failed_files`).
+    pub async fn coverage_migrate_orphans_detailed<F>(
+        &self,
+        file: Option<PathBuf>,
+        filter: Option<PathBuf>,
+        all: bool,
+        mut on_progress: F,
+    ) -> Result<(CoverageMigrationProgress, Vec<CoverageMigrationFailure>), ClientError>
+    where
+        F: FnMut(CoverageMigrationProgress),
+    {
         self.ensure_state_loaded().await?;
+        let mut failures: Vec<CoverageMigrationFailure> = Vec::new();
 
         // Enter bulk mode to defer compaction until migration completes
         let _bulk_guard = self.begin_coverage_bulk_operation().await;
@@ -943,19 +999,13 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let group_id = active_group;
 
-        // During active migration, include tracked files that need migration
-        // Outside migration, only process orphaned wrong-epoch files
+        // Wrong-epoch orphans, plus tracked files still on an older key: any non-target key during
+        // a migration, and older keys after a cutover the device missed.
         let mut files_to_migrate: Vec<(CoverageRoot, FileIndexEntry)> = Vec::new();
         for (root_id, root) in roots.iter() {
             let entries = self.list_file_index_entries_for_root(*root_id).await?;
             for entry in entries {
-                let is_orphaned_wrong_epoch = entry.state == FileCoverageState::Orphaned
-                    && entry.orphan_kind == Some(FileOrphanKind::WrongEpoch);
-                let is_tracked_old_epoch = has_active_migration
-                    && entry.state == FileCoverageState::Tracked
-                    && entry.last_epoch != migration_to;
-
-                if is_orphaned_wrong_epoch || is_tracked_old_epoch {
+                if needs_key_migration(&entry, migration_to, has_active_migration) {
                     files_to_migrate.push((root.clone(), entry));
                 }
             }
@@ -972,6 +1022,7 @@ impl<S: Storage, N: Network> Client<S, N> {
 
         let mut targets: Vec<(FileIndexEntry, PathBuf, u64, Option<u64>)> = Vec::new();
         let mut skipped_missing_epoch = 0usize;
+        let mut already_on_target: Vec<FileIndexEntry> = Vec::new();
 
         for (root, entry) in files_to_migrate.into_iter() {
             if let Some(candidate) = canonical_filter.as_ref() {
@@ -1070,6 +1121,11 @@ impl<S: Storage, N: Network> Client<S, N> {
 
             if from_epoch == 0 {
                 skipped_missing_epoch += 1;
+                failures.push(CoverageMigrationFailure {
+                    path: canonical_path.display().to_string(),
+                    from_version: None,
+                    reason: "No key version is recorded for this file".to_string(),
+                });
                 self.logger.log(
                     crate::logging::LogLevel::Warn,
                     &format!(
@@ -1081,12 +1137,26 @@ impl<S: Storage, N: Network> Client<S, N> {
                 continue;
             }
 
+            if from_epoch == migration_to {
+                // Already on the target key; only the index entry was stale.
+                let mut entry = entry;
+                entry.state = FileCoverageState::Tracked;
+                entry.orphan_kind = None;
+                entry.last_epoch = migration_to;
+                already_on_target.push(entry);
+                continue;
+            }
+
             targets.push((
                 entry,
                 canonical_path,
                 from_epoch,
                 metadata.as_ref().map(|meta| meta.file_size),
             ));
+        }
+
+        if !already_on_target.is_empty() {
+            self.store_file_index_entries(&already_on_target).await?;
         }
 
         if skipped_missing_epoch > 0 {
@@ -1112,12 +1182,54 @@ impl<S: Storage, N: Network> Client<S, N> {
             Some(heartbeat_batch_size as usize)
         };
 
+        // Folder records move too: the index leaves them out, so they are found on disk.
+        // A single-file request leaves them alone.
+        let sidecars = if canonical_file.is_some() {
+            Vec::new()
+        } else {
+            self.directory_sidecars_on_other_key(
+                &roots,
+                canonical_filter.as_deref(),
+                migration_to,
+                has_active_migration,
+            )
+            .await
+        };
+
         let mut progress = CoverageMigrationProgress {
-            total_files: targets.len(),
+            total_files: targets.len() + sidecars.len() + failures.len(),
             migrated_files: 0,
-            failed_files: 0,
+            failed_files: failures.len(),
         };
         on_progress(progress);
+
+        for (sidecar, from_epoch) in &sidecars {
+            match self
+                .rewrap_orphaned_file(sidecar, *from_epoch, migration_to, group_id)
+                .await
+            {
+                Ok(_) => progress.migrated_files += 1,
+                Err(err) => {
+                    progress.failed_files += 1;
+                    failures.push(CoverageMigrationFailure {
+                        path: sidecar.display().to_string(),
+                        from_version: Some(*from_epoch),
+                        reason: err.to_string(),
+                    });
+                    self.logger.log(
+                        crate::logging::LogLevel::Warn,
+                        &format!(
+                            "Failed to migrate folder record {} from epoch {} to {}: {}",
+                            sidecar.display(),
+                            from_epoch,
+                            migration_to,
+                            err
+                        ),
+                        Some("coverage_migrate_failure"),
+                    );
+                }
+            }
+        }
 
         const FILE_INDEX_BATCH_SIZE: usize = 1000;
 
@@ -1153,6 +1265,11 @@ impl<S: Storage, N: Network> Client<S, N> {
                 }
                 Err(err) => {
                     progress.failed_files += 1;
+                    failures.push(CoverageMigrationFailure {
+                        path: canonical_path.display().to_string(),
+                        from_version: Some(from_epoch),
+                        reason: err.to_string(),
+                    });
                     self.logger.log(
                         crate::logging::LogLevel::Warn,
                         &format!(
@@ -1216,7 +1333,7 @@ impl<S: Storage, N: Network> Client<S, N> {
             self.save_client_state().await?;
         }
 
-        Ok(progress)
+        Ok((progress, failures))
     }
 
     /// Apply remediation for all orphaned files under the provided scope.
@@ -1324,6 +1441,15 @@ impl<S: Storage, N: Network> Client<S, N> {
         Ok(metadata.is_some())
     }
 
+    /// Like `coverage_has_metadata_for_path`, for a path already known to be
+    /// canonical, such as one found by walking a canonical root.
+    pub(crate) async fn coverage_has_metadata_for_canonical(
+        &self,
+        canonical: &Path,
+    ) -> Result<bool, ClientError> {
+        Ok(self.load_metadata_for_canonical(canonical).await?.is_some())
+    }
+
     /// Store file metadata so coverage scans can treat the path as tracked.
     pub async fn coverage_store_file_metadata(
         &self,
@@ -1422,6 +1548,21 @@ impl<S: Storage, N: Network> Client<S, N> {
                     }
                 }
 
+                if existing.state == CoverageRootState::Active && existing.path != canonical {
+                    return Err(ClientError::InvalidInput(if existing.path.exists() {
+                        format!(
+                            "'{}' is a copy of protected folder '{}'. Protect the original, or remove the copy's .hybridcipher-root marker first.",
+                            display_path,
+                            existing.path.display()
+                        )
+                    } else {
+                        format!(
+                            "'{}' was protected at '{}' before it moved. Update the protected folder's location instead of protecting it again.",
+                            display_path,
+                            existing.path.display()
+                        )
+                    }));
+                }
                 if existing.state == CoverageRootState::Active {
                     return Err(ClientError::InvalidInput(format!(
                         "Coverage root '{}' is already enrolled",
@@ -1504,6 +1645,18 @@ impl<S: Storage, N: Network> Client<S, N> {
         Ok(root)
     }
 
+    /// Fail unless every encrypted file under `path` belongs to `group_id`. A vault
+    /// joining an account calls this itself: the account has no history of the
+    /// vault's folders, so enrolling them would not check on its own.
+    pub async fn coverage_assert_folder_owned_by(
+        &self,
+        path: &Path,
+        group_id: Uuid,
+    ) -> Result<(), ClientError> {
+        self.assert_reenrollment_contents_for_group(path.to_path_buf(), group_id)
+            .await
+    }
+
     // Inspect headers only, before recording a new owner or touching files. A
     // removed folder may still contain ciphertext belonging to its old group.
     async fn assert_reenrollment_contents_for_group(
@@ -1511,10 +1664,10 @@ impl<S: Storage, N: Network> Client<S, N> {
         path: PathBuf,
         group_id: Uuid,
     ) -> Result<(), ClientError> {
+        use crate::file::group_transfer::{encrypted_file_owner, EncryptedFileOwner};
+
         let client = self.clone();
         task::spawn_blocking(move || {
-            use std::io::{BufReader, Read, Seek};
-
             for entry in WalkDir::new(&path)
                 .follow_links(false)
                 .into_iter()
@@ -1530,34 +1683,12 @@ impl<S: Storage, N: Network> Client<S, N> {
                     continue;
                 }
                 let file_path = entry.path();
-                let mut file = std::fs::File::open(file_path)
-                    .map_err(|err| ClientError::from(StorageError::Io(err)))?;
-                let mut prefix = Vec::new();
-                Read::by_ref(&mut file).take(8192).read_to_end(&mut prefix)
-                    .map_err(|err| ClientError::from(StorageError::Io(err)))?;
-                let encrypted_extension = file_path.extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("encrypted"));
-                let json_prefix = prefix.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{');
-                if !encrypted_extension && !json_prefix {
-                    continue;
-                }
-                file.rewind().map_err(|err| ClientError::from(StorageError::Io(err)))?;
-                let header = crate::file::encrypt::read_encrypted_header(&mut BufReader::new(file));
-                let owner = match header {
-                    Ok(header) => serde_json::from_slice::<Value>(&header).ok()
-                        .and_then(|json| json.get("group_id").and_then(Value::as_str)
-                            .and_then(|value| Uuid::parse_str(value).ok())),
-                    Err(err) if err.kind() != ErrorKind::InvalidData => {
-                        return Err(ClientError::from(StorageError::Io(err)));
-                    }
-                    Err(_) => {
-                        let looks_encrypted = encrypted_extension
-                            || (prefix.windows(b"\"file_id\"".len()).any(|part| part == b"\"file_id\"")
-                                && prefix.windows(b"\"epoch_id\"".len()).any(|part| part == b"\"epoch_id\""));
-                        if !looks_encrypted { continue; }
-                        None
-                    }
+                let owner = match encrypted_file_owner(file_path)
+                    .map_err(|err| ClientError::from(StorageError::Io(err)))?
+                {
+                    EncryptedFileOwner::NotEncrypted => continue,
+                    EncryptedFileOwner::Group(owner) => Some(owner),
+                    EncryptedFileOwner::Unknown => None,
                 };
                 if owner != Some(group_id) {
                     return Err(ClientError::InvalidInput(format!(

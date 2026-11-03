@@ -6,10 +6,11 @@ use serde::Deserialize;
 use serde_cbor;
 use serde_json;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -38,11 +39,27 @@ pub struct LocalFsStorage {
     inner: Arc<MockStorage>,
     base_path: PathBuf,
     account_key: Arc<RwLock<Option<Zeroizing<[u8; 32]>>>>,
-    file_index_sender: mpsc::Sender<FileIndexOp>,
+    /// The folder's shared file index, or why it could not be opened.
+    file_index: Result<Arc<FileIndexHandle>, String>,
 }
 
 const GLOBAL_CONFIG_KEYS: &[&str] = &["coverage_root_registry"];
 const FILE_INDEX_QUEUE_CAPACITY: usize = 5120;
+/// sled locks its folder, and a process that just closed it may still hold the lock briefly.
+const FILE_INDEX_OPEN_ATTEMPTS: u32 = 5;
+const FILE_INDEX_OPEN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// One open file index per folder in this process. A second sled open of the same folder fails
+/// on its lock, so every storage for that folder shares this handle; the worker (and with it the
+/// database and its lock) stops once the last storage drops its handle.
+struct FileIndexHandle {
+    sender: mpsc::Sender<FileIndexOp>,
+}
+
+fn file_index_registry() -> &'static Mutex<HashMap<PathBuf, Weak<FileIndexHandle>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<FileIndexHandle>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 enum FileIndexOp {
     StoreEntry {
@@ -84,42 +101,63 @@ impl LocalFsStorage {
         let base_path = base_path.as_ref().to_path_buf();
         // ensure directory exists synchronously – fine for CLI start-up
         std::fs::create_dir_all(&base_path).ok();
-        let file_index_path = base_path.join("file_index_db");
-        let db = sled::Config::new()
-            .path(&file_index_path)
-            .open()
-            .unwrap_or_else(|err| {
-                log::warn!(
-                    "Failed to open file index database at {}: {}. Falling back to temporary store.",
-                    file_index_path.display(),
-                    err
-                );
-                sled::Config::new()
-                    .temporary(true)
-                    .open()
-                    .expect("temporary sled database should open")
-            });
-        let file_index_entries = db
-            .open_tree("file_index_entries")
-            .expect("file index entries tree");
-        let file_index_by_uuid = db
-            .open_tree("file_index_by_uuid")
-            .expect("file index uuid tree");
-        let file_index_by_path = db
-            .open_tree("file_index_by_path")
-            .expect("file index path tree");
-        let file_index_sender = Self::spawn_file_index_worker(
-            db.clone(),
-            file_index_entries.clone(),
-            file_index_by_uuid.clone(),
-            file_index_by_path.clone(),
-        );
+        let file_index = Self::open_shared_file_index(&base_path.join("file_index_db"));
+        if let Err(reason) = &file_index {
+            log::warn!("{}", reason);
+        }
         Self {
             inner: Arc::new(MockStorage::new()),
             base_path,
             account_key: Arc::new(RwLock::new(None)),
-            file_index_sender,
+            file_index,
         }
+    }
+
+    /// Reuse this process's open index for the folder, or open it. Another process holding the
+    /// folder (usually the desktop app) is reported instead of silently using an empty index,
+    /// which would lose every write and hide every file.
+    fn open_shared_file_index(path: &Path) -> Result<Arc<FileIndexHandle>, String> {
+        let key = std::fs::create_dir_all(path)
+            .and_then(|_| std::fs::canonicalize(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        let mut registry = file_index_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(handle);
+        }
+
+        let mut attempt = 1;
+        let db = loop {
+            match sled::Config::new().path(&key).open() {
+                Ok(db) => break db,
+                Err(_) if attempt < FILE_INDEX_OPEN_ATTEMPTS => {
+                    attempt += 1;
+                    std::thread::sleep(FILE_INDEX_OPEN_RETRY_DELAY);
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "The file index at {} is in use by another HybridCipher process \
+                         (usually the desktop app). Use the app, or close it and try again. ({})",
+                        key.display(),
+                        err
+                    ))
+                }
+            }
+        };
+        let open_tree = |name: &str| {
+            db.open_tree(name)
+                .map_err(|err| format!("Failed to open file index tree {name}: {err}"))
+        };
+        let entries = open_tree("file_index_entries")?;
+        let by_uuid = open_tree("file_index_by_uuid")?;
+        let by_path = open_tree("file_index_by_path")?;
+        let handle = Arc::new(FileIndexHandle {
+            sender: Self::spawn_file_index_worker(db, entries, by_uuid, by_path),
+        });
+        registry.retain(|_, weak| weak.strong_count() > 0);
+        registry.insert(key, Arc::downgrade(&handle));
+        Ok(handle)
     }
 
     /// Helper to create storage rooted in a specific per-user directory
@@ -129,16 +167,71 @@ impl LocalFsStorage {
     }
 
     fn config_file(&self, key: &str) -> PathBuf {
+        self.config_file_named(&Self::config_file_name(key), key)
+    }
+
+    fn config_file_named(&self, name: &str, key: &str) -> PathBuf {
         if Self::is_global_config_key(key) {
             let shared_dir = self
                 .base_path
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| self.base_path.clone());
-            return shared_dir.join(format!("{key}.json"));
+            return shared_dir.join(format!("{name}.json"));
         }
         // store each key in a separate file to avoid concurrent write issues
-        self.base_path.join(format!("{key}.json"))
+        self.base_path.join(format!("{name}.json"))
+    }
+
+    /// Keys may contain characters Windows forbids in file names (`group_members_cache:<id>`;
+    /// on NTFS a colon even names a hidden stream), so those become `_`. Path separators stay:
+    /// keys use them for subfolders.
+    fn config_file_name(key: &str) -> String {
+        key.chars()
+            .map(|c| match c {
+                '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+                c if c.is_control() => '_',
+                c => c,
+            })
+            .collect()
+    }
+
+    /// The file a key used before names were made Windows-safe, when it differs. Only Unix
+    /// could create such files; on Windows the old name never held data.
+    fn legacy_config_file(&self, key: &str) -> Option<PathBuf> {
+        if cfg!(windows) || Self::config_file_name(key) == key {
+            return None;
+        }
+        Some(self.config_file_named(key, key))
+    }
+
+    async fn read_config_file(&self, key: &str) -> std::io::Result<Vec<u8>> {
+        match fs::read(self.config_file(key)).await {
+            Err(err) if err.kind() == ErrorKind::NotFound => match self.legacy_config_file(key) {
+                Some(legacy) => fs::read(legacy).await,
+                None => Err(err),
+            },
+            result => result,
+        }
+    }
+
+    /// Drop what an older name left behind once the key has been written under its new name:
+    /// the legacy file on Unix, or on Windows the empty file a colon-named write created.
+    async fn remove_legacy_config_files(&self, key: &str) {
+        if let Some(legacy) = self.legacy_config_file(key) {
+            let _ = fs::remove_file(legacy).await;
+        }
+        if cfg!(windows) {
+            if let Some((stem, _)) = key.split_once(':') {
+                let stray = self.base_path.join(stem);
+                if fs::metadata(&stray)
+                    .await
+                    .is_ok_and(|meta| meta.is_file() && meta.len() == 0)
+                {
+                    let _ = fs::remove_file(stray).await;
+                }
+            }
+        }
     }
 
     fn is_global_config_key(key: &str) -> bool {
@@ -204,16 +297,9 @@ impl LocalFsStorage {
     }
 
     fn normalize_file_index_path(path: &str) -> String {
-        const SUFFIX: &str = ".encrypted";
-        if path.len() <= SUFFIX.len() {
-            return path.to_string();
-        }
-        let (body, suffix) = path.split_at(path.len() - SUFFIX.len());
-        if suffix.eq_ignore_ascii_case(SUFFIX) {
-            body.to_string()
-        } else {
-            path.to_string()
-        }
+        crate::file::ciphertext::strip_encrypted_suffix(path)
+            .unwrap_or(path)
+            .to_string()
     }
 
     fn file_index_path_key(root_id: Uuid, relative_path: &str) -> Vec<u8> {
@@ -344,7 +430,12 @@ impl LocalFsStorage {
         op: FileIndexOp,
         rx: oneshot::Receiver<Result<T, StorageError>>,
     ) -> Result<T, StorageError> {
-        self.file_index_sender
+        let handle = self
+            .file_index
+            .as_ref()
+            .map_err(|reason| StorageError::FileIndexUnavailable(reason.clone()))?;
+        handle
+            .sender
             .send(op)
             .await
             .map_err(|_| StorageError::Transaction("file index worker unavailable".to_string()))?;
@@ -663,8 +754,8 @@ impl LocalFsStorage {
         })?;
 
         // Write atomically via a temp file to avoid partial/corrupted snapshots when concurrent
-        // writers race to persist the coverage log.
-        let temp_path = file_path.with_extension("json.tmp");
+        // writers race to persist the coverage log; each writer has its own temp file.
+        let temp_path = file_path.with_extension(format!("json.{}.tmp", Uuid::new_v4().simple()));
         fs::write(&temp_path, &payload).await?;
         fs::rename(&temp_path, &file_path).await?;
 
@@ -909,6 +1000,7 @@ impl LocalFsStorage {
             }
         }
 
+        self.remove_legacy_config_files(key).await;
         Ok(())
     }
 
@@ -1124,6 +1216,7 @@ impl Storage for LocalFsStorage {
 
     async fn delete_config(&self, key: &str) -> Result<(), StorageError> {
         self.inner.delete_config(key).await?;
+        self.remove_legacy_config_files(key).await;
         let file_path = self.config_file(key);
         match fs::remove_file(&file_path).await {
             Ok(_) => Ok(()),
@@ -1135,12 +1228,16 @@ impl Storage for LocalFsStorage {
     /// Load configuration from memory; if absent load from disk file and cache
     /// into memory so future reads are cheap.
     async fn load_config(&self, key: &str) -> Result<Option<String>, StorageError> {
+        // Global keys are shared with every other storage on this device, so a
+        // cached copy may be stale; always read them from disk.
+        if Self::is_global_config_key(key) {
+            return self.load_config_fresh(key).await;
+        }
         if let Some(val) = self.inner.load_config(key).await? {
             return Ok(Some(val));
         }
 
-        let file_path = self.config_file(key);
-        match fs::read(&file_path).await {
+        match self.read_config_file(key).await {
             Ok(bytes) => {
                 let raw = String::from_utf8_lossy(&bytes).to_string();
                 let (value, was_encrypted) =
@@ -1171,8 +1268,7 @@ impl Storage for LocalFsStorage {
     }
 
     async fn load_config_fresh(&self, key: &str) -> Result<Option<String>, StorageError> {
-        let file_path = self.config_file(key);
-        match fs::read(&file_path).await {
+        match self.read_config_file(key).await {
             Ok(bytes) => {
                 let raw = String::from_utf8_lossy(&bytes).to_string();
                 let (value, _) = self.load_and_optionally_decrypt_config(key, raw).await?;
@@ -1579,3 +1675,7 @@ mod tests {
         assert!(deterministic.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/storage/test_local_fs_storage.rs"]
+mod local_fs_storage_tests;

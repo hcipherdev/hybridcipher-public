@@ -1,3 +1,4 @@
+// Tests folder action errors, pending-operation labels, folder row status, folder detail mount state and expanded-section preservation in src/ui-utils.js
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
@@ -6,6 +7,9 @@ const {
     pendingOperationLabel,
     getEmbeddedTerminalHeaderTitle,
     getFolderRowStatusState,
+    buildFolderDetailModel,
+    captureOpenDetailsKeys,
+    restoreOpenDetails,
 } = require('../src/ui-utils.js');
 
 test('folder actions preserve Tauri string rejections and Error messages', () => {
@@ -21,7 +25,7 @@ test('pending status counts logical operations independently of retry history', 
 });
 
 test('embedded terminal header title is always static', () => {
-    assert.equal(getEmbeddedTerminalHeaderTitle(), 'Embedded Terminal');
+    assert.equal(getEmbeddedTerminalHeaderTitle(), 'HybridCipher Console');
 });
 
 test('mounted healthy folder shows mounted badge and green dot', () => {
@@ -41,6 +45,7 @@ test('mounted healthy folder shows mounted badge and green dot', () => {
         }),
         {
             showMountedBadge: true,
+            showMountingBadge: false,
             showUnmountingBadge: false,
             showAlertButton: false,
             healthDotTone: 'green',
@@ -60,6 +65,7 @@ test('mounted conflict folder shows alert button and red dot', () => {
         }),
         {
             showMountedBadge: true,
+            showMountingBadge: false,
             showUnmountingBadge: false,
             showAlertButton: true,
             healthDotTone: 'red',
@@ -79,6 +85,7 @@ test('mounted recovery-copy folder shows alert button and red dot', () => {
         }),
         {
             showMountedBadge: true,
+            showMountingBadge: false,
             showUnmountingBadge: false,
             showAlertButton: true,
             healthDotTone: 'red',
@@ -102,6 +109,7 @@ test('mounted pending-only folder stays non-red and does not surface extra pills
         }),
         {
             showMountedBadge: true,
+            showMountingBadge: false,
             showUnmountingBadge: false,
             showAlertButton: true,
             healthDotTone: 'green',
@@ -121,9 +129,55 @@ test('unmounted folder shows no mounted badge or dot', () => {
         }),
         {
             showMountedBadge: false,
+            showMountingBadge: false,
             showUnmountingBadge: false,
             showAlertButton: false,
             healthDotTone: null,
         }
     );
+});
+
+test('folder that is still mounting shows mounting badge and a disabled mount action', () => {
+    assert.deepEqual(
+        getFolderRowStatusState({ isMounted: false, isMounting: true }),
+        {
+            showMountedBadge: false,
+            showMountingBadge: true,
+            showUnmountingBadge: false,
+            showAlertButton: false,
+            healthDotTone: null,
+        }
+    );
+
+    const detail = buildFolderDetailModel({
+        folder: { root_id: 'root-1', path: '/protected' },
+        isMounted: false,
+        isMounting: true,
+    });
+    assert.equal(detail.attention.mountStatusLabel, 'Mounting');
+    assert.deepEqual(detail.primaryAction, { id: 'mount', label: 'Mounting…', disabled: true });
+});
+
+test('mounted folder drops the mounting badge even if mount tracking has not cleared yet', () => {
+    const row = getFolderRowStatusState({ isMounted: true, isMounting: true });
+    assert.equal(row.showMountedBadge, true);
+    assert.equal(row.showMountingBadge, false);
+});
+
+test('expanded detail sections stay open when the folder detail view is re-rendered', () => {
+    const previousDetails = [
+        { dataset: { preserveOpenKey: 'legacy-notice-details' }, open: true },
+        { dataset: { preserveOpenKey: 'provider-diagnostics' }, open: false },
+        { dataset: {}, open: true },
+    ];
+    const nextDetails = [
+        { dataset: { preserveOpenKey: 'legacy-notice-details' }, open: false },
+        { dataset: { preserveOpenKey: 'provider-diagnostics' }, open: false },
+    ];
+
+    const openKeys = captureOpenDetailsKeys({ querySelectorAll: () => previousDetails });
+    restoreOpenDetails({ querySelectorAll: () => nextDetails }, openKeys);
+
+    assert.deepEqual(openKeys, ['legacy-notice-details']);
+    assert.deepEqual(nextDetails.map(item => item.open), [true, false]);
 });

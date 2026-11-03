@@ -149,7 +149,7 @@ pub fn migration_impact_warning(
     target_epoch: u64,
     affected_files: usize,
 ) -> Result<bool, CliError> {
-    migration_impact_warning_with_coverage(current_epoch, target_epoch, affected_files, None)
+    migration_impact_warning_with_coverage(current_epoch, target_epoch, affected_files, None, false)
 }
 
 /// Display migration impact warning with optional coverage percentage
@@ -158,6 +158,7 @@ pub fn migration_impact_warning_with_coverage(
     target_epoch: u64,
     affected_files: usize,
     coverage_info: Option<(usize, usize, usize)>, // (tracked, orphaned, unmanaged)
+    assume_yes: bool,
 ) -> Result<bool, CliError> {
     println!();
     println!("{}", style("🔄 Migration Impact Summary").cyan().bold());
@@ -223,5 +224,9 @@ pub fn migration_impact_warning_with_coverage(
     );
     println!();
 
+    // The summary is still printed for the record; the caller already confirmed.
+    if assume_yes {
+        return Ok(true);
+    }
     confirm("Do you want to proceed with the migration to a new epoch key?")
 }

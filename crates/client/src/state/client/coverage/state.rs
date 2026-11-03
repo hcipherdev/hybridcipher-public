@@ -46,6 +46,9 @@ impl<S: Storage, N: Network> Client<S, N> {
                 )
             })?;
 
+        // Updates made side by side may be journaled out of order.
+        let mut deltas = deltas;
+        deltas.sort_by_key(|delta| delta.sequence);
         for delta in deltas {
             match delta.action {
                 crate::storage::CoverageDeltaAction::Remove => {
@@ -650,6 +653,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         group_id: Uuid,
         root_id: Uuid,
     ) -> Result<(), ClientError> {
+        let _guard = COVERAGE_ROOT_REGISTRY_LOCK.lock().await;
         let mut registry = self.load_root_registry().await?;
         registry.entries.insert(
             canonical.to_string_lossy().to_string(),
@@ -665,6 +669,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         &self,
         canonical: &Path,
     ) -> Result<(), ClientError> {
+        let _guard = COVERAGE_ROOT_REGISTRY_LOCK.lock().await;
         let mut registry = self.load_root_registry().await?;
         let key = canonical.to_string_lossy().to_string();
         if registry.entries.remove(&key).is_some() {

@@ -22,6 +22,7 @@ use hybridcipher_crypto::account_protection::{
 };
 use hybridcipher_crypto::signatures::VerifyingKey;
 use hybridcipher_messages::join_card::JoinCard as MessagesJoinCard;
+use hybridcipher_messages::pin_attestation::PinAttestation;
 use keyring::{Entry, Error as KeyringError};
 use rand::{rngs::OsRng, Rng, RngCore};
 use reqwest::StatusCode;
@@ -35,7 +36,7 @@ use std::convert::TryInto;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use uuid;
 use zeroize::Zeroizing;
@@ -119,6 +120,35 @@ mod tests {
         );
         assert!(alice_dir.starts_with(&base_dir), "alice dir within base");
         assert!(bob_dir.starts_with(&base_dir), "bob dir within base");
+    }
+
+    #[test]
+    fn session_file_is_kept_when_the_device_key_is_out_of_reach() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let manager = SessionManager::new(Some(temp_dir.path())).expect("session manager");
+        manager
+            .set_user_context(
+                &format!("unreachable-key-{}@example.invalid", uuid::Uuid::new_v4()),
+                "https://fixture.example.invalid",
+            )
+            .expect("set context");
+        // An unlocked account but no device key: neither keystore nor fallback has one.
+        manager.set_account_key(Zeroizing::new([9u8; 32]));
+        let session_file = manager
+            .current_user_context()
+            .expect("context")
+            .session_file;
+        std::fs::write(&session_file, "encrypted session").expect("write session");
+
+        manager
+            .load_session_with_validation()
+            .expect("load reports no session");
+
+        assert!(manager.current_session.lock().unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&session_file).expect("session kept"),
+            "encrypted session"
+        );
     }
 
     #[test]
@@ -229,7 +259,7 @@ mod tests {
             server: None,
         };
 
-        let signing_key_id = "transparency-log-dev-key";
+        let signing_key_id = crate::security::transparency::TEST_TRANSPARENCY_KEY_ID;
         let root_hash = hex::encode_upper(Sha256::digest(b"checkpoint-root"));
         let log_url = Some("https://trust.example/checkpoints/latest.json".to_string());
 
@@ -459,7 +489,11 @@ struct UserContext {
 }
 
 /// Represents the state of key pinning for a join card after consistency checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// This account's pin attestations, fetched once per process: a rotation checks many devices.
+static OWN_PIN_ATTESTATIONS: OnceLock<tokio::sync::Mutex<HashMap<String, Vec<PinAttestation>>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinCardPinState {
     /// The pin already exists and matches the join card identity key.
     AlreadyPinned,
@@ -467,10 +501,55 @@ pub enum JoinCardPinState {
     RestoredFromCache,
     /// A pin exists but is not verified yet.
     Unverified { auto_pinned: bool },
+    /// No pin existed (or only an unverified one), and another device of this account that this
+    /// computer verified vouched for the key in a signed pin attestation.
+    RestoredFromOwnDevice { verifier_device_id: String },
     /// No pin exists and no cached verification was available to restore it.
     Missing,
     /// A pin exists but has expired based on the configured max age.
     Expired(DateTime<Utc>),
+}
+
+/// Whether `attestation` lets this device (`session_user_id`/`session_device_id`) trust
+/// `join_card`: made by another device of the same account, naming exactly this card's device
+/// and key, by a verifier this device pinned and verified directly (`verifier_pin`), with a
+/// signature that holds under that pinned key.
+fn attestation_vouches_for(
+    attestation: &PinAttestation,
+    session_user_id: &str,
+    session_device_id: &str,
+    join_card: &ClientJoinCard,
+    verifier_pin: Option<&hybridcipher_client::pinning::PinnedKey>,
+) -> bool {
+    if attestation.verifier_user_id != session_user_id
+        || attestation.verifier_device_id == session_device_id
+        || attestation.subject_user_id != join_card.user_id.to_string()
+        || attestation.subject_device_id != join_card.device_id
+        || attestation.subject_identity_public_key != join_card.identity_public
+    {
+        return false;
+    }
+    let Some(verifier_pin) = verifier_pin else {
+        return false;
+    };
+    let direct = verifier_pin.verified
+        && matches!(
+            verifier_pin.verification_method,
+            PinningMethod::Manual | PinningMethod::SafetyNumber | PinningMethod::QrCode
+        );
+    direct
+        && verifier_pin.device_id == attestation.verifier_device_id
+        && attestation
+            .verify(&verifier_pin.identity_public_key)
+            .is_ok()
+}
+
+fn own_device_note(verifier_device_id: &str) -> String {
+    format!(
+        "Verified on your device {} ({})",
+        verifier_device_id,
+        Utc::now().to_rfc3339()
+    )
 }
 
 /// Result of ensuring a join card is published for the current device.
@@ -556,6 +635,29 @@ const LEGACY_PRODUCTION_HTTP_ALIASES: &[&str] = &[
     "http://api.hybridcipher.com",
     "http://api.hybridcipher.com:8080",
 ];
+
+/// Whether an expired local invitation key pair stops `ensure_current_device_pin_verified`.
+///
+/// Join cards are re-signed with a fresh expiry regardless of key age, so key age only
+/// matters when the key would be newly pinned or promoted from unverified. A key that is
+/// already pinned, verified, and unchanged is trusted on that pin.
+fn expired_invitation_keypair_blocks_auto_verify(
+    keypair_valid: bool,
+    existing_pin: Option<&hybridcipher_client::pinning::PinnedKey>,
+    identity_key: &[u8; 32],
+) -> bool {
+    let already_verified = existing_pin
+        .is_some_and(|pin| pin.verified && pin.identity_public_key == *identity_key);
+    !keypair_valid && !already_verified
+}
+
+#[cfg(test)]
+#[path = "../../tests/device_security/test_expired_invitation_keypair.rs"]
+mod expired_invitation_keypair_tests;
+
+#[cfg(test)]
+#[path = "../../tests/device_security/test_own_device_attestations.rs"]
+mod own_device_attestation_tests;
 
 fn compute_account_verifier(key: &[u8; 32]) -> String {
     let mut hasher = Sha256::new();
@@ -1708,6 +1810,18 @@ impl SessionManager {
 
     fn ensure_state_key_initialized(&self) -> Result<Zeroizing<[u8; 32]>, CliError> {
         self.ensure_state_key_internal(true)
+    }
+
+    /// Make this account's encrypted local files readable. Storage only learns the key when
+    /// something asks for it, and a command started by the desktop app (which names the group
+    /// itself) may never ask; reading encrypted files without it returns ciphertext.
+    pub fn unlock_local_state(&self) -> Result<(), CliError> {
+        self.ensure_state_key_internal(false).map(|_| ()).map_err(|err| {
+            CliError::decryption(format!(
+                "This device's local data is locked, so pinned device keys cannot be read: {}",
+                err
+            ))
+        })
     }
 
     pub fn enforce_password_reset_prerequisites(
@@ -3496,7 +3610,7 @@ impl SessionManager {
             })?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("verify_session_with_server")?;
+            self.discard_session("verify_session_with_server")?;
             return Ok(false);
         }
 
@@ -3551,8 +3665,23 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Invalidate the current session when the server rejects stored credentials.
-    pub fn invalidate_session(&self, source: &str) -> Result<(), CliError> {
+    /// Handle a 401 from one endpoint. Local credentials, cached entitlements and offline access are
+    /// discarded only when the server confirms the token itself is no longer valid; a single endpoint
+    /// rejecting it (or the check being unreachable) keeps the session.
+    pub async fn invalidate_session(&self, source: &str) -> Result<(), CliError> {
+        let Some(session) = self.current_session() else {
+            return Ok(());
+        };
+        match self.verify_session_with_server(&session).await {
+            Ok(false) => Ok(()),
+            Ok(true) | Err(_) => {
+                let _ = self.log_session_event(&format!("session_kept_after_401:{}", source), &session);
+                Ok(())
+            }
+        }
+    }
+
+    fn discard_session(&self, source: &str) -> Result<(), CliError> {
         if let Some(mut session) = self.current_session() {
             let event_type = format!("session_invalidated:{}", source);
             let _ = self.log_session_event(&event_type, &session);
@@ -3664,14 +3793,17 @@ impl SessionManager {
             .unwrap_or(true);
 
         // Ensure the state/device key is available before attempting to decrypt the session file.
+        // Not getting it says nothing about the file: the OS keystore may just be out of reach
+        // for this process (an SSH or service logon on Windows, a locked keychain), and the
+        // desktop app shares this file. Keep it; a later run or login settles it.
         let state_key = match self.ensure_state_key_internal(false) {
             Ok(key) => key,
             Err(err) => {
                 ui::warning(&format!(
-                    "Local session file was unreadable; it has been cleared. Please log in again. ({})",
+                    "Local session could not be unlocked in this session; it was kept. \
+                     Run this from your normal desktop session, or log in again. ({})",
                     err
                 ));
-                self.secure_file_deletion(&context.session_file)?;
                 *self.current_session.lock().unwrap() = None;
                 self.drop_state_key_memory();
                 return Ok(());
@@ -4224,6 +4356,24 @@ impl SessionManager {
         &self,
         join_card: &ClientJoinCard,
     ) -> Result<JoinCardPinState, CliError> {
+        self.check_join_card_pin(join_card, true).await
+    }
+
+    /// Like `check_or_restore_join_card_pin`, but never restores a pin from the join card cache,
+    /// so `AlreadyPinned` and `RestoredFromOwnDevice` mean a verification this account made.
+    /// Used where keys are sent without asking anyone.
+    pub async fn check_join_card_pin_without_cache(
+        &self,
+        join_card: &ClientJoinCard,
+    ) -> Result<JoinCardPinState, CliError> {
+        self.check_join_card_pin(join_card, false).await
+    }
+
+    async fn check_join_card_pin(
+        &self,
+        join_card: &ClientJoinCard,
+        restore_from_cache: bool,
+    ) -> Result<JoinCardPinState, CliError> {
         join_card.verify_signature().map_err(|e| {
             CliError::PinningFailed(format!("Join card signature verification failed: {}", e))
         })?;
@@ -4233,6 +4383,7 @@ impl SessionManager {
             ));
         }
 
+        self.unlock_local_state()?;
         let storage = self.current_storage()?;
         let pinning_config = load_pinning_config_for_storage(storage.as_ref()).await?;
         let pinning_store = PinningStore::new(storage, pinning_config.clone());
@@ -4276,12 +4427,36 @@ impl SessionManager {
                 if existing_pin.verified {
                     return Ok(JoinCardPinState::AlreadyPinned);
                 }
+                if let Some(verifier_device_id) = self
+                    .own_device_attestation_for(join_card, &pinning_store)
+                    .await
+                {
+                    pinning_store
+                        .mark_pin_verified(&user_id, &device_id, PinningMethod::OwnDevice)
+                        .await
+                        .map_err(|e| {
+                            CliError::PinningFailed(format!("Failed to verify pin: {}", e))
+                        })?;
+                    let _ = pinning_store
+                        .update_pin_notes(
+                            &user_id,
+                            &device_id,
+                            Some(own_device_note(&verifier_device_id)),
+                        )
+                        .await;
+                    return Ok(JoinCardPinState::RestoredFromOwnDevice { verifier_device_id });
+                }
                 return Ok(JoinCardPinState::Unverified { auto_pinned: false });
             }
             None => {}
         }
 
-        if let Some(cached_card) = self.find_cached_join_card_for_device(&user_id, &device_id)? {
+        let cached_card = if restore_from_cache {
+            self.find_cached_join_card_for_device(&user_id, &device_id)?
+        } else {
+            None
+        };
+        if let Some(cached_card) = cached_card {
             if cached_card.identity_public == join_card.identity_public {
                 let verifying_key = VerifyingKey::from_bytes(&identity_key_bytes).map_err(|e| {
                     CliError::invalid_input(format!("Join card identity key is invalid: {}", e))
@@ -4312,7 +4487,98 @@ impl SessionManager {
             }
         }
 
+        if let Some(verifier_device_id) = self
+            .own_device_attestation_for(join_card, &pinning_store)
+            .await
+        {
+            let verifying_key = VerifyingKey::from_bytes(&identity_key_bytes).map_err(|e| {
+                CliError::invalid_input(format!("Join card identity key is invalid: {}", e))
+            })?;
+            pinning_store
+                .pin_key(
+                    &user_id,
+                    &device_id,
+                    &verifying_key,
+                    PinningMethod::OwnDevice,
+                    Some(own_device_note(&verifier_device_id)),
+                )
+                .await
+                .map_err(|e| {
+                    CliError::PinningFailed(format!(
+                        "Failed to pin {}:{} from your other device: {}",
+                        user_id, device_id, e
+                    ))
+                })?;
+            return Ok(JoinCardPinState::RestoredFromOwnDevice { verifier_device_id });
+        }
+
         Ok(JoinCardPinState::Missing)
+    }
+
+    /// This account's pin attestations, fetched once per process. A server that predates them,
+    /// or a failed request, yields none, and devices are verified on this computer as before.
+    async fn own_pin_attestations(&self) -> Vec<PinAttestation> {
+        let Ok(session) = self.require_auth() else {
+            return Vec::new();
+        };
+        let mut cache = OWN_PIN_ATTESTATIONS
+            .get_or_init(Default::default)
+            .lock()
+            .await;
+        if let Some(cached) = cache.get(&session.user_id) {
+            return cached.clone();
+        }
+        let url = format!(
+            "{}/pin-attestations",
+            hybridcipher_client::device_actions::api_base(&session.server_url)
+        );
+        let fetched = match reqwest::Client::new()
+            .get(url)
+            .bearer_auth(&session.token)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_value(body["attestations"].clone()).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        cache.insert(session.user_id.clone(), fetched.clone());
+        fetched
+    }
+
+    /// The device of this account that vouches for `join_card`'s key, if one does in a way this
+    /// computer can check: the verifier is another device of the same account, this computer
+    /// verified it directly (not itself through an attestation, so trust stays one hop), its
+    /// signature holds under the key pinned here, and it names exactly this card's key. The
+    /// server only relays the statement and cannot make one pass.
+    async fn own_device_attestation_for<S: hybridcipher_client::storage::Storage>(
+        &self,
+        join_card: &ClientJoinCard,
+        pinning_store: &PinningStore<S>,
+    ) -> Option<String> {
+        let session = self.require_auth().ok()?;
+        for attestation in self.own_pin_attestations().await {
+            let verifier_pin = pinning_store
+                .get_pinned_key(&session.user_id, &attestation.verifier_device_id)
+                .await
+                .ok()
+                .flatten();
+            if attestation_vouches_for(
+                &attestation,
+                &session.user_id,
+                &session.device_id,
+                join_card,
+                verifier_pin.as_ref(),
+            ) {
+                return Some(attestation.verifier_device_id);
+            }
+        }
+        None
     }
 
     /// Optionally auto-pin a join card without verification when missing.
@@ -4403,13 +4669,6 @@ impl SessionManager {
             )));
         }
 
-        if !invitation_keypair.is_valid() {
-            return Err(CliError::PinningFailed(
-                "Local invitation keypair has expired; refresh the join card before continuing."
-                    .to_string(),
-            ));
-        }
-
         let join_card = invitation_keypair
             .create_join_card(user_uuid)
             .map_err(|e| {
@@ -4458,6 +4717,18 @@ impl SessionManager {
                 )))
             }
         };
+
+        if expired_invitation_keypair_blocks_auto_verify(
+            invitation_keypair.is_valid(),
+            existing_pin.as_ref(),
+            &identity_key_bytes,
+        ) {
+            return Err(CliError::PinningFailed(
+                "Local invitation keypair has expired and this device's key is not verified yet, \
+                 so it cannot be verified automatically."
+                    .to_string(),
+            ));
+        }
 
         let mut note = format!(
             "Auto-verified local device during {} on {}",
@@ -4744,9 +5015,7 @@ impl SessionManager {
         &self,
         client: &Client<S, N>,
     ) -> Result<(), CliError> {
-        let saved = self
-            .current_session()
-            .ok_or_else(|| CliError::session("No account is open"))?;
+        let saved = self.saved_session_for_write_access()?;
         client
             .configure_local_write_access(
                 hybridcipher_client::local_write_access::LocalWriteAccess {
@@ -4764,10 +5033,17 @@ impl SessionManager {
             .map_err(|err| CliError::permission(err.to_string()))
     }
 
+    /// Saved session for local write checks; local-only commands may not have loaded it yet.
+    fn saved_session_for_write_access(&self) -> Result<Session, CliError> {
+        if self.current_session().is_none() {
+            self.ensure_session_loaded()?;
+        }
+        self.current_session()
+            .ok_or_else(|| CliError::session("No account is open"))
+    }
+
     pub async fn persist_local_write_access(&self) -> Result<(), CliError> {
-        let saved = self
-            .current_session()
-            .ok_or_else(|| CliError::session("No account is open"))?;
+        let saved = self.saved_session_for_write_access()?;
         let access = hybridcipher_client::local_write_access::LocalWriteAccess {
             issuer: saved
                 .server_url
@@ -4958,7 +5234,7 @@ impl SessionManager {
             .map_err(|e| CliError::network(format!("Failed to fetch verifier status: {}", e)))?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("second_party_status")?;
+            self.invalidate_session("second_party_status").await?;
             return Err(CliError::NotAuthenticated(
                 "Session expired. Please login again.".into(),
             ));
@@ -5018,7 +5294,7 @@ impl SessionManager {
             .map_err(|e| CliError::network(format!("Failed to fetch verifier statuses: {}", e)))?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("second_party_statuses")?;
+            self.invalidate_session("second_party_statuses").await?;
             return Err(CliError::NotAuthenticated(
                 "Session expired. Please login again.".into(),
             ));
@@ -5048,37 +5324,23 @@ impl SessionManager {
     /// Add a member using direct HTTP API call to HybridCipher server
     pub async fn add_member_http(
         &self,
+        group_id: uuid::Uuid,
         member_name: &str,
         welcome_messages: Vec<serde_json::Value>,
     ) -> Result<(), CliError> {
         let session = self.require_auth()?;
 
-        // Use the production HybridCipher server
-        let server_url = "https://api.hybridcipher.com";
+        // Send to the server that issued this session; the token is not valid anywhere else.
+        let server_url = session
+            .server_url
+            .trim_end_matches('/')
+            .trim_end_matches("/api/v1");
 
         // Create HTTP client
         let client = reqwest::Client::new();
 
-        // Get the current active group from client state instead of default group
-        let group_id = match self.ensure_active_group().await {
-            Ok(id) => id,
-            Err(_) => {
-                // Fallback to get_or_create_default_group if no active group is set
-                match self
-                    .get_or_create_default_group(&client, &session.token, server_url)
-                    .await
-                {
-                    Ok(id) => id,
-                    Err(e) => return Err(e),
-                }
-            }
-        };
-
-        // Step 2: Add member to the group using the proper API endpoint
-        // Based on the server integration guide, the endpoint is /api/v1/groups/:id/members
-
-        // Determine if the member_name is a UUID or an email/username
-        // Prioritize email format - if it contains @ it's an email, regardless of whether it could be parsed as UUID
+        // The Welcome payloads were sealed for `group_id`; they are never sent to another group.
+        // Members are identified by email (anything containing '@') or by user ID only.
         if welcome_messages.is_empty() {
             return Err(CliError::invalid_input(
                 "Welcome payload required. Use 'hybridcipher welcome generate' to create one",
@@ -5103,12 +5365,10 @@ impl SessionManager {
                 serde_json::Value::String("Welcome to the group!".into()),
             );
         } else {
-            let email = format!("{}@example.com", member_name);
-            add_member_request.insert("email".into(), serde_json::json!(email));
-            add_member_request.insert(
-                "invitation_message".into(),
-                serde_json::Value::String(format!("Welcome to the group, {}!", member_name)),
-            );
+            return Err(CliError::invalid_input(format!(
+                "'{}' is not an email address or user ID",
+                member_name
+            )));
         }
 
         add_member_request.insert("role".into(), serde_json::Value::String("member".into()));
@@ -5132,7 +5392,7 @@ impl SessionManager {
             .map_err(|e| CliError::network(format!("HTTP request failed: {}", e)))?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("add_member_http")?;
+            self.invalidate_session("add_member_http").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected by the server. Please login again with 'hybridcipher login <username>'.",
             ));
@@ -5164,6 +5424,54 @@ impl SessionManager {
                 "Failed to add member '{}': {} - {}",
                 member_name, status, error_text
             )))
+        }
+    }
+
+    /// Store Welcome messages with a pending Team invitation, so the invited account joins
+    /// `group_id` as soon as it accepts.
+    pub async fn stage_invitation_welcomes_http(
+        &self,
+        invitation_id: uuid::Uuid,
+        group_id: uuid::Uuid,
+        welcome_messages: Vec<serde_json::Value>,
+    ) -> Result<(), CliError> {
+        let session = self.require_auth()?;
+        let server_url = session
+            .server_url
+            .trim_end_matches('/')
+            .trim_end_matches("/api/v1");
+        let response = reqwest::Client::new()
+            .put(format!(
+                "{}/api/v1/organizations/me/invitations/{}/groups/{}/welcomes",
+                server_url, invitation_id, group_id
+            ))
+            .header("Authorization", &format!("Bearer {}", session.token))
+            .json(&serde_json::json!({ "welcome_messages": welcome_messages }))
+            .send()
+            .await
+            .map_err(|e| CliError::network(format!("HTTP request failed: {}", e)))?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            StatusCode::UNAUTHORIZED => {
+                self.invalidate_session("stage_invitation_welcomes_http")
+                    .await?;
+                Err(CliError::authentication(
+                    "Authentication token rejected by the server. Please login again with 'hybridcipher login <username>'.",
+                ))
+            }
+            StatusCode::NOT_FOUND => Err(CliError::member_management(
+                "That invitation is no longer pending".to_string(),
+            )),
+            StatusCode::FORBIDDEN => Err(CliError::member_management(
+                "Only an admin of this group can give access with an invitation".to_string(),
+            )),
+            status => {
+                let error_text = response.text().await.unwrap_or_default();
+                Err(CliError::network(format!(
+                    "Failed to attach group access to the invitation: {} - {}",
+                    status, error_text
+                )))
+            }
         }
     }
 
@@ -5207,7 +5515,7 @@ impl SessionManager {
             })?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("report_unverified_devices")?;
+            self.invalidate_session("report_unverified_devices").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected. Please login again.".to_string(),
             ));
@@ -5262,7 +5570,7 @@ impl SessionManager {
             .map_err(|e| CliError::network(format!("Failed to fetch unverified devices: {}", e)))?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("list_unverified_devices")?;
+            self.invalidate_session("list_unverified_devices").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected. Please login again.".to_string(),
             ));
@@ -5337,7 +5645,7 @@ impl SessionManager {
             })?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("resolve_unverified_device")?;
+            self.invalidate_session("resolve_unverified_device").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected. Please login again.".to_string(),
             ));
@@ -5392,7 +5700,7 @@ impl SessionManager {
 
         match response.status() {
             StatusCode::UNAUTHORIZED => {
-                self.invalidate_session("remove_member_http")?;
+                self.invalidate_session("remove_member_http").await?;
                 Err(CliError::authentication(
                     "Authentication token rejected by the server. Please login again with 'hybridcipher login <username>'.",
                 ))
@@ -5448,7 +5756,7 @@ impl SessionManager {
             .map_err(|e| CliError::network(format!("Failed to publish join card: {}", e)))?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("publish_join_card")?;
+            self.invalidate_session("publish_join_card").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected. Please login again.".to_string(),
             ));
@@ -5483,8 +5791,14 @@ impl SessionManager {
 
         let device_id = session.device_id.clone();
 
+        // An expired card blocks key rotation for this device, so a card only counts
+        // as present while it has comfortable validity left.
+        let now = chrono::Utc::now();
         if let Ok(server_cards) = self.fetch_join_cards_for_user_id(&user_id).await {
-            if server_cards.iter().any(|card| card.device_id == device_id) {
+            if server_cards
+                .iter()
+                .any(|card| card.device_id == device_id && !card.needs_refresh(now))
+            {
                 return Ok(JoinCardPublishState::AlreadyPresent);
             }
         }
@@ -5493,7 +5807,7 @@ impl SessionManager {
         if let Some(cached_card) =
             self.find_cached_join_card_for_device(&session.user_id, &device_id)?
         {
-            if cached_card.verify_signature().is_ok() && cached_card.is_valid() {
+            if cached_card.verify_signature().is_ok() && !cached_card.needs_refresh(now) {
                 join_card = Some(cached_card);
             }
         }
@@ -5581,7 +5895,7 @@ impl SessionManager {
             })?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("fetch_join_cards_directory")?;
+            self.invalidate_session("fetch_join_cards_directory").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected. Please login again.".to_string(),
             ));
@@ -6185,105 +6499,6 @@ impl SessionManager {
         Ok(trust_decision)
     }
 
-    /// Get or create a default group for the user
-    async fn get_or_create_default_group(
-        &self,
-        client: &reqwest::Client,
-        token: &str,
-        server_url: &str,
-    ) -> Result<uuid::Uuid, CliError> {
-        // First, try to list existing groups
-        let response = client
-            .get(&format!("{}/api/v1/groups", server_url))
-            .header("Authorization", &format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| CliError::network(format!("Failed to list groups: {}", e)))?;
-
-        if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("get_or_create_default_group_list")?;
-            return Err(CliError::authentication(
-                "Authentication token rejected. Please login again.".to_string(),
-            ));
-        }
-
-        if response.status().is_success() {
-            let groups: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| CliError::network(format!("Invalid groups response: {}", e)))?;
-
-            // Look for an existing group
-            if let Some(groups_array) = groups.get("groups").and_then(|g| g.as_array()) {
-                if let Some(first_group) = groups_array.first() {
-                    if let Some(group_id_str) = first_group.get("id").and_then(|id| id.as_str()) {
-                        if let Ok(group_id) = uuid::Uuid::parse_str(group_id_str) {
-                            println!("ℹ Using existing group: {}", group_id);
-                            return Ok(group_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        // No existing group found, create a new one
-        println!("ℹ Creating default group...");
-        let create_group_request = serde_json::json!({
-            "name": "Default Group",
-            "description": "Default group for file sharing",
-            "settings": {
-                "auto_rekey_enabled": false,
-                "max_members": 100,
-                "require_admin_approval": false,
-                "allow_member_invite": true
-            }
-        });
-
-        let response = client
-            .post(&format!("{}/api/v1/groups", server_url))
-            .header("Authorization", &format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .json(&create_group_request)
-            .send()
-            .await
-            .map_err(|e| CliError::network(format!("Failed to create group: {}", e)))?;
-
-        if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_session("get_or_create_default_group_create")?;
-            return Err(CliError::authentication(
-                "Authentication token rejected. Please login again.".to_string(),
-            ));
-        }
-
-        if response.status().is_success() {
-            let group_response: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| CliError::network(format!("Invalid create group response: {}", e)))?;
-
-            if let Some(group_id_str) = group_response.get("id").and_then(|id| id.as_str()) {
-                if let Ok(group_id) = uuid::Uuid::parse_str(group_id_str) {
-                    println!("✓ Created default group: {}", group_id);
-                    return Ok(group_id);
-                }
-            }
-        } else {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(CliError::network(format!(
-                "Failed to create default group: {} - {}",
-                status, error_text
-            )));
-        }
-
-        Err(CliError::network(
-            "Failed to parse group ID from server response".to_string(),
-        ))
-    }
-
     /// Create a real authenticated session by running the OPAQUE login flow
     /// against the HybridCipher server.
     pub async fn login_to_server(
@@ -6299,7 +6514,8 @@ impl SessionManager {
         let mut context = self.build_device_login_context().await?;
         context.device_metadata.mfa_code = mfa_code;
         context.device_metadata.backup_code = backup_code;
-        let opaque_auth = OpaqueAuth::new(context.device_id.clone());
+        let opaque_auth = OpaqueAuth::new(context.device_id.clone())
+            .with_device_identity(context.identity_keypair.clone());
 
         let login_result: OpaqueServerLogin = match opaque_auth
             .login_with_server(username, password, server_url, context.device_metadata)
@@ -6501,7 +6717,7 @@ impl SessionManager {
             .map_err(|e| CliError::network(format!("HTTP request failed: {}", e)))?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.invalidate_session("list_groups_http")?;
+            self.invalidate_session("list_groups_http").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected by the server. Please login again with 'hybridcipher login <username>'.",
             ));
@@ -6579,7 +6795,7 @@ impl SessionManager {
                 })
             }
             StatusCode::UNAUTHORIZED => {
-                self.invalidate_session("rename_group_http")?;
+                self.invalidate_session("rename_group_http").await?;
                 Err(CliError::authentication(
                     "Authentication token rejected by the server. Please login again.".to_string(),
                 ))
@@ -6620,7 +6836,7 @@ impl SessionManager {
                 .await
                 .map_err(|e| CliError::network(format!("Failed to parse device list: {}", e))),
             StatusCode::UNAUTHORIZED => {
-                self.invalidate_session("fetch_registered_devices")?;
+                self.invalidate_session("fetch_registered_devices").await?;
                 Err(CliError::authentication(
                     "Session expired. Please login again with 'hybridcipher login <email>'.",
                 ))
@@ -6670,7 +6886,7 @@ impl SessionManager {
             .map_err(|e| CliError::network(format!("HTTP request failed: {}", e)))?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.invalidate_session("list_group_members_http")?;
+            self.invalidate_session("list_group_members_http").await?;
             return Err(CliError::authentication(
                 "Authentication token rejected by the server. Please login again with 'hybridcipher login <username>'.",
             ));

@@ -15,6 +15,10 @@ pub fn display_error_with_context(error: &CliError, execution_time: Duration) {
         style(error.to_string()).red()
     ));
 
+    if let Some(hint) = device_trust_hint(&error.to_string()) {
+        let _ = term.write_line(&format!("  {} {}", style("ℹ").cyan(), hint));
+    }
+
     // Show execution time for performance context
     if execution_time > Duration::from_millis(100) {
         let _ = term.write_line(&format!(
@@ -73,3 +77,18 @@ pub fn display_cli_usage_error(error_message: &str) {
     let _ = term.write_line("  • Use 'hybridcipher login <username>' to authenticate");
     let _ = term.write_line("");
 }
+
+/// Explains a server refusal of Team administration from an unverified device.
+pub fn device_trust_hint(message: &str) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
+    let status_428 = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == "428");
+    (lower.contains("device_trust_required") || status_428 || lower.contains("precondition required")).then_some(
+        "Team administration needs a verified device. Verify this device from a trusted device (hybridcipher pin verify), or confirm it with your password (hybridcipher device confirm-trust).",
+    )
+}
+
+#[cfg(test)]
+#[path = "../../tests/ui/test_error_hints.rs"]
+mod tests;

@@ -152,6 +152,9 @@ pub enum PinningMethod {
     Manual,
     /// Auto-pinned without verification
     Unverified,
+    /// Verified on another device of the same account, which this device verified itself and
+    /// which signed the statement (a pin attestation). Never re-shared, so trust stays one hop.
+    OwnDevice,
 }
 
 impl fmt::Display for PinningMethod {
@@ -161,6 +164,7 @@ impl fmt::Display for PinningMethod {
             PinningMethod::SafetyNumber => write!(f, "Safety Number"),
             PinningMethod::Manual => write!(f, "Manual Verification"),
             PinningMethod::Unverified => write!(f, "Unverified (auto)"),
+            PinningMethod::OwnDevice => write!(f, "Verified on your other device"),
         }
     }
 }

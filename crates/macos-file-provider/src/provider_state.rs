@@ -227,6 +227,7 @@ impl ProviderPersistentState {
         }
     }
 
+    #[cfg(test)]
     pub fn ensure_directory_path(&mut self, relative_path: String) -> String {
         if let Some(existing) = self.path_to_directory_id.get(&relative_path) {
             return existing.clone();
@@ -324,18 +325,6 @@ impl ProviderPersistentState {
 
     pub fn snapshot_cloned(&self, provider_id: &str) -> Option<ProviderItemSnapshot> {
         self.items.get(provider_id).cloned()
-    }
-
-    pub fn snapshot_for_relative_path(
-        &self,
-        root_id: Uuid,
-        entry: ProviderEntry,
-    ) -> Option<ProviderItemSnapshot> {
-        let snapshot = self.snapshot_for_entry(root_id, entry);
-        self.items
-            .get(&snapshot.provider_id)
-            .cloned()
-            .or(Some(snapshot))
     }
 
     pub fn snapshot_for_entry(&self, root_id: Uuid, entry: ProviderEntry) -> ProviderItemSnapshot {

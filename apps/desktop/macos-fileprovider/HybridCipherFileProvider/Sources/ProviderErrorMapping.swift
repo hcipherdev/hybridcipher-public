@@ -13,10 +13,13 @@ func providerCompatibleError(_ error: Error) -> Error {
              .socketPathTooLong,
              .connectFailed,
              .writeFailed,
-             .readFailed:
+             .readFailed,
+             .busy:
             return NSFileProviderError(.serverUnreachable)
         case .providerRejected:
             return NSFileProviderError(.cannotSynchronize)
+        case .legacyConsentRequired:
+            return bridgeError
         }
     }
 

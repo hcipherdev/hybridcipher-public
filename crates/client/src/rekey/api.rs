@@ -117,25 +117,6 @@ pub struct RekeyHeartbeatRequestPayload {
     pub root_kpis: Vec<RootCoverageKpiPayload>,
 }
 
-/// Request payload for cutover execution
-#[derive(Debug, Clone, Serialize)]
-pub struct CutoverRequest {
-    pub rekey_id: Uuid,
-    pub force: bool,
-    pub immediate_cleanup: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature_algorithm: Option<String>,
-}
-
-/// Request payload for cancelling an active rekey operation.
-#[derive(Debug, Clone, Serialize)]
-pub struct RekeyFallbackRequestPayload {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
 /// Per-root coverage KPI payload included with heartbeats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootCoverageKpiPayload {
@@ -161,38 +142,6 @@ pub struct RekeyDescriptorSummary {
 pub struct RekeyDescriptorList {
     pub group_id: Uuid,
     pub descriptors: Vec<RekeyDescriptorSummary>,
-}
-
-/// Response payload returned after cutover completes
-#[derive(Debug, Clone, Deserialize)]
-pub struct CutoverResponsePayload {
-    pub cutover_id: Uuid,
-    pub group_id: Uuid,
-    pub new_epoch_id: Uuid,
-    pub old_epoch_id: Uuid,
-    pub completed_at: DateTime<Utc>,
-    pub cleanup_status: String,
-    #[serde(default)]
-    pub coverage_transparency: Option<CoverageTransparencyMetadata>,
-}
-
-/// Response payload returned when a rekey operation is cancelled.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RekeyFallbackResponsePayload {
-    pub rekey_id: Uuid,
-    pub group_id: Uuid,
-    pub status: RekeyStatus,
-    pub cancelled_at: DateTime<Utc>,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub new_epoch_id: Option<Uuid>,
-    #[serde(default)]
-    pub new_epoch_number: Option<u64>,
-    #[serde(default)]
-    pub previous_epoch_id: Option<Uuid>,
-    #[serde(default)]
-    pub previous_epoch_number: Option<u64>,
 }
 
 /// Reasons for initiating a rekey operation

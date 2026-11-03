@@ -142,3 +142,35 @@ mod security_regression {
         );
     }
 }
+
+/// The git commit this app was built from (see build.rs).
+pub const APP_BUILD_COMMIT: &str = env!("HYBRIDCIPHER_BUILD_COMMIT");
+
+/// The bundled CLI's `--version` line, e.g. "hybridcipher 0.1.0 (fb1e1c417c99)", or None when
+/// there is no bundled CLI or it cannot run.
+pub fn bundled_cli_version() -> Option<String> {
+    let path = locate_bundled_cli_binary()?;
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    crate::process_utils::configure_background_std_command(&mut command);
+    let output = command.output().ok().filter(|output| output.status.success())?;
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
+/// Whether a CLI `--version` line names the commit this app was built from. Builds without a
+/// known commit on either side are not called a mismatch.
+pub fn cli_matches_app_build(version_line: &str) -> bool {
+    let cli_commit = version_line
+        .rsplit_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'));
+    match cli_commit {
+        Some(commit) => commit == APP_BUILD_COMMIT || commit == "unknown" || APP_BUILD_COMMIT == "unknown",
+        // A CLI from before commits were recorded.
+        None => false,
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/operations/test_bundled_cli_build.rs"]
+mod bundled_cli_build_tests;

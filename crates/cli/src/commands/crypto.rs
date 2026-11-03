@@ -71,7 +71,7 @@ pub async fn handle_get_epoch_keys(
             Ok(())
         }
         StatusCode::UNAUTHORIZED => {
-            session_manager.invalidate_session("get_epoch_keys")?;
+            session_manager.invalidate_session("get_epoch_keys").await?;
             Err(CliError::authentication(
                 "Authentication token rejected. Please login again.".to_string(),
             ))

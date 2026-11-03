@@ -12,9 +12,9 @@ use fs2::FileExt;
 pub use hybridcipher_provider_core::{
     local_provider_bridge, local_provider_bridge_for_root_with_compatibility,
     local_provider_bridge_with_compatibility, ClientMountCrypto, ExpectedProviderVersion,
-    LocalProviderBridge, LocalProviderClient, MountSafetyReason, MountSyncRuntimeStatus,
-    ProviderBridge, ProviderContentVersion, ProviderEntryKind, VaultCompatibility,
-    VaultCompatibilityStatus,
+    LegacyFileSummary, LegacyUpgradeReport, LocalProviderBridge, LocalProviderClient,
+    MountSafetyReason, MountSyncRuntimeStatus, ProviderBridge, ProviderContentVersion,
+    ProviderEntryKind, VaultCompatibility, VaultCompatibilityStatus,
 };
 use hybridcipher_provider_core::{
     EncryptedInventory, FileIdentityV1, ProviderCoreError, ProviderEntry, Result as ProviderResult,
@@ -4522,6 +4522,57 @@ impl ProviderBridge for WindowsProjectedBridge {
         self.inner.is_path_excluded(encrypted_root, relative_path)
     }
 
+    async fn upgrade_legacy_files(
+        &self,
+        root_id: Uuid,
+        encrypted_root: &Path,
+        relative_paths: Option<&[String]>,
+        plaintext_staging_dir: &Path,
+    ) -> ProviderResult<LegacyUpgradeReport> {
+        // Callers name files by their Windows-visible paths; the inner bridge
+        // stores them under their raw encrypted names.
+        let raw_entries = self.inner.inventory(root_id, encrypted_root).await?;
+        let projected = project_windows_inventory(raw_entries.clone())?;
+        let raw_by_projected: HashMap<String, String> = projected
+            .iter()
+            .filter_map(|entry| {
+                let file_id = entry.identity.file_id.as_ref()?;
+                let raw = raw_entries
+                    .iter()
+                    .find(|raw| raw.identity.file_id.as_ref() == Some(file_id))?;
+                Some((entry.relative_path.clone(), raw.relative_path.clone()))
+            })
+            .collect();
+        let raw_paths = relative_paths.map(|paths| {
+            paths
+                .iter()
+                .map(|path| {
+                    let normalized = hybridcipher_provider_core::normalize_relative_path(
+                        path.replace('\\', "/"),
+                    );
+                    raw_by_projected
+                        .get(&normalized)
+                        .cloned()
+                        .unwrap_or(normalized)
+                })
+                .collect::<Vec<_>>()
+        });
+        let projected_by_raw: HashMap<String, String> = raw_by_projected
+            .into_iter()
+            .map(|(projected, raw)| (raw, projected))
+            .collect();
+        let report = self
+            .inner
+            .upgrade_legacy_files(
+                root_id,
+                encrypted_root,
+                raw_paths.as_deref(),
+                plaintext_staging_dir,
+            )
+            .await?;
+        Ok(report.map_paths(|raw| projected_by_raw.get(&raw).cloned().unwrap_or(raw)))
+    }
+
     async fn inventory(
         &self,
         root_id: Uuid,
@@ -5526,6 +5577,21 @@ impl CloudProviderHost {
     ) -> Result<()> {
         self.root_controls(root_id)?
             .resolve_pending(operation_id, action)
+            .await
+    }
+
+    pub async fn legacy_files(&self, root_id: Uuid) -> Result<Vec<LegacyFileSummary>> {
+        self.root_controls(root_id)?.legacy_files().await
+    }
+
+    /// Rewrites older-format files in the current format, then re-projects them.
+    pub async fn upgrade_legacy_files(
+        &self,
+        root_id: Uuid,
+        relative_paths: Option<Vec<String>>,
+    ) -> Result<LegacyUpgradeReport> {
+        self.root_controls(root_id)?
+            .upgrade_legacy_files(relative_paths)
             .await
     }
 
@@ -14843,6 +14909,47 @@ mod platform {
             self.context.resolve_pending_locked(id, action).await
         }
 
+        pub async fn legacy_files(&self) -> Result<Vec<super::LegacyFileSummary>> {
+            let registration = &self.context.registration;
+            let entries = self
+                .context
+                .bridge
+                .inventory(registration.root_id, &registration.encrypted_root)
+                .await?;
+            Ok(hybridcipher_provider_core::legacy_file_summaries(&entries))
+        }
+
+        pub async fn upgrade_legacy_files(
+            &self,
+            relative_paths: Option<Vec<String>>,
+        ) -> Result<super::LegacyUpgradeReport> {
+            let _operation = self.context.operation_lock.lock().await;
+            self.context.startup_activity.ensure_running()?;
+            // Record local edits first so an upgrade never races an unsynced save.
+            self.context.ingest_local_tree_locked().await?;
+            if !self.context.read_journal()?.records.is_empty() {
+                return Err(CloudProviderError::Callback(
+                    "Older files can be upgraded after pending changes in this folder finish syncing"
+                        .into(),
+                ));
+            }
+            let registration = &self.context.registration;
+            let report = self
+                .context
+                .bridge
+                .upgrade_legacy_files(
+                    registration.root_id,
+                    &registration.encrypted_root,
+                    relative_paths.as_deref(),
+                    &self.context.runtime_paths.cache_dir,
+                )
+                .await?;
+            if !report.upgraded.is_empty() {
+                self.context.reconcile_remote_inventory_locked().await?;
+            }
+            Ok(report)
+        }
+
         pub async fn begin(&self) -> Result<()> {
             begin_provider_shutdown_barrier(
                 &self.context.startup_activity,
@@ -16457,6 +16564,10 @@ mod platform {
             if completion.file_unavailable && completion.execute_error.is_none() {
                 // Windows received a complete file-specific failure. Restarting the
                 // root cannot grant consent, repair ciphertext or restore a missing file.
+                // The folder's compatibility status carries the reason to the app.
+                if let Some(reason) = completion.handler_error.as_deref() {
+                    tracing::warn!(%reason, "Cloud Files could not provide a file's contents");
+                }
                 observation.finish_observed_at(finished_at);
             } else if completion.cancellation_observed
                 && completion.handler_error.is_none()
@@ -17621,6 +17732,10 @@ mod platform {
                 }
                 ProviderCoreError::Crypto(_) if source.is_legacy_consent_required() => "legacy_compatibility_required: Open folder details and enable access to older files after reviewing the integrity limitation".into(),
                 ProviderCoreError::Crypto(_) if source.is_integrity_failure() => "file_integrity_failed: The file failed authentication. Preserve its encrypted original and recover a verified copy".into(),
+                ProviderCoreError::Crypto(_) if source.is_key_unavailable() => format!(
+                    "key_unavailable: The file uses key version {}, which this device does not have. Move it to the current key from a device that has it, or restore older keys with your password and recovery code",
+                    source.unavailable_key_version().unwrap_or_default()
+                ),
                 ProviderCoreError::Crypto(_) => "file_unavailable: Authenticated file decryption failed; inspect this file's recovery status".into(),
                 ProviderCoreError::MutationUnsupported(_) => {
                     "provider operation is unsupported".into()
@@ -18038,6 +18153,15 @@ mod platform {
             _id: Uuid,
             _action: super::PendingOperationResolution,
         ) -> Result<()> {
+            Err(CloudProviderError::UnsupportedPlatform)
+        }
+        pub async fn legacy_files(&self) -> Result<Vec<super::LegacyFileSummary>> {
+            Err(CloudProviderError::UnsupportedPlatform)
+        }
+        pub async fn upgrade_legacy_files(
+            &self,
+            _relative_paths: Option<Vec<String>>,
+        ) -> Result<super::LegacyUpgradeReport> {
             Err(CloudProviderError::UnsupportedPlatform)
         }
         pub async fn begin(&self) -> Result<()> {

@@ -13,7 +13,28 @@ use std::sync::{
     Arc,
 };
 use tauri::{async_runtime::Mutex, Emitter, Manager};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+
+/// Largest desktop log kept before the next start moves it to `desktop.log.1`.
+const DESKTOP_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// `<HybridCipher home>/logs/desktop.log`, appended to, after rolling an oversized one aside.
+/// `None` when it cannot be opened; logging then goes to the console only.
+fn open_desktop_log_file() -> Option<std::fs::File> {
+    let directory = dirs::home_dir()?
+        .join(hybridcipher_client::config_loader::account_data_location())
+        .join("logs");
+    std::fs::create_dir_all(&directory).ok()?;
+    let path = directory.join("desktop.log");
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > DESKTOP_LOG_MAX_BYTES) {
+        let _ = std::fs::rename(&path, directory.join("desktop.log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
 
 #[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
 #[test]
@@ -23,7 +44,9 @@ fn platform_app_version_matches_tauri_context() {
     #[cfg(target_os = "macos")]
     let platform_config = include_str!("../tauri.macos.conf.json");
     let config: serde_json::Value = serde_json::from_str(platform_config).unwrap();
-    let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+    // `test = true` skips the Info.plist embed, which the app's own context
+    // already defines on macOS.
+    let context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
     assert_eq!(
         context.package_info().version.to_string(),
         config["version"].as_str().unwrap()
@@ -191,22 +214,55 @@ fn main() {
         }
     }
 
-    // Initialize tracing for better debugging
+    // Initialize tracing for better debugging, plus a log file: the app has no console, so
+    // without one a failure (a file that would not move to a new key) leaves no trace.
+    let file_log = open_desktop_log_file().map(|file| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_filter(tracing_subscriber::EnvFilter::new(
+                "hybridcipher_desktop=info,hybridcipher_client=info,hybridcipher_mount_sync=info,\
+                 hybridcipher_macos_file_provider=info,hybridcipher_windows_cloud_provider=info,\
+                 hybridcipher_provider_core=info,tauri=warn",
+            ))
+    });
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hybridcipher_desktop=debug,tauri=info".into()),
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "hybridcipher_desktop=debug,hybridcipher_client=info,tauri=info".into()
+                }),
+            ),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(file_log)
         .init();
 
-    tracing::info!("Starting HybridCipher Desktop Application");
+    tracing::info!(
+        "Starting HybridCipher Desktop Application (build {})",
+        hybridcipher_desktop::cli_utils::APP_BUILD_COMMIT
+    );
+    // An installer that left an older bundled CLI in place shows up here.
+    std::thread::spawn(|| {
+        use hybridcipher_desktop::cli_utils::{
+            bundled_cli_version, cli_matches_app_build, APP_BUILD_COMMIT,
+        };
+        match bundled_cli_version() {
+            Some(line) if !cli_matches_app_build(&line) => tracing::warn!(
+                "The bundled CLI ({}) is from a different build than this app ({}); reinstall HybridCipher",
+                line,
+                APP_BUILD_COMMIT
+            ),
+            Some(line) => tracing::info!("Bundled CLI: {}", line),
+            None => {}
+        }
+    });
 
     let shutting_down = Arc::new(AtomicBool::new(false));
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init());
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_notification::init());
     #[cfg(not(feature = "store-msix"))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     builder
@@ -228,10 +284,14 @@ fn main() {
                     client: Arc::new(client),
                     cli_schema: Arc::new(cli_schema),
                     session: Arc::new(Mutex::new(None)),
+                    auth_generation: AtomicU64::new(0),
                     team_queue: Arc::new(Mutex::new(())),
                     mount_manager,
                     local_client,
                     cloud_provider,
+                    local_vault: Arc::new(Mutex::new(None)),
+                    group_key_watch: Default::default(),
+                    session_refresh_hold: Default::default(),
                 };
 
                 let app_handle = app.app_handle().clone();
@@ -261,6 +321,7 @@ fn main() {
                 })
                 .map_err(|e| anyhow!(format!("Failed to install Ctrl+C handler: {}", e)))?;
 
+                state.cloud_provider.attach_app(app.app_handle().clone());
                 app.manage(state);
                 app.manage(QuitRequestTracker::default());
 
@@ -279,6 +340,13 @@ fn main() {
                         .id("preferences")
                         .accelerator("Cmd+,")
                         .build(app)?;
+                    // Not the predefined Quit: macOS ends the app on that without
+                    // asking, so its mounts would be left behind. This one goes
+                    // through the same safe stop as the tray's Quit.
+                    let quit_item = MenuItemBuilder::new(format!("Quit {}", app_name))
+                        .id("quit")
+                        .accelerator("Cmd+Q")
+                        .build(app)?;
 
                     let app_submenu = SubmenuBuilder::new(app, &app_name)
                         .item(&about_item)
@@ -289,7 +357,7 @@ fn main() {
                         .hide_others()
                         .show_all()
                         .separator()
-                        .quit()
+                        .item(&quit_item)
                         .build()?;
 
                     let edit_submenu = SubmenuBuilder::new(app, "Edit")
@@ -436,10 +504,22 @@ fn main() {
             answer_desktop_operation,
             cancel_desktop_operation,
             get_workspace_group_context,
+            get_personal_workspace,
+            repair_personal_default_group,
+            local_vault_status,
+            create_local_vault,
+            create_local_recovery_kit,
+            confirm_local_recovery_kit,
+            restore_local_vault_from_kit,
+            upgrade_local_vault_to_account,
+            cancel_local_vault_upgrade,
+            merge_local_vault_into_account,
+            close_local_vault,
             list_coverage_verification_files,
             // Authentication commands
             register_user,
             login_user,
+            set_up_device_again,
             check_password_reset_account,
             request_password_reset,
             start_password_reset,
@@ -452,7 +532,10 @@ fn main() {
             get_team_directory,
             redeem_team_code,
             accept_team_invitation,
+            list_my_team_invitations,
+            accept_my_team_invitation,
             invite_team_member,
+            add_team_group_grant,
             queue_team_admin_request,
             list_team_admin_requests,
             sync_team_admin_requests,
@@ -477,17 +560,8 @@ fn main() {
             // Rekey operations commands
             rekey_start,
             rekey_status,
-            rekey_cutover,
             get_migration_status,
-            // Trust and transparency commands
-            server_trust_verify,
-            get_transparency_proof,
-            verify_merkle_proof,
-            pin_server_identity,
             // Audit and diagnostics commands
-            audit_devices,
-            audit_stale_devices,
-            remove_stale_devices,
             get_coverage_status,
             get_settings_status,
             get_individual_home_status,
@@ -498,11 +572,25 @@ fn main() {
             get_group_member_details,
             get_security_status,
             enable_recovery_auto_backup,
+            restore_saved_code_recovery,
             offer_recovery_writer_handoff,
             accept_recovery_writer_handoffs,
             get_personal_devices_overview,
             get_current_device_fingerprint,
+            get_device_trust_status,
+            start_device_trust_confirmation,
+            complete_device_trust_confirmation,
             revoke_device,
+            get_team_member_devices,
+            admin_revoke_member_device,
+            refresh_join_card,
+            get_group_pending_devices,
+            get_group_key_status,
+            report_key_receipts,
+            get_leftover_key_files,
+            get_key_state_report,
+            group_key_update_available,
+            migrate_leftover_key_files,
             mfa_enroll_start,
             mfa_enroll_verify,
             get_pending_devices,
@@ -512,10 +600,9 @@ fn main() {
             get_cli_schema,
             get_command_help,
             execute_cli_command,
-            run_shell_command,
             run_bundled_cli,
             ack_quit_request,
-            start_terminal_session,
+            start_cli_terminal_command,
             write_terminal_stdin,
             close_terminal_session,
             record_terminal_diagnostic,
@@ -543,9 +630,18 @@ fn main() {
             enroll_folder_and_hydrate,
             unenroll_folder_keep_encrypted,
             unenroll_folder_and_decrypt,
+            find_moved_enrolled_folder,
+            relocate_enrolled_folder,
             mount_enrolled_folder,
+            mount_folder_by_root_id,
             check_mount_status_by_root_id,
+            reconnect_mount,
             list_active_mounts,
+            list_mount_overview,
+            set_auto_mount_folders,
+            enqueue_mounts,
+            get_mount_queue,
+            cancel_mounts,
             list_mount_conflicts,
             #[cfg(target_os = "windows")]
             list_windows_cloud_conflicts,
@@ -558,12 +654,16 @@ fn main() {
             get_mount_sync_status,
             get_vault_compatibility,
             set_vault_legacy_compatibility,
+            list_legacy_files,
+            upgrade_legacy_files,
             list_pending_operations,
             resolve_pending_operation,
             unmount_all_mounts,
+            unmount_mounts,
             unmount_mount_by_root_id,
             exit_application,
             open_path_in_shell,
+            reveal_path_in_shell,
             prioritize_folder_decrypt,
             // Feedback command
             submit_feedback,
@@ -588,8 +688,9 @@ fn main() {
                         show_main_window(app_handle);
                     }
                     tauri::RunEvent::Exit => {
-                        // Best-effort cleanup of mount state files (not data) on exit
-                        // The recovery system will handle orphaned mountpoints on next launch
+                        // Best-effort cleanup of mount state files (not data) on exit. Mounts
+                        // still registered (the Dock's Quit, logout) are reconnected once the
+                        // account or vault opens on the next launch.
                         if shutting_down.swap(true, Ordering::SeqCst) {
                             return;
                         }

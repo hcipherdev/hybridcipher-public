@@ -18,6 +18,8 @@ use uuid::Uuid;
 pub struct MockStorage {
     /// In-memory data store
     data: Arc<RwLock<MockStorageData>>,
+    #[cfg(test)]
+    fail_next_config_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -42,20 +44,22 @@ impl MockStorage {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(MockStorageData::default())),
+            #[cfg(test)]
+            fail_next_config_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
+    /// Inject one configuration write failure for persistence regression tests.
+    #[cfg(test)]
+    pub fn fail_next_config_write(&self) {
+        self.fail_next_config_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn normalize_file_index_path(path: &str) -> String {
-        const SUFFIX: &str = ".encrypted";
-        if path.len() <= SUFFIX.len() {
-            return path.to_string();
-        }
-        let (body, suffix) = path.split_at(path.len() - SUFFIX.len());
-        if suffix.eq_ignore_ascii_case(SUFFIX) {
-            body.to_string()
-        } else {
-            path.to_string()
-        }
+        crate::file::ciphertext::strip_encrypted_suffix(path)
+            .unwrap_or(path)
+            .to_string()
     }
 
     /// Get current data size for testing
@@ -366,6 +370,15 @@ impl Storage for MockStorage {
     }
 
     async fn store_config(&self, key: &str, value: &str) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if self
+            .fail_next_config_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Io(std::io::Error::other(
+                "Injected configuration write failure",
+            )));
+        }
         let mut data = self.data.write().await;
         data.config.insert(key.to_string(), value.to_string());
         Ok(())

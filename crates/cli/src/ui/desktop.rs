@@ -91,6 +91,17 @@ fn decode_answer(line: &str, id: &str) -> Result<String, CliError> {
 #[path = "../../tests/ui/test_desktop_transport.rs"]
 mod tests;
 
+/// Structured outcome of a command for the desktop, which shows it instead of the text transcript.
+/// Does nothing outside a desktop operation, so terminal output is unchanged.
+pub fn report_result(kind: &str, data: serde_json::Value) {
+    if !enabled() {
+        return;
+    }
+    let event = serde_json::json!({ "event": "result", "kind": kind, "data": data });
+    println!("\n{}{}", EVENT_PREFIX, event);
+    let _ = std::io::stdout().flush();
+}
+
 pub fn confirmation(message: &str, default: bool) -> Result<bool, CliError> {
     let answer = request("confirm", message, Some(if default { "yes" } else { "no" }))?;
     Ok(matches!(

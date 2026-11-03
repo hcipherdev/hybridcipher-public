@@ -27,9 +27,6 @@ use uuid::Uuid;
 pub(crate) type LocalClient =
     hybridcipher_client::state::client::Client<LocalFsStorage, MockNetwork>;
 
-const ENCRYPTED_FILE_SEPARATOR: &str = "\n---ENCRYPTED_DATA---\n";
-const METADATA_SCAN_LIMIT: usize = 64 * 1024;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TraversalMode {
     BestEffort,
@@ -487,11 +484,9 @@ pub(crate) fn default_encrypted_path(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn ensure_encrypted_suffix(candidate: PathBuf, original: &Path) -> PathBuf {
-    let has_suffix = candidate
-        .extension()
-        .map(|ext| ext == "encrypted")
-        .unwrap_or(false);
-    if has_suffix {
+    if hybridcipher_client::file::ciphertext::classify(&candidate)
+        != hybridcipher_client::file::ciphertext::CiphertextKind::NotEncrypted
+    {
         return candidate;
     }
 
@@ -578,68 +573,20 @@ pub(crate) fn default_in_place_decrypted_path(
 pub(crate) fn detect_existing_encryption_metadata(
     file_path: &Path,
 ) -> Result<Option<ExistingEncryptionMetadata>, CliError> {
-    let mut file = fs::File::open(file_path).map_err(|e| {
+    let contents = hybridcipher_client::file::ciphertext::inspect_path(file_path).map_err(|e| {
         CliError::storage(format!(
-            "Failed to open {} for metadata inspection: {}",
+            "Failed to read {} for metadata inspection: {}",
             file_path.display(),
             e
         ))
     })?;
-
-    let mut buffer = Vec::new();
-    file.by_ref()
-        .take(METADATA_SCAN_LIMIT as u64)
-        .read_to_end(&mut buffer)
-        .map_err(|e| {
-            CliError::storage(format!(
-                "Failed to read {} for metadata inspection: {}",
-                file_path.display(),
-                e
-            ))
-        })?;
-
-    let separator = ENCRYPTED_FILE_SEPARATOR.as_bytes();
-    if buffer.len() < separator.len() {
-        return Ok(None);
-    }
-
-    let Some(sep_pos) = buffer
-        .windows(separator.len())
-        .position(|window| window == separator)
-    else {
-        return Ok(None);
-    };
-
-    let metadata_bytes = &buffer[..sep_pos];
-    if metadata_bytes.is_empty() {
-        return Ok(None);
-    }
-
-    let json: Value = match serde_json::from_slice(metadata_bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-
-    let file_id = match json.get("file_id").and_then(|v| v.as_str()) {
-        Some(id) => id.to_string(),
-        None => return Ok(None),
-    };
-
-    let epoch_id = match json.get("epoch_id").and_then(|v| v.as_u64()) {
-        Some(id) => id,
-        None => return Ok(None),
-    };
-
-    let group_id = json
-        .get("group_id")
-        .and_then(|v| v.as_str())
-        .and_then(|raw| Uuid::parse_str(raw).ok());
-
-    Ok(Some(ExistingEncryptionMetadata {
-        file_id,
-        group_id,
-        epoch_id,
-    }))
+    Ok(contents
+        .identity()
+        .map(|identity| ExistingEncryptionMetadata {
+            file_id: identity.file_id,
+            group_id: identity.group_id,
+            epoch_id: identity.epoch_id,
+        }))
 }
 
 pub(crate) fn scan_directory_ciphertext_groups(
@@ -860,6 +807,7 @@ pub(crate) fn default_safe_decrypt_dir_root(dir_path: &Path) -> Result<PathBuf, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hybridcipher_client::file::encrypt::ENCRYPTED_FILE_SEPARATOR;
     use serde_json::json;
     use std::io::{Seek, Write};
     use tempfile::NamedTempFile;
@@ -877,7 +825,7 @@ mod tests {
             "group_id": group_id.to_string()
         });
         writeln!(temp, "{}", metadata.to_string()).expect("write metadata");
-        writeln!(temp, "{}", ENCRYPTED_FILE_SEPARATOR).expect("write sep");
+        temp.write_all(ENCRYPTED_FILE_SEPARATOR).expect("write sep");
         writeln!(temp, "ciphertext").expect("write data");
 
         let result = detect_existing_encryption_metadata(temp.path()).expect("metadata");
@@ -905,7 +853,7 @@ mod tests {
             temp.as_file_mut().set_len(0).unwrap();
             temp.as_file_mut().rewind().unwrap();
             temp.write_all(header.to_string().as_bytes()).unwrap();
-            temp.write_all(ENCRYPTED_FILE_SEPARATOR.as_bytes()).unwrap();
+            temp.write_all(ENCRYPTED_FILE_SEPARATOR).unwrap();
             temp.write_all(payload).unwrap();
             temp.flush().unwrap();
         };
@@ -940,7 +888,7 @@ mod tests {
                 + 1
         ])
         .unwrap();
-        temp.write_all(ENCRYPTED_FILE_SEPARATOR.as_bytes()).unwrap();
+        temp.write_all(ENCRYPTED_FILE_SEPARATOR).unwrap();
         temp.flush().unwrap();
         assert!(parse_encrypted_file(temp.path()).is_err());
     }

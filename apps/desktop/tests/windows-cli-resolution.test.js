@@ -1,4 +1,4 @@
-// Tests trusted Windows executable quoting and removal of generated PTY workflows.
+// Tests trusted Windows executable quoting, removal of generated PTY workflows, that the embedded console no longer starts a login shell, and that reveal actions never launch files.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -27,6 +27,35 @@ test('normal workflows have no generated PTY execution helper', () => {
     assert.ok(dialogs.includes("'start_desktop_operation'"));
     assert.ok(!dialogs.includes('write_terminal_stdin'));
     assert.ok(!dialogs.includes('run_shell_command'));
+});
+
+test('the embedded console never starts a login shell', () => {
+    const main = fs.readFileSync(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+    const commands = fs.readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
+    for (const removed of ['run_shell_command', 'start_terminal_session', 'default_shell_command']) {
+        assert.ok(!source.includes(removed), `app.js still references ${removed}`);
+        assert.ok(!main.includes(removed), `main.rs still registers ${removed}`);
+        assert.ok(!commands.includes(removed), `commands.rs still defines ${removed}`);
+    }
+    assert.ok(source.includes("invoke('start_cli_terminal_command'"));
+    assert.ok(main.includes('start_cli_terminal_command'));
+});
+
+test('reveal actions never hand a file to the OS launcher', () => {
+    const main = fs.readFileSync(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+    const commands = fs.readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
+    assert.ok(main.includes('reveal_path_in_shell'));
+    for (const revealer of ['async revealConflictPath(', 'async revealRecoveryPath(']) {
+        const start = source.indexOf(revealer);
+        const body = source.slice(start, source.indexOf('\n    }\n', start));
+        assert.ok(body.includes("invoke('reveal_path_in_shell'"), revealer);
+        assert.ok(!body.includes('open_path_in_shell'), revealer);
+    }
+    assert.ok(source.includes("case 'reveal-protected':\n                    await invoke('reveal_path_in_shell'"));
+    // Every call that hands a path to the OS launcher sits behind decide_open().
+    const launches = commands.split('open_path_with_system_handler(').length - 1;
+    assert.equal(launches, 4, 'expected 2 definitions + 2 guarded calls of open_path_with_system_handler');
+    assert.ok(commands.includes('path_opener::decide_open(&target)'));
 });
 test('CMD ignores a planted current-directory CLI for app-generated commands', { skip: process.platform !== 'win32' }, () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-cli-resolution-'));

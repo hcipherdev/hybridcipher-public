@@ -31,11 +31,50 @@ struct PendingDeviceSummary {
     #[serde(with = "chrono::serde::ts_seconds")]
     pending_since: DateTime<Utc>,
     invitation_public_key_hex: String,
+    /// Identity key the approving device introduces as a Welcome signer for the group.
+    #[serde(default)]
+    identity_public_key_hex: String,
     group_ids: Vec<Uuid>,
+    /// Approved device without a group's current key; `group_ids` are the groups it misses.
+    #[serde(default)]
+    missing_current_key: bool,
+}
+
+/// Groups an own device gets a Welcome for: the requested one, or every group it still needs.
+fn own_device_target_groups(
+    pending: &PendingDeviceSummary,
+    requested: Option<Uuid>,
+) -> Result<Vec<Uuid>, CliError> {
+    match requested {
+        Some(group_id) if pending.group_ids.contains(&group_id) => Ok(vec![group_id]),
+        Some(group_id) => Err(CliError::invalid_input(format!(
+            "Device '{}' doesn't need access to group {}",
+            pending.device_id, group_id
+        ))),
+        None if pending.group_ids.is_empty() => Err(CliError::invalid_input(format!(
+            "Device '{}' doesn't need access to any group",
+            pending.device_id
+        ))),
+        None => Ok(pending.group_ids.clone()),
+    }
+}
+
+/// One line on how many groups gave access, naming the ones left for a group admin.
+fn own_device_access_summary(given: usize, needs_admin: &[String]) -> String {
+    let total = given + needs_admin.len();
+    if needs_admin.is_empty() {
+        return format!("Gave access in {given} of {total} groups.");
+    }
+    format!(
+        "Gave access in {given} of {total} groups; {} need{} a group admin.",
+        needs_admin.join(", "),
+        if needs_admin.len() == 1 { "s" } else { "" }
+    )
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SubmitWelcomeRequest {
+    pub group_id: String,
     pub encrypted_epoch_key: Vec<u8>,
     pub signature: Vec<u8>,
     pub signing_public_key: Vec<u8>,
@@ -150,6 +189,10 @@ pub async fn handle_process_welcome_messages(
     } else {
         ui::info("No epoch keys were updated during this run.");
     }
+    ui::desktop::report_result(
+        "welcome_processed",
+        serde_json::json!({ "groups_updated": updated_groups }),
+    );
 
     Ok(())
 }
@@ -209,31 +252,58 @@ pub async fn handle_issue_welcome(
 ) -> Result<(), CliError> {
     session_manager.require_auth()?;
     let pin_config = session_manager.load_pinning_config().await?;
+    super::auth::ensure_device_management_trust(session_manager).await?;
     let require_second_party = pin_config.require_second_party_verification;
 
     ui::section("Approve Pending Device");
 
     let session = session_manager.require_auth()?;
-    let base_url = session.server_url.trim_end_matches('/');
-    let client = reqwest::Client::new();
-    let target_group = if let Some(group_string) = group_id.as_ref() {
-        Uuid::parse_str(group_string).map_err(|e| {
-            CliError::invalid_input(format!(
-                "Invalid group identifier '{}': {}",
-                group_string, e
-            ))
-        })?
-    } else {
-        session_manager.ensure_current_group().await?
-    };
-    let pending_devices = fetch_pending_devices(&session, session_manager, target_group).await?;
+    let requested_group = group_id
+        .as_ref()
+        .map(|group_string| {
+            Uuid::parse_str(group_string).map_err(|e| {
+                CliError::invalid_input(format!(
+                    "Invalid group identifier '{}': {}",
+                    group_string, e
+                ))
+            })
+        })
+        .transpose()?;
 
-    let pending = pending_devices
+    // The user's own devices come from their own list and need no admin role: the server
+    // accepts a Welcome to one's own device from any trusted device of the same account.
+    let own_device = fetch_pending_listing(&session, session_manager, "auth/pending-devices")
+        .await?
         .into_iter()
-        .find(|device| device.device_id == device_id)
-        .ok_or_else(|| {
-            CliError::invalid_input(format!("Device '{}' is not awaiting approval", device_id))
-        })?;
+        .find(|device| device.device_id == device_id);
+    let own_device_requested = own_device.is_some();
+    let (pending, target_groups, target_group) = if let Some(pending) = own_device {
+        let target_groups = own_device_target_groups(&pending, requested_group)?;
+        let first_group = target_groups[0];
+        (pending, target_groups, first_group)
+    } else {
+        let target_group = match requested_group {
+            Some(group_id) => group_id,
+            None => session_manager.ensure_current_group().await?,
+        };
+        let pending = fetch_pending_devices(&session, session_manager, target_group)
+            .await?
+            .into_iter()
+            .find(|device| device.device_id == device_id)
+            .ok_or_else(|| {
+                CliError::invalid_input(format!("Device '{}' is not awaiting approval", device_id))
+            })?;
+        if !pending.group_ids.contains(&target_group) {
+            return Err(CliError::invalid_input(format!(
+                "Device '{}' does not belong to group {}",
+                pending.device_id, target_group
+            )));
+        }
+        session_manager
+            .require_group_admin(target_group, "hybridcipher issue-welcome")
+            .await?;
+        (pending, vec![target_group], target_group)
+    };
 
     let invitation_public_key = hex::decode(&pending.invitation_public_key_hex).map_err(|e| {
         CliError::configuration(format!(
@@ -242,24 +312,10 @@ pub async fn handle_issue_welcome(
         ))
     })?;
 
-    if !pending.group_ids.contains(&target_group) {
-        return Err(CliError::invalid_input(format!(
-            "Device '{}' does not belong to group {}",
-            pending.device_id, target_group
-        )));
-    }
-
-    let target_groups = vec![target_group];
-
-    for group_id in &target_groups {
-        session_manager
-            .require_group_admin(*group_id, "hybridcipher issue-welcome")
-            .await?;
-    }
-
     ui::info(&format!(
-        "Device '{}' has been pending since {}",
+        "Device '{}' has been {} since {}",
         pending.device_id,
+        if pending.missing_current_key { "missing a current group key" } else { "pending" },
         format_local_datetime(&pending.pending_since)
     ));
     if let Some(name) = pending.device_name.as_ref() {
@@ -289,7 +345,9 @@ pub async fn handle_issue_welcome(
                     .await
                 {
                     Ok(state) => match state {
-                        JoinCardPinState::AlreadyPinned | JoinCardPinState::RestoredFromCache => {
+                        JoinCardPinState::AlreadyPinned
+                        | JoinCardPinState::RestoredFromCache
+                        | JoinCardPinState::RestoredFromOwnDevice { .. } => {
                             pin_ok = true;
                         }
                         JoinCardPinState::Unverified { auto_pinned } => {
@@ -374,18 +432,21 @@ pub async fn handle_issue_welcome(
             reasons: unverified_reasons.clone(),
         }];
 
-        if let Err(err) = record_unverified_devices(
-            session_manager,
-            target_group,
-            Some(owner_label.clone()),
-            &devices,
-        )
-        .await
-        {
-            ui::warning(&format!(
-                "Failed to record unverified device locally: {}",
-                err
-            ));
+        // Reporting is an admin action; the owner verifies their own device instead.
+        if !own_device_requested {
+            if let Err(err) = record_unverified_devices(
+                session_manager,
+                target_group,
+                Some(owner_label.clone()),
+                &devices,
+            )
+            .await
+            {
+                ui::warning(&format!(
+                    "Failed to record unverified device locally: {}",
+                    err
+                ));
+            }
         }
 
         if require_second_party {
@@ -407,101 +468,325 @@ pub async fn handle_issue_welcome(
         }
     }
 
+    let GroupWelcomeOutcome { given, needs_admin, last_error } = send_group_welcomes(
+        session_manager,
+        &session,
+        &pending,
+        &invitation_public_key,
+        target_groups,
+    )
+    .await?;
+    if given.is_empty() {
+        return Err(last_error.unwrap_or_else(|| {
+            CliError::invalid_state(format!("No group Welcome was sent to '{}'", pending.device_id))
+        }));
+    }
+    if own_device_requested {
+        ui::info(&own_device_access_summary(given.len(), &needs_admin));
+    }
+
+    ui::info("✅ Device approved. Ask the new device to rerun 'hybridcipher process-welcome-messages' to fetch the new epoch keys.");
+    ui::desktop::report_result(
+        "device_approved",
+        serde_json::json!({
+            "device_id": pending.device_id,
+            "user_id": pending.user_id,
+            "groups_given": given,
+            "groups_needing_admin": needs_admin,
+        }),
+    );
+
+    Ok(())
+}
+
+/// Groups a Welcome was sent in, and the ones left for a group admin.
+struct GroupWelcomeOutcome {
+    given: Vec<String>,
+    needs_admin: Vec<String>,
+    last_error: Option<CliError>,
+}
+
+/// Send `pending` a Welcome in each of `target_groups`. A group this device can't serve (for
+/// example one whose current key it lacks) is reported and left for a group admin; a rejected
+/// session or device proof applies to every group and is returned as the error.
+async fn send_group_welcomes(
+    session_manager: &SessionManager,
+    session: &Session,
+    pending: &PendingDeviceSummary,
+    invitation_public_key: &[u8],
+    target_groups: Vec<Uuid>,
+) -> Result<GroupWelcomeOutcome, CliError> {
+    let base_url = session.server_url.trim_end_matches('/');
     let api_base = if base_url.ends_with("/api/v1") {
         base_url.to_string()
     } else {
         format!("{}/api/v1", base_url)
     };
-
+    let client = reqwest::Client::new();
     let hybrid_client = session_manager.create_client().await?;
+    let identity_public_key = hex::decode(&pending.identity_public_key_hex)
+        .ok()
+        .filter(|key| key.len() == 32)
+        .ok_or_else(|| {
+            CliError::member_management(format!(
+                "Device {} has no valid identity key on the server",
+                pending.device_id
+            ))
+        })?;
 
+    let mut outcome = GroupWelcomeOutcome {
+        given: Vec::new(),
+        needs_admin: Vec::new(),
+        last_error: None,
+    };
     for group_id in target_groups {
         let group_label = session_manager.group_label(&group_id).await;
         ui::subsection(&format!("Issuing Welcome for group {}", group_label));
 
-        let generated = hybrid_client
-            .generate_welcome_for_pending_device(
-                group_id,
-                &pending.device_id,
-                pending.user_id,
-                &invitation_public_key,
-            )
-            .await
-            .map_err(|e| {
-                CliError::member_management(format!(
-                    "Failed to generate Welcome payload for group {}: {}",
-                    group_id, e
-                ))
-            })?;
-
-        let request = SubmitWelcomeRequest {
-            encrypted_epoch_key: generated.encrypted_epoch_key.clone(),
-            signature: generated.signature.clone(),
-            signing_public_key: generated.signing_public_key.clone(),
-            created_at: generated.created_at,
-            expires_at: generated.expires_at,
-        };
-
-        let endpoint = format!(
-            "{}/groups/{}/devices/{}/welcome",
-            api_base, group_id, pending.device_id
-        );
-
-        let response = client
-            .post(&endpoint)
-            .bearer_auth(&session.token)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                CliError::network(format!(
-                    "Failed to submit Welcome payload for group {}: {}",
-                    group_id, e
-                ))
-            })?;
-
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            session_manager.invalidate_session("issue_welcome_submit")?;
-            return Err(CliError::authentication(
-                "Authentication token rejected. Please login again.".to_string(),
-            ));
-        }
-
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            return Err(CliError::invalid_state(format!(
-                "Server reported that device '{}' is no longer pending",
-                pending.device_id
-            )));
-        }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
+        let sent: Result<SubmitWelcomeResponse, CliError> = async {
+            let generated = hybrid_client
+                .generate_welcome_for_pending_device(
+                    group_id,
+                    &pending.device_id,
+                    pending.user_id,
+                    invitation_public_key,
+                    &identity_public_key,
+                )
                 .await
-                .unwrap_or_else(|_| "<no body>".to_string());
-            return Err(CliError::network(format!(
-                "Server rejected Welcome payload for group {}: {} - {}",
-                group_id, status, body
-            )));
+                .map_err(|e| {
+                    CliError::member_management(format!(
+                        "Failed to generate Welcome payload for group {}: {}",
+                        group_id, e
+                    ))
+                })?;
+
+            let request = SubmitWelcomeRequest {
+                group_id: group_id.to_string(),
+                encrypted_epoch_key: generated.encrypted_epoch_key.clone(),
+                signature: generated.signature.clone(),
+                signing_public_key: generated.signing_public_key.clone(),
+                created_at: generated.created_at,
+                expires_at: generated.expires_at,
+            };
+
+            let endpoint = format!(
+                "{}/groups/{}/devices/{}/welcome",
+                api_base, group_id, pending.device_id
+            );
+
+            let payload = serde_json::to_value(&request).map_err(|error| {
+                CliError::configuration(format!("Could not authorize Welcome: {error}"))
+            })?;
+            let proof = hybrid_client
+                .device_action_proof(
+                    &hybridcipher_client::device_actions::DeviceActionContext {
+                        server_url: &session.server_url,
+                        token: &session.token,
+                        user_id: &session.user_id,
+                        device_id: &session.device_id,
+                    },
+                    hybridcipher_messages::device_actions::DeviceAction::ApproveWelcome,
+                    &pending.device_id,
+                    None,
+                    &payload,
+                )
+                .await
+                .map_err(CliError::authentication)?;
+            let response = proof
+                .apply(
+                    client
+                        .post(&endpoint)
+                        .bearer_auth(&session.token)
+                        .json(&request),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    CliError::network(format!(
+                        "Failed to submit Welcome payload for group {}: {}",
+                        group_id, e
+                    ))
+                })?;
+
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                session_manager.invalidate_session("issue_welcome_submit").await?;
+                return Err(CliError::authentication(
+                    "Authentication token rejected. Please login again.".to_string(),
+                ));
+            }
+
+            if response.status() == reqwest::StatusCode::CONFLICT {
+                return Err(CliError::invalid_state(format!(
+                    "Server reported that device '{}' is no longer pending",
+                    pending.device_id
+                )));
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<no body>".to_string());
+                return Err(CliError::network(format!(
+                    "Server rejected Welcome payload for group {}: {} - {}",
+                    group_id, status, body
+                )));
+            }
+
+            response.json::<SubmitWelcomeResponse>().await.map_err(|e| {
+                CliError::network(format!(
+                    "Failed to parse Welcome submission response: {}",
+                    e
+                ))
+            })
         }
+        .await;
+        match sent {
+            Ok(confirmation) => {
+                ui::success(&format!(
+                    "Welcome message {} stored; pending flag cleared at {}",
+                    confirmation.message_id,
+                    format_local_datetime(&confirmation.pending_cleared_at)
+                ));
+                outcome.given.push(group_label);
+            }
+            // A rejected session or device proof applies to every group, so stop here.
+            Err(error @ CliError::Authentication { .. }) => return Err(error),
+            Err(error) => {
+                ui::warning(&format!("Could not give access in {}: {}", group_label, error));
+                outcome.needs_admin.push(group_label);
+                outcome.last_error = Some(error);
+            }
+        }
+    }
+    Ok(outcome)
+}
 
-        let confirmation: SubmitWelcomeResponse = response.json().await.map_err(|e| {
-            CliError::network(format!(
-                "Failed to parse Welcome submission response: {}",
-                e
-            ))
-        })?;
+/// Pin states that let this device send keys without anyone comparing a fingerprint now: the
+/// key was verified on this computer, or on another device of this account that it verified.
+/// A pin restored from the join card cache doesn't count (see `check_join_card_pin_without_cache`).
+pub(crate) fn pin_state_allows_auto_repair(state: &JoinCardPinState) -> bool {
+    matches!(
+        state,
+        JoinCardPinState::AlreadyPinned | JoinCardPinState::RestoredFromOwnDevice { .. }
+    )
+}
 
-        ui::success(&format!(
-            "Welcome message {} stored; pending flag cleared at {}",
-            confirmation.message_id,
-            format_local_datetime(&confirmation.pending_cleared_at)
-        ));
+#[derive(Debug, Serialize)]
+struct OwnDeviceRepair {
+    device_id: String,
+    groups_given: Vec<String>,
+    groups_needing_admin: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct OwnDeviceRepairReport {
+    repaired: Vec<OwnDeviceRepair>,
+    /// Devices nobody on this account verified; they get nothing until a fingerprint is compared.
+    needs_check: Vec<String>,
+    /// This device can't manage devices, so it did nothing.
+    skipped: bool,
+}
+
+/// Send keys to this account's other devices that need them and that this account verified
+/// itself, for example after a key rotation skipped them. Runs in the background and never
+/// prompts: devices nobody verified are reported as `needs_check` and get nothing.
+pub async fn handle_repair_own_devices(
+    device_id: Option<String>,
+    json: bool,
+    session_manager: &SessionManager,
+) -> Result<(), CliError> {
+    let session = session_manager.require_auth()?;
+    let mut report = OwnDeviceRepairReport::default();
+    // Not `ensure_device_management_trust`: that may ask for a password.
+    let trust = hybridcipher_client::device_actions::fetch_device_trust(
+        &hybridcipher_client::device_actions::DeviceActionContext {
+            server_url: &session.server_url,
+            token: &session.token,
+            user_id: &session.user_id,
+            device_id: &session.device_id,
+        },
+    )
+    .await
+    .map_err(CliError::authentication)?;
+    if !(trust.can_approve_devices && trust.can_verify_devices) {
+        report.skipped = true;
+        return finish_own_device_repair(&report, json);
     }
 
-    ui::info("✅ Device approved. Ask the new device to rerun 'hybridcipher process-welcome-messages' to fetch the new epoch keys.");
+    let candidates = fetch_pending_listing(&session, session_manager, "auth/pending-devices")
+        .await?
+        .into_iter()
+        .filter(|device| device.device_id != session.device_id)
+        .filter(|device| device_id.as_deref().map_or(true, |wanted| wanted == device.device_id))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return finish_own_device_repair(&report, json);
+    }
+    let user_id = Uuid::parse_str(&session.user_id)
+        .map_err(|e| CliError::invalid_state(format!("Invalid account identifier: {}", e)))?;
+    let cards = session_manager.fetch_join_cards_for_user_id(&user_id).await?;
 
+    for pending in candidates {
+        // The Welcome is encrypted to the invitation key the verified card signs, so the server
+        // can't swap in a key of its own.
+        let invitation_public_key = hex::decode(&pending.invitation_public_key_hex).ok();
+        let card = cards.iter().find(|card| card.device_id == pending.device_id);
+        let verified = match (card, invitation_public_key.as_ref()) {
+            (Some(card), Some(key)) if &card.invitation_public == key => session_manager
+                .check_join_card_pin_without_cache(card)
+                .await
+                .map(|state| pin_state_allows_auto_repair(&state))
+                .unwrap_or(false),
+            _ => false,
+        };
+        let Some(invitation_public_key) = invitation_public_key.filter(|_| verified) else {
+            report.needs_check.push(pending.device_id.clone());
+            continue;
+        };
+        let target_groups = pending.group_ids.clone();
+        if target_groups.is_empty() {
+            continue;
+        }
+        let outcome = send_group_welcomes(
+            session_manager,
+            &session,
+            &pending,
+            &invitation_public_key,
+            target_groups,
+        )
+        .await?;
+        if outcome.given.is_empty() {
+            if let Some(error) = outcome.last_error {
+                ui::warning(&format!("Could not repair {}: {}", pending.device_id, error));
+            }
+            continue;
+        }
+        report.repaired.push(OwnDeviceRepair {
+            device_id: pending.device_id.clone(),
+            groups_given: outcome.given,
+            groups_needing_admin: outcome.needs_admin,
+        });
+    }
+    finish_own_device_repair(&report, json)
+}
+
+fn finish_own_device_repair(report: &OwnDeviceRepairReport, json: bool) -> Result<(), CliError> {
+    let value = serde_json::to_value(report)
+        .map_err(|e| CliError::format(format!("Failed to serialize repair report: {}", e)))?;
+    ui::desktop::report_result("own_devices_repaired", value.clone());
+    if json {
+        println!("{}", value);
+    } else if report.skipped {
+        ui::info("This device can't give other devices access yet; nothing was sent.");
+    } else {
+        ui::info(&format!(
+            "Repaired {} device(s); {} need a fingerprint check first.",
+            report.repaired.len(),
+            report.needs_check.len()
+        ));
+    }
     Ok(())
 }
 
@@ -571,12 +856,27 @@ async fn fetch_pending_devices(
     session_manager: &SessionManager,
     group_id: Uuid,
 ) -> Result<Vec<PendingDeviceSummary>, CliError> {
+    fetch_pending_listing(
+        session,
+        session_manager,
+        &format!("groups/{}/pending-devices", group_id),
+    )
+    .await
+}
+
+/// Fetch a pending-device listing: a group's (admin only) or `auth/pending-devices`, the
+/// signed-in user's own devices.
+async fn fetch_pending_listing(
+    session: &Session,
+    session_manager: &SessionManager,
+    path: &str,
+) -> Result<Vec<PendingDeviceSummary>, CliError> {
     let client = reqwest::Client::new();
     let base_url = session.server_url.trim_end_matches('/');
     let pending_endpoint = if base_url.ends_with("/api/v1") {
-        format!("{}/groups/{}/pending-devices", base_url, group_id)
+        format!("{}/{}", base_url, path)
     } else {
-        format!("{}/api/v1/groups/{}/pending-devices", base_url, group_id)
+        format!("{}/api/v1/{}", base_url, path)
     };
 
     let pending_response = client
@@ -587,7 +887,7 @@ async fn fetch_pending_devices(
         .map_err(|e| CliError::network(format!("Failed to fetch pending devices: {}", e)))?;
 
     if pending_response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("pending_devices")?;
+        session_manager.invalidate_session("pending_devices").await?;
         return Err(CliError::authentication(
             "Session rejected by server while fetching pending devices",
         ));
@@ -843,3 +1143,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/device_security/test_own_device_welcome.rs"]
+mod own_device_welcome_tests;

@@ -347,12 +347,17 @@ impl<S: Storage, N: Network> Client<S, N> {
         }
     }
 
-    /// Remove a device via the HybridCipher API and return a summary of the outcome.
+    /// Remove another device via the HybridCipher API.
+    /// Current-device removal must use the platform CLI or desktop safe-shutdown flow.
     pub async fn remove_device(
         &self,
         device_id: Option<String>,
     ) -> Result<DeviceRemovalSummary, ClientError> {
         let auth_token = self.get_auth_token().await?;
+        let session = self.get_session_info().await?;
+        let actor_device = session.device_id.clone().ok_or_else(|| {
+            ClientError::InvalidState("The device action requires an authenticated device.".into())
+        })?;
         let local_device_id = self.local_device_id();
         let target_device_id = device_id
             .and_then(|id| {
@@ -363,17 +368,55 @@ impl<S: Storage, N: Network> Client<S, N> {
                     Some(trimmed)
                 }
             })
-            .unwrap_or_else(|| local_device_id.clone());
+            .unwrap_or_else(|| actor_device.clone());
 
-        let server_base = DEFAULT_SERVER_URL.trim_end_matches('/');
-        let request_url = format!("{}/api/v1/auth/device/{}", server_base, target_device_id);
+        if target_device_id.eq_ignore_ascii_case(&actor_device)
+            || target_device_id.eq_ignore_ascii_case(&local_device_id)
+        {
+            return Err(ClientError::InvalidState(
+                "Remove this device through the CLI or desktop app after protected folders stop safely.".into(),
+            ));
+        }
+
+        let server_base = self.active_server_base_url().await;
+        let request_url = format!(
+            "{}/auth/device/{}",
+            crate::device_actions::api_base(&server_base),
+            target_device_id
+        );
+        let actor_user = session
+            .user_id
+            .ok_or_else(|| {
+                ClientError::InvalidState(
+                    "The device action requires an authenticated account.".into(),
+                )
+            })?
+            .to_string();
+        let proof = self
+            .device_action_proof(
+                &crate::device_actions::DeviceActionContext {
+                    server_url: &server_base,
+                    token: &auth_token,
+                    user_id: &actor_user,
+                    device_id: &actor_device,
+                },
+                hybridcipher_messages::device_actions::DeviceAction::Revoke,
+                &target_device_id,
+                None,
+                &serde_json::json!({}),
+            )
+            .await
+            .map_err(ClientError::InvalidState)?;
 
         let client = reqwest::Client::new();
-        let response = client
-            .delete(&request_url)
-            .header("Authorization", format!("Bearer {}", auth_token))
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(30))
+        let response = proof
+            .apply(
+                client
+                    .delete(&request_url)
+                    .header("Authorization", format!("Bearer {}", auth_token))
+                    .header("Content-Type", "application/json")
+                    .timeout(std::time::Duration::from_secs(30)),
+            )
             .send()
             .await
             .map_err(|e| {
@@ -1037,14 +1080,6 @@ impl<S: Storage, N: Network> Client<S, N> {
                     invitation_keypair,
                 );
 
-                let signing_key_bytes = self.get_welcome_signing_key(&server_url).await?;
-
-                if server_welcome.signing_public_key != signing_key_bytes {
-                    return Err(ClientError::InvalidState(
-                        "Server welcome signing key mismatch".to_string(),
-                    ));
-                }
-
                 let current_epoch_str = acceptance_response["group"]
                     .get("current_epoch")
                     .and_then(|v| v.as_str())
@@ -1061,8 +1096,13 @@ impl<S: Storage, N: Network> Client<S, N> {
                     ))
                 })?;
 
-                let epoch_secrets = welcome_manager
-                    .process_server_welcome_message(&server_welcome, group_id, current_epoch_uuid)
+                let epoch_secrets = self
+                    .open_trusted_welcome(
+                        &welcome_manager,
+                        &server_welcome,
+                        group_id,
+                        current_epoch_uuid,
+                    )
                     .await?;
 
                 self.logger.log(

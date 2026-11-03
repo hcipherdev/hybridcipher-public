@@ -168,6 +168,9 @@ pub(super) fn failed(record: &mut CloudMutationRecord, error: &CloudProviderErro
         CloudProviderError::ProviderCore(e) if e.is_integrity_failure() => {
             Some(ProviderFileErrorCode::IntegrityFailure)
         }
+        CloudProviderError::ProviderCore(e) if e.is_key_unavailable() => {
+            Some(ProviderFileErrorCode::KeyUnavailable)
+        }
         _ => None,
     };
     record.observed_local_state = Some(local_revision(record));

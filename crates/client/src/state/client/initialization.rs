@@ -147,6 +147,42 @@ impl<S: Storage, N: Network> Client<S, N> {
         group_id: Uuid,
         epoch_id: u64,
     ) -> Result<u64, ClientError> {
+        self.initialize_group_epoch_inner(group_id, epoch_id, None)
+            .await
+    }
+
+    /// Commit an accountless vault's existing key as this group's genesis epoch,
+    /// so files encrypted before the account existed stay readable. Succeeds only
+    /// when the server's canonical epoch 1 carries exactly this key.
+    pub async fn initialize_group_epoch_with_key(
+        &self,
+        group_id: Uuid,
+        epoch_key: &[u8; 32],
+    ) -> Result<u64, ClientError> {
+        let epoch_id = self
+            .initialize_group_epoch_inner(group_id, 1, Some(epoch_key))
+            .await?;
+        let state = self.state.read().await;
+        let committed = Self::get_epoch_state(&state, group_id, epoch_id);
+        if epoch_id != 1
+            || !committed.is_some_and(|epoch| {
+                epoch.key_source == EpochKeySource::Welcome && epoch.encryption_key == *epoch_key
+            })
+        {
+            return Err(setup_error(
+                ErrorCode::SecurityTampering,
+                "The account's group key does not match this device's local vault key",
+            ));
+        }
+        Ok(epoch_id)
+    }
+
+    async fn initialize_group_epoch_inner(
+        &self,
+        group_id: Uuid,
+        epoch_id: u64,
+        supplied_key: Option<&[u8; 32]>,
+    ) -> Result<u64, ClientError> {
         self.ensure_state_loaded().await?;
         if epoch_id != 1 {
             return Err(ClientError::InvalidInput(
@@ -166,13 +202,20 @@ impl<S: Storage, N: Network> Client<S, N> {
         let server_url = Self::resolve_server_base_url(session.server_url.clone());
         let invitation = self.ensure_invitation_keypair().await?;
         let pending = self
-            .load_or_create_pending_genesis(group_id, user_id, &server_url, &invitation)
+            .load_or_create_pending_genesis(
+                group_id,
+                user_id,
+                &server_url,
+                &invitation,
+                supplied_key,
+            )
             .await?;
         if pending.user_id != user_id
             || pending.device_id != invitation.device_id
             || pending.server_url != server_url
             || pending.group_id != group_id
             || pending.request.client_epoch_id != epoch_id
+            || supplied_key.is_some_and(|key| pending.epoch_key != *key)
         {
             return Err(setup_error(
                 ErrorCode::SecurityTampering,
@@ -190,6 +233,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         user_id: Uuid,
         server_url: &str,
         invitation: &InvitationKeyPair,
+        supplied_key: Option<&[u8; 32]>,
     ) -> Result<PendingGenesis, ClientError> {
         let key = pending_key(server_url, user_id, &invitation.device_id, group_id);
         if let Some(value) = self.storage.load_config_fresh(&key).await? {
@@ -202,7 +246,7 @@ impl<S: Storage, N: Network> Client<S, N> {
             });
         }
         let candidate = self
-            .build_pending_genesis(group_id, user_id, server_url, invitation)
+            .build_pending_genesis(group_id, user_id, server_url, invitation, supplied_key)
             .await?;
         let encoded = Zeroizing::new(
             serde_json::to_string(&candidate)
@@ -305,10 +349,14 @@ impl<S: Storage, N: Network> Client<S, N> {
         user_id: Uuid,
         server_url: &str,
         invitation: &InvitationKeyPair,
+        supplied_key: Option<&[u8; 32]>,
     ) -> Result<PendingGenesis, ClientError> {
         use rand::RngCore;
         let mut epoch_key = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(epoch_key.as_mut());
+        match supplied_key {
+            Some(key) => epoch_key.copy_from_slice(key),
+            None => rand::rngs::OsRng.fill_bytes(epoch_key.as_mut()),
+        }
         let manager = WelcomeManager::new(self.storage.clone(), invitation.clone());
         let encrypted_epoch_key = manager.encrypt_epoch_key_for_device(
             epoch_key.as_ref(),

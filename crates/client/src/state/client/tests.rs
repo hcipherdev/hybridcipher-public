@@ -32,9 +32,7 @@ fn file_exclusion_list_matches_obsidian_absolute_directory_and_file() {
         "**/.obsidian/**".to_string(),
     ]);
 
-    let obsidian_dir = PathBuf::from(
-        "/Users/test/Library/CloudStorage/Dropbox/Hybridcipher_development/.obsidian",
-    );
+    let obsidian_dir = PathBuf::from("/Users/test/Documents/notes/vault/.obsidian");
     let obsidian_file = obsidian_dir.join("appearance.json");
 
     assert!(exclusions.matches(&obsidian_dir));
@@ -110,8 +108,6 @@ async fn test_epoch_transition() {
 #[tokio::test]
 async fn save_client_state_persists_group_memberships() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let original_home = std::env::var("HOME").ok();
-    std::env::set_var("HOME", temp_dir.path());
 
     let storage = Arc::new(LocalFsStorage::new(temp_dir.path()));
     let network = Arc::new(MockNetwork::new());
@@ -155,12 +151,6 @@ async fn save_client_state_persists_group_memberships() {
         groups.contains_key(&group_id.to_string()),
         "client_state.json must include persisted membership"
     );
-
-    if let Some(original) = original_home {
-        std::env::set_var("HOME", original);
-    } else {
-        std::env::remove_var("HOME");
-    }
 }
 
 #[tokio::test]

@@ -6,7 +6,7 @@ pub async fn export_existing_team_file(
     output_path: String,
     state: State<'_, AppState>,
 ) -> Result<CommandResponse<bool>, String> {
-    let _guard = ensure_local_data_access(&state).await?;
+    let _guard = ensure_local_data_or_vault(&state).await?;
     let client = state.local_client.client().await?;
     let source = PathBuf::from(encrypted_path);
     let destination = PathBuf::from(output_path);

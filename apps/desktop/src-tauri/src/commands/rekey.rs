@@ -65,18 +65,6 @@ pub async fn rekey_status(
 }
 
 #[tauri::command]
-pub async fn rekey_cutover(
-    group_id: String,
-    state: State<'_, AppState>,
-) -> Result<CommandResponse<bool>, String> {
-    super::license::require_team_write(&state).await?;
-    tracing::info!("Rekey cutover command called for group: {}", group_id);
-    Ok(CommandResponse::err(
-        "Complete rekey through the bundled CLI so group keys are updated",
-    ))
-}
-
-#[tauri::command]
 pub async fn get_migration_status(
     group_id: String,
     state: State<'_, AppState>,

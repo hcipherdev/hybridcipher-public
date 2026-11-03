@@ -64,29 +64,17 @@ test('buildForceUnmountConfirmation handles all-folder force unmount copy', () =
     assert.match(model.detail, /recovery copy/i);
 });
 
-test('buildMountProgressModel includes folder identity and countdown copy before backgrounding', () => {
+test('buildMountProgressModel allows continuing in background immediately', () => {
     const model = buildMountProgressModel({
         folderLabel: 'Taxes',
         folderPath: '/Users/test/Documents/Taxes',
-        elapsedMs: 4000,
-        continueEnableMs: 10000,
     });
 
     assert.equal(model.title, 'Mounting Taxes');
     assert.equal(model.folderLabel, 'Taxes');
-    assert.match(model.hint, /6s/i);
-});
-
-test('buildMountProgressModel switches copy after backgrounding is available', () => {
-    const model = buildMountProgressModel({
-        folderLabel: 'Taxes',
-        folderPath: '/Users/test/Documents/Taxes',
-        elapsedMs: 12000,
-        continueEnableMs: 10000,
-    });
-
-    assert.match(model.status, /background/i);
+    assert.equal(model.canContinue, true);
     assert.match(model.hint, /continue in background/i);
+    assert.doesNotMatch(model.hint, /available in \d+s/i);
 });
 
 test('buildMountTimeoutMessage names the folder and gives recovery guidance', () => {

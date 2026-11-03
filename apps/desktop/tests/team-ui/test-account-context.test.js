@@ -1,4 +1,4 @@
-// Tests actual app.js folder, mount, member, and enrollment methods against delayed account/workspace responses.
+// Tests actual app.js startup, folder, mount, and enrollment methods against delayed account/workspace responses.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
@@ -38,10 +38,68 @@ function appFor(names, invoke, globals = {}) {
         renderFolderList() { renders.push(this.enrolledFolders.map(folder => folder.path)); },
         renderSettingsEnrollmentList() {}, maybeShowMarkersReminder() {}, hideMarkersReminder() {},
         syncSelectedFolderMountUi() {}, updateSidebarMountSummary() {}, showNotification() {},
-        async refreshActiveMounts() {},
+        async refreshActiveMounts() {}, ensureNoFolderJob() { return true; },
     }, methods);
     return { app, renders, nodes };
 }
+
+function personalStartup() {
+    const keys = deferred();
+    const initializing = deferred();
+    const license = deferred();
+    const events = [];
+    const { app, nodes } = appFor(['showMainApp'], () => {
+        throw new Error('Startup must use the supplied services');
+    }, { localStorage: { getItem: () => null } });
+    nodes.set('appContainer', { style: {}, classList: { remove() {} } });
+    Object.assign(app, {
+        currentDeviceId: 'primary-device', activeWorkspaceType: 'personal',
+        applyAppMode() {}, setAdminPanelVisible() {}, updateMountButtons() {},
+        async performSessionHealthCheck() { events.push('session'); return { refreshed: false }; },
+        ensurePersonalWorkspaceReady() { events.push('keys'); initializing.resolve(); return keys.promise; },
+        refreshTeamLicenseStatus() { events.push('license'); return license.promise; },
+        startSessionHealthTimer(options) { events.push('health-timer'); assert.equal(options.runImmediately, false); },
+        startMountStatusPolling() { events.push('mount-timer'); },
+        loadEnrolledFolders() { events.push('folders'); },
+        showWorkspaceHome() { events.push('home'); },
+    });
+    return { app, keys, initializing, events };
+}
+
+test('Personal startup waits for encryption readiness and opens Home without waiting for Team licensing', { timeout: 1000 }, async () => {
+    const { app, keys, initializing, events } = personalStartup();
+    const startup = app.showMainApp();
+    await initializing.promise;
+    assert.deepEqual(events, ['session', 'keys']);
+
+    keys.resolve(true);
+    await startup;
+    assert.deepEqual(events, ['session', 'keys', 'license', 'health-timer', 'mount-timer', 'folders', 'home']);
+});
+
+test('a changed login during Personal initialization cannot start timers or open Home', async t => {
+    const changes = [
+        ['account', app => { app.currentUser = 'account-b@example.com'; }],
+        ['device', app => { app.currentDeviceId = 'replacement-device'; }],
+        ['generation', app => { app.desktopAccountGeneration += 1; }],
+    ];
+    for (const [name, change] of changes) {
+        await t.test(name, { timeout: 1000 }, async () => {
+            const { app, keys, initializing, events } = personalStartup();
+            const startup = app.showMainApp();
+            await initializing.promise;
+            assert.deepEqual(events, ['session', 'keys']);
+            change(app);
+            keys.resolve(true);
+            await startup;
+            assert.equal(events.includes('license'), false);
+            assert.equal(events.includes('health-timer'), false);
+            assert.equal(events.includes('mount-timer'), false);
+            assert.equal(events.includes('folders'), false);
+            assert.equal(events.includes('home'), false);
+        });
+    }
+});
 
 test('a late Personal folder response cannot render or replace the newer Team folder list', async () => {
     const old = deferred();
@@ -92,16 +150,6 @@ test('workspace changes while awaiting secondary mount status do not render fold
     assert.equal(await pending, false);
     assert.deepEqual(app.enrolledFolders, [{ path: 'new-folder' }]);
     assert.deepEqual(renders, []);
-});
-
-test('late member-list failures cannot clear content displayed for the newer group', async () => {
-    const old = deferred();
-    const { app, nodes } = appFor(['loadListMembers'], () => old.promise);
-    const pending = app.loadListMembers();
-    app.workspaceSwitchSequence += 1;
-    old.reject(new Error('Old group failed'));
-    await pending;
-    assert.equal(nodes.get('listMembersList').innerHTML, 'current content');
 });
 
 test('a native folder picker completing after a workspace switch cannot enroll into the next group', async () => {

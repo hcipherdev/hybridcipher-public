@@ -1,9 +1,56 @@
 use crate::local_client::LocalClient;
 #[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tauri::async_runtime::Mutex;
+use tauri::Emitter;
 use uuid::Uuid;
+
+/// Event telling the app which mounts left by the last run were reconnected.
+pub(crate) const MOUNTS_RECONNECTED_EVENT: &str = "mounts_reconnected";
+
+/// A mount the last run left registered with Windows or macOS that this run
+/// connected again.
+#[derive(Debug, Clone)]
+pub struct ReconnectedRoot {
+    pub root_id: Uuid,
+    /// The folder shown in File Explorer or Finder.
+    pub mountpoint: PathBuf,
+    pub encrypted_root: PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReconnectFailure {
+    pub root_id: String,
+    pub name: String,
+    pub error: String,
+}
+
+/// What reconnecting the mounts left by the last run did.
+#[derive(Debug, Clone, Default)]
+pub struct ReconnectReport {
+    pub reconnected: Vec<ReconnectedRoot>,
+    pub failed: Vec<ReconnectFailure>,
+}
+
+impl ReconnectReport {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    fn fail(&mut self, root_id: Uuid, encrypted_root: &Path, error: String) {
+        self.failed.push(ReconnectFailure {
+            root_id: root_id.to_string(),
+            name: encrypted_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| root_id.to_string()),
+            error,
+        });
+    }
+}
 
 #[cfg(any(test, target_os = "windows"))]
 fn cloud_provider_health_ready(
@@ -37,6 +84,7 @@ struct RunningCloudRoot {
 struct RunningMacFileProviderRoot {
     host: hybridcipher_macos_file_provider::MacFileProviderHost,
     registration: hybridcipher_macos_file_provider::FileProviderDomainRegistration,
+    compatibility: Arc<hybridcipher_macos_file_provider::VaultCompatibility>,
 }
 
 #[cfg(target_os = "macos")]
@@ -72,15 +120,34 @@ impl MacFileProviderSystemDomainRegistrar for NativeMacFileProviderSystemDomainR
     }
 }
 
+/// How long an unmount waits for Finder to hand over edits it still holds.
 #[cfg(target_os = "macos")]
-fn register_macos_domain_for_desktop<R: MacFileProviderSystemDomainRegistrar>(
+const MACOS_PENDING_CHANGES_WAIT_SECS: u32 = 30;
+
+/// Saves the registration, starts the bridge, and only then adds the domain
+/// to macOS. macOS asks a new domain for its contents at once; a bridge not
+/// yet listening answers "server unreachable", and macOS then backs the
+/// domain off for longer after each such failure, past the mount's wait.
+#[cfg(target_os = "macos")]
+async fn start_macos_root_with<R, F>(
     host: &hybridcipher_macos_file_provider::MacFileProviderHost,
     registration: &hybridcipher_macos_file_provider::FileProviderDomainRegistration,
     registrar: &R,
-) -> Result<(), String> {
+    start_bridge: F,
+) -> Result<(), String>
+where
+    R: MacFileProviderSystemDomainRegistrar,
+    F: std::future::Future<Output = Result<(), String>>,
+{
     host.register_domain(registration)
         .map_err(|err| err.to_string())?;
+    if let Err(err) = start_bridge.await {
+        let _ = registrar.unregister_system_domain(registration);
+        let _ = host.unregister_domain_state(registration.root_id);
+        return Err(err);
+    }
     if let Err(err) = registrar.register_system_domain(registration) {
+        let _ = host.stop_root(registration.root_id);
         let _ = host.unregister_domain_state(registration.root_id);
         return Err(err);
     }
@@ -105,6 +172,31 @@ pub struct DesktopCloudProviderManager {
     supervisor_started: AtomicBool,
     #[cfg(target_os = "macos")]
     running: Mutex<HashMap<Uuid, RunningMacFileProviderRoot>>,
+    /// Roots whose first sync is underway; a second start of one waits its turn.
+    #[cfg(target_os = "macos")]
+    starting: std::sync::Mutex<HashSet<Uuid>>,
+    /// Restarting kept roots after sign-in, run in the background so sign-in
+    /// does not wait for a large folder's first sync.
+    #[cfg(target_os = "macos")]
+    reconcile_task: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Set once the app is built, for events that don't answer a command.
+    app: std::sync::OnceLock<tauri::AppHandle>,
+}
+
+/// A root claimed for starting, released when dropped (also when cancelled).
+#[cfg(target_os = "macos")]
+struct StartingRoot<'a> {
+    starting: &'a std::sync::Mutex<HashSet<Uuid>>,
+    root_id: Uuid,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for StartingRoot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut starting) = self.starting.lock() {
+            starting.remove(&self.root_id);
+        }
+    }
 }
 
 impl DesktopCloudProviderManager {
@@ -119,7 +211,58 @@ impl DesktopCloudProviderManager {
             supervisor_started: AtomicBool::new(false),
             #[cfg(target_os = "macos")]
             running: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "macos")]
+            starting: std::sync::Mutex::new(HashSet::new()),
+            #[cfg(target_os = "macos")]
+            reconcile_task: std::sync::Mutex::new(None),
+            app: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn attach_app(&self, app: tauri::AppHandle) {
+        let _ = self.app.set(app);
+    }
+
+    /// Tell the app which mounts left by the last run were reconnected, so it
+    /// shows them as mounted and reports any it could not bring back.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    pub(crate) fn emit_mounts_reconnected(&self, report: &ReconnectReport) {
+        if report.reconnected.is_empty() && report.failed.is_empty() {
+            return;
+        }
+        let Some(app) = self.app.get() else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "reconnected": report
+                .reconnected
+                .iter()
+                .map(|root| root.root_id.to_string())
+                .collect::<Vec<_>>(),
+            "failed": report.failed,
+        });
+        if let Err(err) = app.emit(MOUNTS_RECONNECTED_EVENT, payload) {
+            tracing::warn!("Could not report reconnected mounts to the app: {}", err);
+        }
+    }
+
+    /// Whether a start of `root_id` (such as the one after sign-in) is underway.
+    #[cfg(target_os = "macos")]
+    pub fn is_root_starting(&self, root_id: Uuid) -> bool {
+        self.starting
+            .lock()
+            .map(|starting| starting.contains(&root_id))
+            .unwrap_or(false)
+    }
+
+    /// Claim `root_id` for starting, or `None` while another start of it runs.
+    #[cfg(target_os = "macos")]
+    fn claim_start(&self, root_id: Uuid) -> Option<StartingRoot<'_>> {
+        let mut starting = self.starting.lock().ok()?;
+        starting.insert(root_id).then_some(StartingRoot {
+            starting: &self.starting,
+            root_id,
+        })
     }
 
     #[cfg(target_os = "windows")]
@@ -167,7 +310,7 @@ impl DesktopCloudProviderManager {
         root_id: Uuid,
         sync_root_path: PathBuf,
         encrypted_root: PathBuf,
-        _display_name: String,
+        display_name: String,
         client: Arc<LocalClient>,
     ) -> Result<(), String> {
         {
@@ -211,12 +354,7 @@ impl DesktopCloudProviderManager {
             }));
         }
 
-        let vault_name = encrypted_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or("Vault");
-        let base_display_name = format!("HybridCipher — {vault_name}");
+        let base_display_name = format!("HybridCipher — {display_name}");
         let display_name = if host
             .load_registrations()
             .map_err(|err| err.to_string())?
@@ -511,6 +649,41 @@ impl DesktopCloudProviderManager {
     }
 
     #[cfg(target_os = "windows")]
+    pub async fn legacy_files(
+        &self,
+        root_id: Uuid,
+    ) -> Result<Vec<hybridcipher_windows_cloud_provider::LegacyFileSummary>, String> {
+        let (host, lock) = {
+            let running = self.running.lock().await;
+            let root = running
+                .get(&root_id)
+                .ok_or("Mount the folder to review older files")?;
+            (root.host.clone(), root.operation_lock.clone())
+        };
+        let _operation = lock.lock().await;
+        host.legacy_files(root_id).await.map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub async fn upgrade_legacy_files(
+        &self,
+        root_id: Uuid,
+        relative_paths: Option<Vec<String>>,
+    ) -> Result<hybridcipher_windows_cloud_provider::LegacyUpgradeReport, String> {
+        let (host, lock) = {
+            let running = self.running.lock().await;
+            let root = running
+                .get(&root_id)
+                .ok_or("Mount the folder to upgrade older files")?;
+            (root.host.clone(), root.operation_lock.clone())
+        };
+        let _operation = lock.lock().await;
+        host.upgrade_legacy_files(root_id, relative_paths)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_os = "windows")]
     pub async fn list_pending_operations(
         &self,
         root_id: Uuid,
@@ -562,10 +735,20 @@ impl DesktopCloudProviderManager {
                 return Ok(());
             }
         }
+        let Some(_starting) = self.claim_start(root_id) else {
+            return Err(
+                "This folder is still being prepared after sign-in. Try again when it finishes."
+                    .to_string(),
+            );
+        };
 
+        let compatibility = Arc::new(
+            hybridcipher_macos_file_provider::VaultCompatibility::load(&user_config_dir, root_id)
+                .map_err(|error| error.to_string())?,
+        );
         let host = hybridcipher_macos_file_provider::MacFileProviderHost::new(
             hybridcipher_macos_file_provider::ProviderHostConfig {
-                user_config_dir,
+                user_config_dir: user_config_dir.clone(),
                 socket_path: None,
                 provider_identifier: Some(
                     "com.hybridcipher.app.HybridCipherFileProvider".to_string(),
@@ -586,30 +769,165 @@ impl DesktopCloudProviderManager {
             encrypted_root,
             user_visible_url: Some(provider_url),
         };
-        register_macos_domain_for_desktop(
+        let start_bridge = async {
+            let excluded_patterns = client.excluded_file_patterns();
+            let crypto = Arc::new(
+                hybridcipher_macos_file_provider::ClientMountCrypto::for_root_with_compatibility(
+                    client,
+                    root_id,
+                    compatibility.clone(),
+                )
+                .await
+                .map_err(|err| err.to_string())?,
+            );
+            host.start_root_with_compatibility(
+                root_id,
+                crypto,
+                excluded_patterns,
+                compatibility.clone(),
+            )
+            .await
+            .map_err(|err| err.to_string())
+        };
+        start_macos_root_with(
             &host,
             &registration,
             &NativeMacFileProviderSystemDomainRegistrar,
-        )?;
-        let excluded_patterns = client.excluded_file_patterns();
-        let crypto = Arc::new(
-            hybridcipher_macos_file_provider::ClientMountCrypto::for_root(client, root_id)
-                .await
-                .map_err(|err| err.to_string())?,
-        );
-        if let Err(err) = host
-            .start_root_with_crypto_and_exclusions(root_id, crypto, excluded_patterns)
-            .await
-        {
-            let registrar = NativeMacFileProviderSystemDomainRegistrar;
-            let _ = registrar.unregister_system_domain(&registration);
-            let _ = host.unregister_domain_state(root_id);
-            return Err(err.to_string());
-        }
+            start_bridge,
+        )
+        .await?;
 
         let mut running = self.running.lock().await;
-        running.insert(root_id, RunningMacFileProviderRoot { host, registration });
+        running.insert(
+            root_id,
+            RunningMacFileProviderRoot {
+                host,
+                registration,
+                compatibility,
+            },
+        );
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn vault_compatibility(
+        &self,
+        root_id: Uuid,
+        enabled: Option<bool>,
+    ) -> Result<Option<hybridcipher_macos_file_provider::VaultCompatibilityStatus>, String> {
+        let (host, compatibility) = {
+            let running = self.running.lock().await;
+            let root = running
+                .get(&root_id)
+                .ok_or("Mount the folder to manage legacy compatibility")?;
+            (root.host.clone(), root.compatibility.clone())
+        };
+        if let Some(enabled) = enabled {
+            compatibility
+                .set_enabled(enabled)
+                .map_err(|error| error.to_string())?;
+            host.refresh_root(root_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(Some(compatibility.status()))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn legacy_files(
+        &self,
+        root_id: Uuid,
+    ) -> Result<Vec<hybridcipher_macos_file_provider::LegacyFileSummary>, String> {
+        let host = self.running_macos_host(root_id).await?;
+        host.legacy_files(root_id)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn upgrade_legacy_files(
+        &self,
+        root_id: Uuid,
+        relative_paths: Option<Vec<String>>,
+    ) -> Result<hybridcipher_macos_file_provider::LegacyUpgradeReport, String> {
+        let host = self.running_macos_host(root_id).await?;
+        host.upgrade_legacy_files(root_id, relative_paths)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Returns the conflict registry and the cache directory its relative paths
+    /// resolve against.
+    #[cfg(target_os = "macos")]
+    pub async fn macos_conflict_location(
+        &self,
+        root_id: Uuid,
+    ) -> Result<(PathBuf, PathBuf), String> {
+        let host = self.running_macos_host(root_id).await?;
+        let registry_path = host
+            .conflict_registry_path(root_id)
+            .map_err(|error| error.to_string())?;
+        let cache_dir = host
+            .runtime_paths(root_id)
+            .map_err(|error| error.to_string())?
+            .cache_dir;
+        Ok((registry_path, cache_dir))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn resolve_macos_conflict(
+        &self,
+        root_id: Uuid,
+        request: hybridcipher_mount_sync::ConflictResolutionRequest,
+    ) -> Result<hybridcipher_mount_sync::ConflictResolutionResult, String> {
+        let host = self.running_macos_host(root_id).await?;
+        host.resolve_conflict(root_id, request)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn running_macos_host(
+        &self,
+        root_id: Uuid,
+    ) -> Result<hybridcipher_macos_file_provider::MacFileProviderHost, String> {
+        let running = self.running.lock().await;
+        let root = running
+            .get(&root_id)
+            .ok_or("Mount the folder to review conflicts")?;
+        Ok(root.host.clone())
+    }
+
+    /// Run `reconcile_file_provider_roots` in the background, replacing any run
+    /// still going. `stop_all` cancels it.
+    #[cfg(target_os = "macos")]
+    pub fn spawn_file_provider_reconcile(
+        self: &Arc<Self>,
+        user_config_dir: PathBuf,
+        client: Arc<LocalClient>,
+    ) {
+        let manager = Arc::clone(self);
+        let task = tauri::async_runtime::spawn(async move {
+            match manager
+                .reconcile_file_provider_roots(user_config_dir.clone(), client)
+                .await
+            {
+                Ok(report) => {
+                    crate::commands::record_reconnected_mounts(&user_config_dir, &report).await;
+                    manager.emit_mounts_reconnected(&report);
+                }
+                Err(err) => {
+                    tracing::warn!("macOS File Provider reconciliation failed: {}", err);
+                }
+            }
+        });
+        let previous = self
+            .reconcile_task
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.replace(task));
+        if let Some(previous) = previous {
+            previous.abort();
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -617,10 +935,10 @@ impl DesktopCloudProviderManager {
         &self,
         user_config_dir: PathBuf,
         client: Arc<LocalClient>,
-    ) -> Result<(), String> {
+    ) -> Result<ReconnectReport, String> {
         let host = hybridcipher_macos_file_provider::MacFileProviderHost::new(
             hybridcipher_macos_file_provider::ProviderHostConfig {
-                user_config_dir,
+                user_config_dir: user_config_dir.clone(),
                 socket_path: None,
                 provider_identifier: Some(
                     "com.hybridcipher.app.HybridCipherFileProvider".to_string(),
@@ -630,8 +948,9 @@ impl DesktopCloudProviderManager {
         let registrations = host
             .load_registrations()
             .map_err(|err| format!("Failed to load macOS File Provider registrations: {err}"))?;
+        let mut report = ReconnectReport::default();
         if registrations.is_empty() {
-            return Ok(());
+            return Ok(report);
         }
 
         let status = host.status();
@@ -648,8 +967,13 @@ impl DesktopCloudProviderManager {
                 );
                 let _ = registrar.unregister_system_domain(&registration);
                 let _ = host.unregister_domain_state(registration.root_id);
+                report.fail(
+                    registration.root_id,
+                    &registration.encrypted_root,
+                    format!("Unmounted because {reason}"),
+                );
             }
-            return Ok(());
+            return Ok(report);
         }
 
         let registrar = NativeMacFileProviderSystemDomainRegistrar;
@@ -660,6 +984,10 @@ impl DesktopCloudProviderManager {
                     continue;
                 }
             }
+            // A mount the user started meanwhile owns this root.
+            let Some(_starting) = self.claim_start(registration.root_id) else {
+                continue;
+            };
 
             let health = host.check_runtime_health(registration.root_id);
             if matches!(
@@ -674,19 +1002,28 @@ impl DesktopCloudProviderManager {
             }
 
             let excluded_patterns = client.excluded_file_patterns();
+            let compatibility = Arc::new(
+                hybridcipher_macos_file_provider::VaultCompatibility::load(
+                    &user_config_dir,
+                    registration.root_id,
+                )
+                .map_err(|error| error.to_string())?,
+            );
             let crypto = Arc::new(
-                hybridcipher_macos_file_provider::ClientMountCrypto::for_root(
+                hybridcipher_macos_file_provider::ClientMountCrypto::for_root_with_compatibility(
                     client.clone(),
                     registration.root_id,
+                    compatibility.clone(),
                 )
                 .await
                 .map_err(|err| err.to_string())?,
             );
             let restart_result = host
-                .start_root_with_crypto_and_exclusions(
+                .start_root_with_compatibility(
                     registration.root_id,
                     crypto,
                     excluded_patterns,
+                    compatibility.clone(),
                 )
                 .await
                 .map_err(|err| err.to_string())
@@ -697,12 +1034,44 @@ impl DesktopCloudProviderManager {
 
             match restart_result {
                 Ok(health) if health.registration_present && health.socket_reachable => {
+                    // macOS restarted this kept domain before the bridge existed and
+                    // may have backed it off; lift that now the bridge answers.
+                    let domain_identifier = registration.domain_identifier.clone();
+                    let root_id = registration.root_id;
+                    if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
+                        crate::macos_file_provider_native::wake_domain(&domain_identifier)
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            "Could not wake the restored File Provider root {}: {}",
+                            root_id,
+                            err
+                        );
+                    }
+                    report.reconnected.push(ReconnectedRoot {
+                        root_id: registration.root_id,
+                        mountpoint: registration
+                            .user_visible_url
+                            .clone()
+                            .or_else(|| {
+                                dirs::home_dir().map(|home| {
+                                    home.join("Library").join("CloudStorage").join(format!(
+                                        "HybridCipher-{}",
+                                        registration.display_name
+                                    ))
+                                })
+                            })
+                            .unwrap_or_default(),
+                        encrypted_root: registration.encrypted_root.clone(),
+                    });
                     let mut running = self.running.lock().await;
                     running.insert(
                         registration.root_id,
                         RunningMacFileProviderRoot {
                             host: host.clone(),
                             registration,
+                            compatibility,
                         },
                     );
                 }
@@ -717,6 +1086,11 @@ impl DesktopCloudProviderManager {
                     );
                     let _ = registrar.unregister_system_domain(&registration);
                     let _ = host.unregister_domain_state(registration.root_id);
+                    report.fail(
+                        registration.root_id,
+                        &registration.encrypted_root,
+                        format!("Unmounted because it could not be reconnected: {reason}"),
+                    );
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -726,11 +1100,16 @@ impl DesktopCloudProviderManager {
                     );
                     let _ = registrar.unregister_system_domain(&registration);
                     let _ = host.unregister_domain_state(registration.root_id);
+                    report.fail(
+                        registration.root_id,
+                        &registration.encrypted_root,
+                        format!("Unmounted because it could not be reconnected: {err}"),
+                    );
                 }
             }
         }
 
-        Ok(())
+        Ok(report)
     }
 
     #[cfg(target_os = "windows")]
@@ -738,7 +1117,7 @@ impl DesktopCloudProviderManager {
         &self,
         user_config_dir: PathBuf,
         client: Arc<LocalClient>,
-    ) -> Result<(), String> {
+    ) -> Result<ReconnectReport, String> {
         let host = hybridcipher_windows_cloud_provider::CloudProviderHost::new(
             hybridcipher_windows_cloud_provider::ProviderHostConfig {
                 user_config_dir: user_config_dir.clone(),
@@ -748,7 +1127,7 @@ impl DesktopCloudProviderManager {
         let registrations = host
             .load_registrations()
             .map_err(|err| format!("Failed to load Windows Cloud Files registrations: {err}"))?;
-        let mut failures = Vec::new();
+        let mut report = ReconnectReport::default();
         for registration in registrations {
             if self
                 .running
@@ -786,15 +1165,16 @@ impl DesktopCloudProviderManager {
                     }
                 }
             }
-            if let Some(error) = last_error {
-                failures.push(format!("{}: {}", registration.root_id, error));
+            match last_error {
+                Some(error) => report.fail(registration.root_id, &registration.encrypted_root, error),
+                None => report.reconnected.push(ReconnectedRoot {
+                    root_id: registration.root_id,
+                    mountpoint: registration.sync_root_path,
+                    encrypted_root: registration.encrypted_root,
+                }),
             }
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
+        Ok(report)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -909,6 +1289,29 @@ impl DesktopCloudProviderManager {
         };
 
         if !force {
+            // Let macOS hand over edits it has not given the extension yet, while
+            // the bridge still runs; removing the domain first sets them aside.
+            let domain_identifier = running.registration.domain_identifier.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::macos_file_provider_native::wait_for_pending_changes(
+                    &domain_identifier,
+                    MACOS_PENDING_CHANGES_WAIT_SECS,
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!(
+                    "macOS File Provider root {} still had edits Finder had not handed over: {}",
+                    root_id,
+                    err
+                ),
+                Err(err) => tracing::warn!(
+                    "Waiting for macOS File Provider edits of root {} failed: {}",
+                    root_id,
+                    err
+                ),
+            }
             let status = running
                 .host
                 .read_runtime_status(root_id)
@@ -968,6 +1371,13 @@ impl DesktopCloudProviderManager {
 
     #[cfg(target_os = "macos")]
     pub async fn stop_all(&self, dehydrate: bool, force: bool) -> Result<(), String> {
+        // Stop restarting roots first, so none starts after this sweep or keeps
+        // decrypting for an account that is signing out.
+        let reconcile = self.reconcile_task.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = reconcile {
+            task.abort();
+            let _ = task.await;
+        }
         let root_ids = {
             let running = self.running.lock().await;
             running.keys().copied().collect::<Vec<_>>()
@@ -1032,10 +1442,15 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
 
+    type EventLog = Arc<StdMutex<Vec<&'static str>>>;
+
     #[derive(Default)]
     struct RecordingMacRegistrar {
         registered: Arc<StdMutex<Vec<String>>>,
         unregistered: Arc<StdMutex<Vec<String>>>,
+        /// Shared with a test's bridge start, to record the order of steps.
+        events: EventLog,
+        fail_register: bool,
     }
 
     impl MacFileProviderSystemDomainRegistrar for RecordingMacRegistrar {
@@ -1043,6 +1458,10 @@ mod tests {
             &self,
             registration: &hybridcipher_macos_file_provider::FileProviderDomainRegistration,
         ) -> Result<(), String> {
+            self.events.lock().unwrap().push("system");
+            if self.fail_register {
+                return Err("addDomain refused".to_string());
+            }
             self.registered
                 .lock()
                 .unwrap()
@@ -1062,9 +1481,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn desktop_macos_registration_uses_in_app_registrar() {
-        let temp = tempfile::tempdir().unwrap();
+    fn test_host_and_registration(
+        temp: &tempfile::TempDir,
+    ) -> (
+        hybridcipher_macos_file_provider::MacFileProviderHost,
+        hybridcipher_macos_file_provider::FileProviderDomainRegistration,
+        std::path::PathBuf,
+    ) {
         let host = hybridcipher_macos_file_provider::MacFileProviderHost::new(
             hybridcipher_macos_file_provider::ProviderHostConfig {
                 user_config_dir: temp.path().to_path_buf(),
@@ -1079,20 +1502,73 @@ mod tests {
             encrypted_root: temp.path().join("encrypted"),
             user_visible_url: None,
         };
+        let state_path = temp
+            .path()
+            .join("macos-file-provider")
+            .join("domains")
+            .join(format!("{}.json", registration.root_id));
+        (host, registration, state_path)
+    }
+
+    #[tokio::test]
+    async fn the_bridge_starts_before_macos_learns_of_the_domain() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, registration, state_path) = test_host_and_registration(&temp);
         let registrar = RecordingMacRegistrar::default();
+        let events = registrar.events.clone();
 
-        register_macos_domain_for_desktop(&host, &registration, &registrar).unwrap();
+        start_macos_root_with(&host, &registration, &registrar, async {
+            assert!(
+                state_path.is_file(),
+                "the bridge needs the saved registration"
+            );
+            events.lock().unwrap().push("bridge");
+            Ok(())
+        })
+        .await
+        .unwrap();
 
+        assert_eq!(
+            registrar.events.lock().unwrap().as_slice(),
+            ["bridge", "system"]
+        );
         assert_eq!(
             registrar.registered.lock().unwrap().as_slice(),
             ["com.hybridcipher.root.test"]
         );
-        assert!(temp
-            .path()
-            .join("macos-file-provider")
-            .join("domains")
-            .join(format!("{}.json", registration.root_id))
-            .is_file());
+        assert!(state_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_fails_to_start_never_reaches_macos() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, registration, state_path) = test_host_and_registration(&temp);
+        let registrar = RecordingMacRegistrar::default();
+
+        let result = start_macos_root_with(&host, &registration, &registrar, async {
+            Err("crypto unavailable".to_string())
+        })
+        .await;
+
+        assert_eq!(result.unwrap_err(), "crypto unavailable");
+        assert!(registrar.registered.lock().unwrap().is_empty());
+        assert!(!state_path.exists(), "the saved registration is removed");
+    }
+
+    #[tokio::test]
+    async fn a_domain_macos_refuses_undoes_the_saved_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, registration, state_path) = test_host_and_registration(&temp);
+        let registrar = RecordingMacRegistrar {
+            fail_register: true,
+            ..Default::default()
+        };
+
+        let result =
+            start_macos_root_with(&host, &registration, &registrar, async { Ok(()) }).await;
+
+        assert_eq!(result.unwrap_err(), "addDomain refused");
+        assert!(!state_path.exists());
     }
 
     #[test]

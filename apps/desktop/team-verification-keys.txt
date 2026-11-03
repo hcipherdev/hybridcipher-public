@@ -1,0 +1,6 @@
+# Team verification public keys embedded in HybridCipher desktop and CLI builds
+# (the HYBRIDCIPHER_ENTITLEMENT_PUBLIC_KEYS build input). These are public keys
+# only. Entries are kid:base64url; multiple entries are joined with commas in
+# file order, and that exact string is compiled into the binaries, so keep the
+# order stable. Release builds must embed exactly this list.
+local-signed-team-b9717bd1-4c4e-488d-bf31-271f5b32eaa6:k8OTJbS2Xc4JrvUr_eL8ggE4HWVkiMKXupbDWNPASSE

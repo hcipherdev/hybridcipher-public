@@ -1,4 +1,5 @@
 //! Bounded chunk output. Nothing is published until every chunk authenticates.
+use super::durability::OutputDurability;
 use super::encrypt::{SparseExtent, SparseFileMetadata};
 use crate::ClientError;
 use std::{
@@ -99,13 +100,15 @@ impl PlaintextOutput {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<(), ClientError> {
+    pub fn finish(self, durability: OutputDurability) -> Result<(), ClientError> {
         if self.remaining != 0 {
             return Err(ClientError::FileIntegrity(
                 "Plaintext is shorter than declared layout".into(),
             ));
         }
-        self.temporary.as_file().sync_all().map_err(output_error)?;
+        durability
+            .apply(self.temporary.as_file())
+            .map_err(output_error)?;
         self.temporary
             .persist(&self.destination)
             .map_err(|e| output_error(e.error))?;

@@ -236,13 +236,11 @@ fn read_protected_string(
     }
 }
 
-fn load_cli_device_keys(
-    email: &str,
-    server_url: &str,
+fn load_device_keys_in(
+    user_dir: &Path,
     current_account_key: Option<&[u8; 32]>,
     current_state_key: Option<&[u8; 32]>,
 ) -> Result<Option<DeviceKeys>, String> {
-    let user_dir = cli_user_dir(email, server_url)?;
     if !user_dir.exists() {
         return Ok(None);
     }
@@ -254,14 +252,14 @@ fn load_cli_device_keys(
 
     let account_key = match current_account_key {
         Some(key) => Some(Zeroizing::new(*key)),
-        None => load_cached_account_key(&user_dir)?.map(Zeroizing::new),
+        None => load_cached_account_key(user_dir)?.map(Zeroizing::new),
     };
 
     // Try to load state_key if account_key is available
     let state_key = if let Some(key) = current_state_key {
         Some(Zeroizing::new(*key))
     } else if let Some(ref acc_key) = account_key {
-        load_device_key_from_fallback(&user_dir, acc_key)
+        load_device_key_from_fallback(user_dir, acc_key)
             .ok()
             .flatten()
             .map(Zeroizing::new)
@@ -397,14 +395,12 @@ fn write_protected_file(path: &Path, data: &str, aad: &[u8], key: &[u8; 32]) -> 
     Ok(())
 }
 
-fn persist_device_keys(
-    email: &str,
-    server_url: &str,
+fn persist_device_keys_in(
+    user_dir: &Path,
     keys: &DeviceKeys,
     state_key: Option<&[u8; 32]>,
 ) -> Result<(), String> {
-    let user_dir = cli_user_dir(email, server_url)?;
-    ensure_user_dirs(&user_dir)?;
+    ensure_user_dirs(user_dir)?;
 
     let stored = StoredInvitationKeyPair {
         device_id: keys.device_id.clone(),
@@ -452,6 +448,116 @@ fn persist_device_keys(
     }
 
     Ok(())
+}
+
+/// Login error code for a saved device identity that no available key opens.
+pub(crate) const DEVICE_IDENTITY_UNREADABLE: &str = "DEVICE_IDENTITY_UNREADABLE";
+
+/// Account folders moved out of `users/` when a device is set up again.
+const REPLACED_IDENTITIES_DIR: &str = "replaced_device_identities";
+
+pub(crate) enum DeviceIdentityError {
+    /// Saved identity files exist, but neither state key copy opens them.
+    Unreadable(String),
+    Other(String),
+}
+
+impl From<DeviceIdentityError> for String {
+    fn from(err: DeviceIdentityError) -> Self {
+        match err {
+            DeviceIdentityError::Unreadable(message) | DeviceIdentityError::Other(message) => {
+                message
+            }
+        }
+    }
+}
+
+/// A saved identity, and the OS keystore state key when only that copy opened it.
+type SavedDeviceKeys = (DeviceKeys, Option<[u8; 32]>);
+
+/// This device's saved identity, if any. The OS keystore's state key outlives
+/// deleted folders and can disagree with `device_key.protected`, so it is
+/// tried (lazily) before the identity is declared unreadable.
+fn load_saved_device_keys_in(
+    user_dir: &Path,
+    account_key: Option<&[u8; 32]>,
+    state_key: Option<&[u8; 32]>,
+    keystore_state_key: impl FnOnce() -> Option<[u8; 32]>,
+) -> Result<Option<SavedDeviceKeys>, DeviceIdentityError> {
+    let err = match load_device_keys_in(user_dir, account_key, state_key) {
+        Ok(keys) => return Ok(keys.map(|keys| (keys, None))),
+        Err(err) => err,
+    };
+    if let Some(keystore_key) = keystore_state_key().filter(|key| state_key != Some(key)) {
+        if let Ok(Some(keys)) = load_device_keys_in(user_dir, account_key, Some(&keystore_key)) {
+            return Ok(Some((keys, Some(keystore_key))));
+        }
+    }
+    Err(DeviceIdentityError::Unreadable(format!(
+        "This device's saved identity could not be unlocked, so sign-in was stopped \
+         to avoid replacing it with a new device. Your existing device keys were not \
+         changed. Details: {err}"
+    )))
+}
+
+/// Reuse this device's saved identity, creating one only when none exists yet.
+/// A saved identity that can't be unlocked is never replaced, and new keys are
+/// never used unsaved: either would register a device ID that can't be reused.
+fn load_or_create_device_keys_in(
+    user_dir: &Path,
+    account_key: Option<&[u8; 32]>,
+    state_key: Option<&[u8; 32]>,
+    keystore_state_key: impl FnOnce() -> Option<[u8; 32]>,
+) -> Result<SavedDeviceKeys, DeviceIdentityError> {
+    if let Some(saved) =
+        load_saved_device_keys_in(user_dir, account_key, state_key, keystore_state_key)?
+    {
+        return Ok(saved);
+    }
+
+    let keys = generate_fresh_device_keys().map_err(DeviceIdentityError::Other)?;
+    persist_device_keys_in(user_dir, &keys, state_key).map_err(|err| {
+        DeviceIdentityError::Other(format!(
+            "New device keys could not be saved, so sign-in was stopped to avoid registering \
+             a device that can't be used again. Details: {err}"
+        ))
+    })?;
+    Ok((keys, None))
+}
+
+fn keystore_state_key_for(user_dir: &Path) -> Option<[u8; 32]> {
+    let storage_id = user_dir.file_name()?.to_str()?;
+    crate::key_bundle::load_state_key(storage_id).ok().flatten()
+}
+
+/// Move an account folder out of `users/` (so nothing scans it as an account)
+/// into `replaced_device_identities/<storage id>-<time>`, keeping its old keys.
+fn move_device_identity_aside(
+    user_dir: &Path,
+    now: chrono::DateTime<Utc>,
+) -> Result<PathBuf, String> {
+    let storage_id = user_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("Account folder name is invalid")?;
+    let data_root = user_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("Account folder has no data directory")?;
+    let replaced_root = data_root.join(REPLACED_IDENTITIES_DIR);
+    fs::create_dir_all(&replaced_root)
+        .map_err(|e| format!("Failed to prepare {}: {}", replaced_root.display(), e))?;
+    let target = replaced_root.join(format!("{storage_id}-{}", now.format("%Y%m%d-%H%M%S")));
+    if target.exists() {
+        return Err("This device was just set up again. Wait a moment and try again.".into());
+    }
+    fs::rename(user_dir, &target).map_err(|e| {
+        format!(
+            "The old device files couldn't be moved ({e}). Close other HybridCipher windows \
+             and the command-line tool, then try again."
+        )
+    })?;
+    Ok(target)
 }
 
 fn generate_fresh_device_keys() -> Result<DeviceKeys, String> {
@@ -589,43 +695,78 @@ impl HybridCipherClient {
     }
 
     /// Load device keys from the CLI state if present, otherwise generate ephemeral keys.
-    fn ensure_device_keys(&self, email: &str) -> Result<DeviceKeys, String> {
+    fn ensure_device_keys(&self, email: &str) -> Result<DeviceKeys, DeviceIdentityError> {
         if let Some(keys) = self.device_keys.lock().unwrap().clone() {
             return Ok(keys);
         }
 
         let account_key = self.account_key.lock().unwrap().clone();
         let state_key = self.state_key.lock().unwrap().clone();
-        if let Some(keys) = match load_cli_device_keys(
-            email,
-            &self.server_url,
+        let user_dir =
+            cli_user_dir(email, &self.server_url).map_err(DeviceIdentityError::Other)?;
+        let (keys, keystore_key) = load_or_create_device_keys_in(
+            &user_dir,
             account_key.as_deref(),
             state_key.as_deref(),
-        ) {
-            Ok(keys) => keys,
-            Err(err) => {
-                warn!("Failed to load CLI device keys: {}", err);
-                None
+            || keystore_state_key_for(&user_dir),
+        )
+        .map_err(|err| {
+            if let DeviceIdentityError::Unreadable(message) = &err {
+                warn!("Device identity unavailable for {}: {}", email, message);
             }
-        } {
-            info!("Reusing CLI device keys for {}", email);
-            *self.device_keys.lock().unwrap() = Some(keys.clone());
-            return Ok(keys);
+            err
+        })?;
+        if let Some(key) = keystore_key {
+            warn!("Device identity for {} opened with the OS keystore state key", email);
+            *self.state_key.lock().unwrap() = Some(Zeroizing::new(key));
         }
-
-        let mut keys = generate_fresh_device_keys()?;
-        if let Err(err) = persist_device_keys(email, &self.server_url, &keys, state_key.as_deref())
-        {
-            warn!("Failed to persist device keys for {}: {}", email, err);
-            // continue with in-memory keys to avoid blocking login
-            // but regenerate created/expires to avoid drift if we retry
-            keys.created_at = Utc::now();
-            keys.expires_at = keys.created_at + Duration::days(30);
-        } else {
-            info!("Persisted device keys for {}", email);
-        }
+        info!("Using device identity {} for {}", keys.device_id, email);
         *self.device_keys.lock().unwrap() = Some(keys.clone());
         Ok(keys)
+    }
+
+    /// Account folder holding this device's identity for `email`.
+    pub(crate) fn device_identity_dir(&self, email: &str) -> Result<PathBuf, String> {
+        cli_user_dir(email, &self.server_url)
+    }
+
+    /// Check the password, then confirm the saved identity really can't be
+    /// opened with either state key copy. Only then may the device be set up again.
+    pub(crate) fn confirm_unreadable_device_identity(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        self.ensure_auth_scope(email);
+        let result = (|| {
+            self.ensure_state_key(email, password)?;
+            let account_key = self.account_key.lock().unwrap().clone();
+            let state_key = self.state_key.lock().unwrap().clone();
+            let user_dir = cli_user_dir(email, &self.server_url)?;
+            match load_saved_device_keys_in(
+                &user_dir,
+                account_key.as_deref(),
+                state_key.as_deref(),
+                || keystore_state_key_for(&user_dir),
+            ) {
+                Ok(Some(_)) => Err("This device's identity opens normally, so it doesn't need \
+                                    to be set up again. Sign in instead."
+                    .to_string()),
+                Ok(None) => Err("This device has no saved identity to replace. Sign in to \
+                                 set it up."
+                    .to_string()),
+                Err(DeviceIdentityError::Unreadable(_)) => Ok(()),
+                Err(DeviceIdentityError::Other(message)) => Err(message),
+            }
+        })();
+        self.clear_auth_cache();
+        result
+    }
+
+    /// Move the account folder aside; the next sign-in creates a new identity.
+    pub(crate) fn move_device_identity_aside(&self, email: &str) -> Result<PathBuf, String> {
+        self.clear_auth_cache();
+        move_device_identity_aside(&cli_user_dir(email, &self.server_url)?, Utc::now())
     }
 
     pub(crate) fn device_crypto_material(
@@ -776,6 +917,76 @@ impl HybridCipherClient {
         })
     }
 
+    /// Create a local vault's device identity, sealed with the vault's state key
+    /// in the same files an account's identity uses.
+    pub(crate) fn create_local_vault_device_keys(
+        &self,
+        user_dir: &Path,
+        state_key: &[u8; 32],
+    ) -> Result<String, String> {
+        let keys = generate_fresh_device_keys()?;
+        persist_device_keys_in(user_dir, &keys, Some(state_key))?;
+        Ok(keys.device_id.clone())
+    }
+
+    /// Register a new account with a local vault's existing device identity, so
+    /// the account's first device is the one that already holds the vault keys.
+    pub(crate) async fn register_with_local_vault_keys(
+        &self,
+        email: String,
+        password: String,
+        user_dir: &Path,
+        account_key: &[u8; 32],
+        state_key: &[u8; 32],
+    ) -> Result<RegisterResult, String> {
+        self.ensure_auth_scope(&email);
+        let keys = load_device_keys_in(user_dir, Some(account_key), Some(state_key))?
+            .ok_or_else(|| "The local vault's device identity is missing".to_string())?;
+        *self.device_keys.lock().unwrap() = Some(keys);
+        let result = self.register(email, password).await;
+        if result.is_err() {
+            self.clear_auth_cache();
+        }
+        result
+    }
+
+    /// Re-sign this device's join card with a fresh expiry and publish it, so key
+    /// rotations can keep reaching a device that stays signed in for weeks. Never
+    /// creates an identity: without readable saved keys the published card is left alone.
+    pub(crate) async fn refresh_published_join_card(
+        &self,
+        email: &str,
+        user_id: &str,
+        device_id: &str,
+        access_token: &str,
+    ) -> Result<(), String> {
+        let cached = self.device_keys.lock().unwrap().clone();
+        let keys = match cached {
+            Some(keys) => keys,
+            None => {
+                let account_key = self.account_key.lock().unwrap().clone();
+                let state_key = self.state_key.lock().unwrap().clone();
+                let user_dir = cli_user_dir(email, &self.server_url)?;
+                match load_saved_device_keys_in(
+                    &user_dir,
+                    account_key.as_deref(),
+                    state_key.as_deref(),
+                    || keystore_state_key_for(&user_dir),
+                ) {
+                    Ok(Some((keys, _))) => keys,
+                    Ok(None) => return Err("This device has no saved identity.".to_string()),
+                    Err(DeviceIdentityError::Unreadable(message))
+                    | Err(DeviceIdentityError::Other(message)) => return Err(message),
+                }
+            }
+        };
+        if keys.device_id != device_id {
+            return Err("Local identity does not match the signed-in device.".to_string());
+        }
+        self.publish_join_card_for_user(user_id, access_token, &keys)
+            .await
+    }
+
     async fn publish_join_card_for_user(
         &self,
         user_id: &str,
@@ -899,8 +1110,8 @@ impl HybridCipherClient {
         // Initialize or load device keys (prefer CLI device identity if present)
         let mut device_keys = self
             .ensure_device_keys(&email)
-            .map_err(|message| LoginErrorInfo::new("LOGIN_FAILED", message))?;
-        let mut opaque = OpaqueAuth::new(device_keys.device_id.clone());
+            .map_err(device_identity_login_error)?;
+        let mut opaque = login_authenticator(&device_keys)?;
 
         let mut login_result = opaque
             .login_with_server(
@@ -930,8 +1141,8 @@ impl HybridCipherClient {
                     .map_err(|message| LoginErrorInfo::new("LOGIN_FAILED", message))?;
                 device_keys = self
                     .ensure_device_keys(&email)
-                    .map_err(|message| LoginErrorInfo::new("LOGIN_FAILED", message))?;
-                opaque = OpaqueAuth::new(device_keys.device_id.clone());
+                    .map_err(device_identity_login_error)?;
+                opaque = login_authenticator(&device_keys)?;
                 login_result = opaque
                     .login_with_server(
                         &email,
@@ -1050,7 +1261,11 @@ impl HybridCipherClient {
         file_path: String,
         output_path: Option<String>,
     ) -> Result<DecryptFileResult, String> {
-        let output = output_path.unwrap_or_else(|| file_path.replace(".encrypted", ""));
+        let output = output_path.unwrap_or_else(|| {
+            hybridcipher_client::file::ciphertext::strip_encrypted_suffix(&file_path)
+                .unwrap_or(&file_path)
+                .to_string()
+        });
 
         Ok(DecryptFileResult {
             decrypted_path: output,
@@ -1142,6 +1357,27 @@ impl LoginErrorInfo {
     }
 }
 
+/// OPAQUE client that signs logins with this device's identity key, so a registered
+/// device proves it holds that key instead of only presenting its identifier.
+fn login_authenticator(keys: &DeviceKeys) -> Result<OpaqueAuth, LoginErrorInfo> {
+    let identity = Ed25519KeyPair::from_bytes(&keys.identity_secret).map_err(|err| {
+        LoginErrorInfo::new(
+            DEVICE_IDENTITY_UNREADABLE,
+            format!("This device's identity key is unreadable: {err}"),
+        )
+    })?;
+    Ok(OpaqueAuth::new(keys.device_id.clone()).with_device_identity(identity))
+}
+
+fn device_identity_login_error(err: DeviceIdentityError) -> LoginErrorInfo {
+    match err {
+        DeviceIdentityError::Unreadable(message) => {
+            LoginErrorInfo::new(DEVICE_IDENTITY_UNREADABLE, message)
+        }
+        DeviceIdentityError::Other(message) => LoginErrorInfo::new("LOGIN_FAILED", message),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LoginResult {
     pub success: bool,
@@ -1224,3 +1460,7 @@ pub enum UserRole {
     TeamMember, // Part of teams, can't create/rekey
     TeamAdmin,  // Can create groups and rekey
 }
+
+#[cfg(test)]
+#[path = "../tests/device_security/test_device_identity_load.rs"]
+mod device_identity_load_tests;

@@ -3,7 +3,8 @@
 /// This module implements secure file encryption that automatically selects
 /// the most appropriate epoch for encryption while maintaining consistency
 /// and enabling seamless access during epoch transitions.
-const ENCRYPTED_FILE_SEPARATOR: &[u8] = b"\n---ENCRYPTED_DATA---\n";
+/// Line between an encrypted file's JSON header and its ciphertext.
+pub const ENCRYPTED_FILE_SEPARATOR: &[u8] = b"\n---ENCRYPTED_DATA---\n";
 const COVERAGE_TMP_DIR_NAME: &str = ".hybridcipher-tmp";
 /// Maximum JSON header accepted from an encrypted file on disk.
 pub const MAX_ENCRYPTED_HEADER_BYTES: usize = 16 * 1024 * 1024;

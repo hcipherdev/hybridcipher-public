@@ -8,7 +8,10 @@ use crate::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tauri::async_runtime::Mutex;
 use zeroize::Zeroize;
 
@@ -21,10 +24,55 @@ pub struct AppState {
     pub client: Arc<HybridCipherClient>,
     pub cli_schema: Arc<CliSchemaManager>,
     pub session: Arc<Mutex<Option<UserSession>>>,
+    pub auth_generation: AtomicU64,
     pub team_queue: Arc<Mutex<()>>,
     pub mount_manager: Arc<MountManager>,
     pub local_client: Arc<LocalClientProvider>,
     pub cloud_provider: Arc<DesktopCloudProviderManager>,
+    /// The accountless vault while no account session is open.
+    pub local_vault: Arc<Mutex<Option<crate::local_vault::LocalVaultContext>>>,
+    /// When the group list last came from the server, and the newer group keys already
+    /// reported to the app (see `commands::group_key_update_available`).
+    pub group_key_watch: std::sync::Mutex<GroupKeyWatch>,
+    /// Stops repeated refresh attempts after the server rejected or throttled a refresh token.
+    pub session_refresh_hold: std::sync::Mutex<Option<SessionRefreshHold>>,
+}
+
+/// A refresh token the server refused (held until the next login) or asked us to retry later.
+#[derive(Debug, Clone)]
+pub struct SessionRefreshHold {
+    /// SHA-256 of the refresh token, so a new login lifts the hold without storing the token twice.
+    pub token_sha256: String,
+    /// `None` while the token stays rejected; otherwise the earliest time to try again.
+    pub until: Option<std::time::Instant>,
+    pub message: String,
+}
+
+impl SessionRefreshHold {
+    pub fn token_sha256(refresh_token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(refresh_token.as_bytes()))
+    }
+
+    pub fn rejected(&self) -> bool {
+        self.until.is_none()
+    }
+
+    /// The hold still applies to this refresh token.
+    pub fn blocks(&self, refresh_token: &str) -> bool {
+        self.token_sha256 == Self::token_sha256(refresh_token)
+            && self
+                .until
+                .map_or(true, |until| std::time::Instant::now() < until)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GroupKeyWatch {
+    pub list_refreshed_at: Option<std::time::Instant>,
+    /// (group, key version) pairs already reported, so a key this device is never sent (it was
+    /// skipped in the rotation) triggers one early key check, not one every minute.
+    pub announced: std::collections::HashSet<(uuid::Uuid, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +110,11 @@ impl Drop for UserSession {
 }
 
 impl AppState {
+    /// Distinguish separate logins while allowing normal token refresh.
+    pub fn auth_generation(&self) -> u64 {
+        self.auth_generation.load(Ordering::SeqCst)
+    }
+
     pub fn has_cached_team_data_access(&self, session: &UserSession) -> bool {
         // The session was unlocked from protected account storage. Existing
         // ciphertext keys remain usable after an old licensing key is retired.
@@ -71,6 +124,19 @@ impl AppState {
             .team_entitlement
             .as_deref()
             .is_some_and(|token| !token.is_empty())
+    }
+
+    /// The vault group while the app runs in local mode. An open account
+    /// session always takes precedence over a vault record.
+    pub async fn local_vault_group(&self) -> Option<uuid::Uuid> {
+        if self.session.lock().await.is_some() {
+            return None;
+        }
+        self.local_vault
+            .lock()
+            .await
+            .as_ref()
+            .map(|vault| vault.record.group_id)
     }
 
     /// Check if user is authenticated
@@ -117,8 +183,10 @@ impl AppState {
         }
 
         // Clear from memory
+        crate::commands::clear_device_trust_confirmations().await;
         {
             let mut session = self.session.lock().await;
+            self.auth_generation.fetch_add(1, Ordering::SeqCst);
             *session = None;
         }
 
@@ -292,12 +360,13 @@ impl AppState {
         // Publish authentication only after the local client can serve it.
         {
             let mut session = self.session.lock().await;
+            self.auth_generation.fetch_add(1, Ordering::SeqCst);
             *session = Some(user_session.clone());
         }
 
         // Sync Welcome messages to load epoch keys (critical for decryption!)
         self.sync_welcome_messages_after_login().await;
-        self.reconcile_file_provider_roots_after_session_setup(&user_session, server_url)
+        self.reconnect_mounts_for_session(&user_session, server_url)
             .await;
 
         Ok(())
@@ -437,31 +506,34 @@ impl AppState {
                             persistent: true,
                         };
 
-                        // Store in memory
-                        {
-                            let mut session = self.session.lock().await;
-                            *session = Some(user_session.clone());
-                        }
-
                         // Initialize mount manager scope
                         let scope_id =
                             format!("{}::{}", user_session.email, user_session.device_id);
                         let _ = self.mount_manager.activate_manifest_scope(&scope_id).await;
 
-                        // Initialize local client
-                        self.local_client
+                        // Publish the session only once the local client can serve
+                        // it: a failed restore must not leave a session that blocks
+                        // the next login.
+                        if let Err(err) = self
+                            .local_client
                             .initialize_for_session(&user_session, &server_url)
-                            .await?;
+                            .await
+                        {
+                            self.mount_manager.clear_manifest_scope().await;
+                            return Err(err);
+                        }
+                        {
+                            let mut session = self.session.lock().await;
+                            self.auth_generation.fetch_add(1, Ordering::SeqCst);
+                            *session = Some(user_session.clone());
+                        }
 
                         // Sync Welcome messages to load epoch keys
                         if persisted_session.is_valid() {
                             self.sync_welcome_messages_after_login().await;
-                            self.reconcile_file_provider_roots_after_session_setup(
-                                &user_session,
-                                &server_url,
-                            )
-                            .await;
                         }
+                        self.reconnect_mounts_for_session(&user_session, &server_url)
+                            .await;
 
                         return Ok(Some(user_session));
                     }
@@ -479,57 +551,59 @@ impl AppState {
         Ok(None)
     }
 
-    #[cfg(target_os = "macos")]
-    async fn reconcile_file_provider_roots_after_session_setup(
-        &self,
-        user_session: &UserSession,
-        server_url: &str,
-    ) {
-        let Ok(client) = self.local_client.client().await else {
-            tracing::warn!("Cannot reconcile macOS File Provider roots: local client unavailable");
-            return;
-        };
+    /// Reconnect the account's mounts left by the last run. Without a valid
+    /// token, only a Team entitlement that still verifies offline may serve
+    /// them, as for a mount the user starts.
+    async fn reconnect_mounts_for_session(&self, user_session: &UserSession, server_url: &str) {
+        if user_session.expires_at <= Utc::now().timestamp() {
+            if let Err(err) = crate::commands::team_write_allowed_offline(self, user_session) {
+                tracing::warn!("Not reconnecting mounts left from the last run: {}", err);
+                return;
+            }
+        }
         let user_dir = self
             .local_client
             .user_dir_for_session(&user_session.email, server_url);
-        if let Err(err) = self
-            .cloud_provider
-            .reconcile_file_provider_roots(user_dir, client)
-            .await
-        {
-            tracing::warn!("macOS File Provider reconciliation failed: {}", err);
-        }
+        self.reconnect_left_mounts(user_dir).await;
     }
 
-    #[cfg(target_os = "windows")]
-    async fn reconcile_file_provider_roots_after_session_setup(
-        &self,
-        user_session: &UserSession,
-        server_url: &str,
-    ) {
-        let Ok(client) = self.local_client.client().await else {
-            tracing::warn!("Cannot reconcile Windows Cloud Files roots: local client unavailable");
-            return;
-        };
-        let user_dir = self
-            .local_client
-            .user_dir_for_session(&user_session.email, server_url);
-        if let Err(err) = self
-            .cloud_provider
-            .reconcile_windows_cloud_roots(user_dir, client)
-            .await
+    /// Reconnect the mounts the last run left registered with Windows or macOS
+    /// (after a crash, a kill or a reboot), so they show as mounted and serve
+    /// files again. A clean Quit unmounts everything, so this finds nothing then.
+    pub(crate) async fn reconnect_left_mounts(&self, user_dir: std::path::PathBuf) {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            tracing::warn!("Windows Cloud Files reconciliation failed: {}", err);
+            let Ok(client) = self.local_client.client().await else {
+                tracing::warn!("Cannot reconnect mounts: local client unavailable");
+                return;
+            };
+            // A kept root's first sync can take an hour for a large folder; sign-in
+            // and session restore must not wait for it.
+            #[cfg(target_os = "macos")]
+            {
+                self.cloud_provider
+                    .spawn_file_provider_reconcile(user_dir, client);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                match self
+                    .cloud_provider
+                    .reconcile_windows_cloud_roots(user_dir.clone(), client)
+                    .await
+                {
+                    Ok(report) => {
+                        crate::commands::record_reconnected_mounts(&user_dir, &report).await;
+                        self.cloud_provider.emit_mounts_reconnected(&report);
+                    }
+                    Err(err) => {
+                        tracing::warn!("Windows Cloud Files reconciliation failed: {}", err);
+                    }
+                }
+                self.cloud_provider.start_windows_health_supervisor();
+            }
         }
-        self.cloud_provider.start_windows_health_supervisor();
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    async fn reconcile_file_provider_roots_after_session_setup(
-        &self,
-        _user_session: &UserSession,
-        _server_url: &str,
-    ) {
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let _ = user_dir;
     }
 }
 
@@ -571,6 +645,10 @@ fn compute_session_integrity(
     hasher.update(created_at.to_rfc3339().as_bytes());
     hex::encode(hasher.finalize())
 }
+
+#[cfg(test)]
+#[path = "../tests/session/test_session_refresh_hold.rs"]
+mod session_refresh_hold_tests;
 
 #[cfg(test)]
 mod session_policy_tests {

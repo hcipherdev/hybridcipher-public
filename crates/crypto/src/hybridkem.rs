@@ -286,7 +286,7 @@ pub fn encap<R: RngCore + CryptoRng>(
     // Perform X25519 ECDH
     let x25519_shared = x25519_ephemeral
         .private
-        .diffie_hellman(&pk_remote.x25519_public);
+        .diffie_hellman(&pk_remote.x25519_public)?;
 
     // Perform ML-KEM encapsulation
     let (mlkem_ciphertext, mlkem_shared) = MlKemKeyPair::encapsulate(&pk_remote.mlkem_public, rng)?;
@@ -312,7 +312,7 @@ pub fn decap(
     context: Context,
 ) -> CryptoResult<SharedSecret> {
     // Perform X25519 ECDH with ephemeral public key
-    let x25519_shared = sk_local.x25519_private.diffie_hellman(&ct.x25519_public);
+    let x25519_shared = sk_local.x25519_private.diffie_hellman(&ct.x25519_public)?;
 
     // Perform ML-KEM decapsulation
     let mlkem_shared = MlKemKeyPair::decapsulate(&sk_local.mlkem_secret, &ct.mlkem_ciphertext)?;
@@ -516,3 +516,7 @@ mod tests {
         assert_eq!(ss2.as_bytes(), ss2_decap.as_bytes());
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/x25519/test_low_order_rejection.rs"]
+mod low_order_tests;

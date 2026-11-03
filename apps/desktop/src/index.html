@@ -20,8 +20,11 @@
             </div>
 
             <div class="welcome-actions">
-                <button class="btn btn-primary btn-large" id="loginBtn">Login</button>
+                <button class="btn btn-primary btn-large" id="startLocalVaultBtn" type="button">Start on this device</button>
+                <p class="welcome-local-hint">No account needed. Files are protected on this computer, and you can add an account later.</p>
+                <button class="btn btn-secondary btn-large" id="loginBtn">Login</button>
                 <button class="btn btn-secondary btn-large" id="registerBtn">Register</button>
+                <button class="btn btn-text" id="restoreLocalVaultBtn" type="button">Restore from a recovery kit</button>
                 <button class="btn btn-text" id="forgotPasswordBtn">Forgot password</button>
             </div>
         </div>
@@ -35,17 +38,17 @@
             <div class="first-run-hero">
                 <div class="first-run-hero-text">
                     <h2 id="firstRunWelcomeTitle">Welcome to HybridCipher</h2>
-                    <p class="first-run-subtitle">
+                    <p class="first-run-subtitle" id="firstRunWelcomeSubtitle">
                         Secure collaboration that stays secure as your team grows.
                     </p>
                 </div>
                 <button class="modal-close" id="closeFirstRunWelcomeBtn" aria-label="Close">&times;</button>
             </div>
             <div class="first-run-body">
-                <div class="first-run-steps">
+                <div class="first-run-steps" id="firstRunWelcomeSteps">
                     <div class="first-run-step">
-                        <div class="first-run-step-title">1. Sign in</div>
-                        <div class="first-run-step-desc">Create an account or log in to your team server.</div>
+                        <div class="first-run-step-title">1. Start</div>
+                        <div class="first-run-step-desc">Start on this device right away, or sign in to use your files on other devices.</div>
                     </div>
                     <div class="first-run-step">
                         <div class="first-run-step-title">2. Verify devices</div>
@@ -57,7 +60,20 @@
                     </div>
                 </div>
                 <div class="first-run-actions">
-                    <button class="btn btn-primary btn-large" id="firstRunCreateAccountBtn" type="button">
+                    <!-- Shown after the app opened straight into the vault. -->
+                    <button class="btn btn-primary btn-large hidden" id="firstRunGetStartedBtn" type="button">
+                        Get started
+                    </button>
+                    <button class="btn btn-secondary btn-large hidden" id="firstRunVaultSignInBtn" type="button">
+                        I have an account
+                    </button>
+                    <button class="btn btn-text hidden" id="firstRunVaultRestoreBtn" type="button">
+                        Restore from a recovery kit
+                    </button>
+                    <button class="btn btn-primary btn-large" id="firstRunStartLocalBtn" type="button">
+                        Start on this device
+                    </button>
+                    <button class="btn btn-secondary btn-large" id="firstRunCreateAccountBtn" type="button">
                         Create account
                     </button>
                     <button class="btn btn-secondary btn-large" id="firstRunLoginBtn" type="button">
@@ -134,15 +150,6 @@
         <!-- Header Bar -->
         <header class="app-header">
             <div class="header-left">
-                <button class="sidebar-toggle" id="settingsBtn" title="Settings">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                            d="M12 15a3 3 0 100-6 3 3 0 000 6z" />
-                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                            d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z" />
-                    </svg>
-                    <span class="update-badge hidden" id="settingsUpdateBadge"></span>
-                </button>
                 <div class="logo-compact">
                     <img src="logo.png" alt="HybridCipher" width="32" height="32">
                     <span class="app-name">HybridCipher</span>
@@ -154,21 +161,13 @@
                 </select>
                 <span id="workspaceLicenseBadge" class="workspace-license-badge hidden"></span>
             </div>
-            <div class="header-center">
-                <div class="global-search">
-                    <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none">
-                        <path stroke="currentColor" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-                    </svg>
-                    <input type="text" id="globalSearch" placeholder="Search protected folders…"
-                        aria-label="Search protected folders" autocomplete="off" />
-                    <div class="command-palette" id="commandPalette" role="listbox" aria-hidden="true"></div>
-                </div>
-            </div>
             <div class="header-right">
                 <button class="post-quantum-badge hidden" id="postQuantumBadge" type="button" aria-hidden="true">
                     <span class="post-quantum-badge-eyebrow" id="postQuantumBadgeEyebrow">Post-quantum protection</span>
                     <span class="post-quantum-badge-label" id="postQuantumBadgeLabel">Protected now</span>
                 </button>
+                <button class="labeled-btn local-vault-header-btn hidden" id="localVaultHeaderBtn" type="button"
+                    title="Create an account to use these files on other devices">On this device only</button>
                 <div class="user-status-wrapper" id="userStatusWrapper">
                     <div class="user-status-pill" id="userStatusPill" aria-haspopup="true" aria-expanded="false">
                         <span class="status-dot"></span>
@@ -176,20 +175,19 @@
                         <span class="status-alert" id="userStatusAlert" aria-hidden="true">!</span>
                     </div>
                     <div class="status-warning-panel" id="statusWarningPanel" aria-hidden="true">
-                        <div class="status-warning-header">Action needed</div>
-                        <div class="status-warning-list" id="statusWarningList">
-                            <div class="status-warning-empty">All security checks look good.</div>
-                        </div>
+                        <div class="status-warning-header" id="statusWarningHeader">Action needed</div>
+                        <div class="status-warning-list" id="statusWarningList"></div>
+                        <section class="status-device-section" id="statusDeviceSection" aria-label="This device">
+                            <div class="status-warning-header">This device</div>
+                            <span class="status-device-label">Device fingerprint</span>
+                            <div class="status-device-fingerprint-row">
+                                <code id="statusDeviceFingerprint">Loading…</code>
+                                <button class="btn btn-secondary btn-small" id="statusCopyFingerprintBtn" type="button" disabled>Copy</button>
+                            </div>
+                            <p class="status-device-trust" id="statusDeviceTrust"></p>
+                        </section>
                     </div>
                 </div>
-                <button class="labeled-btn hidden" id="adminPanelBtn" title="Team administration" aria-hidden="true" tabindex="-1">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                            d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
-                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 12h8M8 16h5" />
-                    </svg>
-                    <span class="btn-label">Team administration</span>
-                </button>
                 <button class="labeled-btn" id="feedbackBtn" title="Send Feedback">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
                         <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -200,6 +198,15 @@
                 <button class="labeled-btn hidden" id="desktopOperationsBtn" type="button" title="Review operation">
                     <span class="btn-label">Activity</span>
                 </button>
+                <button class="header-icon-btn" type="button" id="settingsBtn" title="Settings">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                            d="M12 15a3 3 0 100-6 3 3 0 000 6z" />
+                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                            d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z" />
+                    </svg>
+                    <span class="update-badge hidden" id="settingsUpdateBadge"></span>
+                </button>
             </div>
         </header>
 
@@ -209,9 +216,40 @@
             <aside class="sidebar" id="sidebar">
                 <div class="sidebar-resize-handle" id="sidebarResizeHandle" aria-hidden="true"></div>
                 <div class="sidebar-content">
+                    <!-- Team only: the overview and each group are places to go; the selected group's folders follow. -->
+                    <nav class="sidebar-team-nav hidden" id="sidebarTeamNav" aria-label="Team" aria-hidden="true">
+                        <button class="sidebar-nav-item" id="sidebarOverviewBtn" type="button" aria-pressed="false">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                                    d="M3 11l9-7 9 7M5 10v10h14V10" />
+                            </svg>
+                            <span class="sidebar-nav-label" id="sidebarOverviewLabel">Team overview</span>
+                            <span class="sidebar-nav-badge hidden" id="sidebarOverviewBadge"></span>
+                        </button>
+                        <button class="sidebar-nav-item hidden" id="sidebarMembersBtn" type="button" aria-pressed="false">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                                    d="M16 20v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 20v-1a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
+                            </svg>
+                            <span class="sidebar-nav-label">Members &amp; devices</span>
+                            <span class="sidebar-nav-badge hidden" id="sidebarMembersBadge"></span>
+                        </button>
+                        <div class="sidebar-groups-header">
+                            <span class="sidebar-groups-title" id="sidebarGroupsTitle">Groups</span>
+                            <button class="sidebar-icon-btn hidden" id="sidebarNewGroupBtn" type="button" title="New group"
+                                aria-label="New group">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                    <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14" />
+                                </svg>
+                            </button>
+                        </div>
+                        <input class="sidebar-group-filter hidden" id="sidebarGroupFilter" type="search" placeholder="Filter groups"
+                            aria-label="Filter groups" autocomplete="off" spellcheck="false">
+                        <ul class="sidebar-group-list" id="sidebarGroupList"></ul>
+                    </nav>
                     <div class="sidebar-header">
                         <div>
-                            <h2 class="sidebar-title">Protected Folders</h2>
+                            <h2 class="sidebar-title" id="sidebarFoldersTitle">Protected Folders</h2>
                             <p class="sidebar-mount-summary" id="sidebarMountSummary">0 protected • 0 mounted</p>
                         </div>
                         <button class="btn-icon btn-small" id="refreshFoldersBtn" title="Refresh">
@@ -220,6 +258,14 @@
                                     d="M1 4v6h6M23 20v-6h-6M20.49 9A9 9 0 105.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" />
                             </svg>
                         </button>
+                    </div>
+                    <!-- Filters the folder list below; kept next to the list it affects. -->
+                    <div class="global-search sidebar-search" id="sidebarSearch">
+                        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none">
+                            <path stroke="currentColor" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                        </svg>
+                        <input type="text" id="globalSearch" placeholder="Filter folders…"
+                            aria-label="Filter folders" autocomplete="off" />
                     </div>
                     <div class="folder-list" id="folderList">
                         <div class="empty-state">
@@ -231,6 +277,16 @@
                         </div>
                     </div>
                     <div class="sidebar-footer">
+                        <!-- Mounts from every workspace and group, not just the one open now. -->
+                        <button class="btn btn-add-folder sidebar-action" id="sidebarMountCenterBtn" type="button"
+                            title="Mounted folders from every workspace">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                                    d="M22 12H2M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11zM6 16h.01M10 16h.01" />
+                            </svg>
+                            <span>Mount Center</span>
+                            <span class="sidebar-nav-badge hidden" id="sidebarMountCenterCount"></span>
+                        </button>
                         <button class="btn btn-add-folder sidebar-action" id="sidebarCoverageCenterBtn" type="button">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
                                 <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
@@ -238,22 +294,21 @@
                             </svg>
                             <span id="sidebarCoverageCenterLabel">Coverage Center</span>
                         </button>
+                        <!-- A protect or decrypt job sent to the background; click to watch it again. -->
+                        <button class="folder-job-chip hidden" id="folderJobChip" type="button" aria-live="polite">
+                            <span class="spinner-small" aria-hidden="true"></span>
+                            <span class="folder-job-chip-label" id="folderJobChipLabel"></span>
+                            <progress class="folder-job-chip-bar" id="folderJobChipBar" max="100"></progress>
+                        </button>
                         <button class="btn btn-add-folder" id="addFolderBtn">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
                                 <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 5v14M5 12h14" />
                             </svg>
                             Add Protected Folder
                         </button>
-                        <button class="btn btn-add-folder sidebar-action hidden" id="sidebarSwitchGroupBtn" type="button">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                                <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                    d="M7 7h10l-3-3m3 13H7l3 3" />
-                            </svg>
-                            Switch group
-                        </button>
                     </div>
                 </div>
-                <div class="sidebar-terminal-slot">
+                <div class="sidebar-terminal-slot" id="sidebarHomeSlot">
                     <div class="sidebar-view-actions">
                         <button class="btn btn-secondary sidebar-terminal-btn active" id="sidebarHomeBtn" type="button"
                             title="Return to workspace home" aria-pressed="true">
@@ -265,8 +320,6 @@
                             </svg>
                             Home
                         </button>
-                        <button class="btn btn-secondary sidebar-terminal-btn" id="sidebarFilesBtn" type="button"
-                            title="Open workspace files" aria-pressed="false">Files</button>
                     </div>
                 </div>
             </aside>
@@ -274,508 +327,336 @@
             <!-- Main Content -->
             <main class="main-content" id="mainContent">
                 <div class="workspace" id="workspace">
-                    <section class="admin-dashboard" id="adminDashboard">
+                    <!-- The selected Team group's page: who can open it, its devices, and its keys. -->
+                    <section class="admin-dashboard" id="adminDashboard" aria-labelledby="teamAdministrationTitle">
                         <div class="dashboard-header">
                             <div class="dashboard-header-main">
-                                <h2 class="dashboard-title" id="teamAdministrationTitle">Team administration</h2>
-                                <p class="dashboard-subtitle">Team-wide security operations and onboarding at a glance.
-                                </p>
-                                <div class="dashboard-meta">
-                                    <span class="dashboard-meta-item" id="adminDeviceLabel">Device —</span>
-                                </div>
+                                <p class="dashboard-breadcrumb" id="adminGroupBreadcrumb">Groups</p>
+                                <h2 class="dashboard-title" id="teamAdministrationTitle">Group</h2>
+                                <p class="dashboard-subtitle" id="adminGroupMeta"></p>
                             </div>
                             <div class="dashboard-header-actions">
-                                <button class="btn btn-secondary btn-small" id="adminRefreshStatusBtn" type="button">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                                <button class="btn btn-primary btn-small" id="adminAddMemberBtn" type="button">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                        <path stroke="currentColor" stroke-width="2.4" stroke-linecap="round" d="M12 5v14M5 12h14" />
+                                    </svg>
+                                    Add person
+                                </button>
+                                <div class="group-settings">
+                                    <button class="btn btn-secondary btn-small" id="adminGroupSettingsBtn" type="button"
+                                        aria-haspopup="menu" aria-expanded="false" aria-controls="adminGroupSettingsMenu">
+                                        Group settings
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M6 9l6 6 6-6" />
+                                        </svg>
+                                    </button>
+                                    <div class="group-settings-menu hidden" id="adminGroupSettingsMenu" role="menu"
+                                        aria-labelledby="adminGroupSettingsBtn">
+                                        <button class="group-settings-item" id="adminRenameGroupBtn" type="button" role="menuitem">Rename group…</button>
+                                        <button class="group-settings-item group-settings-item-danger" id="adminDeleteGroupBtn" type="button"
+                                            role="menuitem">Delete group…</button>
+                                    </div>
+                                </div>
+                                <button class="btn btn-secondary btn-small" id="adminRefreshStatusBtn" type="button" title="Refresh"
+                                    aria-label="Refresh">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                                         <path stroke="currentColor" stroke-width="2"
                                             d="M1 4v6h6M23 20v-6h-6M20.49 9A9 9 0 105.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15" />
                                     </svg>
-                                    Refresh
                                 </button>
                             </div>
                         </div>
 
-                        <!-- Status Cards Grid -->
-                        <div class="dashboard-status-grid">
-                            <div class="dashboard-card dashboard-card-actionable" id="adminPendingActionsCard">
-                                <div class="card-icon">
-                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M12 2v6m0 8v6M4.93 4.93l4.24 4.24m5.66 5.66 4.24 4.24M2 12h6m8 0h6M4.93 19.07l4.24-4.24m5.66-5.66 4.24-4.24" />
-                                    </svg>
-                                </div>
-                                <div class="dashboard-card-label">Pending</div>
-                                <div class="dashboard-card-value" id="adminPendingActionsValue">Pending actions: —</div>
-                                <div class="dashboard-card-meta" id="adminPendingActionsMeta">Need attention</div>
-                                <button class="btn btn-tertiary" id="adminPendingActionsRefreshBtn" type="button">
-                                    Refresh
-                                </button>
-                            </div>
+                        <div class="admin-tabs" role="tablist" aria-label="Group administration">
+                            <button class="admin-tab" id="adminTabPeople" type="button" role="tab" data-admin-tab="people"
+                                aria-selected="true" aria-controls="adminPanelPeople">
+                                People <span class="admin-tab-badge hidden" id="adminTabPeopleBadge"></span>
+                            </button>
+                            <button class="admin-tab" id="adminTabDevices" type="button" role="tab" data-admin-tab="devices"
+                                aria-selected="false" aria-controls="adminPanelDevices" tabindex="-1">
+                                Devices <span class="admin-tab-badge hidden" id="adminTabDevicesBadge"></span>
+                            </button>
+                            <button class="admin-tab" id="adminTabKeys" type="button" role="tab" data-admin-tab="keys"
+                                aria-selected="false" aria-controls="adminPanelKeys" tabindex="-1">Keys &amp; security</button>
+                            <button class="admin-tab" id="adminTabAdvanced" type="button" role="tab" data-admin-tab="advanced"
+                                aria-selected="false" aria-controls="adminPanelAdvanced" tabindex="-1">Advanced</button>
+                        </div>
 
-                            <div class="dashboard-card">
-                                <div class="card-icon">
-                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
-                                        <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="2" />
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
-                                    </svg>
+                        <div class="admin-tab-panel" id="adminPanelPeople" role="tabpanel" aria-labelledby="adminTabPeople"
+                            data-admin-panel="people">
+                            <div class="people-toolbar">
+                                <div class="segmented" role="group" aria-label="Show people">
+                                    <button class="segmented-btn active" type="button" data-people-filter="all" aria-pressed="true">All</button>
+                                    <button class="segmented-btn" type="button" data-people-filter="attention" aria-pressed="false">Needs action</button>
                                 </div>
-                                <div class="dashboard-card-label">Team members</div>
-                                <div class="dashboard-card-value" id="adminTeamMembersValue">Loading members...</div>
-                                <div class="dashboard-card-meta" id="adminTeamMembersMeta">—</div>
-                                <button class="btn btn-tertiary" id="adminTeamMembersRefreshBtn" type="button">
-                                    Refresh
-                                </button>
+                                <input class="people-search" id="adminPeopleSearch" type="search" placeholder="Search by email"
+                                    aria-label="Search people in this group" autocomplete="off" spellcheck="false">
                             </div>
+                            <p class="people-summary">
+                                <span id="adminTeamMembersValue">Loading members…</span>
+                                <span id="adminTeamMembersMeta"></span>
+                                <button class="dashboard-card-link hidden" id="adminTeamMembersInactiveLink" type="button"></button>
+                            </p>
+                            <p class="people-attention hidden" id="adminPeopleAttention" role="status"></p>
+                            <div class="people-list" id="adminPeopleList" aria-live="polite"></div>
+                            <p class="admin-panel-note" id="adminPeopleNote">Who can open this group, and who is still joining.</p>
+                            <p class="admin-panel-note">Adding someone shares this group&#39;s keys with their approved devices. Removing someone rotates the keys so they cannot open files added afterwards.</p>
+                        </div>
 
-                            <div class="dashboard-card">
-                                <div class="card-icon card-icon-coverage">
-                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M3 13h4l3-6 4 10 3-6h4" />
-                                    </svg>
+                        <div class="admin-tab-panel" id="adminPanelDevices" role="tabpanel" aria-labelledby="adminTabDevices"
+                            data-admin-panel="devices" hidden>
+                            <div class="admin-devices-layout">
+                                <div class="dashboard-panel dashboard-panel-queues">
+                                    <div class="dashboard-panel-header">
+                                        <h3>Waiting on you</h3>
+                                        <p>Choose a list to see the devices involved.</p>
+                                    </div>
+                                    <div class="dashboard-queue">
+                                        <button class="queue-row" id="adminDeviceAccessQueue" type="button">
+                                            <span class="queue-info">
+                                                <span class="queue-title">Devices to set up</span>
+                                                <span class="queue-desc">Give a device access or verify it, comparing its fingerprint with its owner.</span>
+                                            </span>
+                                            <span class="queue-actions">
+                                                <span class="queue-count">—</span>
+                                                <span class="queue-alert-dot" aria-hidden="true"></span>
+                                            </span>
+                                        </button>
+                                        <button class="queue-row" id="adminStaleDevicesQueue" type="button">
+                                            <span class="queue-info">
+                                                <span class="queue-title">Inactive devices</span>
+                                                <span class="queue-desc">Devices that stopped syncing or are missing keys.</span>
+                                            </span>
+                                            <span class="queue-actions">
+                                                <span class="queue-count">—</span>
+                                                <span class="queue-alert-dot" aria-hidden="true"></span>
+                                            </span>
+                                        </button>
+                                    </div>
+                                    <button class="btn btn-secondary btn-small" id="adminTrustVerifyBtn" type="button">
+                                        Verify a device fingerprint
+                                    </button>
                                 </div>
-                                <div class="dashboard-card-label">Coverage</div>
-                                <div class="dashboard-card-value" id="adminCoverageStatus">Loading coverage...</div>
-                                <div class="dashboard-card-meta" id="adminCoverageMeta">—</div>
-                                <button class="btn btn-tertiary" id="adminCoverageRefreshBtn" type="button">
-                                    Refresh
-                                </button>
-                            </div>
 
-                            <div class="dashboard-card">
-                                <div class="card-icon card-icon-trust">
-                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M9 12l2 2 4-4" />
-                                    </svg>
+                                <div class="dashboard-panel dashboard-panel-queue-details" id="adminQueueDetailsPanel">
+                                    <div class="dashboard-panel-header queue-details-header">
+                                        <div>
+                                            <h3 id="adminQueueDetailsTitle">Details</h3>
+                                            <p id="adminQueueDetailsSubtitle">Choose a list on the left.</p>
+                                        </div>
+                                        <button class="btn btn-secondary btn-small" id="adminQueueRefreshBtn" type="button">
+                                            Refresh
+                                        </button>
+                                    </div>
+                                    <div class="queue-details-body" id="adminQueueDetailsBody">
+                                    </div>
+                                    <div class="queue-details-footer" id="adminQueueDetailsFooter" hidden>
+                                        <div class="queue-pagination">
+                                            <button class="btn btn-secondary btn-small" id="adminQueuePrevBtn" type="button">
+                                                Prev
+                                            </button>
+                                            <span class="queue-pagination-info" id="adminQueuePageInfo">Page 1 of 1</span>
+                                            <button class="btn btn-secondary btn-small" id="adminQueueNextBtn" type="button">
+                                                Next
+                                            </button>
+                                        </div>
+                                    </div>
                                 </div>
-                                <div class="dashboard-card-label">Server status</div>
-                                <div class="dashboard-card-value" id="adminServerStatusValue">Loading status...</div>
-                                <div class="dashboard-card-meta" id="adminServerStatusMeta">Last: —</div>
-                                <button class="btn btn-tertiary" id="adminServerStatusRefreshBtn" type="button">
-                                    Refresh
-                                </button>
                             </div>
                         </div>
 
-                        <!-- Accordion Sections -->
-                        <div class="dashboard-accordion">
-                            <!-- Section: Operations -->
-                            <div class="accordion-section expanded" data-section="operations">
-                                <button class="accordion-header" type="button">
-                                    <div class="accordion-header-content">
-                                        <svg class="accordion-icon" width="20" height="20" viewBox="0 0 24 24"
-                                            fill="none">
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
-                                        </svg>
-                                        <span class="accordion-title">Operations</span>
-                                        <span class="accordion-subtitle">Quick actions and workflow queues</span>
-                                    </div>
-                                    <svg class="accordion-chevron" width="20" height="20" viewBox="0 0 24 24"
-                                        fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M6 9l6 6 6-6" />
-                                    </svg>
-                                </button>
-                                <div class="accordion-content">
-                                    <div class="accordion-panels accordion-panels-operations">
-                                        <div class="dashboard-panel dashboard-panel-queues">
-                                            <div class="dashboard-panel-header">
-                                                <h3>Queues</h3>
-                                                <p>Pending work that needs attention.</p>
-                                            </div>
-                                            <div class="dashboard-queue">
-                                                <div class="queue-row" id="adminIssueWelcomeQueue">
-                                                    <div class="queue-info">
-                                                        <div class="queue-title">Issue welcome</div>
-                                                        <div class="queue-desc">Send a Welcome to a waiting device.</div>
-                                                    </div>
-                                                    <div class="queue-actions">
-                                                        <span class="queue-count">—</span>
-                                                        <span class="queue-alert-dot" aria-hidden="true"></span>
-                                                    </div>
-                                                </div>
-                                                <div class="queue-row" id="adminStaleDevicesQueue">
-                                                    <div class="queue-info">
-                                                        <div class="queue-title">Stale devices</div>
-                                                        <div class="queue-desc">Review inactive or missing-key devices.</div>
-                                                    </div>
-                                                    <div class="queue-actions">
-                                                        <span class="queue-count">—</span>
-                                                        <span class="queue-alert-dot" aria-hidden="true"></span>
-                                                    </div>
-                                                </div>
-                                                <div class="queue-row" id="adminUnverifiedDevicesQueue">
-                                                    <div class="queue-info">
-                                                        <div class="queue-title">Unverified devices</div>
-                                                        <div class="queue-desc">Devices pending verification in this group.</div>
-                                                    </div>
-                                                    <div class="queue-actions">
-                                                        <span class="queue-count">—</span>
-                                                        <span class="queue-alert-dot" aria-hidden="true"></span>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        </div>
-
-                                        <div class="dashboard-panel dashboard-panel-queue-details"
-                                            id="adminQueueDetailsPanel">
-                                            <div class="dashboard-panel-header queue-details-header">
-                                                <div>
-                                                    <h3 id="adminQueueDetailsTitle">Queue details</h3>
-                                                    <p id="adminQueueDetailsSubtitle">Select a queue to view its list.</p>
-                                                </div>
-                                                <button class="btn btn-secondary btn-small" id="adminQueueRefreshBtn"
-                                                    type="button">
-                                                    Refresh
-                                                </button>
-                                            </div>
-                                            <div class="queue-details-body" id="adminQueueDetailsBody">
-                                            </div>
-                                            <div class="queue-details-footer" id="adminQueueDetailsFooter" hidden>
-                                                <div class="queue-pagination">
-                                                    <button class="btn btn-secondary btn-small" id="adminQueuePrevBtn"
-                                                        type="button">
-                                                        Prev
-                                                    </button>
-                                                    <span class="queue-pagination-info"
-                                                        id="adminQueuePageInfo">Page 1 of 1</span>
-                                                    <button class="btn btn-secondary btn-small" id="adminQueueNextBtn"
-                                                        type="button">
-                                                        Next
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </div>
+                        <div class="admin-tab-panel" id="adminPanelKeys" role="tabpanel" aria-labelledby="adminTabKeys"
+                            data-admin-panel="keys" hidden>
+                            <div class="admin-status-row">
+                                <div class="admin-status-main">
+                                    <span class="admin-status-label">Key version</span>
+                                    <span class="admin-status-value" id="adminKeyVersionsValue">Loading key status…</span>
+                                    <span class="admin-status-meta" id="adminKeyVersionsMeta"></span>
+                                    <button class="dashboard-card-link hidden" id="adminKeyVersionsAttentionLink" type="button"></button>
+                                </div>
+                                <button class="btn btn-secondary btn-small" type="button" data-card-target="keys">Devices on each key</button>
+                            </div>
+                            <div class="dashboard-panel">
+                                <div class="dashboard-panel-header">
+                                    <h3>Key rotation</h3>
+                                    <p>Rotate keys after removing someone. The new key takes effect at once; each member's computer picks it up and moves its files to it automatically.</p>
+                                    <p class="key-rotation-status" id="adminRekeyStatusLine" aria-live="polite">Checking key status…</p>
+                                </div>
+                                <div class="dashboard-actions-grid" id="adminRekeyIdleActions">
+                                    <button class="btn btn-primary" id="adminRekeyStartBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" /> </svg>
+                                        Rotate group keys
+                                    </button>
+                                </div>
+                                <div class="key-rotation-active hidden" id="adminRekeyLeftoverActions">
+                                    <p class="key-rotation-hint hidden" id="adminRekeyLeftoverHint"></p>
+                                    <div class="dashboard-actions-grid">
+                                        <button class="btn btn-secondary" id="adminRekeyMigrationBtn" type="button">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 3v18m-6-6 6 6 6-6" /> </svg>
+                                            <span id="adminRekeyMigrationLabel">Move files to the new key</span>
+                                        </button>
                                     </div>
                                 </div>
                             </div>
-
-                            <!-- Section: Folder & File Audit -->
-                            <div class="accordion-section" data-section="audit">
-                                <button class="accordion-header" type="button">
-                                    <div class="accordion-header-content">
-                                        <svg class="accordion-icon" width="20" height="20" viewBox="0 0 24 24"
-                                            fill="none">
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                d="M9 13l2 2 4-4" />
-                                        </svg>
-                                        <span class="accordion-title">Folder &amp; File Audit</span>
-                                        <span class="accordion-subtitle">Coverage proof checks and file verification</span>
-                                    </div>
-                                    <svg class="accordion-chevron" width="20" height="20" viewBox="0 0 24 24"
-                                        fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M6 9l6 6 6-6" />
-                                    </svg>
-                                </button>
-                                <div class="accordion-content">
-                                    <div class="accordion-panels">
-                                        <div class="dashboard-panel">
-                                            <div class="dashboard-panel-header">
-                                                <h3>Coverage checks</h3>
-                                                <p>Audit coverage proofs and verify a specific file ID.</p>
-                                            </div>
-                                            <div class="dashboard-actions-grid">
-                                                <button class="btn btn-secondary" id="adminCoverageSampleAuditBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
-                                                    </svg>
-                                                    Sample Audit
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminCoverageFullAuditBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M12 3v18m-6-6 6 6 6-6" />
-                                                    </svg>
-                                                    Full Audit
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminCoverageVerifyBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                                    </svg>
-                                                    Coverage Verify
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminCoverageEnrolledListBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round" stroke-linejoin="round"
-                                                            d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
-                                                    </svg>
-                                                    Enrolled List
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
+                            <div class="dashboard-panel">
+                                <div class="dashboard-panel-header">
+                                    <h3>Membership proof</h3>
+                                    <p>Confirm that the members of this group are who the server says they are.</p>
+                                </div>
+                                <div class="dashboard-actions-grid">
+                                    <button class="btn btn-secondary" id="adminVerifyMembershipBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /> </svg>
+                                        Check membership proof
+                                    </button>
                                 </div>
                             </div>
+                        </div>
 
-                            <!-- Section: Group & Members -->
-                            <div class="accordion-section" data-section="group">
-                                <button class="accordion-header" type="button">
-                                    <div class="accordion-header-content">
-                                        <svg class="accordion-icon" width="20" height="20" viewBox="0 0 24 24"
-                                            fill="none">
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
-                                            <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="2" />
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
-                                        </svg>
-                                        <span class="accordion-title">Group & Members</span>
-                                        <span class="accordion-subtitle">Create groups and manage membership</span>
-                                    </div>
-                                    <svg class="accordion-chevron" width="20" height="20" viewBox="0 0 24 24"
-                                        fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M6 9l6 6 6-6" />
-                                    </svg>
-                                </button>
-                                <div class="accordion-content">
-                                    <div class="accordion-panels">
-                                        <div class="dashboard-panel">
-                                            <div class="dashboard-panel-header">
-                                                <h3>Group lifecycle</h3>
-                                                <p>Create and switch group context.</p>
-                                            </div>
-                                            <div class="dashboard-actions-grid">
-                                                <button class="btn btn-secondary" id="adminListGroupsBtn" type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
-                                                    </svg>
-                                                    List groups
-                                                </button>
-                                                <button class="btn btn-primary" id="adminCreateGroupBtn" type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round" d="M12 5v14M5 12h14" />
-                                                    </svg>
-                                                    Create group
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminSwitchGroupBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round" d="M7 7h10l-3-3m3 13H7l3 3" />
-                                                    </svg>
-                                                    Switch group
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminRenameGroupBtn" type="button">Rename selected group</button>
-                                                <button class="btn btn-secondary" id="adminDeleteGroupBtn" type="button">Delete selected group</button>
-                                            </div>
-                                        </div>
-
-                                        <div class="dashboard-panel">
-                                            <div class="dashboard-panel-header">
-                                                <h3>Member management</h3>
-                                                <p>Invite, remove, and verify membership.</p>
-                                            </div>
-                                            <div class="dashboard-actions-grid">
-                                                <button class="btn btn-primary" id="adminAddMemberBtn" type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
-                                                        <circle cx="8.5" cy="7" r="4" stroke="currentColor"
-                                                            stroke-width="2" />
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round" d="M20 8v6M23 11h-6" />
-                                                    </svg>
-                                                    Add member
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminPendingDevicesBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <circle cx="12" cy="12" r="10" stroke="currentColor"
-                                                            stroke-width="2" />
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round" d="M12 6v6l4 2" />
-                                                    </svg>
-                                                    Pending devices
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminRemoveMemberBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
-                                                        <circle cx="8.5" cy="7" r="4" stroke="currentColor"
-                                                            stroke-width="2" />
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round" d="M18 11h6" />
-                                                    </svg>
-                                                    Remove member
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminListMembersBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
-                                                        <circle cx="9" cy="7" r="4" stroke="currentColor"
-                                                            stroke-width="2" />
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
-                                                    </svg>
-                                                    List members
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminVerifyMembershipBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                                    </svg>
-                                                    Verify membership
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
+                        <div class="admin-tab-panel" id="adminPanelAdvanced" role="tabpanel" aria-labelledby="adminTabAdvanced"
+                            data-admin-panel="advanced" hidden>
+                            <div class="admin-status-row">
+                                <div class="admin-status-main">
+                                    <span class="admin-status-label">Server</span>
+                                    <span class="admin-status-value" id="adminServerStatusValue">Loading status…</span>
+                                    <span class="admin-status-meta" id="adminServerStatusMeta"></span>
+                                </div>
+                                <button class="btn btn-secondary btn-small" type="button" data-card-target="server">Server identity</button>
+                            </div>
+                            <div class="admin-status-row">
+                                <div class="admin-status-main">
+                                    <span class="admin-status-label">Coverage on this device</span>
+                                    <span class="admin-status-value" id="adminCoverageStatus">Loading coverage…</span>
+                                    <span class="admin-status-meta" id="adminCoverageMeta"></span>
+                                    <button class="dashboard-card-link hidden" id="adminCoverageAttentionLink" type="button"></button>
+                                </div>
+                                <button class="btn btn-secondary btn-small" type="button" data-card-target="coverage">Open coverage</button>
+                            </div>
+                            <div class="dashboard-panel">
+                                <div class="dashboard-panel-header">
+                                    <h3>File audits</h3>
+                                    <p>Check that protected files match their recorded proofs.</p>
+                                </div>
+                                <div class="dashboard-actions-grid">
+                                    <button class="btn btn-secondary" id="adminCoverageSampleAuditBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" /> </svg>
+                                        Sample audit
+                                    </button>
+                                    <button class="btn btn-secondary" id="adminCoverageFullAuditBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 3v18m-6-6 6 6 6-6" /> </svg>
+                                        Full audit
+                                    </button>
+                                    <button class="btn btn-secondary" id="adminCoverageVerifyBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /> </svg>
+                                        Verify one file
+                                    </button>
+                                    <button class="btn btn-secondary" id="adminCoverageEnrolledListBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" /> </svg>
+                                        Protected folders
+                                    </button>
                                 </div>
                             </div>
-
-                            <!-- Section: Security & Maintenance -->
-                            <div class="accordion-section" data-section="security">
-                                <button class="accordion-header" type="button">
-                                    <div class="accordion-header-content">
-                                        <svg class="accordion-icon" width="20" height="20" viewBox="0 0 24 24"
-                                            fill="none">
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
-                                            <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                                d="M9 12l2 2 4-4" />
-                                        </svg>
-                                        <span class="accordion-title">Security & Maintenance</span>
-                                        <span class="accordion-subtitle">Rekey operations and trust verification</span>
-                                    </div>
-                                    <svg class="accordion-chevron" width="20" height="20" viewBox="0 0 24 24"
-                                        fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M6 9l6 6 6-6" />
-                                    </svg>
-                                </button>
-                                <div class="accordion-content">
-                                    <div class="accordion-panels">
-                                        <div class="dashboard-panel">
-                                            <div class="dashboard-panel-header">
-                                                <h3>Rekey</h3>
-                                                <p>Coordinate epoch transitions.</p>
-                                            </div>
-                                            <div class="dashboard-actions-grid">
-                                                <button class="btn btn-primary" id="adminRekeyStartBtn" type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
-                                                    </svg>
-                                                    Start rekey
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminRekeyMigrationBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M12 3v18m-6-6 6 6 6-6" />
-                                                    </svg>
-                                                    Migrate coverage
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminRekeyCutoverBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                                    </svg>
-                                                    Cutover
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminRekeyFallbackBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M3 12a9 9 0 019-9 9.75 9.75 0 016.74 2.74L21 8" />
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round" d="M21 3v5h-5" />
-                                                    </svg>
-                                                    Fallback
-                                                </button>
-                                            </div>
-                                        </div>
-
-                                        <div class="dashboard-panel">
-                                            <div class="dashboard-panel-header">
-                                                <h3>Trust & PIN</h3>
-                                                <p>Verification and key pinning.</p>
-                                            </div>
-                                            <div class="dashboard-actions-grid">
-                                                <button class="btn btn-secondary" id="adminTrustVerifyBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                                    </svg>
-                                                    Verify trust
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminTrustCheckpointBtn"
-                                                    type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z" />
-                                                    </svg>
-                                                    Checkpoint
-                                                </button>
-                                                <button class="btn btn-secondary" id="adminPinListBtn" type="button">
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                                                        <path stroke="currentColor" stroke-width="2"
-                                                            stroke-linecap="round"
-                                                            d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
-                                                    </svg>
-                                                    Pin list
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
+                            <div class="dashboard-panel">
+                                <div class="dashboard-panel-header">
+                                    <h3>Trust records</h3>
+                                    <p>Server identity checkpoints and pinned device keys.</p>
+                                </div>
+                                <div class="dashboard-actions-grid">
+                                    <button class="btn btn-secondary" id="adminTrustCheckpointBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z" /> </svg>
+                                        Save trust checkpoint
+                                    </button>
+                                    <button class="btn btn-secondary" id="adminPinListBtn" type="button">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"> <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" /> </svg>
+                                        Pinned device keys
+                                    </button>
                                 </div>
                             </div>
+                            <p class="admin-panel-note" id="adminDeviceLabel">Device ID: —</p>
                         </div>
                     </section>
 
                     <section class="workspace-home" id="workspaceHome">
+                        <!-- First on Home, above the workspace box, so it can't be missed. -->
+                        <section class="workspace-home-panel getting-started-panel hidden" id="gettingStartedPanel"
+                            aria-labelledby="gettingStartedTitle">
+                            <div class="workspace-home-panel-header getting-started-header">
+                                <div>
+                                    <h3 id="gettingStartedTitle">Get started</h3>
+                                    <p id="gettingStartedProgress"></p>
+                                </div>
+                                <button class="btn btn-text btn-small" id="gettingStartedDismissBtn" type="button">Hide</button>
+                            </div>
+                            <ol class="getting-started-list" id="gettingStartedList" aria-live="polite"></ol>
+                            <div class="getting-started-optional hidden" id="gettingStartedOptional">
+                                <div class="getting-started-optional-copy">
+                                    <span class="getting-started-step-label" id="gettingStartedOptionalLabel"></span>
+                                    <span class="getting-started-step-detail" id="gettingStartedOptionalDetail"></span>
+                                </div>
+                                <button class="btn btn-secondary btn-small" id="gettingStartedOptionalBtn" type="button"></button>
+                            </div>
+                        </section>
+
                         <div class="workspace-home-hero">
                             <div class="workspace-home-copy">
-                                <span class="workspace-home-eyebrow">Workspace Home</span>
+                                <span class="workspace-home-eyebrow" id="workspaceHomeEyebrow">Workspace Home</span>
                                 <h2 class="workspace-home-title" id="workspaceHomeTitle">Personal Workspace</h2>
                                 <p class="workspace-context-label" id="workspaceContextLabel" aria-live="polite"></p>
                                 <div class="workspace-setup-notice hidden" id="teamSetupNotice" role="status">
                                     <span id="teamSetupMessage"></span>
                                     <button class="btn btn-secondary btn-small" id="teamSetupRetryBtn" type="button">Retry setup</button>
+                                    <button class="btn btn-secondary btn-small hidden" id="teamSetupCompleteBtn" type="button">Complete setup</button>
+                                    <button class="btn btn-secondary btn-small hidden" id="teamSetupCheckStatusBtn" type="button">Check status</button>
                                     <button class="btn btn-secondary btn-small hidden" id="teamSetupDevicesBtn" type="button">Open Devices</button>
+                                </div>
+                                <div class="workspace-setup-notice hidden" id="teamDeviceTrustNotice" role="status">
+                                    <span id="teamDeviceTrustMessage">Team administration is available after this device is verified. Ask someone on a trusted device to verify its fingerprint, or confirm it with your password.</span>
+                                    <button class="btn btn-secondary btn-small" id="teamDeviceTrustFingerprintBtn" type="button">Show fingerprint</button>
+                                    <button class="btn btn-secondary btn-small" id="teamDeviceTrustConfirmBtn" type="button">Verify with password</button>
+                                    <button class="btn btn-secondary btn-small" id="teamDeviceTrustCheckBtn" type="button">Check status</button>
+                                </div>
+                                <div class="workspace-setup-notice hidden" id="teamInvitationNotice" role="status">
+                                    <span id="teamInvitationMessage"></span>
+                                    <button class="btn btn-primary btn-small" id="teamInvitationJoinBtn" type="button">Join Team</button>
+                                    <button class="btn btn-secondary btn-small" id="teamInvitationDismissBtn" type="button">Not now</button>
+                                </div>
+                                <div class="workspace-setup-notice hidden" id="ownDeviceAccessNotice" role="status">
+                                    <span id="ownDeviceAccessMessage"></span>
+                                    <button class="btn btn-primary btn-small" id="ownDeviceAccessBtn" type="button">Give access</button>
                                 </div>
                                 <p class="workspace-home-text" id="workspaceHomeLead">
                                     Add a protected folder to start securing files on this account.
                                 </p>
+                                <div class="local-vault-panel hidden" id="localVaultPanel" role="region"
+                                    aria-labelledby="localVaultPanelTitle">
+                                    <span class="local-vault-badge">On this device only</span>
+                                    <h3 class="local-vault-panel-title" id="localVaultPanelTitle">Your files stay on this computer</h3>
+                                    <p class="local-vault-panel-text">
+                                        Protected files use the same encryption as an account. There is no online backup of
+                                        your key, and other devices can't open these files until you create an account.
+                                    </p>
+                                    <p class="local-vault-kit-status" id="localVaultKitStatus" aria-live="polite"></p>
+                                    <div class="local-vault-panel-actions">
+                                        <button class="btn btn-secondary" id="localVaultKitBtn" type="button">Save recovery kit</button>
+                                        <button class="btn btn-primary" id="localVaultUpgradeBtn" type="button">Use on other devices</button>
+                                        <button class="btn btn-text" id="localVaultRestoreBtn" type="button">Restore a previous vault</button>
+                                        <button class="btn btn-text" id="localVaultSignInBtn" type="button">Sign in to an account</button>
+                                    </div>
+                                </div>
+                                <div class="local-vault-panel hidden" id="localMergePanel" role="region"
+                                    aria-labelledby="localMergePanelTitle">
+                                    <h3 class="local-vault-panel-title" id="localMergePanelTitle">Files from before you signed in</h3>
+                                    <p class="local-vault-panel-text" id="localMergePanelText"></p>
+                                    <div class="local-vault-panel-actions">
+                                        <button class="btn btn-primary" id="localMergeBtn" type="button">Move them into your account</button>
+                                    </div>
+                                </div>
+                                <div class="workspace-setup-notice hidden" id="personalSetupNotice" role="status" aria-live="polite">
+                                    <span id="personalSetupMessage"></span>
+                                    <button class="btn btn-secondary btn-small hidden" id="personalSetupRecoverBtn" type="button">Recover with code</button>
+                                    <button class="btn btn-secondary btn-small hidden" id="personalSetupRepairBtn" type="button">Repair Personal workspace</button>
+                                    <button class="btn btn-secondary btn-small hidden" id="personalSetupCheckStatusBtn" type="button">Check status</button>
+                                    <button class="btn btn-secondary btn-small hidden" id="personalSetupDevicesBtn" type="button">Open Devices</button>
+                                </div>
                             </div>
                             <div class="workspace-home-summary-card" id="workspaceHomeSummaryCard">
                                 <div class="workspace-home-summary-label" id="workspaceHomeStatusLabel">Workspace status</div>
@@ -790,6 +671,27 @@
                                     </div>
                                 </div>
                             </div>
+                        </div>
+
+                        <!-- Team only: what is waiting on an admin, then each group as a place to open. -->
+                        <div class="team-overview hidden" id="teamOverview" aria-hidden="true">
+                            <section class="workspace-home-panel team-todo-panel hidden" id="teamTodoPanel" aria-labelledby="teamTodoTitle">
+                                <div class="workspace-home-panel-header">
+                                    <h3 id="teamTodoTitle">To do <span class="team-count" id="teamTodoCount"></span></h3>
+                                    <p id="teamTodoNote"></p>
+                                </div>
+                                <ul class="team-todo-list" id="teamTodoList" aria-live="polite"></ul>
+                            </section>
+                            <section class="workspace-home-panel team-groups-panel" id="teamGroupsPanel" aria-labelledby="teamGroupsTitle">
+                                <div class="workspace-home-panel-header team-groups-header">
+                                    <div>
+                                        <h3 id="teamGroupsTitle">Groups</h3>
+                                        <p id="teamGroupsNote"></p>
+                                    </div>
+                                    <button class="btn btn-secondary btn-small hidden" id="homeNewGroupBtn" type="button">New group</button>
+                                </div>
+                                <ul class="team-group-cards" id="teamGroupCards"></ul>
+                            </section>
                         </div>
 
                         <div class="workspace-home-grid">
@@ -870,52 +772,82 @@
                         <div id="coverageCenterContent"></div>
                     </section>
 
-                    <!-- File Browser - Hidden (legacy, kept for compatibility) -->
-                    <div class="file-browser hidden" id="fileBrowser">
-                        <div class="file-browser-header">
-                            <div class="breadcrumb" id="breadcrumb">
-                                <span>Select a folder to begin</span>
+                    <!-- Every enrolled folder of the account, across Personal and Team groups. -->
+                    <section class="workspace-section-view" id="mountCenterView" aria-labelledby="mountCenterTitle">
+                        <div class="mount-center">
+                            <header class="mount-center-header">
+                                <div>
+                                    <span class="workspace-section-eyebrow">All workspaces</span>
+                                    <h2 id="mountCenterTitle">Mount Center</h2>
+                                    <p id="mountCenterSummary">Mounted folders from Personal and every Team group, in one place.</p>
+                                </div>
+                                <div class="mount-center-actions">
+                                    <button class="btn btn-secondary btn-small" id="mountCenterRefreshBtn" type="button">Refresh</button>
+                                    <button class="btn btn-primary btn-small" id="mountCenterMountAllBtn" type="button"
+                                        title="Mount every folder that isn't mounted yet, in Personal and every Team group">Mount all</button>
+                                    <button class="btn btn-danger btn-small" id="mountCenterUnmountAllBtn" type="button">Unmount all…</button>
+                                </div>
+                            </header>
+                            <div class="mount-center-toolbar">
+                                <div class="mount-center-filters" role="group" aria-label="Show folders">
+                                    <button class="mount-center-filter active" type="button" data-mount-filter="all" aria-pressed="true">All</button>
+                                    <button class="mount-center-filter" type="button" data-mount-filter="mounted" aria-pressed="false">Mounted</button>
+                                    <button class="mount-center-filter" type="button" data-mount-filter="unmounted" aria-pressed="false">Not mounted</button>
+                                </div>
+                                <input class="mount-center-search" id="mountCenterSearch" type="search" placeholder="Filter folders or groups"
+                                    aria-label="Filter folders or groups" autocomplete="off" spellcheck="false">
                             </div>
-                            <div class="file-actions">
-                                <button class="btn btn-secondary hidden" id="resolveConflictsBtn">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                                            d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M12 9v4m0 4h.01" />
-                                    </svg>
-                                    Resolve conflicts
-                                </button>
-                                <button class="btn btn-secondary hidden" id="resolveRecoveryCopiesBtn">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                                            d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
-                                        <path stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                                            d="M8 12h8m-4-4v8" />
-                                    </svg>
-                                    Resolve recovery copies
-                                </button>
-                                <button class="btn btn-secondary hidden" id="unmountBtn">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                                        <path stroke="currentColor" stroke-width="2"
-                                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                    </svg>
-                                    Unmount
-                                </button>
+                            <!-- Chosen folders mount in the background after sign-in; only problems are reported. -->
+                            <div class="mount-center-autobar">
+                                <label class="mount-center-auto">
+                                    <input type="checkbox" id="mountCenterAutoMountAll" data-mount-center-auto="all" data-auto-state="none">
+                                    <span>Auto-mount all folders</span>
+                                </label>
+                                <span class="mount-center-autobar-note" id="mountCenterAutoMountSummary">Tick folders to mount them automatically when you sign in</span>
                             </div>
+                            <div id="mountCenterContent"></div>
                         </div>
-                        <div class="file-list" id="fileList">
-                            <div class="empty-state">
-                                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" opacity="0.5">
-                                    <path stroke="currentColor" stroke-width="2"
-                                        d="M9 13h6m-3-3v6m5 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                                </svg>
-                                <p>No folder selected</p>
+                    </section>
+                    <!-- Team owners and admins: every member and each of their devices. -->
+                    <section class="workspace-section-view" id="membersCenterView" aria-labelledby="membersCenterTitle">
+                        <div class="members-center">
+                            <header class="members-center-header">
+                                <div>
+                                    <span class="workspace-section-eyebrow">Organization</span>
+                                    <h2 id="membersCenterTitle">Members &amp; devices</h2>
+                                    <p id="membersCenterNote">Everyone in the Team, open invitations, and each member's devices. Joining the Team uses a seat; groups decide which files each person can open.</p>
+                                </div>
+                                <div class="members-center-actions">
+                                    <button class="btn btn-primary btn-small" id="membersInviteBtn" type="button">Invite to Team</button>
+                                    <button class="btn btn-secondary btn-small" id="membersRefreshBtn" type="button">Refresh</button>
+                                </div>
+                            </header>
+                            <!-- Invitations and removals saved while offline, until the server answers. -->
+                            <div class="members-pending-requests hidden" id="membersPendingRequests">
+                                <strong>Waiting for the server</strong>
+                                <p>Changes made while offline take effect only after the server accepts them.</p>
+                                <div id="membersPendingRequestsList" aria-live="polite"></div>
                             </div>
+                            <div class="people-toolbar">
+                                <div class="segmented members-filter" role="group" aria-label="Show members" id="membersFilter">
+                                    <button class="segmented-btn active" type="button" data-members-filter="all" aria-pressed="true">All</button>
+                                    <button class="segmented-btn" type="button" data-members-filter="attention" aria-pressed="false">Needs attention</button>
+                                    <button class="segmented-btn" type="button" data-members-filter="needs_access" aria-pressed="false">Needs group access</button>
+                                    <button class="segmented-btn" type="button" data-members-filter="invited" aria-pressed="false">Invited</button>
+                                    <button class="segmented-btn" type="button" data-members-filter="pending" aria-pressed="false">Needs approval</button>
+                                    <button class="segmented-btn" type="button" data-members-filter="unverified" aria-pressed="false">Unverified</button>
+                                    <button class="segmented-btn" type="button" data-members-filter="missing_key" aria-pressed="false">Missed key</button>
+                                    <button class="segmented-btn" type="button" data-members-filter="stale" aria-pressed="false">Stale</button>
+                                </div>
+                                <input class="people-search" id="membersSearch" type="search" placeholder="Search by email or device"
+                                    aria-label="Search members and devices" autocomplete="off" spellcheck="false">
+                            </div>
+                            <p class="people-summary" id="membersSummary" role="status"></p>
+                            <div class="members-list" id="membersList" aria-live="polite"></div>
                         </div>
-                    </div>
+                    </section>
 
-                    <!-- Embedded Terminal -->
+                    <!-- HybridCipher Console (runs only hybridcipher commands, no shell) -->
                     <div class="terminal-container" id="terminalContainer">
                         <!-- Resize Handle -->
                         <div class="terminal-resize-handle" id="terminalResizeHandle"></div>
@@ -941,7 +873,7 @@
                                 <span class="dot dot-yellow"></span>
                                 <span class="dot dot-green"></span>
                                 <img src="logo.png" alt="HybridCipher" class="terminal-logo" width="16" height="16">
-                                <span id="terminalHeaderTitle">Embedded Terminal</span>
+                                <span id="terminalHeaderTitle">HybridCipher Console</span>
                             </div>
                             <div class="terminal-status" id="terminalCwdDisplay">Ready</div>
                         </div>
@@ -983,6 +915,24 @@
                             Cancel mount
                         </button>
                     </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Unmount Progress Modal -->
+    <div class="modal hidden" id="unmountProgressModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-small" role="dialog" aria-modal="true" aria-labelledby="unmountProgressTitle">
+            <div class="modal-header">
+                <h2 id="unmountProgressTitle">Unmounting folders</h2>
+            </div>
+            <div class="modal-body">
+                <p class="unmount-progress-summary" id="unmountProgressSummary" aria-live="polite"></p>
+                <ul class="unmount-progress-list" id="unmountProgressList"></ul>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="unmountRunInBackgroundBtn">Run in background</button>
+                    <button type="button" class="btn btn-primary hidden" id="unmountProgressCloseBtn">Close</button>
                 </div>
             </div>
         </div>
@@ -1239,12 +1189,12 @@
         <div class="modal-backdrop" id="recoveryAutoBackupBackdrop"></div>
         <div class="modal-content recovery-auto-backup-modal">
             <div class="modal-header">
-                <h2>Enable automatic backup</h2>
+                <h2>Recover with code</h2>
                 <button class="modal-close" id="closeRecoveryAutoBackupModalBtn">&times;</button>
             </div>
             <div class="modal-body">
                 <p class="recovery-auto-backup-lead">
-                    Enter your account password and saved recovery code once to enable silent recovery backup updates on this device.
+                    Restore your encryption keys and fully trust this device using your account password and saved encryption recovery code.
                 </p>
                 <form id="recoveryAutoBackupForm">
                     <div class="form-group">
@@ -1256,12 +1206,195 @@
                         <label for="recoveryAutoBackupCodeInput">Recovery code</label>
                         <input type="password" id="recoveryAutoBackupCodeInput"
                             placeholder="XXXXXXXX-XXXXXXXX-..." autocomplete="off">
-                        <span class="form-hint">This code is only used locally to unlock your existing recovery backup.</span>
+                        <span class="form-hint">Use your encryption recovery code. MFA backup codes are used only for sign-in and verification.</span>
                         <span class="form-error hidden" id="recoveryAutoBackupError"></span>
                     </div>
                     <div class="form-actions">
                         <button type="button" class="btn btn-secondary" id="cancelRecoveryAutoBackupBtn">Cancel</button>
-                        <button type="submit" class="btn btn-primary" id="submitRecoveryAutoBackupBtn">Enable</button>
+                        <button type="submit" class="btn btn-primary" id="submitRecoveryAutoBackupBtn">Recover</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Local Vault Recovery Kit Modal -->
+    <div class="modal hidden" id="localRecoveryKitModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content recovery-code-modal" role="dialog" aria-modal="true"
+            aria-labelledby="localRecoveryKitTitle">
+            <div class="modal-header">
+                <h2 id="localRecoveryKitTitle">Save your recovery kit</h2>
+                <button class="modal-close" id="closeLocalRecoveryKitModalBtn" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="localRecoveryKitIntro">
+                    <p class="recovery-code-lead">
+                        Protecting a folder encrypts its files on this computer. If this computer is lost, reset or
+                        replaced, your recovery kit is the only way to open them again. It takes a minute.
+                    </p>
+                    <p class="recovery-code-hint">
+                        You'll save a small kit file and see a recovery key. Keep them apart: for example, the file on a
+                        USB drive or cloud folder, and the key in a password manager or on paper.
+                    </p>
+                    <button class="btn btn-primary btn-block" id="saveLocalRecoveryKitBtn" type="button">
+                        Save recovery kit…
+                    </button>
+                </div>
+                <form id="localRecoveryKitConfirm" class="hidden">
+                    <p class="recovery-code-lead">This is your recovery key. HybridCipher does not keep a copy.</p>
+                    <div class="recovery-code-box">
+                        <code id="localRecoveryKitCode">----</code>
+                        <button class="btn btn-secondary btn-small" id="copyLocalRecoveryKitCodeBtn" type="button">Copy</button>
+                    </div>
+                    <div class="form-group">
+                        <label for="localRecoveryKitCheckInput">To confirm you saved it, type its last 4 characters</label>
+                        <input type="text" id="localRecoveryKitCheckInput" maxlength="4" autocomplete="off"
+                            autocapitalize="characters" spellcheck="false">
+                        <span class="form-error hidden" id="localRecoveryKitError" role="alert"></span>
+                    </div>
+                    <button class="btn btn-primary btn-block" id="confirmLocalRecoveryKitBtn" type="submit">
+                        I've saved it
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Local Vault Upgrade Modal -->
+    <div class="modal hidden" id="localUpgradeModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content recovery-auto-backup-modal" role="dialog" aria-modal="true"
+            aria-labelledby="localUpgradeTitle">
+            <div class="modal-header">
+                <h2 id="localUpgradeTitle">Use your files on other devices</h2>
+                <button class="modal-close" id="closeLocalUpgradeModalBtn" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="localUpgradeForm">
+                    <p class="recovery-auto-backup-lead">
+                        Create an account and the files already protected here become part of it. Nothing is
+                        re-encrypted, and your files never leave this computer unencrypted.
+                    </p>
+                    <div class="form-group">
+                        <label for="localUpgradeEmailInput">Email</label>
+                        <input type="email" id="localUpgradeEmailInput" autocomplete="email" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="localUpgradePasswordInput">Password</label>
+                        <input type="password" id="localUpgradePasswordInput" autocomplete="new-password" required>
+                    </div>
+                    <div class="form-group" id="localUpgradeConfirmGroup">
+                        <label for="localUpgradePasswordConfirmInput">Confirm password</label>
+                        <input type="password" id="localUpgradePasswordConfirmInput" autocomplete="new-password">
+                    </div>
+                    <div class="form-group" id="localUpgradeCodeGroup">
+                        <label for="localUpgradeCodeInput">Recovery key</label>
+                        <input type="password" id="localUpgradeCodeInput" placeholder="XXXXXXXX-XXXXXXXX-..."
+                            autocomplete="off" spellcheck="false">
+                        <span class="form-hint">Your recovery key keeps working for the account.</span>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="localUpgradeNoCodeInput">
+                            I don't have it. Give me a new recovery key.
+                        </label>
+                    </div>
+                    <p class="form-hint hidden" id="localUpgradeStatus" role="status" aria-live="polite"></p>
+                    <span class="form-error hidden" id="localUpgradeError" role="alert"></span>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary hidden" id="localUpgradeResendBtn">Resend email</button>
+                        <button type="button" class="btn btn-secondary hidden" id="localUpgradeChangeEmailBtn">Use a different email</button>
+                        <button type="button" class="btn btn-secondary" id="cancelLocalUpgradeBtn">Cancel</button>
+                        <button type="button" class="btn btn-secondary" id="localUpgradeSignInBtn"
+                            title="Sign in and move these files into your existing account">Sign in to existing account</button>
+                        <button type="submit" class="btn btn-primary" id="submitLocalUpgradeBtn">Create account</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Local Vault Recovery Key Reminder (after creating an account with the same key) -->
+    <div class="modal hidden" id="localRecoveryReminderModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content recovery-code-modal" role="dialog" aria-modal="true"
+            aria-labelledby="localRecoveryReminderTitle">
+            <div class="modal-header">
+                <h2 id="localRecoveryReminderTitle">Keep your recovery key safe</h2>
+                <button class="modal-close" id="closeLocalRecoveryReminderBtn" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="recovery-code-lead">
+                    The recovery key you just entered is now your account's recovery key too. If you forget your
+                    password or lose this computer, it's the only way to get your files back.
+                </p>
+                <p class="recovery-code-hint">
+                    Keep it somewhere other than this computer, such as a password manager or on paper. Keep the
+                    recovery kit file too. HybridCipher doesn't keep a copy.
+                </p>
+                <button class="btn btn-primary btn-block" id="ackLocalRecoveryReminderBtn" type="button">
+                    Got it
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Move a local vault into an existing account -->
+    <div class="modal hidden" id="localMergeModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content recovery-auto-backup-modal" role="dialog" aria-modal="true"
+            aria-labelledby="localMergeTitle">
+            <div class="modal-header">
+                <h2 id="localMergeTitle">Move files into your account</h2>
+                <button class="modal-close" id="closeLocalMergeModalBtn" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="recovery-auto-backup-lead">
+                    The folders you protected on this device before signing in move into your Personal workspace.
+                    Their files aren't decrypted or re-encrypted; only the keys that open them change.
+                </p>
+                <p class="form-hint">
+                    Protected folders close while this runs. Afterwards your account's recovery key protects these
+                    files. Keep the vault's recovery kit if you have backups or copies of them from before the move:
+                    only the kit opens those.
+                </p>
+                <p class="form-hint hidden" id="localMergeStatus" role="status" aria-live="polite"></p>
+                <span class="form-error hidden" id="localMergeError" role="alert"></span>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="cancelLocalMergeBtn">Not now</button>
+                    <button type="button" class="btn btn-primary" id="submitLocalMergeBtn">Move files</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Local Vault Restore Modal -->
+    <div class="modal hidden" id="localRestoreModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content recovery-auto-backup-modal" role="dialog" aria-modal="true"
+            aria-labelledby="localRestoreTitle">
+            <div class="modal-header">
+                <h2 id="localRestoreTitle">Restore from a recovery kit</h2>
+                <button class="modal-close" id="closeLocalRestoreModalBtn" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="localRestoreForm">
+                    <p class="recovery-auto-backup-lead" id="localRestoreLead">
+                        Open files you protected on another computer without an account.
+                    </p>
+                    <div class="form-group">
+                        <label for="localRestoreFileBtn">Recovery kit file</label>
+                        <button type="button" class="btn btn-secondary" id="localRestoreFileBtn">Choose file…</button>
+                        <span class="form-hint" id="localRestoreFileName">No file chosen</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="localRestoreCodeInput">Recovery key</label>
+                        <input type="password" id="localRestoreCodeInput" placeholder="XXXXXXXX-XXXXXXXX-..."
+                            autocomplete="off" spellcheck="false">
+                        <span class="form-error hidden" id="localRestoreError" role="alert"></span>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" id="cancelLocalRestoreBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="submitLocalRestoreBtn">Restore</button>
                     </div>
                 </form>
             </div>
@@ -1372,20 +1505,52 @@
         <div class="modal-backdrop"></div>
         <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="addGroupMemberTitle">
             <div class="modal-header">
-                <h2 id="addGroupMemberTitle">Add group member</h2>
+                <h2 id="addGroupMemberTitle">Add person</h2>
                 <button class="modal-close" id="closeAddGroupMemberBtn" type="button" aria-label="Close">&times;</button>
             </div>
             <div class="modal-body">
-                <p>Choose someone who has joined your organization. Adding them shares access to this encrypted group.</p>
+                <p>Enter their email. People already in your Team get access to this group right away. Anyone else is invited to the Team, which uses one seat, and gets access to this group after they join.</p>
                 <form id="addGroupMemberForm">
                     <div class="form-group">
-                        <label for="groupMemberSelect">Organization member</label>
-                        <select id="groupMemberSelect" required></select>
+                        <label for="groupMemberEmail">Email</label>
+                        <input type="email" id="groupMemberEmail" list="groupMemberSuggestions" autocomplete="off" spellcheck="false" required placeholder="name@example.com">
+                        <datalist id="groupMemberSuggestions"></datalist>
                     </div>
                     <p class="form-hint" id="groupMemberDirectoryNote" role="status"></p>
                     <div class="form-actions">
-                        <button class="btn btn-secondary" id="groupMemberInviteOrganizationBtn" type="button">Invite to organization</button>
-                        <button class="btn btn-primary" id="groupMemberAddBtn" type="submit">Add to group</button>
+                        <button class="btn btn-secondary" id="groupMemberCancelBtn" type="button">Cancel</button>
+                        <button class="btn btn-primary" id="groupMemberAddBtn" type="submit">Add person</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Invite to Team, or choose groups for an existing member (Members & devices). -->
+    <div class="modal hidden" id="teamInviteModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="teamInviteTitle">
+            <div class="modal-header">
+                <h2 id="teamInviteTitle">Invite to Team</h2>
+                <button class="modal-close" id="closeTeamInviteBtn" type="button" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="teamInviteIntro">Inviting someone uses one seat. Choose groups now, or add them to groups later.</p>
+                <form id="teamInviteForm">
+                    <div class="form-group" id="teamInviteEmailGroup">
+                        <label for="teamInviteEmail">Email</label>
+                        <input type="email" id="teamInviteEmail" autocomplete="off" spellcheck="false" placeholder="name@example.com">
+                    </div>
+                    <fieldset class="form-group team-invite-groups" id="teamInviteGroupsField">
+                        <legend>Groups</legend>
+                        <div id="teamInviteGroups"></div>
+                    </fieldset>
+                    <p class="form-hint" id="teamInviteSeats" role="status"></p>
+                    <label for="teamInviteCode" class="hidden" id="teamInviteCodeLabel">Invitation code (shown once; send it to them)</label>
+                    <input id="teamInviteCode" class="hidden" type="text" readonly aria-label="Invitation code">
+                    <div class="form-actions">
+                        <button class="btn btn-secondary" id="teamInviteCancelBtn" type="button">Cancel</button>
+                        <button class="btn btn-primary" id="teamInviteSubmitBtn" type="submit">Invite</button>
                     </div>
                 </form>
             </div>
@@ -1423,95 +1588,12 @@
         </div>
     </div>
 
-    <!-- Switch Group Modal -->
-    <div class="modal hidden" id="switchGroupModal">
-        <div class="modal-backdrop"></div>
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Switch Group</h2>
-                <button class="modal-close" id="closeSwitchGroupModalBtn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="group-list" id="switchGroupList">
-                    <div class="group-list-empty">Loading groups...</div>
-                </div>
-                <span class="form-hint">Select a group, or enter an ID manually.</span>
-                <div class="form-group">
-                    <label for="switchGroupManualId">Group ID (optional)</label>
-                    <input type="text" id="switchGroupManualId" placeholder="UUID or prefix">
-                </div>
-                <div class="form-actions">
-                    <button type="button" class="btn btn-secondary" id="cancelSwitchGroupBtn">Cancel</button>
-                    <button type="button" class="btn btn-primary" id="submitSwitchGroupBtn">Switch group</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- List Groups Modal -->
-    <div class="modal hidden" id="listGroupsModal">
-        <div class="modal-backdrop" id="listGroupsBackdrop"></div>
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Groups</h2>
-                <button class="modal-close" id="closeListGroupsModalBtn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="group-details-list" id="listGroupsList">
-                    <div class="group-list-empty">Loading groups...</div>
-                </div>
-                <div class="form-actions">
-                    <button type="button" class="btn btn-secondary" id="cancelListGroupsBtn">Close</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Remove Member Modal -->
-    <div class="modal hidden" id="removeMemberModal">
-        <div class="modal-backdrop" id="removeMemberBackdrop"></div>
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Remove member</h2>
-                <button class="modal-close" id="closeRemoveMemberModalBtn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="member-list" id="removeMemberList">
-                    <div class="member-list-empty">Loading members...</div>
-                </div>
-                <span class="form-hint">Removing a member revokes access and requires a rekey.</span>
-                <div class="form-actions">
-                    <button type="button" class="btn btn-secondary" id="cancelRemoveMemberBtn">Close</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- List Members Modal -->
-    <div class="modal hidden" id="listMembersModal">
-        <div class="modal-backdrop" id="listMembersBackdrop"></div>
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Group members</h2>
-                <button class="modal-close" id="closeListMembersModalBtn">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="member-details-list" id="listMembersList">
-                    <div class="member-list-empty">Loading members...</div>
-                </div>
-                <div class="form-actions">
-                    <button type="button" class="btn btn-secondary" id="cancelListMembersBtn">Close</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
     <!-- Device Verification Modal -->
     <div class="modal hidden" id="deviceVerifyModal">
         <div class="modal-backdrop" id="deviceVerifyBackdrop"></div>
         <div class="modal-content device-verify-modal">
             <div class="modal-header">
-                <h2>Verify device</h2>
+                <h2 id="deviceVerifyTitle">Verify device</h2>
                 <button class="modal-close" id="closeDeviceVerifyModalBtn">&times;</button>
             </div>
             <div class="modal-body">
@@ -1535,6 +1617,67 @@
     </div>
 
     <!-- Verify Trust Modal -->
+    <div class="modal hidden" id="rotationSkipModal">
+        <div class="modal-backdrop" id="rotationSkipBackdrop"></div>
+        <div class="modal-content rotation-skip-modal">
+            <div class="modal-header">
+                <h2>Some devices may not get the new key</h2>
+                <button class="modal-close" id="closeRotationSkipModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="rotation-skip-intro" id="rotationSkipSummary"></p>
+                <div class="queue-details-body rotation-skip-list" id="rotationSkipList" aria-live="polite"></div>
+                <p class="rotation-skip-note">Remove devices nobody uses. A device that can't receive the new key is skipped and then appears under Needs attention &rarr; Approve new devices. Approve it there after it signs in again, and it gets the new key.</p>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="cancelRotationSkipBtn">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="confirmRotationSkipBtn">Rotate without them</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal hidden" id="serverIdentityModal">
+        <div class="modal-backdrop" id="serverIdentityBackdrop"></div>
+        <div class="modal-content server-identity-modal">
+            <div class="modal-header">
+                <h2>Server identity</h2>
+                <button class="modal-close" id="closeServerIdentityModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="server-identity-intro">The app pins this server's key on first contact. Compare the safety number with another trusted device or your administrator to confirm you are talking to the real server.</p>
+                <dl class="server-identity-details" id="serverIdentityDetails" aria-live="polite">
+                    <dt>Connection</dt><dd id="serverIdentityConnection">Checking…</dd>
+                    <dt>Server</dt><dd id="serverIdentityUrl">—</dd>
+                    <dt>Identity</dt><dd id="serverIdentityTrust">—</dd>
+                    <dt>Safety number</dt><dd class="server-identity-mono" id="serverIdentitySafetyNumber">—</dd>
+                    <dt>Fingerprint</dt><dd class="server-identity-mono" id="serverIdentityFingerprint">—</dd>
+                </dl>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" id="serverIdentityCheckpointBtn">Save trust checkpoint</button>
+                    <button type="button" class="btn btn-primary" id="serverIdentityVerifyBtn">Verify safety number</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal hidden" id="keyVersionsModal">
+        <div class="modal-backdrop" id="keyVersionsBackdrop"></div>
+        <div class="modal-content key-versions-modal">
+            <div class="modal-header">
+                <h2>Key versions</h2>
+                <button class="modal-close" id="closeKeyVersionsModalBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="key-versions-current" id="keyVersionsCurrent" aria-live="polite">Loading…</p>
+                <h3 class="key-versions-heading">History</h3>
+                <ol class="key-versions-history" id="keyVersionsHistory"></ol>
+                <h3 class="key-versions-heading">Devices <span class="key-versions-summary" id="keyVersionsDeviceSummary"></span></h3>
+                <div class="key-versions-devices" id="keyVersionsDeviceList"></div>
+                <p class="key-versions-note">A device confirms a new key the next time HybridCipher opens on it. Devices still on an older app version cannot confirm and stay under Waiting until they update.</p>
+            </div>
+        </div>
+    </div>
+
     <div class="modal hidden" id="adminPinVerifyModal">
         <div class="modal-backdrop" id="adminPinVerifyBackdrop"></div>
         <div class="modal-content admin-pin-verify-modal">
@@ -1647,6 +1790,22 @@
             <div class="logging-in-content">
                 <div class="spinner"></div>
                 <p id="actionProgressMessage">Working...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Protecting or decrypting a folder: progress the user can send to the background -->
+    <div class="modal hidden" id="folderJobModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-compact folder-job-content" role="dialog" aria-modal="true"
+            aria-labelledby="folderJobTitle">
+            <h3 class="folder-job-title" id="folderJobTitle">Protecting folder</h3>
+            <p class="folder-job-phase" id="folderJobPhase" aria-live="polite">Counting files…</p>
+            <progress class="folder-job-bar" id="folderJobBar" max="100"></progress>
+            <p class="folder-job-detail" id="folderJobDetail"></p>
+            <p class="folder-job-hint">You can keep using HybridCipher while this runs. You'll be told when it's done.</p>
+            <div class="folder-job-actions">
+                <button class="btn btn-secondary" id="folderJobBackgroundBtn" type="button">Run in background</button>
             </div>
         </div>
     </div>
@@ -1923,6 +2082,7 @@
                             <p>Account actions that apply immediately on this device.</p>
                         </div>
                         <div class="settings-actions">
+                            <button class="btn btn-secondary settings-action" id="settingsOpenTeamBtn" type="button">Activate Team</button>
                             <button class="btn btn-secondary settings-action" id="settingsLogoutBtn" type="button">
                                 Logout
                             </button>
@@ -1932,7 +2092,7 @@
                         </div>
                     </section>
 
-                    <section class="settings-section" id="settingsTeamSection">
+                    <section class="settings-section hidden" id="settingsTeamSection">
                         <div class="settings-section-header">
                             <h3>Workspace license</h3>
                             <p>Personal is always available. A Team code adds an organization to this account.</p>
@@ -1959,35 +2119,8 @@
                         <button class="btn btn-secondary hidden" id="teamExportExistingBtn" type="button">
                             Export an existing encrypted file
                         </button>
-                        <div id="teamActivationForm" class="team-license-form">
-                            <label for="teamOrganizationName">Organization name</label>
-                            <input id="teamOrganizationName" type="text" maxlength="100" autocomplete="organization" placeholder="Your organization">
-                            <label for="teamUnlockCode">Single-use Team code</label>
-                            <input id="teamUnlockCode" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="HC-TEAM-…">
-                            <button class="btn btn-primary" id="teamActivateBtn" type="button">Activate Team</button>
-                        </div>
-                        <div id="teamInvitationAcceptance" class="team-license-form">
-                            <label for="teamInvitationCode">Joining an existing Team?</label>
-                            <input id="teamInvitationCode" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="Invitation code">
-                            <button class="btn btn-secondary" id="teamAcceptInvitationBtn" type="button">Join Team</button>
-                        </div>
-                        <div id="teamInviteForm" class="team-license-form hidden">
-                            <label for="teamInviteEmail">Invite an organization member</label>
-                            <input id="teamInviteEmail" type="email" autocomplete="email" placeholder="person@example.com">
-                            <button class="btn btn-secondary" id="teamInviteBtn" type="button">Reserve seat and create invitation</button>
-                            <label for="teamGeneratedInvitation" class="hidden" id="teamGeneratedInvitationLabel">Invitation code (shown once)</label>
-                            <input id="teamGeneratedInvitation" class="hidden" type="text" readonly aria-label="Invitation code">
-                        </div>
-                        <div id="teamDirectoryPanel" class="team-license-form hidden">
-                            <strong>Organization members and invitations</strong>
-                            <p id="teamDirectoryNote"></p>
-                            <div id="teamDirectoryList" aria-live="polite"></div>
-                        </div>
-                        <div id="teamPendingRequestsPanel" class="team-license-form hidden">
-                            <strong>Team administration requests</strong>
-                            <p>Offline requests take effect only after the server accepts them.</p>
-                            <div id="teamPendingRequestsList" aria-live="polite"></div>
-                        </div>
+                        <!-- Inviting and removing people happens on Members & devices. -->
+                        <button class="dashboard-card-link hidden" id="teamDirectoryMembersLink" type="button">Manage members and invitations</button>
                     </section>
 
                     <section class="settings-section" id="settingsFoldersSection">
@@ -1998,13 +2131,10 @@
                         <div class="settings-info">
                             <div class="settings-info-item settings-info-item-checkbox">
                                 <div class="settings-info-copy">
-                                    <span class="settings-info-label">Auto-mount last folder</span>
-                                    <span class="settings-info-help">Automatically mount the last mounted protected folder after login.</span>
+                                    <span class="settings-info-label">Auto-mount</span>
+                                    <span class="settings-info-help" id="settingsAutoMountSummary">Choose folders in the Mount Center to mount them in the background when you sign in.</span>
                                 </div>
-                                <label class="checkbox-label settings-checkbox-label">
-                                    <input type="checkbox" id="settingsAutoMountLastFolder">
-                                    <span>Enabled</span>
-                                </label>
+                                <button class="btn btn-secondary btn-small" id="settingsAutoMountChooseBtn" type="button">Choose in Mount Center</button>
                             </div>
                         </div>
                         <div class="settings-actions">
@@ -2015,6 +2145,9 @@
                             <button class="btn btn-secondary settings-action" id="settingsUnenrollFoldersBtn"
                                 type="button" aria-expanded="false" aria-controls="settingsEnrollmentModal">
                                 Remove protected folder
+                            </button>
+                            <button class="btn btn-secondary settings-action" id="settingsShowGuideBtn" type="button">
+                                Show getting started guide
                             </button>
                         </div>
                     </section>
@@ -2051,6 +2184,24 @@
                         <div class="settings-actions">
                             <button class="btn settings-action mfa-enable-btn" id="settingsMfaEnableBtn" type="button">
                                 Enable MFA
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section hidden" id="settingsLocalKitSection">
+                        <div class="settings-section-header">
+                            <h3>Recovery kit</h3>
+                            <p>Your recovery kit is the only way to open these files if this computer is lost or replaced.</p>
+                        </div>
+                        <div class="settings-info">
+                            <div class="settings-info-item">
+                                <span class="settings-info-label">Recovery kit</span>
+                                <span class="settings-info-value" id="settingsLocalKitStatus">—</span>
+                            </div>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn btn-secondary settings-action" id="settingsLocalKitBtn" type="button">
+                                Make a new recovery kit
                             </button>
                         </div>
                     </section>
@@ -2147,9 +2298,12 @@
                             <section class="settings-section" id="settingsAdvancedMountSection">
                                 <div class="settings-section-header">
                                     <h3>Mount management</h3>
-                                    <p>Safely disconnect every mounted folder after checking pending changes and conflicts.</p>
+                                    <p>See and manage mounted folders from every workspace and group in the Mount Center, or safely disconnect every mounted folder after checking pending changes and conflicts.</p>
                                 </div>
                                 <div class="settings-actions">
+                                    <button class="btn btn-secondary settings-action" id="settingsMountCenterBtn" type="button">
+                                        Open Mount Center
+                                    </button>
                                     <button class="btn btn-danger settings-action" id="settingsUnmountBtn" type="button">
                                         Unmount all…
                                     </button>
@@ -2171,14 +2325,12 @@
                             <section class="settings-section" id="settingsAdvancedTrustSection">
                                 <div class="settings-section-header">
                                     <h3>Server trust</h3>
-                                    <p>Inspect trust checkpoints, pins, and diagnostic command help.</p>
+                                    <p>Check the server&#39;s identity and the device keys you have pinned.</p>
                                 </div>
                                 <div class="settings-actions">
-                                    <button class="btn btn-secondary settings-action" id="settingsServerTrustShowBtn" type="button">Server trust status</button>
-                                    <button class="btn btn-secondary settings-action" id="settingsServerTrustCheckpointBtn" type="button">Trust checkpoint</button>
-                                    <button class="btn btn-secondary settings-action" id="settingsPinListBtn" type="button">Pin list</button>
-                                    <button class="btn btn-secondary settings-action" id="settingsPinHelpBtn" type="button">Pin help</button>
-                                    <button class="btn btn-secondary settings-action" id="settingsServerTrustHelpBtn" type="button">Server trust help</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsServerTrustShowBtn" type="button">Server identity</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsServerTrustCheckpointBtn" type="button">Save trust checkpoint</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsPinListBtn" type="button">Pinned device keys</button>
                                 </div>
                             </section>
 
@@ -2203,6 +2355,7 @@
                                     <button class="btn btn-secondary settings-action" id="settingsAuditSampleBtn" type="button">Sample audit</button>
                                     <button class="btn btn-secondary settings-action" id="settingsAuditFullBtn" type="button">Full audit</button>
                                     <button class="btn btn-secondary settings-action" id="settingsRecoverMarkersBtn" type="button">Sync protected folders</button>
+                                    <button class="btn btn-secondary settings-action" id="settingsCopyKeyStateBtn" type="button">Copy key diagnostics</button>
                                 </div>
                             </section>
 
@@ -2329,42 +2482,33 @@
     <div class="notification-container" id="notificationContainer"></div>
 
     <!-- Context Menu -->
-    <div class="context-menu hidden" id="contextMenu">
-        <div class="context-menu-item" data-action="mount">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path stroke="currentColor" stroke-width="2" d="M21 3L3 21M3 3l18 18" />
-            </svg>
-            <span>Mount</span>
-        </div>
-        <div class="context-menu-item hidden" data-action="open-mounted">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                    d="M3 7h5l2 2h11v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 13h7" />
-            </svg>
-            <span>Open</span>
-        </div>
-        <div class="context-menu-item hidden" data-action="resolve-conflicts">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                    d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
-                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 9v4m0 4h.01" />
-            </svg>
-            <span>Resolve conflicts</span>
-        </div>
-        <div class="context-menu-item hidden" data-action="resolve-recovery">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                    d="M12 3l8 4v6c0 4.418-3.582 8-8 8s-8-3.582-8-8V7l8-4z" />
-                <path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 12h8m-4-4v8" />
-            </svg>
-            <span>Resolve recovery copies</span>
-        </div>
-        <div class="context-menu-item" data-action="unmount-cli">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path stroke="currentColor" stroke-width="2" d="M18 6L6 18M6 6l12 12" />
-            </svg>
-            <span>Unmount</span>
+    <!-- Items are rendered from buildFolderContextMenuActions() in showContextMenu() -->
+    <div class="context-menu hidden" id="contextMenu" role="menu"></div>
+
+    <div class="modal hidden" id="teamActivationModal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="teamActivationTitle">
+            <div class="modal-header">
+                <h2 id="teamActivationTitle">Activate Team</h2>
+                <button class="modal-close" id="closeTeamActivationBtn" type="button" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="teamActivationError" class="form-error hidden" role="alert"></p>
+                <button class="btn btn-primary hidden" id="teamOpenWorkspaceBtn" type="button">Open Team workspace</button>
+                <div id="teamActivationForm" class="team-license-form">
+                    <label for="teamOrganizationName">Organization name</label>
+                    <input id="teamOrganizationName" type="text" maxlength="100" autocomplete="organization" placeholder="Your organization">
+                    <label for="teamUnlockCode">Single-use Team code</label>
+                    <input id="teamUnlockCode" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="HC-TEAM-…">
+                    <button class="btn btn-primary" id="teamActivateBtn" type="button">Activate Team</button>
+                </div>
+                <div id="teamInvitationAcceptance" class="team-license-form">
+                    <label for="teamInvitationCode">Joining an existing Team?</label>
+                    <input id="teamInvitationCode" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="Invitation code">
+                    <button class="btn btn-secondary" id="teamAcceptInvitationBtn" type="button">Join Team</button>
+                </div>
+                <div class="form-actions"><button class="btn btn-secondary" id="teamActivationCancelBtn" type="button">Cancel</button></div>
+            </div>
         </div>
     </div>
 
@@ -2391,6 +2535,7 @@
             </div>
             <div class="modal-body">
                 <p id="desktopOperationPhase" role="status" aria-live="polite">Preparing…</p>
+                <ul id="desktopOperationSummary" class="operation-summary hidden"></ul>
                 <progress id="desktopOperationProgress" class="operation-progress" aria-label="Operation progress"></progress>
                 <p id="desktopOperationError" class="form-error hidden" role="alert"></p>
                 <form id="desktopOperationInputForm" class="hidden">
@@ -2405,19 +2550,18 @@
                     </div>
                 </form>
                 <details id="desktopOperationDetails" class="hidden">
-                    <summary>Results and details</summary>
+                    <summary>Technical details</summary>
                     <div id="desktopOperationOutput" class="operation-output"></div>
                 </details>
                 <div class="form-actions">
                     <button class="btn btn-secondary" id="desktopOperationCloseBtn" type="button">Close</button>
                     <button class="btn btn-primary hidden" id="desktopOperationRetryBtn" type="button">Retry</button>
                 </div>
-                <p class="form-hint" id="desktopOperationBackgroundNote">Closing this window keeps the operation available in Activity.</p>
+                <p class="form-hint" id="desktopOperationBackgroundNote">It keeps running in the background; Activity in the header shows its progress, and you get a notification when it finishes.</p>
             </div>
         </div>
     </div>
 
-    <script src="cli-commands.js"></script>
     <script src="vendor/xterm/xterm.js"></script>
     <script src="vendor/xterm/xterm-addon-fit.js"></script>
     <script src="security-utils.js"></script>
@@ -2427,9 +2571,11 @@
     <script src="auto-mount-utils.js"></script>
     <script src="legal-utils.js"></script>
     <script src="release-notes-utils.js"></script>
+    <script src="getting-started-utils.js"></script>
     <script src="app-tauri.js"></script>
     <script src="app-update-methods.js"></script>
     <script src="app-team-methods.js"></script>
+    <script src="app-local-vault-methods.js"></script>
     <script src="app.js"></script>
 </body>
 

@@ -196,6 +196,9 @@ pub struct GroupInfo {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub current_epoch: Option<String>,
+    /// Absent on servers from before key versions were listed with groups.
+    #[serde(default)]
+    pub current_key_version: Option<u64>,
     pub member_count: u32,
     pub settings: GroupSettings,
     pub user_role: GroupRole,

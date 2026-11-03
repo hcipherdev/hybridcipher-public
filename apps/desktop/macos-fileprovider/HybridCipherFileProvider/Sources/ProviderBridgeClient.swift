@@ -14,6 +14,8 @@ enum ProviderBridgeError: Error, LocalizedError {
     case writeFailed(String)
     case readFailed(String)
     case providerRejected(String)
+    case legacyConsentRequired
+    case busy(String)
 
     var errorDescription: String? {
         switch self {
@@ -29,12 +31,18 @@ enum ProviderBridgeError: Error, LocalizedError {
             return "Provider socket read failed: \(detail)"
         case .providerRejected(let detail):
             return detail
+        case .legacyConsentRequired:
+            return "Open HybridCipher and review access to older files in this folder before opening this item."
+        case .busy(let detail):
+            return detail
         }
     }
 }
 
 actor ProviderBridgeClient: ProviderEnumeratorBridge {
-    static let unixSocketPathLimit = 104
+    /// Longest socket path an address can carry: the kernel reads up to 255
+    /// bytes (`sun_len`), less the length and family bytes and the trailing NUL.
+    static let maxSocketPathLength = 252
 
     private let rootId: UUID
     private let encoder: JSONEncoder
@@ -43,29 +51,44 @@ actor ProviderBridgeClient: ProviderEnumeratorBridge {
 
     init(rootId: UUID, socketURL: URL? = nil) throws {
         self.rootId = rootId
-        self.socketURL = socketURL ?? Self.defaultSocketURL(rootId: rootId)
+        self.socketURL = try socketURL ?? Self.defaultSocketURL(rootId: rootId)
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
         self.decoder.dateDecodingStrategy = .iso8601
         self.encoder.dateEncodingStrategy = .iso8601
     }
 
-    private static func defaultSocketURL(rootId: UUID) -> URL {
+    /// The app-group container is the only place the sandbox lets the extension
+    /// connect to, so there is no fallback: a long path is handled in `connectSocket`.
+    static func defaultSocketURL(rootId: UUID) throws -> URL {
         let rootHex = rootId.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let shortRoot = String(rootHex.prefix(16))
         let filename = "\(shortRoot).sock"
         let groupIdentifier = ProviderAppGroup.identifier()
-        if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
-            let candidate = container
-                .appendingPathComponent(filename)
-            if candidate.path.utf8.count < unixSocketPathLimit {
-                return candidate
-            }
+        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) else {
+            throw ProviderBridgeError.appGroupUnavailable(groupIdentifier)
         }
+        return container.appendingPathComponent(filename)
+    }
 
-        return URL(fileURLWithPath: "/tmp", isDirectory: true)
-            .appendingPathComponent("hc-fp", isDirectory: true)
-            .appendingPathComponent(filename)
+    /// A `sockaddr_un` for `path`, which may run past the struct's 104-byte
+    /// `sun_path`: the kernel reads as many bytes as `sun_len` says. The Rust host
+    /// binds the same way (`crates/macos-file-provider/src/long_socket.rs`).
+    static func socketAddress(path: String) throws -> [UInt8] {
+        let pathBytes = Array(path.utf8)
+        guard !pathBytes.isEmpty, !pathBytes.contains(0) else {
+            throw ProviderBridgeError.connectFailed("invalid socket path")
+        }
+        guard pathBytes.count <= maxSocketPathLength else {
+            throw ProviderBridgeError.socketPathTooLong(path)
+        }
+        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
+        let length = pathOffset + pathBytes.count + 1
+        var address = [UInt8](repeating: 0, count: length)
+        address[0] = UInt8(length)
+        address[1] = UInt8(AF_UNIX)
+        address.replaceSubrange(pathOffset..<(pathOffset + pathBytes.count), with: pathBytes)
+        return address
     }
 
     func status() async throws -> ProviderSocketResponse {
@@ -150,6 +173,12 @@ actor ProviderBridgeClient: ProviderEnumeratorBridge {
         let responseData = try readAll(from: fd)
         let response = try decoder.decode(ProviderSocketResponse.self, from: responseData)
         guard response.ok else {
+            if response.errorCode == .legacyConsentRequired {
+                throw ProviderBridgeError.legacyConsentRequired
+            }
+            if response.retryLater == true {
+                throw ProviderBridgeError.busy(response.message ?? "HybridCipher is busy")
+            }
             throw ProviderBridgeError.providerRejected(response.message ?? "Provider operation failed")
         }
         return response
@@ -167,29 +196,19 @@ actor ProviderBridgeClient: ProviderEnumeratorBridge {
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        var pathBytes = Array(socketURL.path.utf8)
-        pathBytes.append(0)
-        let maxPathLength = MemoryLayout.size(ofValue: address.sun_path)
-        guard pathBytes.count <= maxPathLength else {
+        let address: [UInt8]
+        do {
+            address = try Self.socketAddress(path: socketURL.path)
+        } catch {
             close(fd)
-            throw ProviderBridgeError.socketPathTooLong(socketURL.path)
+            throw error
         }
-
-        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
-            pointer.withMemoryRebound(to: UInt8.self, capacity: maxPathLength) { buffer in
-                for index in 0..<pathBytes.count {
-                    buffer[index] = pathBytes[index]
-                }
-            }
-        }
-
-        let addressLength = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count)
-        let result = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(fd, $0, addressLength)
-            }
+        let result = address.withUnsafeBytes { buffer in
+            Darwin.connect(
+                fd,
+                buffer.baseAddress!.assumingMemoryBound(to: sockaddr.self),
+                socklen_t(buffer.count)
+            )
         }
         guard result == 0 else {
             let detail = String(cString: strerror(errno))

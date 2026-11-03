@@ -109,6 +109,171 @@ pub struct DeviceRemovalOutcome {
     pub removed_current_device: bool,
 }
 
+#[cfg(test)]
+#[path = "../../tests/device_security/test_device_removal_ordering.rs"]
+mod device_removal_tests;
+
+async fn authorize_and_prepare_device_removal<P, A, S>(
+    authorization: A,
+    removing_current_device: bool,
+    shutdown: S,
+) -> Result<P, CliError>
+where
+    A: std::future::Future<Output = Result<P, CliError>>,
+    S: std::future::Future<Output = Result<(), CliError>>,
+{
+    let proof = authorization.await?;
+    if removing_current_device {
+        shutdown.await?;
+    }
+    Ok(proof)
+}
+
+/// First cross-device management action requires independent trust evidence.
+pub(crate) async fn ensure_device_management_trust(
+    session_manager: &SessionManager,
+) -> Result<(), CliError> {
+    let session = session_manager.require_auth()?;
+    let trust = hybridcipher_client::device_actions::fetch_device_trust(
+        &hybridcipher_client::device_actions::DeviceActionContext {
+            server_url: &session.server_url,
+            token: &session.token,
+            user_id: &session.user_id,
+            device_id: &session.device_id,
+        },
+    )
+    .await
+    .map_err(CliError::authentication)?;
+    if trust.can_revoke_other_devices && trust.can_approve_devices && trust.can_verify_devices {
+        return Ok(());
+    }
+    if trust.confirmation_required {
+        return handle_confirm_device_trust(session_manager).await;
+    }
+    Err(CliError::authentication(trust.blocking_reason.unwrap_or_else(||
+        "Approve and verify this device from a distinct trusted device before managing other devices.".into())))
+}
+
+/// Reconfirm an eligible existing key through a separate account-recovery step-up.
+pub async fn handle_confirm_device_trust(session_manager: &SessionManager) -> Result<(), CliError> {
+    use hybridcipher_client::device_actions::{
+        complete_device_trust_recovery, fetch_device_trust, DeviceActionContext,
+    };
+    use sha2::{Digest, Sha256};
+    use zeroize::Zeroize;
+    let session = session_manager.require_auth()?;
+    let identity = session_manager.get_or_create_device_keypair().await?;
+    let context = DeviceActionContext {
+        server_url: &session.server_url,
+        token: &session.token,
+        user_id: &session.user_id,
+        device_id: &session.device_id,
+    };
+    let trust = fetch_device_trust(&context)
+        .await
+        .map_err(CliError::authentication)?;
+    if trust.identity_key_sha256 != hex::encode(Sha256::digest(identity.public_key_bytes())) {
+        return Err(CliError::authentication(
+            "The registered device key does not match this local identity.",
+        ));
+    }
+    if trust.can_revoke_other_devices {
+        ui::success("This device is already trusted for device management.");
+        return Ok(());
+    }
+    if !trust.confirmation_required {
+        return Err(CliError::authentication(
+            "Use a trusted device to approve and verify this device before managing other devices.",
+        ));
+    }
+    ui::section("Confirm Device Trust");
+    let password = SecretString::new(ui::prompts::password("Account password")?);
+    let invitation = session_manager.get_or_create_invitation_keypair().await?;
+    let invitation_public = invitation
+        .invitation_public_key()
+        .map_err(|error| CliError::session(error.to_string()))?
+        .to_bytes();
+    let opaque = OpaqueAuth::new(session.device_id.clone());
+    let challenge = opaque
+        .device_trust_recovery_start(
+            &session.username,
+            password.expose_secret(),
+            &session.server_url,
+            DeviceLoginMetadata {
+                identity_public_key_hex: hex::encode(identity.public_key_bytes()),
+                invitation_public_key_hex: hex::encode(invitation_public),
+                device_display_name: None,
+                mfa_code: None,
+                backup_code: None,
+            },
+        )
+        .await
+        .map_err(map_recovery_error)?;
+    let otp_required = challenge.otp_required();
+    if otp_required {
+        ui::info("A confirmation code was sent to your registered email.");
+    }
+    let mut finalization = challenge
+        .finalize(password.expose_secret())
+        .map_err(map_recovery_error)?;
+    let mut mfa_proof: Option<MfaProof> = None;
+    let mut otp_code = if otp_required {
+        Some(ui::prompts::input("Email confirmation code")?)
+    } else {
+        None
+    };
+    let verification = async {
+        for _ in 0..3 {
+            match opaque
+                .device_trust_recovery_verify(
+                    &session.server_url,
+                    otp_code.clone(),
+                    finalization.clone(),
+                    mfa_proof.as_ref().and_then(|proof| proof.mfa_code.clone()),
+                    mfa_proof
+                        .as_ref()
+                        .and_then(|proof| proof.backup_code.clone()),
+                )
+                .await
+            {
+                Ok(verified) => return Ok(verified),
+                Err(OpaqueError::MfaRequired(_)) => mfa_proof = Some(prompt_mfa_proof()?),
+                Err(error) if otp_required && is_invalid_recovery_code(&error) => {
+                    ui::warning("The email code was rejected.");
+                    otp_code = Some(ui::prompts::input("Email confirmation code")?);
+                }
+                Err(error) => return Err(map_recovery_error(error)),
+            }
+        }
+        Err(CliError::authentication(
+            "Trust confirmation attempts exhausted. Start again.",
+        ))
+    }
+    .await;
+    finalization.credential_finalization.zeroize();
+    finalization.session_key.zeroize();
+    finalization.export_key.zeroize();
+    let mut verified = verification?;
+    let current = session_manager.require_auth()?;
+    if current.user_id != session.user_id
+        || current.device_id != session.device_id
+        || current.server_url != session.server_url
+        || current.token != session.token
+    {
+        return Err(CliError::authentication(
+            "The account changed during trust confirmation.",
+        ));
+    }
+    let recovery_id = verified.recovery_session_id;
+    verified.session_key.zeroize();
+    verified.export_key.zeroize();
+    complete_device_trust_recovery(&identity, &context, recovery_id)
+        .await
+        .map_err(CliError::authentication)?;
+    ui::success("Device trust confirmed. Device management is available.");
+    Ok(())
+}
+
 /// Handle user login with OPAQUE-PAKE authentication and migration state recovery
 pub async fn handle_login(
     username: String,
@@ -1150,6 +1315,9 @@ pub async fn execute_device_removal(
     target_device_id: &str,
 ) -> Result<DeviceRemovalOutcome, CliError> {
     let session = session_manager.require_auth()?;
+    if !target_device_id.eq_ignore_ascii_case(&session.device_id) {
+        ensure_device_management_trust(session_manager).await?;
+    }
 
     let trimmed_server_url = session.server_url.trim_end_matches('/');
     let request_url = if trimmed_server_url.ends_with("/api/v1") {
@@ -1162,15 +1330,46 @@ pub async fn execute_device_removal(
     };
 
     let client = reqwest::Client::new();
-    let response = client
-        .delete(&request_url)
-        .bearer_auth(&session.token)
+    let identity = session_manager.get_or_create_device_keypair().await?;
+    let proof = authorize_and_prepare_device_removal(
+        async {
+            hybridcipher_client::device_actions::signed_device_action(
+                &identity,
+                &hybridcipher_client::device_actions::DeviceActionContext {
+                    server_url: &session.server_url,
+                    token: &session.token,
+                    user_id: &session.user_id,
+                    device_id: &session.device_id,
+                },
+                hybridcipher_messages::device_actions::DeviceAction::Revoke,
+                target_device_id,
+                None,
+                &json!({}),
+            )
+            .await
+            .map_err(CliError::authentication)
+        },
+        target_device_id.eq_ignore_ascii_case(&session.device_id),
+        mount::stop_all_mounts_before_device_removal(session_manager),
+    )
+    .await?;
+    let current = session_manager.require_auth()?;
+    if current.user_id != session.user_id
+        || current.device_id != session.device_id
+        || current.server_url != session.server_url
+        || current.token != session.token
+    {
+        return Err(CliError::authentication(
+            "The session changed while preparing device removal. Retry the action.",
+        ));
+    }
+    let response = proof
+        .apply(client.delete(&request_url).bearer_auth(&session.token))
         .send()
         .await
         .map_err(|e| CliError::network(format!("Failed to contact server: {}", e)))?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        session_manager.invalidate_session("remove_device")?;
         return Err(CliError::authentication(
             "Authentication token rejected. Please login again.",
         ));
@@ -1193,7 +1392,9 @@ pub async fn execute_device_removal(
         .await
         .map_err(|e| CliError::network(format!("Failed to parse server response: {}", e)))?;
 
-    let removed_current_device = payload.removed_device_id == session.device_id;
+    let removed_current_device = payload
+        .removed_device_id
+        .eq_ignore_ascii_case(&session.device_id);
     drop(session);
     if removed_current_device {
         perform_secure_logout(session_manager).await?;
@@ -1986,7 +2187,10 @@ pub async fn handle_forgot_password(
         .map_err(|e| CliError::network(format!("Failed to contact server: {}", e)))?;
 
     if response.status().is_success() {
-        ui::success("If an account exists for that email, a reset link has been sent.");
+        ui::success(
+            "If an account exists for that email and your MFA code is valid, a reset link has been sent.",
+        );
+        ui::info("No email usually means the MFA code was wrong or MFA is not enrolled (`hybridcipher mfa enroll`).");
         Ok(())
     } else {
         let status = response.status();

@@ -123,6 +123,34 @@ pub(super) fn find_marker_for_path(
     None
 }
 
+/// The marker a root wrote for itself, found by its id so a renamed root still
+/// matches. `dir` is the folder itself, or a single file's parent.
+pub(super) fn find_marker_for_root_id(
+    dir: &Path,
+    root_id: Uuid,
+    group_id: Uuid,
+) -> Option<CoverageMarkerFile> {
+    read_marker_file(&dir.join(marker_filename(root_id)))
+        .filter(|marker| marker.root_id == root_id && marker.group_id == group_id)
+}
+
+/// Every folder marker of `group_id` directly inside `dir`, whatever its name.
+pub(super) fn folder_markers_in_dir(dir: &Path, group_id: Uuid) -> Vec<CoverageMarkerFile> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with(COVERAGE_MARKER_PREFIX) && name.ends_with(COVERAGE_MARKER_SUFFIX)
+            })
+        })
+        .filter_map(|entry| read_marker_file(&entry.path()))
+        .filter(|marker| marker.group_id == group_id && marker.kind == CoverageRootKind::Folder)
+        .collect()
+}
+
 pub(super) fn marker_path_from_marker(
     marker_file_path: &Path,
     marker: &CoverageMarkerFile,
@@ -279,17 +307,12 @@ impl<S: Storage, N: Network> Client<S, N> {
 
             let canonical_path = entry.canonical_path.clone();
             let metadata = self.load_metadata_for_canonical(&canonical_path).await?;
-            let header = Self::parse_encrypted_file_metadata(&canonical_path);
-            let mut file_id = metadata.as_ref().and_then(|data| data.file_id.clone());
-            if file_id.is_none() {
-                if let Some(header) = header.as_ref() {
-                    if !header.file_id.is_empty() {
-                        file_id = Some(header.file_id.clone());
-                    }
-                }
-            }
 
-            if metadata.is_none() && !Self::path_has_encrypted_suffix(&canonical_path) {
+            // Untracked files are judged by their contents, whatever their name:
+            // plaintext is encrypted and renamed-away ciphertext gets its name back.
+            if metadata.is_none()
+                && ciphertext::classify(&canonical_path) != CiphertextKind::FolderRecord
+            {
                 match self.auto_encrypt_plaintext_file(&canonical_path).await {
                     Ok(Some(encrypted_path)) => match fs::metadata(&encrypted_path).await {
                         Ok(meta) => {
@@ -325,6 +348,16 @@ impl<S: Storage, N: Network> Client<S, N> {
                             ),
                             Some("coverage_auto_encrypt_failed"),
                         );
+                    }
+                }
+            }
+
+            let header = Self::parse_encrypted_file_metadata(&canonical_path);
+            let mut file_id = metadata.as_ref().and_then(|data| data.file_id.clone());
+            if file_id.is_none() {
+                if let Some(header) = header.as_ref() {
+                    if !header.file_id.is_empty() {
+                        file_id = Some(header.file_id.clone());
                     }
                 }
             }
@@ -386,7 +419,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                     state,
                     orphan_kind,
                 )
-            } else if Self::path_has_encrypted_suffix(&canonical_path)
+            } else if ciphertext::classify(&canonical_path) == CiphertextKind::File
                 && Self::detect_hybridcipher_header(&canonical_path)
             {
                 let (header_epoch, header_group) = header
@@ -519,7 +552,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                     return;
                 }
 
-                if Self::is_directory_metadata_sidecar(&path) {
+                if ciphertext::classify(&path) == CiphertextKind::FolderRecord {
                     return;
                 }
 
@@ -630,7 +663,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         match root.kind {
             CoverageRootKind::SingleFile => root.path.clone(),
             CoverageRootKind::Folder => {
-                if relative_path.to_ascii_lowercase().ends_with(".encrypted") {
+                if ciphertext::strip_encrypted_suffix(relative_path).is_some() {
                     root.path.join(relative_path)
                 } else {
                     root.path.join(format!("{relative_path}.encrypted"))
@@ -640,7 +673,7 @@ impl<S: Storage, N: Network> Client<S, N> {
     }
 
     pub(super) fn normalized_relative_path(relative_path: &str) -> String {
-        if let Some(stripped) = Self::strip_encrypted_suffix(relative_path) {
+        if let Some(stripped) = ciphertext::strip_encrypted_suffix(relative_path) {
             stripped.to_string()
         } else {
             relative_path.to_string()
@@ -659,7 +692,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         }
 
         let rel = entry.relative_path.clone();
-        if !rel.to_ascii_lowercase().ends_with(".encrypted") {
+        if ciphertext::strip_encrypted_suffix(&rel).is_none() {
             match root.kind {
                 CoverageRootKind::SingleFile => candidates.push(root.path.clone()),
                 CoverageRootKind::Folder => {
@@ -668,7 +701,7 @@ impl<S: Storage, N: Network> Client<S, N> {
             }
         }
 
-        if let Some(stripped) = Self::strip_encrypted_suffix(&rel) {
+        if let Some(stripped) = ciphertext::strip_encrypted_suffix(&rel) {
             match root.kind {
                 CoverageRootKind::SingleFile => candidates.push(root.path.clone()),
                 CoverageRootKind::Folder => {
@@ -698,161 +731,37 @@ impl<S: Storage, N: Network> Client<S, N> {
                     .unwrap_or(false)
     }
 
-    pub(super) fn strip_encrypted_suffix(value: &str) -> Option<&str> {
-        const SUFFIX: &str = ".encrypted";
-        if value.len() <= SUFFIX.len() {
-            return None;
-        }
-
-        let (body, suffix) = value.split_at(value.len() - SUFFIX.len());
-        if suffix.eq_ignore_ascii_case(SUFFIX) {
-            Some(body)
-        } else {
-            None
-        }
-    }
-
-    pub(super) fn decode_header_bytes(val: Option<&serde_json::Value>) -> Option<Vec<u8>> {
-        if let Some(v) = val {
-            if let Some(s) = v.as_str() {
-                if let Ok(bytes) = general_purpose::STANDARD.decode(s) {
-                    return Some(bytes);
-                }
-            }
-            if let Ok(vec_bytes) = serde_json::from_value::<Vec<u8>>(v.clone()) {
-                return Some(vec_bytes);
-            }
-        }
-        None
-    }
-
+    /// Header metadata plus the ciphertext, limited to what decrypts in memory.
     pub(super) fn parse_encrypted_metadata_from_parts(
         _path: &Path,
         header_json: &serde_json::Value,
         ciphertext: Vec<u8>,
     ) -> Option<EncryptedFileMetadata> {
-        let file_id = header_json.get("file_id")?.as_str()?.to_string();
-        let epoch_id = header_json.get("epoch_id")?.as_u64()?;
-        let header_version = match header_json.get("header_version") {
-            None => 1,
-            Some(value) => u32::try_from(value.as_u64()?).ok()?,
+        let mut metadata = ciphertext::parse_header_metadata(header_json, ciphertext.len() as u64)?;
+        let packed_size = match metadata.sparse_metadata.as_ref() {
+            Some(layout) => layout.validated_packed_size(metadata.content_size)?,
+            None => metadata.content_size,
         };
-
-        let group_id = header_json
-            .get("group_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok());
-
-        let wrapped_file_key = Self::decode_header_bytes(header_json.get("wrapped_file_key"))?;
-        let key_wrap_nonce = Self::decode_header_bytes(header_json.get("key_wrap_nonce"))?;
-        let key_wrap_aad_hash = Self::decode_header_bytes(header_json.get("key_wrap_aad_hash"))?;
-        let content_nonce = Self::decode_header_bytes(header_json.get("content_nonce"))?;
-
-        let created_at = header_json
-            .get("encrypted_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|| chrono::Utc::now());
-
-        let content_size_field = header_json
-            .get("file_size")
-            .and_then(|v| v.as_u64())
-            .or_else(|| header_json.get("original_size").and_then(|v| v.as_u64()));
-        if header_version >= 3 && content_size_field.is_none() {
-            return None;
-        }
-        let content_size = content_size_field.unwrap_or(0);
-        let content_chunk_size = match header_json.get("chunk_size") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => Some(value.as_u64()?),
-        };
-        let platform_metadata = header_json
-            .get("platform_metadata")
-            .and_then(|value| serde_json::from_value::<PlatformFileMetadata>(value.clone()).ok())
-            .filter(|metadata| !metadata.is_empty());
-        let parsed_sparse_metadata = match header_json.get("sparse_metadata") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => Some(serde_json::from_value::<SparseFileMetadata>(value.clone()).ok()?),
-        };
-        if let Some(layout) = parsed_sparse_metadata.as_ref() {
-            layout.validated_packed_size(content_size)?;
-        }
-        let sparse_metadata =
-            parsed_sparse_metadata.filter(SparseFileMetadata::is_effectively_sparse);
-        let packed_size = match sparse_metadata.as_ref() {
-            Some(layout) => layout.validated_packed_size(content_size)?,
-            None => content_size,
-        };
-        if content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
+        if metadata.content_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
             || packed_size > MAX_IN_MEMORY_PLAINTEXT_BYTES
         {
             return None;
         }
-        if let Some(chunk_size) = content_chunk_size {
-            let chunk_size = usize::try_from(chunk_size).ok()?;
-            if chunk_size == 0 || chunk_size > MAX_CONTENT_CHUNK_SIZE {
-                return None;
-            }
-            if chunked_encrypted_size(packed_size, chunk_size).ok()? != ciphertext.len() as u64 {
-                return None;
-            }
-        } else {
-            if content_size_field.is_some()
-                && ciphertext.len() as u64 != packed_size.checked_add(12 + AEAD_TAG_SIZE as u64)?
-            {
-                return None;
-            }
-            if ciphertext.len() as u64 > MAX_IN_MEMORY_PLAINTEXT_BYTES + 12 + AEAD_TAG_SIZE as u64 {
-                return None;
-            }
+        if metadata.content_chunk_size.is_none()
+            && ciphertext.len() as u64 > MAX_IN_MEMORY_PLAINTEXT_BYTES + 12 + AEAD_TAG_SIZE as u64
+        {
+            return None;
         }
-
-        let stored_file_path = header_json
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .filter(|value| !value.trim().is_empty())?;
-        let aad_label = Self::normalize_file_identifier(&stored_file_path);
-
-        Some(EncryptedFileMetadata {
-            file_id,
-            file_path: aad_label,
-            group_id,
-            epoch_id,
-            header_version: Some(header_version),
-            wrapped_file_key: Some(wrapped_file_key),
-            key_wrap_nonce: Some(key_wrap_nonce),
-            key_wrap_aad_hash: Some(key_wrap_aad_hash),
-            content_nonce: Some(content_nonce),
-            content_chunk_size,
-            content_size,
-            encrypted_size: ciphertext.len() as u64,
-            created_at,
-            platform_metadata,
-            sparse_metadata,
-            encrypted_content: ciphertext,
-        })
+        metadata.encrypted_content = ciphertext;
+        Some(metadata)
     }
 
+    /// Whether the file starts with a HybridCipher header, even a damaged one.
     pub(super) fn detect_hybridcipher_header(path: &Path) -> bool {
-        use std::io::Read;
-
-        let Ok(mut file) = std::fs::File::open(path) else {
-            return false;
-        };
-
-        const SCAN_LIMIT: usize = 8192;
-        let mut buffer = vec![0u8; SCAN_LIMIT];
-
-        let Ok(bytes_read) = file.read(&mut buffer) else {
-            return false;
-        };
-        buffer.truncate(bytes_read);
-
-        buffer
-            .windows(ENCRYPTED_FILE_SEPARATOR.len())
-            .any(|window| window == ENCRYPTED_FILE_SEPARATOR)
+        matches!(
+            ciphertext::inspect_path(path),
+            Ok(ContentKind::Ciphertext(_) | ContentKind::Damaged(_))
+        )
     }
 
     pub(super) fn parse_encrypted_file_metadata(path: &Path) -> Option<EncryptedFileMetadata> {
@@ -1146,7 +1055,7 @@ impl<S: Storage, N: Network> Client<S, N> {
                 .unwrap_or_else(|| Uuid::new_v5(&root.root_id, normalized_path.as_bytes()));
 
             let should_promote = matches!(entry_state, FileCoverageState::Unmanaged)
-                && relative_path.to_ascii_lowercase().ends_with(".encrypted");
+                && ciphertext::strip_encrypted_suffix(&relative_path).is_some();
 
             if should_promote {
                 if let Some(prev) = previous_entry.as_ref() {
@@ -1200,7 +1109,7 @@ impl<S: Storage, N: Network> Client<S, N> {
         }
 
         for (_, mut entry) in previous {
-            if Self::is_directory_metadata_sidecar_relative(&entry.relative_path) {
+            if ciphertext::classify_relative(&entry.relative_path) == CiphertextKind::FolderRecord {
                 continue;
             }
             stats.orphaned += 1;
